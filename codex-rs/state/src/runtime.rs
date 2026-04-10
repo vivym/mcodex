@@ -50,6 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+mod account_pool;
 mod agent_jobs;
 mod backfill;
 mod logs;

@@ -1,3 +1,4 @@
+mod account_pool;
 mod agent_job;
 mod backfill_state;
 mod graph;
@@ -5,6 +6,16 @@ mod log;
 mod memories;
 mod thread_metadata;
 
+pub use account_pool::AccountHealthEvent;
+pub use account_pool::AccountHealthState;
+pub use account_pool::AccountLeaseError;
+pub use account_pool::AccountLeaseRecord;
+pub use account_pool::AccountPoolHealthState;
+pub use account_pool::AccountStartupSelectionState;
+pub use account_pool::AccountStartupSelectionUpdate;
+pub use account_pool::LeaseKey;
+pub use account_pool::LeaseRenewal;
+pub use account_pool::LegacyAccountImport;
 pub use agent_job::AgentJob;
 pub use agent_job::AgentJobCreateParams;
 pub use agent_job::AgentJobItem;
@@ -33,6 +44,8 @@ pub use thread_metadata::ThreadMetadata;
 pub use thread_metadata::ThreadMetadataBuilder;
 pub use thread_metadata::ThreadsPage;
 
+pub(crate) use account_pool::datetime_to_epoch_seconds as account_datetime_to_epoch_seconds;
+pub(crate) use account_pool::epoch_seconds_to_datetime as account_epoch_seconds_to_datetime;
 pub(crate) use agent_job::AgentJobItemRow;
 pub(crate) use agent_job::AgentJobRow;
 pub(crate) use memories::Stage1OutputRow;
