@@ -21,12 +21,13 @@ Key decisions:
   Leased request paths must use process-local auth materialization. Shared `auth.json` remains a
   legacy compatibility surface for single-account flows only.
 - Use runtime-instance-scoped sticky leases: one Codex runtime instance keeps one active account
-  until it is near its limit, exhausted, unauthorized, manually switched, or its lease expires.
+  until it is near its limit, exhausted, unauthorized, explicitly overridden, or its lease
+  expires.
 - Default to `exclusive` allocation so multiple local Codex instances do not silently share the
   same account.
 - Implement the local backend on top of atomic SQLite-backed lease state with fencing tokens.
-- Implement automatic retry through an explicit turn replay guard, not an informal "no side
-  effects yet" check.
+- Gate any current-turn automatic retry behind an explicit turn replay guard plus provider-backed
+  authenticated no-commit proof; current Responses transports stay future-turn-only in v1.
 - Support both local and future remote pool backends through a common backend interface.
 - Ship the first version with local backend support, ChatGPT-first account support, and minimal
   TUI changes.
@@ -36,8 +37,8 @@ Key decisions:
 - Support multiple accounts in a single Codex installation.
 - Monitor rate limits and usage-limit signals per account.
 - Automatically switch accounts before hard exhaustion when possible.
-- Automatically fail over after `usage_limit_reached` only when the current turn is still
-  replayable and transport commit state is known-safe.
+- Automatically fail over to another account after `usage_limit_reached`, with current-turn replay
+  reserved for transports that can prove no remote commit for that attempt.
 - Avoid introducing a fork-only `auth.json` format that will make future upstream merges painful.
 - Support multiple concurrent local Codex processes without accidentally assigning the same account
   by default.
@@ -119,6 +120,53 @@ Instead:
 
 This is the main merge-friendly choice in the design.
 
+### 3a. Add an explicit auth-view seam before pool logic
+
+Before any pool-selection logic lands, v1 should introduce a narrow seam between:
+
+- `LegacyAuthView`: the existing installation-scoped compatibility auth view backed by
+  `AuthManager`, `auth.json`, and existing auth storage
+- `LeasedTurnAuth`: a runtime-instance-scoped immutable auth snapshot derived from the active lease
+  and used only for leased request execution
+
+This seam is required because current repo code still treats `AuthManager` as the single shared
+source of truth for both request auth and legacy compatibility surfaces.
+
+The consumer split in v1 should be explicit:
+
+- `LegacyAuthView` remains the source for legacy `codex login/logout/status`, legacy app-server
+  `account/*`, `codex cloud`, and any other shipped surfaces that still intentionally reflect the
+  shared compatibility auth store
+- `LeasedTurnAuth` becomes the source for `codex-core` request execution, active leased model
+  client setup, lease-bound rate-limit reporting, and other paths whose correctness must not depend
+  on shared mutable auth storage
+
+`codex-login` remains the only owner of writes to compatibility auth storage, but leased turn
+execution must stop reading that shared storage directly once this seam exists.
+
+### 3b. Separate local thread identity from remote transport identity
+
+Cross-account rotation that requires remote-context reset cannot rely on the current transport shape
+where the local thread identifier is also reused as the outbound remote session or conversation
+identity.
+
+Before such rotation is allowed on a transport, v1 must introduce an explicit
+`RemoteSessionId`-style seam:
+
+- local thread identity remains stable for local history, rollout, and UI continuity
+- outbound transport identity becomes a distinct value carried by `ModelClient` and any other
+  transport that currently sends the local thread id as a remote session or conversation id
+- transport reset generation remains a sub-generation of that remote transport identity rather than
+  a substitute for minting a new remote identity
+
+When cross-account rotation requires remote-context reset:
+
+- the runtime must mint a fresh outbound remote transport identity
+- it must also reset the transport generation and cached transport state under that new identity
+
+If a transport cannot support a distinct remote transport identity in v1, then cross-account
+rotation that requires remote-context reset is unsupported on that transport.
+
 ### 4. Separate backend from policy
 
 The account-pool layer should depend on a backend trait rather than assuming local file storage.
@@ -145,6 +193,15 @@ That means:
   app-server and core
 - account-pool should reuse the existing DB initialization and migration path
 - v1 should not create a second independent SQLite bootstrap path for account-pool state
+
+Schema and migration ownership should also be explicit:
+
+- `codex-state` owns account-pool schema, migrations, and typed persistence APIs for the shared
+  SQLite runtime
+- if code organization becomes awkward, a thin state-owned companion crate may expose typed
+  account-pool repositories, but it remains subordinate to `codex-state` for migrations and DB
+  initialization
+- `codex-account-pool` must not run an independent SQL bootstrap path or own shared-DB migrations
 
 ## High-Level Flow
 
@@ -175,9 +232,9 @@ This avoids request-time thrashing and keeps switching behavior closer to "runti
 When the current account hits `usage_limit_reached`:
 
 - mark it exhausted or cooling down
-- if the turn is still in the replayable state and remote commit status is known-safe, switch
-  accounts, rebuild turn transport state, and retry once
-- if the turn is no longer replayable, do not replay the turn; only switch future turns
+- if the active transport can produce an authenticated no-commit proof for that attempt and the
+  turn is still replayable, switch accounts, rebuild turn transport state, and retry once
+- otherwise do not replay the turn; only switch future turns
 
 This preserves automation without risking duplicate shell, MCP, or patch operations.
 
@@ -204,10 +261,18 @@ The allocation unit in v1 is a Codex runtime instance, not a single request.
 For this spec, a "runtime instance" means:
 
 - one CLI or TUI process, or
-- one app-server process handling one pooled-selection context
+- one stdio app-server process handling one pooled-selection context
 
-Threads inside the same runtime instance share that one pooled lease context in v1. Supporting
-multiple independent pooled leases inside one process is deferred.
+For CLI and TUI runtimes, threads inside the same runtime instance share that one pooled lease
+context in v1.
+
+For stdio app-server runtimes, pooled mode is only valid while the process hosts at most one loaded
+or running thread context at a time. If a second thread is loaded, resumed, or started while
+pooled mode is active, the operation must fail clearly or pooled mode must be unavailable.
+
+In v1, pooled lease mode is not available for multi-client WebSocket app-server processes. Those
+processes remain on legacy compatibility auth or explicit external-auth flows until pooled lease
+scope is redesigned around connection, session, or thread boundaries.
 
 Default behavior:
 
@@ -221,7 +286,6 @@ Default switching triggers:
 - `usage_limit_reached`
 - unrecoverable auth failure
 - lease expiration or lease revocation
-- manual user switch
 
 Default safeguards:
 
@@ -568,7 +632,14 @@ materialization that request execution uses.
 Refresh or rotation must create a new handle and rebuild transport state; the auth used by an
 in-flight turn must never mutate underneath that turn.
 
-Turn execution must also carry the current `remote_context_generation` for its transport state.
+Turn execution must also carry the current transport-reset generation for its transport state.
+In v1, this is the same generation that already feeds `ModelClient` window reset behavior and
+`x-codex-window-id`; v1 should not introduce a second independent generation mechanism for the same
+transport reset boundary.
+
+Turn execution must also carry the current outbound remote transport identity when the active
+transport has one. Cross-account reset that requires a fresh remote session must replace that
+identity as well as the transport-reset generation.
 
 ## Integration Points
 
@@ -581,7 +652,8 @@ the current single-auth access pattern.
   for that turn
 - update account-pool state when rate-limit snapshots arrive
 - update account-pool state when usage-limit or unauthorized errors arrive
-- attempt one automatic retry only when the turn is still replayable
+- attempt one automatic retry only when the turn is still replayable and the transport has
+  authenticated no-commit proof for that attempt
 - on account rotation, rebuild model-client or transport state from the new lease instead of
   mutating shared auth underneath an existing client session
 - when rotating across accounts in a pool whose `allow_context_reuse = false`, rebuild transport
@@ -590,8 +662,13 @@ the current single-auth access pattern.
   instead of reusing the local thread id as the outbound remote session identifier
 - replace direct active-auth reads on request-execution and account-affecting paths with a
   lease-scoped auth accessor or equivalent adapter
-- revalidate `lease_id + lease_epoch` and `remote_context_generation` immediately before every new
-  model round-trip, tool dispatch, or other effectful remote step inside a turn
+- revalidate `lease_id + lease_epoch` and the transport-reset generation immediately before every
+  new model round-trip, tool dispatch, or other effectful remote step inside a turn
+- on account rotation or remote-context reset, bump the same generation that feeds
+  `x-codex-window-id`, drop cached websocket state, clear any `previous_response_id` chain, and
+  force a fresh `ModelClientSession` before any further round-trip
+- when reset requires a fresh remote session, mint a new outbound remote transport identity instead
+  of continuing to send the stable local thread id as the remote session or conversation id
 - discard late callbacks or streamed events from abandoned transport generations after rotation,
   retry, or remote-context reset
 
@@ -614,6 +691,17 @@ shared auth store state directly.
 The first version should keep compatibility for existing `account/*` surfaces while adding one new
 explicit pooled-status surface.
 
+Pooled app-server support in v1 is intentionally narrow:
+
+- pooled lease mode is supported only for stdio or other effectively single-client app-server
+  runtimes
+- multi-client WebSocket app-server processes remain on legacy compatibility auth or explicit
+  external-auth flows in v1
+- stdio pooled mode is only valid while at most one thread context is loaded or running in that
+  process
+- pool-aware app-server work must not assume one process-global pooled lease can safely represent
+  multiple concurrent thread contexts
+
 Existing `account/*` RPCs and notifications remain legacy compatibility operations and continue to
 describe only the compatibility single-account auth view.
 
@@ -626,13 +714,31 @@ Mutating legacy `account/*` RPCs remain compatibility-only single-account operat
 - successful legacy login may upsert that default entry and attach it to the current effective
   default pool without changing any other stored accounts
 - successful legacy login clears durable default-startup suppression
-- `account/logout` clears the current compatibility auth view, revokes any currently active
-  process-local pooled lease, and durably suppresses automatic pooled selection for default startup
+- `account/logout` clears the current compatibility auth view
+- when the current auth mode is a managed or persisted legacy auth mode, `account/logout` also
+  revokes any currently active process-local pooled lease and durably suppresses automatic pooled
+  selection for default startup
+- when the current auth mode is runtime-local `chatgptAuthTokens`, `account/logout` clears only
+  that runtime-local external-auth context and any lease derived from it; it does not mutate
+  durable startup suppression or the persisted default legacy account entry
 - after legacy `account/logout`, a legacy client should observe signed-out behavior until an
   explicit new legacy login or explicit pool-aware selection clears that suppression state
 
 These compatibility operations must not silently enumerate, mutate, or rotate through other pooled
 accounts behind the caller's back.
+
+The externally supplied `chatgptAuthTokens` path is a required carve-out from those installation-
+scoped compatibility rules:
+
+- `chatgptAuthTokens` login, refresh, and logout remain runtime-local external-auth flows owned by
+  the embedding client
+- those flows bind only the running app-server runtime's external-auth context
+- they do not upsert the migrated default legacy account entry
+- they do not clear or set durable startup suppression
+- they do not change durable preferred-account overrides unless a future explicit pool-aware API
+  asks for that
+- `account/chatgptAuthTokens/refresh` remains a runtime-scoped client callback keyed to that
+  external session rather than an installation-scoped pool mutation
 
 To represent pooled status explicitly, v1 should add a new app-server v2 surface:
 
@@ -645,8 +751,12 @@ That surface should report the current process-local pooled lease state, includi
 - whether pooled selection is active or durably suppressed
 - current `account_id`, `pool_id`, `lease_id`, and `lease_epoch` when a lease exists
 - the current switch reason or suppression reason when known
-- a monotonic `remote_context_generation`
+- the current transport-reset generation backed by the same window reset mechanism used for
+  `x-codex-window-id`
 - `last_remote_context_reset_turn_id` when a reset has occurred in the current session
+- current pooled health state, nearing-limit state, and next eligible time when known
+- enough pooled-selection status to explain why the active account was chosen or why no leased
+  account is currently eligible
 
 Existing `account/read` and `account/updated` should remain stable for legacy clients and should
 not be overloaded with pooled lease semantics.
@@ -716,6 +826,13 @@ Compatibility expectations:
 Legacy `codex login/logout` only operate on that default legacy account entry. They must not add,
 remove, enable, disable, or auto-select unrelated pooled accounts.
 
+`codex login status` remains a legacy compatibility view in v1. It continues to report only the
+shared compatibility auth store, not the predicted pooled selection for a fresh runtime instance.
+
+Other shipped products or commands that still intentionally read shared compatibility auth, such as
+`codex cloud`, also remain compatibility-only in v1 unless they are explicitly migrated onto
+pooled leased auth.
+
 Legacy `codex login` clears durable default-startup suppression.
 Legacy `codex logout` also enables durable default-startup suppression for pooled auto-selection.
 Generic future runtime instances should remain signed out until the user explicitly resumes pooled selection
@@ -729,18 +846,19 @@ Pool selection in v1 should be explicit:
 - for management commands, the effective pool still resolves from the explicit `--account-pool`
   override first and then the default-pool resolution order above, even when startup suppression is
   active
-- make `codex accounts current` and `codex accounts status` report durable selection state for a
-  fresh runtime instance, not mutate or inspect an already-running runtime-instance lease
-- make `codex accounts current` and `codex accounts status` show the effective pool, any durable
-  preferred-account override, any durable suppression state, the predicted selected account for a
-  fresh runtime instance, health state, switch reason, and next eligible time when known
+- make `codex accounts current` report the single predicted selection result for a fresh runtime
+  instance, including effective pool, durable override or suppression, and predicted account when
+  known
+- make `codex accounts status` report full pool diagnostics for a fresh runtime instance, including
+  effective pool, durable override or suppression, predicted account, health state, switch reason,
+  next eligible time, and per-account eligibility reasons when known
 - `codex accounts resume` clears durable default-startup suppression and removes any durable
   preferred-account override so automatic selection resumes from the effective default pool
   resolution order
 - `codex accounts switch <account>` is a durable manual override for future runtime instances only
 - `codex accounts switch <account>` clears durable default-startup suppression
-- runtime switching of an already-running runtime instance requires an in-process or app-server
-  pooled API and is not provided by the one-shot CLI in v1
+- runtime switching of an already-running runtime instance is not provided by the one-shot CLI in
+  v1, and app-server live manual lease switching is also deferred
 - `codex accounts switch <account>` only switches within the current effective pool
 - switching to an account in another pool must require an explicit pool override such as
   `--account-pool <pool>` instead of implicitly changing pool context
@@ -771,7 +889,9 @@ Side effects include at least:
 
 Retry behavior:
 
-- replayable turn: switch account and retry once
+- transport without authenticated no-commit proof: switch only future turns, return a clear
+  message for the current turn
+- transport with authenticated no-commit proof: replayable turn may switch account and retry once
 - non-replayable turn: switch only future turns, return a clear message for the current turn
 
 This rule is mandatory to prevent duplicated work.
@@ -779,11 +899,16 @@ This rule is mandatory to prevent duplicated work.
 Replay safety must also account for remote commit state:
 
 - automatic retry is allowed only when the local replay guard is `Replayable` and the transport can
-  prove that remote commit state is safe to retry
+  prove remote no-commit for that specific attempt using a provider-authenticated signal, such as
+  an explicit no-commit result bound to a per-attempt nonce
 - if the first attempt may already have created or advanced remote conversation state and commit
   status is unknown, the turn becomes non-replayable in v1
 - when retry does proceed after rotation, it must use fresh transport state; if safe reuse of prior
   remote state cannot be proven, retry must use fresh remote conversation state
+
+For the current Responses HTTP and WebSocket transports in this repo, v1 should assume that such an
+authenticated no-commit proof does not exist. Therefore, cross-account automatic replay is disabled
+on those transports in v1; `usage_limit_reached` only rotates future turns there.
 
 ### Turn replay guard
 
@@ -800,9 +925,17 @@ Suggested states:
 Required transitions:
 
 - the guard flips out of `Replayable` before any effectful tool dispatch is launched
-- the guard also flips out of `Replayable` before user-visible assistant output is committed
+- the guard also flips out of `Replayable` before any user-visible assistant output is committed
+- the guard also flips out of `Replayable` before any non-replay-safe event is durably persisted
+  or any pending per-turn waiter is installed for approvals, patch review, permissions, user
+  input, or MCP elicitation
 - `usage_limit_reached` may auto-retry only from `Replayable`
 - once the guard leaves `Replayable`, that turn must never be replayed
+
+Replay-safe local bookkeeping is explicitly exempt from that transition. In particular, local
+turn-context allocation and persistence of the user's own input may remain within `Replayable` so
+long as they are deterministically replaced by the retry attempt and do not create additional
+assistant-visible output, pending waiters, or irreversible external effects.
 
 This is intentionally conservative. A turn that already emitted visible assistant output but did
 not yet launch tools is still treated as non-replayable in v1 to avoid duplicated or divergent
@@ -829,7 +962,7 @@ If the current active account crosses the proactive threshold:
 ### `usage_limit_reached`
 
 - mark the account exhausted or cooling down
-- retry once only if the turn is still replayable and remote commit state is known-safe
+- retry once only on transports that satisfy the authenticated no-commit requirement above
 - otherwise switch only future turns
 
 ### Unauthorized or refresh failure
@@ -871,13 +1004,19 @@ The first implementation should include:
 
 - new account-pool strategy layer independent from the existing auth-bound `codex-account` crate
 - local backend
+- explicit `LegacyAuthView` / `LeasedTurnAuth` seam before request paths stop reading shared auth
+- explicit outbound `RemoteSessionId`-style seam before transports that need remote-context reset
+  can support cross-account rotation
 - runtime-instance-scoped sticky leases
 - `exclusive` allocation
 - ChatGPT-first full support
 - proactive threshold switching
-- `usage_limit_reached` failover with safe retry rules
+- `usage_limit_reached` failover for future turns, with current Responses transports keeping
+  automatic replay disabled
 - CLI account management under `codex accounts`
 - small TUI status surfaces
+- pooled support for CLI, TUI, and stdio single-client app-server runtimes
+- `chatgptAuthTokens` preserved as a runtime-local external-auth carve-out
 
 The first implementation may include API key accounts in the data model and CLI, while deferring
 full automatic quota-awareness for API keys until later.
@@ -905,6 +1044,11 @@ The first version should not include:
 
 - full TUI account-management UI
 - production remote backend implementation
+- pooled mode for multi-client WebSocket app-server runtimes
+- pooled mode for stdio app-server processes with more than one loaded or running thread context
+- live manual lease switching for app-server runtimes
+- cross-account automatic replay on current Responses transports without authenticated no-commit
+  proof
 - advanced weighted scheduling
 - shared lease mode
 - cross-project sticky routing
@@ -952,14 +1096,19 @@ Add coverage for:
 - reporting rate-limit snapshots into account-pool state
 - rotating only future turns after threshold updates
 - rebuilding request transport state after lease rotation
-- retrying once after `usage_limit_reached` only from the replayable state
-- refusing to replay a turn after visible output or side effects occurred
+- refusing current-turn replay on current Responses transports after `usage_limit_reached`
+- refusing to replay a turn after visible output, non-replay-safe persisted events, or pending-turn
+  allocations occurred
 - stale lease fencing blocking request execution
 - per-step lease and remote-context revalidation inside multi-step turns
 - refusing new work after fence failure on a long-running local turn
 - resetting remote conversation state on cross-account rotation when `allow_context_reuse = false`
-- suppressing retry when remote commit status is unknown
+- suppressing retry when remote commit status is unknown or no authenticated no-commit proof exists
 - preserving the same local thread while resetting remote session state on rotation
+- minting a new outbound remote transport identity on cross-account reset when the transport
+  supports remote-context reset
+- bumping the existing window reset generation, clearing cached websocket state, and clearing
+  `previous_response_id` on remote-context reset
 
 ### CLI tests
 
@@ -990,12 +1139,18 @@ Add coverage for:
 - legacy `account/read` and `account/updated` preserving signed-out compatibility semantics
 - legacy `account/login/*` clearing durable suppression
 - `account/logout` revoking any active process-local pooled lease and enabling durable
-  default-startup suppression
+  default-startup suppression only for managed or persisted legacy auth modes
+- `account/logout` remaining runtime-local and non-durable for `chatgptAuthTokens`
+- `chatgptAuthTokens` login/refresh/logout remaining runtime-local and not mutating durable pool
+  startup state
 - `accountLease/read`, `accountLease/resume`, and `accountLease/updated` reflecting process-local
   lease state
 - `accountLease/resume` affecting a live process without interrupting an in-flight turn
-- pooled status surfaces reporting `remote_context_generation` and
-  `last_remote_context_reset_turn_id` when reset occurs
+- pooled status surfaces reporting transport-reset generation, health state, next eligible time,
+  and `last_remote_context_reset_turn_id` when reset occurs
+- pooled mode rejection or disablement for multi-client WebSocket app-server runtimes in v1
+- pooled mode rejection or disablement once a stdio app-server process hosts more than one loaded
+  or running thread context
 
 ### TUI tests
 
@@ -1010,12 +1165,20 @@ Add only targeted coverage and snapshot updates for:
 
 ## Rollout Plan
 
+### Phase 0: Auth and state seam
+
+- introduce explicit `LegacyAuthView` versus `LeasedTurnAuth`
+- move request execution onto `LeasedTurnAuth` without changing legacy compatibility surfaces
+- introduce an outbound `RemoteSessionId`-style seam distinct from the stable local thread id
+- assign account-pool schema, migrations, and typed persistence ownership to `codex-state`
+- scope v1 pooled app-server support to stdio single-client runtimes
+- preserve `chatgptAuthTokens` as a runtime-local external-auth carve-out
+
 ### Phase 1: Foundation
 
 - add account-pool strategy layer independent from the existing auth-bound `codex-account` crate
 - add local backend
 - extend `codex-state::StateRuntime` with account-pool registry, lease, and runtime state tables
-- add process-local auth materialization
 - add `codex accounts` CLI
 - add explicit pooled app-server lease-status surface
 - add durable suppression and resume semantics
@@ -1026,10 +1189,17 @@ Add only targeted coverage and snapshot updates for:
 - wire rate-limit reporting into account-pool state
 - implement proactive threshold switching
 - implement turn replay guard
-- implement safe retry after `usage_limit_reached`
+- implement future-turn failover after `usage_limit_reached`
+- bind account rotation and remote-context reset to the existing transport window reset boundary
 - add small TUI surfaces
 
-### Phase 3: Remote backend
+### Phase 3: Replay and broader runtime support
+
+- add transport-specific authenticated no-commit proof if a provider later supports it
+- only then enable current-turn automatic replay behind the replay guard
+- redesign pooled app-server scope for multi-client WebSocket runtimes
+
+### Phase 4: Remote backend
 
 - add remote backend trait implementation
 - acquire and release remote leases
