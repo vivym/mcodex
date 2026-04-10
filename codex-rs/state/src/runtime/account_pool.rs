@@ -1,9 +1,7 @@
 use super::*;
 use crate::model::AccountHealthEvent;
-use crate::model::AccountHealthState;
 use crate::model::AccountLeaseError;
 use crate::model::AccountLeaseRecord;
-use crate::model::AccountPoolHealthState;
 use crate::model::AccountStartupSelectionState;
 use crate::model::AccountStartupSelectionUpdate;
 use crate::model::LeaseKey;
@@ -261,9 +259,7 @@ INSERT INTO account_registry (
     created_at,
     updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(account_id) DO UPDATE SET
-    pool_id = excluded.pool_id,
-    updated_at = excluded.updated_at
+ON CONFLICT(account_id) DO NOTHING
             "#,
         )
         .bind(&legacy_account.account_id)
@@ -353,10 +349,11 @@ ON CONFLICT(singleton) DO UPDATE SET
         Ok(())
     }
 
-    pub async fn read_account_health_state(
+    #[cfg(test)]
+    async fn read_account_health_state(
         &self,
         account_id: &str,
-    ) -> anyhow::Result<Option<AccountPoolHealthState>> {
+    ) -> anyhow::Result<Option<crate::model::AccountPoolHealthState>> {
         let row = sqlx::query(
             r#"
 SELECT
@@ -375,10 +372,10 @@ WHERE account_id = ?
         .await?;
 
         match row {
-            Some(row) => Ok(Some(AccountPoolHealthState {
+            Some(row) => Ok(Some(crate::model::AccountPoolHealthState {
                 account_id: row.try_get("account_id")?,
                 pool_id: row.try_get("pool_id")?,
-                health_state: AccountHealthState::try_from(
+                health_state: crate::model::AccountHealthState::try_from(
                     row.try_get::<String, _>("health_state")?.as_str(),
                 )?,
                 last_health_event_sequence: row.try_get("last_health_event_sequence")?,
@@ -642,6 +639,33 @@ mod tests {
                 suppressed: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn import_legacy_default_account_preserves_existing_pool_membership() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let pool_id: String = sqlx::query_scalar(
+            r#"
+SELECT pool_id
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(pool_id, "pool-main");
     }
 
     async fn test_runtime() -> Arc<StateRuntime> {
