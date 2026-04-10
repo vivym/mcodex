@@ -13,16 +13,20 @@ existing single-account auth flow in place.
 
 Key decisions:
 
-- Add a new `codex-account-pool` crate that owns account-pool policy, lease management,
-  rate-limit state, and account selection.
+- Add an account-pool strategy layer, tentatively named `codex-account-pool`, that owns
+  account-pool policy, lease management, rate-limit state, and account selection.
 - Keep `codex-login` focused on single-account auth material, refresh, and compatibility with the
   current auth model.
-- Treat existing `auth.json` or keyring state as a compatibility projection for the current active
-  account, not as the source of truth for all accounts.
+- Do not use shared mutable `auth.json` as the request-path source of truth for leased accounts.
+  Leased request paths must use process-local auth materialization. Shared `auth.json` remains a
+  legacy compatibility surface for single-account flows only.
 - Use session-scoped sticky leases: one Codex process keeps one active account until it is near
   its limit, exhausted, unauthorized, manually switched, or its lease expires.
 - Default to `exclusive` allocation so multiple local Codex instances do not silently share the
   same account.
+- Implement the local backend on top of atomic SQLite-backed lease state with fencing tokens.
+- Implement automatic retry through an explicit turn replay guard, not an informal "no side
+  effects yet" check.
 - Support both local and future remote pool backends through a common backend interface.
 - Ship the first version with local backend support, ChatGPT-first account support, and minimal
   TUI changes.
@@ -54,14 +58,16 @@ Key decisions:
 - Upstream already evolves auth, account, and rate-limit flows. The design should minimize edits
   to high-churn code in `codex-core`, app-server account handling, and large TUI files.
 - The design must support both ChatGPT accounts and API keys in the long term.
-- The design must allow same-pool context reuse across accounts by explicit user choice.
+- The design must allow same-pool context reuse across accounts only after explicit user choice.
 - Automatic retry after switching accounts must not duplicate side-effecting tool work.
+- Multiple local Codex processes may share one `CODEX_HOME`, so correctness must not depend on a
+  single shared mutable "current account" file.
 
 ## Recommended Architecture
 
-### 1. New strategy crate: `codex-account-pool`
+### 1. New strategy layer: `codex-account-pool`
 
-Add a new crate, tentatively named `codex-account-pool`, that owns:
+Add a new strategy layer, tentatively named `codex-account-pool`, that owns:
 
 - account registry metadata
 - pool definitions and policy evaluation
@@ -72,6 +78,11 @@ Add a new crate, tentatively named `codex-account-pool`, that owns:
 
 This crate should not own low-level token refresh logic for a single account. That work remains in
 `codex-login`.
+
+This layer should build on the existing `codex-account` workspace crate instead of duplicating
+account-domain helpers. `codex-account` remains the home for shared account-domain primitives and
+backend-facing account helpers, while `codex-account-pool` owns orchestration, policy, and lease
+state.
 
 ### 2. Keep `codex-login` single-account focused
 
@@ -84,16 +95,21 @@ This crate should not own low-level token refresh logic for a single account. Th
 
 This keeps the existing auth code understandable and reduces conflicts with upstream changes.
 
-### 3. Treat `auth.json` as a compatibility projection
+### 3. Use process-local auth materialization for leased requests
 
-Multi-account state must not be encoded by changing `auth.json` into a multi-account container.
+Multi-account state must not be encoded by changing `auth.json` into a multi-account container,
+and leased request paths must not depend on a shared mutable `auth.json` slot.
 
 Instead:
 
 - account-pool state is stored separately
-- the current active account may be projected into the existing auth store so existing request
-  paths continue to work
-- upstream code that assumes one current account can continue to operate with minimal changes
+- each process materializes its selected account into a process-local auth view for request
+  execution, ideally by constructing `CodexAuth` directly from `credential_ref` or by using a
+  per-instance ephemeral auth store
+- shared `auth.json` is retained only as a legacy compatibility surface for single-account flows
+  and explicit compatibility commands
+- upstream code that assumes one current account can continue to operate inside a single process,
+  but multi-process correctness must never depend on a single shared mutable auth file
 
 This is the main merge-friendly choice in the design.
 
@@ -118,9 +134,11 @@ service can be added later without redesigning the strategy layer.
 
 1. Codex starts and creates a process/session `instance_id`.
 2. The account-pool layer loads pool policy and runtime state.
-3. The process obtains one sticky active lease for its pool.
-4. Requests keep using the same leased account.
-5. Rate-limit snapshots and usage-limit signals update runtime state for that lease.
+3. The process obtains one sticky active lease for its pool, including a fencing token such as
+   `lease_epoch`.
+4. The process materializes a process-local auth view for the selected account.
+5. Requests keep using the same leased account.
+6. Rate-limit snapshots and usage-limit signals update runtime state for that lease.
 
 ### Proactive switching
 
@@ -139,8 +157,9 @@ This avoids request-time thrashing and keeps switching behavior closer to "sessi
 When the current account hits `usage_limit_reached`:
 
 - mark it exhausted or cooling down
-- if the turn has not yet produced any side effects, switch accounts and retry once
-- if the turn has already produced side effects, do not replay the turn; only switch future turns
+- if the turn is still in the replayable state, switch accounts, rebuild turn transport state, and
+  retry once
+- if the turn is no longer replayable, do not replay the turn; only switch future turns
 
 This preserves automation without risking duplicate shell, MCP, or patch operations.
 
@@ -158,7 +177,7 @@ Default switching triggers:
 
 - proactive rate-limit threshold reached
 - `usage_limit_reached`
-- repeated unauthorized or refresh failure
+- unrecoverable auth failure
 - lease expiration or lease revocation
 - manual user switch
 
@@ -205,6 +224,16 @@ For remote mode, the backend may instead:
 
 The same policy layer should be able to operate in both cases.
 
+Authority differs by backend:
+
+- local backend is authoritative for local lease state and cooldown decisions
+- remote backend is authoritative for lease ownership, revocation, cooldown, and lease renewal
+  outcomes
+- client-side policy may request proactive rotation, but remote policy may still deny or redirect
+  that request
+- in remote mode, client-side cooldown and eligibility caches are advisory only; acquire, renew,
+  rotate, and revoke decisions are finalized by backend responses
+
 ## Data Model
 
 The design separates static config, account metadata, secrets, and runtime state.
@@ -227,7 +256,7 @@ min_switch_interval_secs = 300
 
 [accounts.pools.team-main]
 allow_context_reuse = true
-account_kinds = ["chatgpt", "api_key"]
+account_kinds = ["chatgpt"]
 ```
 
 This area should define:
@@ -238,6 +267,18 @@ This area should define:
 - allocation mode
 - lease timing
 - optional pool-level policy
+
+In v1, the combination of:
+
+- manually assigning accounts into the same pool
+- setting that pool's `allow_context_reuse = true`
+
+is the explicit opt-in boundary for cross-account context reuse. There is no implicit
+cross-account reuse outside that boundary.
+
+When `allow_context_reuse = false`, any manual or automatic rotation to a different account must
+rebuild transport state with fresh remote conversation or thread state. Remote conversation ids,
+thread ids, and equivalent session handles must not be carried across accounts in that case.
 
 ### 2. Account registry metadata
 
@@ -257,6 +298,7 @@ Suggested fields:
 - `priority`
 - `source`
 - `credential_ref`
+- `explicit_context_reuse_consent`
 
 Suggested account kinds:
 
@@ -301,6 +343,28 @@ Suggested health states:
 - `cooling_down`
 - `unavailable`
 
+### 5. Local backend storage layout
+
+The local backend should not use ad hoc JSON files for lease state. It should use SQLite under the
+existing `sqlite_home` umbrella so multi-process lease acquisition can be atomic and schema
+versioned.
+
+Suggested durable local tables:
+
+- `account_registry`
+- `account_pool_membership`
+- `account_runtime_state`
+- `account_leases`
+- `account_backend_metadata`
+
+Credentials should remain out of SQLite where practical:
+
+- API keys and long-lived secrets stay in file or keyring storage keyed by `credential_ref`
+- SQLite stores references, lease state, and non-secret runtime metadata
+
+The local backend must define schema versioning and migration behavior for upgrading from a legacy
+single-account installation.
+
 ## Lease Model
 
 Every active assignment should be represented by a lease.
@@ -311,6 +375,7 @@ Suggested lease fields:
 - `account_id`
 - `pool_id`
 - `holder_instance_id`
+- `lease_epoch`
 - `leased_at`
 - `expires_at`
 - `last_heartbeat_at`
@@ -327,6 +392,27 @@ The design should leave room for future:
 
 Default behavior must remain `exclusive`.
 
+### Local acquisition and fencing
+
+The local backend must implement exclusive leases with atomic compare-and-set semantics.
+
+Required behavior:
+
+- lease acquisition occurs inside a transaction
+- a reclaimed or replaced lease increments `lease_epoch`
+- heartbeat and release update only when `lease_id + lease_epoch` still match
+- a process that loses the lease must stop starting new work with its previously materialized auth
+  immediately
+
+Every turn should carry the current `lease_epoch` so stale holders can be detected before request
+execution, again before any retry or auth refresh path, and again after any refresh or revalidation
+round-trip before refreshed credentials are persisted or reused.
+
+For v1 local exclusivity, the hard guarantee is "no new work after fence failure." A long-running
+turn that began while the holder was valid may finish if it cannot be cancelled cleanly, but it
+must not start retries, refresh follow-up work, or additional turns after fence failure is
+detected.
+
 ## Core Interfaces
 
 The account-pool layer should expose lease-oriented APIs rather than a simple "give me an account"
@@ -335,6 +421,7 @@ API.
 Suggested interface shape:
 
 - `ensure_active_lease(session_context) -> Lease`
+- `materialize_turn_auth(lease) -> ProcessLocalAuthHandle`
 - `report_rate_limits(lease, snapshot)`
 - `report_usage_limit_reached(lease, error)`
 - `report_unauthorized(lease)`
@@ -344,16 +431,24 @@ Suggested interface shape:
 The active lease is session-scoped and sticky. `ensure_active_lease` should typically return the
 current active lease unless policy says a rotation is required.
 
+`ProcessLocalAuthHandle` must not depend on shared mutable `auth.json`. It is the turn-local auth
+materialization that request execution uses.
+
 ## Integration Points
 
 ### `codex-core`
 
 `codex-core` should only gain thin integration points:
 
-- before beginning a model turn, ensure there is an active lease
+- before beginning a model turn, ensure there is an active lease and materialize process-local auth
+  for that turn
 - update account-pool state when rate-limit snapshots arrive
 - update account-pool state when usage-limit or unauthorized errors arrive
-- attempt one automatic retry only when the turn has not yet produced side effects
+- attempt one automatic retry only when the turn is still replayable
+- on account rotation, rebuild model-client or transport state from the new lease instead of
+  mutating shared auth underneath an existing client session
+- when rotating across accounts in a pool whose `allow_context_reuse = false`, rebuild transport
+  state from a fresh remote conversation or thread context rather than carrying prior remote ids
 
 This keeps the new behavior mostly out of the existing large request pipeline.
 
@@ -361,9 +456,12 @@ This keeps the new behavior mostly out of the existing large request pipeline.
 
 `codex-login` should provide the account-pool layer with the means to:
 
-- materialize the selected local account as current auth
+- materialize the selected local account into process-local auth
 - persist or refresh a single account's auth state
-- project the active local account into the current auth store
+- project an account into legacy compatibility storage only through explicit, lease-bound APIs
+
+`codex-login` should be the only owner of compatibility-store writes. No other crate should write
+shared auth store state directly.
 
 ### App-server
 
@@ -375,20 +473,43 @@ Minimal app-server work is acceptable where needed for:
 - reusing existing rate-limit notifications
 - reusing external ChatGPT token support
 
+In v1, existing `account/*` RPCs and notifications continue to mean the process-local active
+account or lease only. They do not enumerate pool state or all stored accounts.
+
+Mutating legacy `account/*` RPCs remain compatibility-only single-account operations in v1:
+
+- `account/login/*` operates on the installation's default legacy account entry only
+- successful legacy login may upsert that default entry and attach it to `accounts.default_pool`
+  without changing any other stored accounts
+- `account/logout` clears the current process-local active credentials, releases any active lease
+  for that default entry, and disables immediate auto-reacquisition through the same legacy
+  account path
+- after legacy `account/logout`, a legacy client should observe signed-out behavior until an
+  explicit new legacy login or explicit pool-aware selection occurs
+
+These compatibility operations must not silently enumerate, mutate, or rotate through other pooled
+accounts behind the caller's back.
+
 For future remote pool support, the design should be compatible with existing app-server external
 auth flows, especially:
 
 - externally supplied `chatgptAuthTokens`
 - refresh requests that already include `previousAccountId`
 
+If pool-aware app-server APIs are needed later, they should be added as new `accounts/*` methods
+rather than changing the meaning of existing `account/*` methods.
+
 ### TUI
 
 The first version should keep TUI changes intentionally small:
 
 - show current account label or id
+- show current pool
+- show current health state
 - show nearing-limit status
-- show "automatically switched account" events
+- show "automatically switched account" events with switch reason
 - show "no accounts available" errors
+- show next eligible time when known
 
 The first version should not add a large account-management screen.
 
@@ -404,6 +525,7 @@ Recommended first-version commands:
 - `codex accounts add api-key`
 - `codex accounts list`
 - `codex accounts current`
+- `codex accounts status`
 - `codex accounts switch <account>`
 - `codex accounts enable <account>`
 - `codex accounts disable <account>`
@@ -413,14 +535,33 @@ Recommended first-version commands:
 
 Compatibility expectations:
 
-- `codex login` remains a single-account convenience path
-- `codex logout` only logs out the current active account
+- `codex login` remains a legacy single-account convenience path that imports or replaces the
+  installation's default active account entry
+- `codex logout` remains a legacy "clear active credentials" path until a later deprecation
+  window; it must not silently change semantics in v1
 - docs and future features should guide users toward `codex accounts`
+
+Legacy `codex login/logout` only operate on that default legacy account entry. They must not add,
+remove, enable, disable, or auto-select unrelated pooled accounts.
+
+Pool selection in v1 should be explicit:
+
+- use `accounts.default_pool` when no override is supplied
+- support a process-level override such as `--account-pool <pool>` for interactive commands
+- make `codex accounts current` and `codex accounts status` show the active pool, lease id,
+  health state, switch reason, and next eligible time when known
+- `codex accounts switch <account>` only switches within the current effective pool
+- switching to an account in another pool must require an explicit pool override such as
+  `--account-pool <pool>` instead of implicitly changing pool context
+
+`codex accounts status` should also have a machine-readable form and include per-account
+eligibility or ineligibility reasons for the current pool so pool behavior is debuggable without
+parsing human-oriented text.
 
 ## Automatic Retry Rules
 
-Automatic retry after switching accounts is only allowed when the current turn has not produced
-side effects.
+Automatic retry after switching accounts is only allowed when the current turn is still
+replayable.
 
 Side effects include at least:
 
@@ -431,11 +572,33 @@ Side effects include at least:
 
 Retry behavior:
 
-- no side effects yet: switch account and retry once
-- side effects already occurred: switch only future turns, return a clear message for the current
-  turn
+- replayable turn: switch account and retry once
+- non-replayable turn: switch only future turns, return a clear message for the current turn
 
 This rule is mandatory to prevent duplicated work.
+
+### Turn replay guard
+
+Automatic retry must be implemented as an explicit turn-scoped state machine, not an informal
+"nothing happened yet" check.
+
+Suggested states:
+
+- `Replayable`
+- `VisibleOutputCommitted`
+- `SideEffectStarted`
+- `NotReplayable`
+
+Required transitions:
+
+- the guard flips out of `Replayable` before any effectful tool dispatch is launched
+- the guard also flips out of `Replayable` before user-visible assistant output is committed
+- `usage_limit_reached` may auto-retry only from `Replayable`
+- once the guard leaves `Replayable`, that turn must never be replayed
+
+This is intentionally conservative. A turn that already emitted visible assistant output but did
+not yet launch tools is still treated as non-replayable in v1 to avoid duplicated or divergent
+transcript output.
 
 ## Failure Handling
 
@@ -458,14 +621,18 @@ If the current active account crosses the proactive threshold:
 ### `usage_limit_reached`
 
 - mark the account exhausted or cooling down
-- retry once only if the turn has not produced side effects
+- retry once only if the turn is still replayable
 - otherwise switch only future turns
 
 ### Unauthorized or refresh failure
 
-- first attempt the selected account's normal auth recovery
-- if recovery fails, mark the account unavailable
-- rotate to another eligible account in the same pool
+- for local managed auth, attempt the account's normal auth recovery once
+- after any local auth refresh round-trip, re-check `lease_id + lease_epoch` before persisting or
+  reusing refreshed credentials
+- if local auth recovery fails permanently, mark the account unavailable and rotate
+- for remote leases, first ask the backend to renew or revalidate the leased credential
+- only backend-confirmed revocation, lease expiry, or unrecoverable auth failure should mark the
+  account unavailable
 
 ### Local crash recovery
 
@@ -490,7 +657,7 @@ If a remote pool backend is unavailable:
 
 The first implementation should include:
 
-- new `codex-account-pool` crate
+- new account-pool strategy layer built on top of `codex-account`
 - local backend
 - session-scoped sticky leases
 - `exclusive` allocation
@@ -502,6 +669,12 @@ The first implementation should include:
 
 The first implementation may include API key accounts in the data model and CLI, while deferring
 full automatic quota-awareness for API keys until later.
+
+In v1, automatic rotation should only be enabled for homogeneous pools of a single account kind.
+Mixed ChatGPT and API-key pools may be represented in config and CLI metadata, but the automatic
+selector should reject them until kind-specific quota semantics are implemented. That rejection
+must be explicit in CLI, TUI, and logs so users do not mistake representable config for supported
+automatic behavior.
 
 ## Deferred Scope
 
@@ -526,15 +699,23 @@ Add focused tests for:
 - minimum switch interval
 - exclusive allocation across multiple local processes
 - local lease expiration and reclaim
+- lease fencing after reclaim
+- SQLite transaction and lock race behavior
 - no-eligible-account cases
+- legacy single-account migration into account-pool state
+- idempotent migration reruns
+- migration recovery after partial failure
+- restart behavior after migration with lease state rebuilt from persisted storage
 
 ### Integration tests for `codex-login`
 
 Add coverage for:
 
-- materializing one selected account as current auth
+- materializing one selected account into process-local auth
 - ChatGPT and API key account materialization
 - preserving single-account compatibility semantics
+- legacy `login/logout` compatibility behavior during the migration window
+- post-refresh fence checks before persisting refreshed credentials
 
 ### Integration tests for `codex-core`
 
@@ -543,8 +724,12 @@ Add coverage for:
 - selecting the session's active lease before a turn
 - reporting rate-limit snapshots into account-pool state
 - rotating only future turns after threshold updates
-- retrying once after `usage_limit_reached` when no side effects occurred
-- refusing to replay a turn after side effects occurred
+- rebuilding request transport state after lease rotation
+- retrying once after `usage_limit_reached` only from the replayable state
+- refusing to replay a turn after visible output or side effects occurred
+- stale lease fencing blocking request execution
+- refusing new work after fence failure on a long-running local turn
+- resetting remote conversation state on cross-account rotation when `allow_context_reuse = false`
 
 ### CLI tests
 
@@ -552,9 +737,15 @@ Add coverage for:
 
 - `codex accounts list`
 - `codex accounts current`
+- `codex accounts status`
 - `codex accounts switch`
 - add, remove, enable, and disable flows
 - pool assignment flows
+- pool override selection
+- switch-reason and cooldown output
+- cross-pool switch rejection without explicit override
+- structured status output with per-account eligibility reasons
+- migrated-install `accounts list/current/status` behavior after restart
 
 ### TUI tests
 
@@ -562,16 +753,18 @@ Add only targeted coverage and snapshot updates for:
 
 - current account status display
 - nearing-limit status
-- automatic-switch notification
+- automatic-switch notification with reason
 - no-available-account error state
+- retry-suppressed state after a non-replayable limit failure
 
 ## Rollout Plan
 
 ### Phase 1: Foundation
 
-- add `codex-account-pool`
+- add account-pool strategy layer on top of `codex-account`
 - add local backend
-- add registry, lease, and runtime state model
+- add SQLite-backed registry, lease, and runtime state model
+- add process-local auth materialization
 - add `codex accounts` CLI
 - support manual switch and current-account inspection
 
@@ -579,6 +772,7 @@ Add only targeted coverage and snapshot updates for:
 
 - wire rate-limit reporting into account-pool state
 - implement proactive threshold switching
+- implement turn replay guard
 - implement safe retry after `usage_limit_reached`
 - add small TUI surfaces
 
@@ -598,7 +792,7 @@ It also avoids a dead-end local implementation:
 
 - local mode works now
 - remote pool support fits the same model later
-- `auth.json` compatibility is preserved
+- legacy `auth.json` compatibility is preserved without relying on a shared request-path auth slot
 - multiple local Codex instances are handled by default through exclusive sticky leases
 
 That makes it the best fit for a fork that still plans to keep rebasing onto upstream Codex.
