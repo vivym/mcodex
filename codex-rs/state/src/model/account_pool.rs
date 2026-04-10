@@ -79,13 +79,6 @@ impl AccountHealthState {
             Self::Unauthorized => "unauthorized",
         }
     }
-
-    pub(crate) fn is_healthy(self) -> bool {
-        match self {
-            Self::Healthy => true,
-            Self::RateLimited | Self::Unauthorized => false,
-        }
-    }
 }
 
 impl TryFrom<&str> for AccountHealthState {

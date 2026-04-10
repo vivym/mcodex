@@ -206,11 +206,19 @@ ON CONFLICT(account_id) DO UPDATE SET
         sqlx::query(
             r#"
 UPDATE account_registry
-SET healthy = ?, updated_at = ?
+SET healthy = CASE
+        WHEN (
+            SELECT health_state
+            FROM account_runtime_state
+            WHERE account_runtime_state.account_id = account_registry.account_id
+        ) = 'healthy'
+            THEN 1
+        ELSE 0
+    END,
+    updated_at = ?
 WHERE account_id = ?
             "#,
         )
-        .bind(i64::from(event.health_state.is_healthy()))
         .bind(updated_at)
         .bind(&event.account_id)
         .execute(&mut *tx)
@@ -429,8 +437,12 @@ WHERE lease_id = ?
 mod tests {
     use super::StateRuntime;
     use super::test_support::unique_temp_dir;
+    use crate::AccountHealthEvent;
+    use crate::AccountHealthState;
     use crate::AccountLeaseError;
     use crate::LegacyAccountImport;
+    use chrono::DateTime;
+    use chrono::Utc;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
@@ -460,6 +472,42 @@ mod tests {
             Some("acct-legacy")
         );
         assert_eq!(selection.suppressed, false);
+    }
+
+    #[tokio::test]
+    async fn stale_health_event_does_not_restore_lease_eligibility() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Unauthorized,
+                sequence_number: 2,
+                observed_at: test_timestamp(2),
+            })
+            .await
+            .unwrap();
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Healthy,
+                sequence_number: 1,
+                observed_at: test_timestamp(1),
+            })
+            .await
+            .unwrap();
+
+        let health = runtime.read_account_health_state("acct-1").await.unwrap();
+        let lease = runtime.acquire_account_lease("pool-main", "inst-a").await;
+
+        assert_eq!(
+            health.expect("persisted health state").health_state,
+            AccountHealthState::Unauthorized
+        );
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
     }
 
     async fn test_runtime() -> Arc<StateRuntime> {
@@ -507,5 +555,9 @@ INSERT INTO account_registry (
         .execute(runtime.pool.as_ref())
         .await
         .expect("seed account");
+    }
+
+    fn test_timestamp(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(seconds, 0).expect("timestamp")
     }
 }
