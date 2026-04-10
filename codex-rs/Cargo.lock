@@ -1377,6 +1377,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-account-pool"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "codex-analytics"
 version = "0.0.0"
 dependencies = [
