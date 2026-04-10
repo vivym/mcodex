@@ -20,8 +20,8 @@ Key decisions:
 - Do not use shared mutable `auth.json` as the request-path source of truth for leased accounts.
   Leased request paths must use process-local auth materialization. Shared `auth.json` remains a
   legacy compatibility surface for single-account flows only.
-- Use session-scoped sticky leases: one Codex process keeps one active account until it is near
-  its limit, exhausted, unauthorized, manually switched, or its lease expires.
+- Use runtime-instance-scoped sticky leases: one Codex runtime instance keeps one active account
+  until it is near its limit, exhausted, unauthorized, manually switched, or its lease expires.
 - Default to `exclusive` allocation so multiple local Codex instances do not silently share the
   same account.
 - Implement the local backend on top of atomic SQLite-backed lease state with fencing tokens.
@@ -72,7 +72,7 @@ Add a new strategy layer, tentatively named `codex-account-pool`, that owns:
 - account registry metadata
 - pool definitions and policy evaluation
 - lease acquisition and release
-- sticky active-account selection per Codex process
+- sticky active-account selection per runtime instance
 - rate-limit state and cooldown tracking
 - automatic failover decisions
 
@@ -150,11 +150,11 @@ That means:
 
 ### Normal startup and steady state
 
-1. Codex starts and creates a process/session `instance_id`.
+1. Codex starts and creates a runtime-instance `instance_id`.
 2. The account-pool layer loads pool policy and runtime state.
-3. The process obtains one sticky active lease for its pool, including a fencing token such as
+3. The runtime instance obtains one sticky active lease for its pool, including a fencing token such as
    `lease_epoch`.
-4. The process materializes a process-local auth view for the selected account.
+4. The runtime instance materializes a process-local auth view for the selected account.
 5. Requests keep using the same leased account.
 6. Rate-limit snapshots and usage-limit signals update runtime state for that lease.
 
@@ -167,7 +167,7 @@ When the active account crosses a configured threshold, such as 85 or 90 percent
 - select a different account for the next turn
 - place the old account into cooldown when appropriate
 
-This avoids request-time thrashing and keeps switching behavior closer to "session rotation" than
+This avoids request-time thrashing and keeps switching behavior closer to "runtime-instance rotation" than
 "per-request scheduling."
 
 ### Hard-failure switching
@@ -199,11 +199,19 @@ Instead:
 
 ## Sticky Lease Model
 
-The allocation unit is a Codex process or session, not a single request.
+The allocation unit in v1 is a Codex runtime instance, not a single request.
+
+For this spec, a "runtime instance" means:
+
+- one CLI or TUI process, or
+- one app-server process handling one pooled-selection context
+
+Threads inside the same runtime instance share that one pooled lease context in v1. Supporting
+multiple independent pooled leases inside one process is deferred.
 
 Default behavior:
 
-- one Codex process holds one sticky active lease
+- one Codex runtime instance holds one sticky active lease
 - that lease remains active until the account is no longer suitable
 - switching is exceptional, not routine
 
@@ -240,7 +248,7 @@ The backend owns durable source-of-truth behavior for:
 
 The policy layer owns:
 
-- choosing the active account for the process
+- choosing the active account for the runtime instance
 - applying threshold rules
 - cooldown logic
 - deciding when a switch is allowed
@@ -310,6 +318,14 @@ This area should define:
 - allocation mode
 - lease timing
 - optional pool-level policy
+
+Default-pool resolution in v1 should be explicit and ordered:
+
+1. process-level override such as `--account-pool <pool>`
+2. `accounts.default_pool` from config when present
+3. synthesized migrated default pool id persisted in account-pool runtime state when config does
+   not define a default
+4. otherwise no effective default pool exists and startup must fail clearly
 
 In v1, the combination of:
 
@@ -385,13 +401,15 @@ Runtime state should include:
 
 - latest rate-limit snapshot by account
 - latest account health state
+- latest authoritative health event sequence
 - last selected time
 - hard-limit timestamp
 - next eligible timestamp
 - current lease holder
 - lease expiration and heartbeat
 - selection suppression state for default startup
-- durable preferred-account override for future sessions
+- durable preferred-account override for future runtime instances
+- resolved effective default pool id for startup
 - last switch reason
 
 Suggested health states:
@@ -401,6 +419,16 @@ Suggested health states:
 - `exhausted`
 - `cooling_down`
 - `unavailable`
+
+Durable startup-selection state is installation-scoped for a shared `CODEX_HOME` in v1.
+
+That means:
+
+- durable suppression and preferred-account overrides affect future runtime instances sharing the
+  same local installation state
+- they do not mutate already-running turns except where an API explicitly revokes the current
+  process-local lease
+- app-server and CLI management commands operate on that same installation-scoped startup state
 
 ### 5. Local backend storage layout
 
@@ -432,7 +460,9 @@ Migration rules for v1:
   state
 - if legacy auth exists and no explicit pool config is present, migration synthesizes a durable
   default pool record such as `legacy-default` inside account-pool state
-- the imported legacy account becomes the preferred default entry for future sessions until the
+- that synthesized pool id also becomes the persisted effective default pool for startup
+  resolution until the user explicitly configures another default
+- the imported legacy account becomes the preferred default entry for future runtime instances until the
   user explicitly changes pool or account selection
 - if migration fails, no partial account-pool state should become visible; legacy single-account
   behavior remains the fallback on the next startup
@@ -487,6 +517,16 @@ Late `report_rate_limits`, `report_usage_limit_reached`, and `report_unauthorize
 stale holder must be ignored for selection state purposes. At most they may be recorded as
 best-effort diagnostics separate from authoritative runtime state.
 
+Within one still-valid lease epoch, runtime-state writes must also be monotonic:
+
+- every authoritative `report_*` update carries a lease-local event sequence or equivalent
+  strictly monotonic ordering key
+- newer events may advance health from healthier to less healthy states
+- a later rate-limit snapshot or lower-severity event must not overwrite `cooling_down`,
+  `exhausted`, or `unavailable` back to a healthier state within the same lease epoch
+- recovery to a healthier state requires an explicit recovery event such as successful auth
+  recovery, cooldown expiry, or a new lease epoch
+
 For v1 local exclusivity, the hard guarantee is "no new work after fence failure." A long-running
 turn that began while the holder was valid may finish if it cannot be cancelled cleanly, but it
 must not start retries, refresh follow-up work, or additional turns after fence failure is
@@ -518,7 +558,7 @@ Suggested interface shape:
 - `release_lease(lease)`
 - `heartbeat_lease(lease)`
 
-The active lease is session-scoped and sticky. `ensure_active_lease` should typically return the
+The active lease is runtime-instance-scoped and sticky. `ensure_active_lease` should typically return the
 current active lease unless policy says a rotation is required.
 
 `ProcessLocalAuthHandle` must not depend on shared mutable `auth.json`. It is the turn-local auth
@@ -527,6 +567,8 @@ materialization that request execution uses.
 `ProcessLocalAuthHandle` must be an immutable snapshot bound to a specific lease epoch and turn.
 Refresh or rotation must create a new handle and rebuild transport state; the auth used by an
 in-flight turn must never mutate underneath that turn.
+
+Turn execution must also carry the current `remote_context_generation` for its transport state.
 
 ## Integration Points
 
@@ -548,6 +590,10 @@ the current single-auth access pattern.
   instead of reusing the local thread id as the outbound remote session identifier
 - replace direct active-auth reads on request-execution and account-affecting paths with a
   lease-scoped auth accessor or equivalent adapter
+- revalidate `lease_id + lease_epoch` and `remote_context_generation` immediately before every new
+  model round-trip, tool dispatch, or other effectful remote step inside a turn
+- discard late callbacks or streamed events from abandoned transport generations after rotation,
+  retry, or remote-context reset
 
 The goal is to keep pool policy centralized even though auth access itself is currently
 cross-cutting.
@@ -571,11 +617,14 @@ explicit pooled-status surface.
 Existing `account/*` RPCs and notifications remain legacy compatibility operations and continue to
 describe only the compatibility single-account auth view.
 
+Any pool-state mutations triggered by legacy compatibility RPCs should route through narrow
+account-pool compatibility helpers rather than open-coded logic in legacy app-server handlers.
+
 Mutating legacy `account/*` RPCs remain compatibility-only single-account operations in v1:
 
 - `account/login/*` operates on the installation's default legacy account entry only
-- successful legacy login may upsert that default entry and attach it to `accounts.default_pool`
-  without changing any other stored accounts
+- successful legacy login may upsert that default entry and attach it to the current effective
+  default pool without changing any other stored accounts
 - successful legacy login clears durable default-startup suppression
 - `account/logout` clears the current compatibility auth view, revokes any currently active
   process-local pooled lease, and durably suppresses automatic pooled selection for default startup
@@ -603,7 +652,13 @@ Existing `account/read` and `account/updated` should remain stable for legacy cl
 not be overloaded with pooled lease semantics.
 
 `accountLease/resume` clears durable default-startup suppression and removes any durable preferred
-account override so the next fresh session returns to automatic selection from `accounts.default_pool`.
+account override so the next fresh runtime instance returns to automatic selection from
+the effective default pool resolution order.
+
+For a running app-server process, `accountLease/resume` updates durable startup-selection state
+immediately and emits `accountLease/updated`, but it does not interrupt an in-flight turn. If no
+lease is active, the next turn in that same process may auto-acquire a lease under the resumed
+policy.
 
 For future remote pool support, the design should be compatible with existing app-server external
 auth flows, especially:
@@ -663,27 +718,29 @@ remove, enable, disable, or auto-select unrelated pooled accounts.
 
 Legacy `codex login` clears durable default-startup suppression.
 Legacy `codex logout` also enables durable default-startup suppression for pooled auto-selection.
-Generic future sessions should remain signed out until the user explicitly resumes pooled selection
+Generic future runtime instances should remain signed out until the user explicitly resumes pooled selection
 through a pool-aware command.
 
 Pool selection in v1 should be explicit:
 
-- if default-startup suppression is inactive, use `accounts.default_pool` when no override is
-  supplied
+- if default-startup suppression is inactive, use the effective default pool resolution order when
+  no override is supplied
 - support a process-level override such as `--account-pool <pool>` for interactive commands
 - for management commands, the effective pool still resolves from the explicit `--account-pool`
-  override first and then `accounts.default_pool`, even when startup suppression is active
+  override first and then the default-pool resolution order above, even when startup suppression is
+  active
 - make `codex accounts current` and `codex accounts status` report durable selection state for a
-  fresh session, not mutate or inspect an already-running session lease
+  fresh runtime instance, not mutate or inspect an already-running runtime-instance lease
 - make `codex accounts current` and `codex accounts status` show the effective pool, any durable
   preferred-account override, any durable suppression state, the predicted selected account for a
-  fresh session, health state, switch reason, and next eligible time when known
+  fresh runtime instance, health state, switch reason, and next eligible time when known
 - `codex accounts resume` clears durable default-startup suppression and removes any durable
-  preferred-account override so automatic selection resumes from `accounts.default_pool`
-- `codex accounts switch <account>` is a durable manual override for future sessions only
+  preferred-account override so automatic selection resumes from the effective default pool
+  resolution order
+- `codex accounts switch <account>` is a durable manual override for future runtime instances only
 - `codex accounts switch <account>` clears durable default-startup suppression
-- runtime switching of an already-running session requires an in-process or app-server pooled API
-  and is not provided by the one-shot CLI in v1
+- runtime switching of an already-running runtime instance requires an in-process or app-server
+  pooled API and is not provided by the one-shot CLI in v1
 - `codex accounts switch <account>` only switches within the current effective pool
 - switching to an account in another pool must require an explicit pool override such as
   `--account-pool <pool>` instead of implicitly changing pool context
@@ -694,8 +751,8 @@ parsing human-oriented text.
 
 Migrated-install visibility in v1 should also be explicit:
 
-- the synthesized migrated pool may be exposed verbatim as `legacy-default`
-- `codex accounts list` and `codex accounts status` should mark migrated pools or accounts with a
+- the synthesized migrated pool is exposed verbatim as `legacy-default` in v1
+- `codex accounts list` and `codex accounts status` must mark migrated pools or accounts with a
   `source = migrated` style indicator
 - immediately after migration, legacy compatibility views continue to reflect the imported legacy
   account while pooled status views report the synthesized `legacy-default` selection state
@@ -814,7 +871,7 @@ The first implementation should include:
 
 - new account-pool strategy layer independent from the existing auth-bound `codex-account` crate
 - local backend
-- session-scoped sticky leases
+- runtime-instance-scoped sticky leases
 - `exclusive` allocation
 - ChatGPT-first full support
 - proactive threshold switching
@@ -834,6 +891,13 @@ automatic behavior.
 If an unsupported mixed-kind pool is configured as the effective default startup pool in v1, that
 must be treated as an explicit configuration error for automatic selection rather than silently
 falling back or masquerading as a transient no-eligible-account case.
+
+If a mixed-kind pool has a durable preferred-account override or explicit account selection for one
+concrete account, startup may proceed in manual-only mode on that pinned account. In that mode:
+
+- automatic failover and proactive rotation across kinds remain disabled
+- if the pinned account becomes unsuitable, the session fails clearly instead of selecting another
+  account from the mixed-kind pool
 
 ## Deferred Scope
 
@@ -866,6 +930,7 @@ Add focused tests for:
 - migration recovery after partial failure
 - restart behavior after migration with lease state rebuilt from persisted storage
 - stale `report_*` updates rejected after fence loss
+- monotonic state updates within one lease epoch
 - minimum-TTL gate before starting a turn
 
 ### Integration tests for `codex-login`
@@ -890,6 +955,7 @@ Add coverage for:
 - retrying once after `usage_limit_reached` only from the replayable state
 - refusing to replay a turn after visible output or side effects occurred
 - stale lease fencing blocking request execution
+- per-step lease and remote-context revalidation inside multi-step turns
 - refusing new work after fence failure on a long-running local turn
 - resetting remote conversation state on cross-account rotation when `allow_context_reuse = false`
 - suppressing retry when remote commit status is unknown
@@ -914,7 +980,8 @@ Add coverage for:
 - migrated `legacy-default` visibility and migrated-source markers
 - durable signed-out suppression after legacy logout
 - `codex accounts resume` clearing suppression without pinning a preferred account
-- durable manual switch applying only to future sessions
+- durable manual switch applying only to future runtime instances
+- mixed-kind pool manual-only startup when a preferred account override is present
 
 ### App-server protocol and integration tests
 
@@ -926,6 +993,7 @@ Add coverage for:
   default-startup suppression
 - `accountLease/read`, `accountLease/resume`, and `accountLease/updated` reflecting process-local
   lease state
+- `accountLease/resume` affecting a live process without interrupting an in-flight turn
 - pooled status surfaces reporting `remote_context_generation` and
   `last_remote_context_reset_turn_id` when reset occurs
 
@@ -951,7 +1019,7 @@ Add only targeted coverage and snapshot updates for:
 - add `codex accounts` CLI
 - add explicit pooled app-server lease-status surface
 - add durable suppression and resume semantics
-- support durable manual switch and current-account inspection for future sessions
+- support durable manual switch and current-account inspection for future runtime instances
 
 ### Phase 2: Automatic local rotation
 
