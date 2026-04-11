@@ -24,6 +24,9 @@ use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::profile_toml::ConfigProfile;
+use codex_config::types::AccountAllocationModeToml;
+use codex_config::types::AccountPoolBackendToml;
+use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
@@ -266,6 +269,37 @@ consolidation_model = "gpt-5"
             consolidation_model: Some("gpt-5".to_string()),
         }
     );
+}
+
+#[test]
+fn load_config_retains_accounts_settings() {
+    let accounts = AccountsConfigToml {
+        backend: Some(AccountPoolBackendToml::Local),
+        default_pool: Some("team-main".to_string()),
+        proactive_switch_threshold_percent: Some(85),
+        lease_ttl_secs: Some(900),
+        heartbeat_interval_secs: Some(60),
+        min_switch_interval_secs: Some(300),
+        allocation_mode: Some(AccountAllocationModeToml::Exclusive),
+        pools: Some(HashMap::from([(
+            "team-main".to_string(),
+            AccountPoolDefinitionToml {
+                allow_context_reuse: Some(false),
+                account_kinds: Some(vec!["chatgpt".to_string()]),
+            },
+        )])),
+    };
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            accounts: Some(accounts.clone()),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").path().to_path_buf(),
+    )
+    .expect("load config from accounts settings");
+
+    assert_eq!(config.accounts, Some(accounts));
 }
 
 #[test]
@@ -4597,6 +4631,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
             agent_roles: BTreeMap::new(),
+            accounts: None,
             memories: MemoriesConfig::default(),
             agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
             codex_home: fixture.codex_home(),
@@ -4743,6 +4778,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),
+        accounts: None,
         memories: MemoriesConfig::default(),
         agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
         codex_home: fixture.codex_home(),
@@ -4887,6 +4923,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),
+        accounts: None,
         memories: MemoriesConfig::default(),
         agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
         codex_home: fixture.codex_home(),
@@ -5017,6 +5054,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
         agent_max_depth: DEFAULT_AGENT_MAX_DEPTH,
         agent_roles: BTreeMap::new(),
+        accounts: None,
         memories: MemoriesConfig::default(),
         agent_job_max_runtime_seconds: DEFAULT_AGENT_JOB_MAX_RUNTIME_SECONDS,
         codex_home: fixture.codex_home(),

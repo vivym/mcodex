@@ -28,6 +28,7 @@ use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::profile_toml::ConfigProfile;
+use codex_config::types::AccountsConfigToml;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::DEFAULT_OTEL_ENVIRONMENT;
@@ -393,6 +394,9 @@ pub struct Config {
 
     /// User-defined role declarations keyed by role name.
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+
+    /// Multi-account pool settings.
+    pub accounts: Option<AccountsConfigToml>,
 
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
@@ -2072,6 +2076,7 @@ impl Config {
             agent_max_threads,
             agent_max_depth,
             agent_roles,
+            accounts: cfg.accounts.clone(),
             memories: cfg.memories.unwrap_or_default().into(),
             agent_job_max_runtime_seconds,
             codex_home,
