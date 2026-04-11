@@ -2354,4 +2354,4 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 #[path = "config_tests.rs"]
-mod tests;
+mod config_tests;
