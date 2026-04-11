@@ -256,6 +256,7 @@ struct LastResponse {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    account_id: Option<String>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     connection_reused: StdMutex<bool>,
@@ -875,6 +876,7 @@ impl ModelClientSession {
 
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.account_id = None;
         self.websocket_session.last_request = None;
         self.clear_previous_response_id();
         self.websocket_session
@@ -1080,20 +1082,26 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
 
         let client_setup = self.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        if self.websocket_session.connection.is_some()
+            && self.websocket_session.account_id != client_setup.api_auth.account_id
+        {
+            self.reset_websocket_session();
+        }
+        if self.websocket_session.connection.is_some() {
+            return Ok(());
+        }
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             &client_setup.api_auth,
             PendingUnauthorizedRetry::default(),
         );
+        let connection_account_id = client_setup.api_auth.account_id.clone();
         let connection = self
             .client
             .connect_websocket(
@@ -1107,6 +1115,7 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        self.websocket_session.account_id = connection_account_id;
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
         Ok(())
@@ -1137,14 +1146,20 @@ impl ModelClientSession {
             auth_context,
             request_route_telemetry,
         } = params;
-        let needs_new = match self.websocket_session.connection.as_ref() {
+        let connection_closed = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
-            None => true,
+            None => false,
         };
+        let account_changed = self.websocket_session.connection.is_some()
+            && self.websocket_session.account_id != api_auth.account_id;
+        let needs_new =
+            self.websocket_session.connection.is_none() || connection_closed || account_changed;
 
         if needs_new {
-            if self.websocket_session.connection.is_some() {
+            if connection_closed {
                 self.reset_remote_session_identity();
+            } else if account_changed {
+                self.reset_websocket_session();
             }
             self.websocket_session.last_request = None;
             self.clear_previous_response_id();
@@ -1152,6 +1167,7 @@ impl ModelClientSession {
                 .turn_state
                 .clone()
                 .unwrap_or_else(|| Arc::clone(&self.turn_state));
+            let connection_account_id = api_auth.account_id.clone();
             let new_conn = match self
                 .client
                 .connect_websocket(
@@ -1174,6 +1190,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.account_id = connection_account_id;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {

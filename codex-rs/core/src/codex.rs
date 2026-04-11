@@ -6030,7 +6030,7 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
-struct AccountLeaseHeartbeatGuard {
+pub(crate) struct AccountLeaseHeartbeatGuard {
     cancellation_token: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -6042,7 +6042,7 @@ impl Drop for AccountLeaseHeartbeatGuard {
     }
 }
 
-async fn start_account_pool_lease_heartbeat(
+pub(crate) async fn start_account_pool_lease_heartbeat(
     sess: &Arc<Session>,
     lease_selected_for_turn: bool,
     cancellation_token: &CancellationToken,

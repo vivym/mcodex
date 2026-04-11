@@ -28,7 +28,7 @@ impl SessionTask for CompactTask {
         session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
         input: Vec<UserInput>,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
         let use_remote_compact = crate::compact::should_use_remote_compact_task(&ctx.provider);
@@ -67,6 +67,12 @@ impl SessionTask for CompactTask {
         let turn_account_id_override = turn_account_selection
             .as_ref()
             .map(|(account_id, _reset_remote_context)| account_id.clone());
+        let _account_pool_lease_heartbeat = crate::codex::start_account_pool_lease_heartbeat(
+            &session,
+            turn_account_selection.is_some(),
+            &cancellation_token,
+        )
+        .await;
         let _ = if use_remote_compact {
             if turn_account_selection
                 .as_ref()

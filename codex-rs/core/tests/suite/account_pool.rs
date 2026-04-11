@@ -10,6 +10,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
+use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -589,6 +590,90 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "before compact"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let compact_mock = core_test_support::responses::mount_compact_response_once(
+        &server,
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .set_delay(Duration::from_secs(8))
+            .set_body_json(json!({
+                "output": [{
+                    "type": "compaction",
+                    "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                }]
+            })),
+    )
+    .await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    let mut first_builder = pooled_accounts_builder()
+        .with_home(Arc::clone(&shared_home))
+        .with_config(|config| {
+            if let Some(accounts) = config.accounts.as_mut() {
+                accounts.lease_ttl_secs = Some(4);
+                accounts.heartbeat_interval_secs = Some(1);
+            }
+        });
+    let first = first_builder.build(&server).await?;
+    seed_account(&first, PRIMARY_ACCOUNT_ID).await?;
+
+    let mut second_builder = pooled_accounts_builder()
+        .with_home(shared_home)
+        .with_config(|config| {
+            if let Some(accounts) = config.accounts.as_mut() {
+                accounts.lease_ttl_secs = Some(4);
+                accounts.heartbeat_interval_secs = Some(1);
+            }
+        });
+    let second = second_builder.build(&server).await?;
+
+    let first_turn_error = submit_turn_and_wait(&first, "before manual compact").await?;
+    assert!(first_turn_error.is_none());
+
+    first.codex.submit(Op::Compact).await?;
+    wait_for_compact_request(&compact_mock).await;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
+    let contender_turn_error = contender_turn_error
+        .expect("contender runtime should fail-closed while manual compact heartbeat is healthy");
+    assert!(
+        contender_turn_error
+            .message
+            .to_ascii_lowercase()
+            .contains("pooled account"),
+        "unexpected fail-closed error: {}",
+        contender_turn_error.message
+    );
+
+    wait_for_event(&first.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(
+        response_mock.requests().len(),
+        1,
+        "contender runtime should not issue /responses while compact lease remains active"
+    );
+
+    Ok(())
+}
+
 fn pooled_accounts_builder() -> core_test_support::test_codex::TestCodexBuilder {
     test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -665,6 +750,20 @@ async fn seed_account(test: &TestCodex, account_id: &str) -> Result<()> {
         })
         .await?;
     Ok(())
+}
+
+async fn wait_for_compact_request(mock_response: &ResponseMock) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if !mock_response.requests().is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for compact request"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(

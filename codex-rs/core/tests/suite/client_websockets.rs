@@ -424,6 +424,125 @@ async fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused() {
+    skip_if_no_network!();
+
+    let near_limit_event = json!({
+        "type": "codex.rate_limits",
+        "plan_type": "plus",
+        "rate_limits": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary": {
+                "used_percent": 100,
+                "window_minutes": 60,
+                "reset_at": 1700000000
+            },
+            "secondary": null
+        },
+        "code_review_rate_limits": null,
+        "credits": null,
+        "promo": null
+    });
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                near_limit_event,
+                ev_response_created("resp-rate-limited"),
+                ev_completed("resp-rate-limited"),
+            ],
+            vec![
+                ev_response_created("resp-unexpected-reused-socket"),
+                ev_completed("resp-unexpected-reused-socket"),
+            ],
+        ],
+        vec![vec![
+            ev_response_created("resp-rotated-account"),
+            ev_completed("resp-rotated-account"),
+        ]],
+    ])
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            let mut pools = HashMap::new();
+            pools.insert(
+                "legacy-default".to_string(),
+                AccountPoolDefinitionToml {
+                    allow_context_reuse: Some(true),
+                    account_kinds: None,
+                },
+            );
+            config.accounts = Some(AccountsConfigToml {
+                backend: None,
+                default_pool: Some("legacy-default".to_string()),
+                proactive_switch_threshold_percent: Some(85),
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: Some(pools),
+            });
+        });
+    let test = builder
+        .build_with_websocket_server(&server)
+        .await
+        .expect("build websocket codex");
+    let Some(state_db) = test.codex.state_db() else {
+        panic!("state db should be available in core integration tests");
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: "account_id".to_string(),
+        })
+        .await
+        .expect("seed primary pooled account");
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: "account_id_b".to_string(),
+        })
+        .await
+        .expect("seed secondary pooled account");
+
+    test.submit_turn("near-limit websocket turn")
+        .await
+        .expect("first turn should complete after near-limit telemetry");
+    test.submit_turn("post-rotation websocket turn")
+        .await
+        .expect("second turn should complete on rotated account");
+
+    let handshakes = server.handshakes();
+    assert_eq!(
+        handshakes.len(),
+        2,
+        "rotating pooled accounts must establish a fresh websocket even when remote session identity is reused"
+    );
+    assert_eq!(
+        handshakes[0].header("chatgpt-account-id").as_deref(),
+        Some("account_id")
+    );
+    assert_eq!(
+        handshakes[1].header("chatgpt-account-id").as_deref(),
+        Some("account_id_b")
+    );
+    assert_eq!(
+        handshakes[0].header("session_id"),
+        handshakes[1].header("session_id"),
+        "allow_context_reuse=true should preserve remote session identity across account rotation"
+    );
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(connections[0].len(), 1);
+    assert_eq!(connections[1].len(), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket() {
     skip_if_no_network!();
 
