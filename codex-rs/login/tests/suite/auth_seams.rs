@@ -15,12 +15,22 @@ pub(crate) async fn legacy_auth_view_reads_auth_manager_snapshot() {
     assert_eq!(current.get_account_id(), Some("account_id".to_string()));
 }
 
-pub(crate) fn leased_turn_auth_does_not_read_shared_auth_manager() {
-    let leased = LeasedTurnAuth::chatgpt("acct-1", fake_access_token());
+pub(crate) async fn leased_turn_auth_does_not_read_shared_auth_manager() {
+    let manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let legacy = LegacyAuthView::new(&manager);
+    let leased = LeasedTurnAuth::chatgpt("acct-1", fake_access_token("acct-1"));
+
+    let legacy_current = legacy.current().await.expect("expected auth");
+
+    assert_eq!(
+        legacy_current.get_account_id(),
+        Some("account_id".to_string())
+    );
     assert_eq!(leased.account_id(), Some("acct-1".to_string()));
 }
 
-fn fake_access_token() -> String {
+fn fake_access_token(chatgpt_account_id: &str) -> String {
     #[derive(Serialize)]
     struct Header {
         alg: &'static str,
@@ -37,7 +47,7 @@ fn fake_access_token() -> String {
         "https://api.openai.com/auth": {
             "chatgpt_plan_type": "pro",
             "chatgpt_user_id": "user-12345",
-            "chatgpt_account_id": "acct-1",
+            "chatgpt_account_id": chatgpt_account_id,
         },
     });
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
