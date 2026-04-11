@@ -46,6 +46,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    account_id_override: Option<String>,
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -59,7 +60,7 @@ pub(crate) async fn run_remote_compact_task(
         &sess,
         &turn_context,
         InitialContextInjection::DoNotInject,
-        /*account_id_override*/ None,
+        account_id_override,
     )
     .await
 }

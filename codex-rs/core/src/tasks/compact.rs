@@ -4,8 +4,12 @@ use super::SessionTask;
 use super::SessionTaskContext;
 use crate::codex::TurnContext;
 use crate::state::TaskKind;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CompactTask;
@@ -27,13 +31,58 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
+        let pooled_mode_enabled = session.services.account_pool_manager.is_some();
+        let turn_account_selection =
+            if let Some(account_pool_manager) = session.services.account_pool_manager.as_ref() {
+                let mut account_pool_manager = account_pool_manager.lock().await;
+                match account_pool_manager.prepare_turn().await {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        warn!("failed to prepare account-pool lease for compact task: {err:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        if pooled_mode_enabled && turn_account_selection.is_none() {
+            session
+                .send_event(
+                    &ctx,
+                    EventMsg::Error(ErrorEvent {
+                        message: "No eligible pooled account is available for this turn."
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                )
+                .await;
+            return None;
+        }
+
+        let turn_account_id_override = turn_account_selection
+            .as_ref()
+            .map(|(account_id, _reset_remote_context)| account_id.clone());
         let _ = if crate::compact::should_use_remote_compact_task(&ctx.provider) {
+            if turn_account_selection
+                .as_ref()
+                .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context)
+            {
+                session
+                    .services
+                    .model_client
+                    .reset_remote_session_identity();
+            }
             session.services.session_telemetry.counter(
                 "codex.task.compact",
                 /*inc*/ 1,
                 &[("type", "remote")],
             );
-            crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
+            crate::compact_remote::run_remote_compact_task(
+                session.clone(),
+                ctx,
+                turn_account_id_override,
+            )
+            .await
         } else {
             session.services.session_telemetry.counter(
                 "codex.task.compact",

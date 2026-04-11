@@ -4845,6 +4845,12 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     // Also drain cached guardian state if the submission loop exits because
     // the channel closed without receiving an explicit shutdown op.
     sess.guardian_review_session.shutdown().await;
+    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+        let mut account_pool_manager = account_pool_manager.lock().await;
+        if let Err(err) = account_pool_manager.release_for_shutdown().await {
+            warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
+        }
+    }
     debug!("Agent loop exited");
 }
 
@@ -5724,6 +5730,12 @@ mod handlers {
             .unified_exec_manager
             .terminate_all_processes()
             .await;
+        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            if let Err(err) = account_pool_manager.release_for_shutdown().await {
+                warn!("failed to release account-pool lease during shutdown: {err:#}");
+            }
+        }
         sess.guardian_review_session.shutdown().await;
         info!("Shutting down Codex instance");
         let history = sess.clone_history().await;
@@ -6016,6 +6028,56 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
+struct AccountLeaseHeartbeatGuard {
+    cancellation_token: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Drop for AccountLeaseHeartbeatGuard {
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
+        self.task.abort();
+    }
+}
+
+async fn start_account_pool_lease_heartbeat(
+    sess: &Arc<Session>,
+    lease_selected_for_turn: bool,
+    cancellation_token: &CancellationToken,
+) -> Option<AccountLeaseHeartbeatGuard> {
+    if !lease_selected_for_turn {
+        return None;
+    }
+    let account_pool_manager = sess.services.account_pool_manager.as_ref()?;
+    let heartbeat_interval = {
+        let account_pool_manager = account_pool_manager.lock().await;
+        account_pool_manager.heartbeat_interval()
+    };
+    let account_pool_manager = Arc::clone(account_pool_manager);
+    let heartbeat_cancellation_token = cancellation_token.child_token();
+    let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = heartbeat_task_cancellation.cancelled() => break,
+                _ = ticker.tick() => {
+                    let mut account_pool_manager = account_pool_manager.lock().await;
+                    if let Err(err) = account_pool_manager.renew_active_lease().await {
+                        warn!("failed to renew account-pool lease heartbeat: {err:#}");
+                    }
+                }
+            }
+        }
+    });
+    Some(AccountLeaseHeartbeatGuard {
+        cancellation_token: heartbeat_cancellation_token,
+        task,
+    })
+}
+
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -6069,6 +6131,12 @@ pub(crate) async fn run_turn(
         .await;
         return None;
     }
+    let _account_pool_lease_heartbeat = start_account_pool_lease_heartbeat(
+        &sess,
+        turn_account_selection.is_some(),
+        &cancellation_token,
+    )
+    .await;
     let turn_account_id_override = turn_account_selection
         .as_ref()
         .map(|(account_id, _reset_remote_context)| account_id.clone());

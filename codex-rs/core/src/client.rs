@@ -400,6 +400,15 @@ impl ModelClient {
             .clone()
     }
 
+    pub(crate) fn reset_remote_session_identity(&self) {
+        self.advance_window_generation();
+        *self
+            .state
+            .remote_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RemoteSessionId::new();
+    }
+
     fn take_cached_websocket_session(&self) -> WebsocketSession {
         let mut cached_websocket_session = self
             .state
@@ -877,13 +886,7 @@ impl ModelClientSession {
     }
 
     pub fn reset_remote_session_identity(&mut self) {
-        self.client.advance_window_generation();
-        *self
-            .client
-            .state
-            .remote_session_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = RemoteSessionId::new();
+        self.client.reset_remote_session_identity();
         self.reset_websocket_session();
         self.clear_previous_response_id();
     }

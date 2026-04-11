@@ -347,6 +347,115 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_manual_remote_compact_uses_leased_account_for_compact_and_follow_up() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let pooled_account_id = "account_id_b";
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                let mut pools = HashMap::new();
+                pools.insert(
+                    "legacy-default".to_string(),
+                    AccountPoolDefinitionToml {
+                        allow_context_reuse: Some(true),
+                        account_kinds: None,
+                    },
+                );
+                config.accounts = Some(AccountsConfigToml {
+                    backend: None,
+                    default_pool: Some("legacy-default".to_string()),
+                    proactive_switch_threshold_percent: Some(85),
+                    lease_ttl_secs: None,
+                    heartbeat_interval_secs: None,
+                    min_switch_interval_secs: None,
+                    allocation_mode: None,
+                    pools: Some(pools),
+                });
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let Some(state_db) = codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: pooled_account_id.to_string(),
+        })
+        .await?;
+
+    let responses_mock = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_assistant_message("m1", "before compact"),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("m2", "after compact"),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+        harness.server(),
+        "POOLED_MANUAL_REMOTE_COMPACT_SUMMARY",
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "before manual compact".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "after manual compact".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let compact_request = compact_mock.single_request();
+    assert_eq!(
+        compact_request.header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+    let response_requests = responses_mock.requests();
+    assert_eq!(
+        response_requests[0].header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+    assert_eq!(
+        response_requests[1].header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_runs_automatically() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

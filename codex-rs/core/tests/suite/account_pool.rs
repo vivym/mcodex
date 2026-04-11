@@ -21,10 +21,14 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use http::Method;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
@@ -349,6 +353,186 @@ async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<(
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_active_lease_for_next_runtime() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("m1", "runtime one"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("m2", "runtime two"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    let mut first_builder = pooled_accounts_builder().with_home(Arc::clone(&shared_home));
+    let first = first_builder.build(&server).await?;
+    seed_account(&first, PRIMARY_ACCOUNT_ID).await?;
+
+    let first_turn_error = submit_turn_and_wait(&first, "first runtime turn").await?;
+    assert!(first_turn_error.is_none());
+
+    first.codex.submit(Op::Shutdown {}).await?;
+    wait_for_event(&first.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
+
+    let mut second_builder = pooled_accounts_builder().with_home(shared_home);
+    let second = second_builder.build(&server).await?;
+    let second_turn_error = submit_turn_and_wait(&second, "second runtime turn").await?;
+    assert!(
+        second_turn_error.is_none(),
+        "shutdown should release pooled account lease for immediate reuse"
+    );
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected one request per runtime turn");
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    struct SeqResponder {
+        next_call: std::sync::atomic::AtomicUsize,
+        responses: Vec<ResponseTemplate>,
+    }
+
+    impl Respond for SeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .next_call
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.responses
+                .get(call_index)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing responses response for call {call_index}"))
+        }
+    }
+
+    let server = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(SeqResponder {
+            next_call: std::sync::atomic::AtomicUsize::new(0),
+            responses: vec![
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_delay(Duration::from_secs(8))
+                    .set_body_raw(
+                        sse(vec![
+                            ev_response_created("resp-1"),
+                            ev_assistant_message("m1", "long running turn"),
+                            ev_completed("resp-1"),
+                        ]),
+                        "text/event-stream",
+                    ),
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(
+                        sse(vec![
+                            ev_response_created("resp-2"),
+                            ev_assistant_message("m2", "contender turn"),
+                            ev_completed("resp-2"),
+                        ]),
+                        "text/event-stream",
+                    ),
+            ],
+        })
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    let mut first_builder = pooled_accounts_builder()
+        .with_home(Arc::clone(&shared_home))
+        .with_config(|config| {
+            if let Some(accounts) = config.accounts.as_mut() {
+                accounts.lease_ttl_secs = Some(4);
+                accounts.heartbeat_interval_secs = Some(1);
+            }
+        });
+    let first = first_builder.build(&server).await?;
+    seed_account(&first, PRIMARY_ACCOUNT_ID).await?;
+
+    let mut second_builder = pooled_accounts_builder()
+        .with_home(shared_home)
+        .with_config(|config| {
+            if let Some(accounts) = config.accounts.as_mut() {
+                accounts.lease_ttl_secs = Some(4);
+                accounts.heartbeat_interval_secs = Some(1);
+            }
+        });
+    let second = second_builder.build(&server).await?;
+
+    first
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "long-running turn".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+
+    let first_turn_id = wait_for_event_match(&first.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
+    let contender_turn_error = contender_turn_error
+        .expect("contender runtime should fail-closed while active lease heartbeat is healthy");
+    assert!(
+        contender_turn_error
+            .message
+            .to_ascii_lowercase()
+            .contains("pooled account"),
+        "unexpected fail-closed error: {}",
+        contender_turn_error.message
+    );
+
+    wait_for_event(&first.codex, |event| match event {
+        EventMsg::TurnComplete(event) => event.turn_id == first_turn_id,
+        _ => false,
+    })
+    .await;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let responses_requests = requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(
+        responses_requests, 1,
+        "contender runtime should not issue /responses while lease remains active"
+    );
+
+    Ok(())
+}
+
 fn pooled_accounts_builder() -> core_test_support::test_codex::TestCodexBuilder {
     test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -400,6 +584,12 @@ fn accounts_config_without_default_pool() -> AccountsConfigToml {
 }
 
 async fn seed_two_accounts(test: &TestCodex) -> Result<()> {
+    seed_account(test, PRIMARY_ACCOUNT_ID).await?;
+    seed_account(test, SECONDARY_ACCOUNT_ID).await?;
+    Ok(())
+}
+
+async fn seed_account(test: &TestCodex, account_id: &str) -> Result<()> {
     let Some(state_db) = test.codex.state_db() else {
         return Err(anyhow::anyhow!(
             "state db should be available in core integration tests"
@@ -407,12 +597,7 @@ async fn seed_two_accounts(test: &TestCodex) -> Result<()> {
     };
     state_db
         .import_legacy_default_account(LegacyAccountImport {
-            account_id: PRIMARY_ACCOUNT_ID.to_string(),
-        })
-        .await?;
-    state_db
-        .import_legacy_default_account(LegacyAccountImport {
-            account_id: SECONDARY_ACCOUNT_ID.to_string(),
+            account_id: account_id.to_string(),
         })
         .await?;
     Ok(())

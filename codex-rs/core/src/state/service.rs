@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use crate::RolloutRecorder;
 use crate::SkillsManager;
@@ -95,6 +96,7 @@ pub(crate) struct AccountPoolManager {
     proactive_switch_threshold_percent: u8,
     allow_context_reuse_by_pool_id: HashMap<String, bool>,
     lease_ttl: Duration,
+    heartbeat_interval: StdDuration,
     holder_instance_id: String,
     active_lease: Option<AccountLeaseRecord>,
     next_health_event_sequence: i64,
@@ -118,6 +120,12 @@ impl AccountPoolManager {
         let proactive_switch_threshold_percent =
             accounts.proactive_switch_threshold_percent.unwrap_or(85);
         let lease_ttl_secs = accounts.lease_ttl_secs.unwrap_or(300);
+        let default_heartbeat_interval_secs = (lease_ttl_secs / 3).max(1);
+        let max_heartbeat_interval_secs = lease_ttl_secs.saturating_sub(1).max(1);
+        let heartbeat_interval_secs = accounts
+            .heartbeat_interval_secs
+            .unwrap_or(default_heartbeat_interval_secs)
+            .clamp(1, max_heartbeat_interval_secs);
 
         Self {
             state_db,
@@ -125,6 +133,7 @@ impl AccountPoolManager {
             proactive_switch_threshold_percent,
             allow_context_reuse_by_pool_id,
             lease_ttl: Duration::seconds(lease_ttl_secs as i64),
+            heartbeat_interval: StdDuration::from_secs(heartbeat_interval_secs),
             holder_instance_id,
             active_lease: None,
             next_health_event_sequence: 0,
@@ -139,21 +148,7 @@ impl AccountPoolManager {
             self.rotate_on_next_turn = false;
         }
 
-        if let Some(active_lease) = self.active_lease.clone() {
-            match self
-                .state_db
-                .renew_account_lease(&active_lease.lease_key(), Utc::now(), self.lease_ttl)
-                .await?
-            {
-                LeaseRenewal::Renewed(record) => {
-                    self.active_lease = Some(record);
-                }
-                LeaseRenewal::Missing => {
-                    self.active_lease = None;
-                    self.next_health_event_sequence = 0;
-                }
-            }
-        }
+        self.renew_active_lease().await?;
 
         if self.active_lease.is_none() {
             let Some(pool_id) = self.resolve_pool_id().await? else {
@@ -194,6 +189,33 @@ impl AccountPoolManager {
             && !allow_context_reuse;
         self.previous_turn_account_id = Some(account_id.clone());
         Ok(Some((account_id, reset_remote_context)))
+    }
+
+    pub(crate) fn heartbeat_interval(&self) -> StdDuration {
+        self.heartbeat_interval
+    }
+
+    pub(crate) async fn renew_active_lease(&mut self) -> anyhow::Result<()> {
+        if let Some(active_lease) = self.active_lease.clone() {
+            match self
+                .state_db
+                .renew_account_lease(&active_lease.lease_key(), Utc::now(), self.lease_ttl)
+                .await?
+            {
+                LeaseRenewal::Renewed(record) => {
+                    self.active_lease = Some(record);
+                }
+                LeaseRenewal::Missing => {
+                    self.active_lease = None;
+                    self.next_health_event_sequence = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn release_for_shutdown(&mut self) -> anyhow::Result<()> {
+        self.release_active_lease().await
     }
 
     pub(crate) async fn report_rate_limits(
