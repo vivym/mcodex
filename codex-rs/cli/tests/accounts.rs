@@ -1,9 +1,11 @@
 use std::path::Path;
 
 use anyhow::Result;
+use codex_state::AccountStartupSelectionState;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
+use pretty_assertions::assert_eq;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
@@ -34,6 +36,15 @@ async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
         stderr: String::from_utf8(output.stderr)?,
         success: output.status.success(),
     })
+}
+
+async fn read_startup_selection(codex_home: &TempDir) -> Result<AccountStartupSelectionState> {
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime
+        .read_account_startup_selection()
+        .await
+        .map_err(Into::into)
 }
 
 fn seed_chatgpt_auth(codex_home: &Path) -> Result<()> {
@@ -152,11 +163,36 @@ async fn accounts_resume_clears_durable_suppression() -> Result<()> {
     let output = run_codex(&codex_home, &["accounts", "resume"]).await?;
     assert!(output.success);
     assert!(output.stdout.contains("automatic selection resumed"));
-    let runtime =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
-    let selection = runtime.read_account_startup_selection().await?;
+    let selection = read_startup_selection(&codex_home).await?;
     assert!(!selection.suppressed);
     assert_eq!(selection.preferred_account_id, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_resume_does_not_persist_transient_default_pool_override() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    let output = run_codex(
+        &codex_home,
+        &[
+            "-c",
+            "accounts.default_pool=\"team-override\"",
+            "accounts",
+            "resume",
+        ],
+    )
+    .await?;
+    assert!(output.success);
+
+    let selection = read_startup_selection(&codex_home).await?;
+    assert_eq!(
+        selection,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
     Ok(())
 }
 
@@ -166,9 +202,7 @@ async fn accounts_switch_sets_preferred_account_override() -> Result<()> {
     let output = run_codex(&codex_home, &["accounts", "switch", "acct-2"]).await?;
     assert!(output.success);
     assert!(output.stdout.contains("preferred account"));
-    let runtime =
-        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
-    let selection = runtime.read_account_startup_selection().await?;
+    let selection = read_startup_selection(&codex_home).await?;
     assert_eq!(selection.preferred_account_id.as_deref(), Some("acct-2"));
     assert!(!selection.suppressed);
     Ok(())
@@ -192,6 +226,34 @@ async fn logout_enables_durable_startup_suppression_for_future_runtimes() -> Res
         output
             .stderr
             .contains("automatic pooled selection suppressed")
+    );
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: true,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn logout_does_not_persist_transient_default_pool_override() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    let output = run_codex(
+        &codex_home,
+        &["-c", "accounts.default_pool=\"team-override\"", "logout"],
+    )
+    .await?;
+    assert!(output.success);
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: true,
+        }
     );
     Ok(())
 }

@@ -83,9 +83,7 @@ pub(crate) async fn suppress_pooled_startup_selection_if_configured(
     if !selection.suppressed {
         runtime
             .write_account_startup_selection(AccountStartupSelectionUpdate {
-                default_pool_id: configured_default_pool_id(config)
-                    .map(ToOwned::to_owned)
-                    .or(selection.default_pool_id),
+                default_pool_id: selection.default_pool_id,
                 preferred_account_id: selection.preferred_account_id,
                 suppressed: true,
             })
@@ -105,6 +103,10 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
     let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account startup selection state")?;
+    let selection = runtime
+        .read_account_startup_selection()
+        .await
+        .context("read account startup selection")?;
     let startup_preview = runtime
         .preview_account_startup_selection(configured_default_pool_id(&config))
         .await
@@ -166,7 +168,7 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         AccountsSubcommand::Resume => {
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: startup_preview.effective_pool_id,
+                    default_pool_id: selection.default_pool_id,
                     preferred_account_id: None,
                     suppressed: false,
                 })
