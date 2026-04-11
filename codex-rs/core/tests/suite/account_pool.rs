@@ -2,6 +2,8 @@ use anyhow::Result;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_login::CodexAuth;
+use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -14,6 +16,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_sequence;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -324,6 +327,59 @@ async fn exhausted_pool_fails_closed_without_legacy_auth_fallback() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_compact_in_pooled_mode_does_not_fail_closed_without_eligible_lease() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let compact_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-compact"),
+            ev_assistant_message("m-compact", "local compact summary"),
+            ev_completed("resp-compact"),
+        ]),
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = pooled_accounts_builder().with_config(move |config| {
+        config.model_provider = model_provider;
+    });
+    let test = builder.build(&server).await?;
+
+    test.codex.submit(Op::Compact).await?;
+
+    let mut pooled_fail_closed_error = None;
+    loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
+            EventMsg::Error(error_event) => {
+                if error_event
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("pooled account")
+                {
+                    pooled_fail_closed_error = Some(error_event.message);
+                }
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        pooled_fail_closed_error.is_none(),
+        "local compact should not fail closed due to pooled lease selection"
+    );
+    assert_eq!(
+        compact_mock.requests().len(),
+        1,
+        "local compact should still execute when no pooled lease is available"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -581,6 +637,14 @@ fn accounts_config_without_default_pool() -> AccountsConfigToml {
         allocation_mode: None,
         pools: Some(pools),
     }
+}
+
+fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo {
+    let mut provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
+    provider.name = "OpenAI (test)".into();
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    provider
 }
 
 async fn seed_two_accounts(test: &TestCodex) -> Result<()> {

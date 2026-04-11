@@ -6121,6 +6121,9 @@ pub(crate) async fn run_turn(
             None
         };
     if pooled_mode_enabled && turn_account_selection.is_none() {
+        if let Some(mut client_session) = prewarmed_client_session.take() {
+            client_session.reset_websocket_session();
+        }
         sess.send_event(
             &turn_context,
             EventMsg::Error(ErrorEvent {

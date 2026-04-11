@@ -31,8 +31,10 @@ impl SessionTask for CompactTask {
         _cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
-        let pooled_mode_enabled = session.services.account_pool_manager.is_some();
-        let turn_account_selection =
+        let use_remote_compact = crate::compact::should_use_remote_compact_task(&ctx.provider);
+        let pooled_mode_enabled =
+            use_remote_compact && session.services.account_pool_manager.is_some();
+        let turn_account_selection = if use_remote_compact {
             if let Some(account_pool_manager) = session.services.account_pool_manager.as_ref() {
                 let mut account_pool_manager = account_pool_manager.lock().await;
                 match account_pool_manager.prepare_turn().await {
@@ -44,7 +46,10 @@ impl SessionTask for CompactTask {
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         if pooled_mode_enabled && turn_account_selection.is_none() {
             session
                 .send_event(
@@ -62,7 +67,7 @@ impl SessionTask for CompactTask {
         let turn_account_id_override = turn_account_selection
             .as_ref()
             .map(|(account_id, _reset_remote_context)| account_id.clone());
-        let _ = if crate::compact::should_use_remote_compact_task(&ctx.provider) {
+        let _ = if use_remote_compact {
             if turn_account_selection
                 .as_ref()
                 .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context)
