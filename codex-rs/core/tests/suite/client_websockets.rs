@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use codex_api::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use codex_api::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
 use codex_core::ModelClient;
 use codex_core::ModelClientSession;
 use codex_core::Prompt;
@@ -29,6 +31,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
+use codex_state::LegacyAccountImport;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::WebSocketTestServer;
@@ -45,6 +48,7 @@ use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -332,6 +336,107 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     assert_eq!(follow_up["type"].as_str(), Some("response.create"));
     assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
     assert_eq!(follow_up["input"], serde_json::json!([]));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_first_turn_does_not_reuse_startup_prewarm_websocket() {
+    skip_if_no_network!();
+
+    let pooled_account_id = "account_id_b";
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                ev_response_created("resp-prewarm"),
+                ev_completed("resp-prewarm"),
+            ],
+            vec![
+                ev_response_created("resp-turn-on-prewarm"),
+                ev_completed("resp-turn-on-prewarm"),
+            ],
+        ],
+        vec![vec![
+            ev_response_created("resp-turn"),
+            ev_completed("resp-turn"),
+        ]],
+    ])
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            let mut pools = HashMap::new();
+            pools.insert(
+                "legacy-default".to_string(),
+                AccountPoolDefinitionToml {
+                    allow_context_reuse: Some(true),
+                    account_kinds: None,
+                },
+            );
+            config.accounts = Some(AccountsConfigToml {
+                backend: None,
+                default_pool: Some("legacy-default".to_string()),
+                proactive_switch_threshold_percent: Some(85),
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: Some(pools),
+            });
+        });
+    let test = builder
+        .build_with_websocket_server(&server)
+        .await
+        .expect("build websocket codex");
+
+    let Some(state_db) = test.codex.state_db() else {
+        panic!("state db should be available in core integration tests");
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: pooled_account_id.to_string(),
+        })
+        .await
+        .expect("seed pooled account");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !server.handshakes().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup prewarm should establish websocket connection");
+
+    test.submit_turn("hello")
+        .await
+        .expect("pooled turn should complete");
+
+    let connections = server.connections();
+    let prewarm_request = connections
+        .first()
+        .and_then(|requests| requests.first())
+        .expect("missing startup prewarm request")
+        .body_json();
+    assert_eq!(prewarm_request["generate"].as_bool(), Some(false));
+
+    let handshakes = server.handshakes();
+    assert_eq!(
+        handshakes.len(),
+        2,
+        "first pooled turn must not reuse startup prewarm websocket"
+    );
+    assert_eq!(
+        handshakes[0].header("chatgpt-account-id").as_deref(),
+        Some("account_id")
+    );
+    assert_eq!(
+        handshakes[1].header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
 
     server.shutdown().await;
 }

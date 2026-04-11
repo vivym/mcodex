@@ -1,9 +1,12 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_login::CodexAuth;
 use codex_protocol::items::TurnItem;
@@ -20,6 +23,7 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
+use codex_state::LegacyAccountImport;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
@@ -405,6 +409,141 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     let follow_up_request = responses_mock.single_request();
     let follow_up_body = follow_up_request.body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_follow_up() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let previous_model = "gpt-5.1-codex-max";
+    let next_model = "gpt-5.2-codex";
+    let pooled_account_id = "account_id_b";
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_model(previous_model)
+            .with_config(|config| {
+                let mut pools = HashMap::new();
+                pools.insert(
+                    "legacy-default".to_string(),
+                    AccountPoolDefinitionToml {
+                        allow_context_reuse: Some(true),
+                        account_kinds: None,
+                    },
+                );
+                config.accounts = Some(AccountsConfigToml {
+                    backend: None,
+                    default_pool: Some("legacy-default".to_string()),
+                    proactive_switch_threshold_percent: Some(85),
+                    lease_ttl_secs: None,
+                    heartbeat_interval_secs: None,
+                    min_switch_interval_secs: None,
+                    allocation_mode: None,
+                    pools: Some(pools),
+                });
+                config.model_auto_compact_token_limit = Some(200);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    let Some(state_db) = codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: pooled_account_id.to_string(),
+        })
+        .await?;
+
+    let initial_turn_request_mock = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            responses::ev_assistant_message("m1", "before compact"),
+            responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+        ]),
+    )
+    .await;
+    let post_compact_turn_request_mock = responses::mount_sse_once(
+        harness.server(),
+        responses::sse(vec![
+            responses::ev_assistant_message("m2", "after compact"),
+            responses::ev_completed_with_tokens("r2", /*total_tokens*/ 80),
+        ]),
+    )
+    .await;
+    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+        harness.server(),
+        "POOLED_REMOTE_COMPACT_SUMMARY",
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "BEFORE_SWITCH_USER".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::OverrideTurnContext {
+            cwd: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox_policy: None,
+            windows_sandbox_level: None,
+            model: Some(next_model.to_string()),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "AFTER_SWITCH_USER".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(compact_mock.requests().len(), 1);
+    let compact_request = compact_mock.single_request();
+    let initial_turn_request = initial_turn_request_mock.single_request();
+    let second_turn_request = post_compact_turn_request_mock.single_request();
+    assert_eq!(
+        initial_turn_request.header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+    assert_eq!(
+        compact_request.header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+    assert_eq!(
+        second_turn_request.header("chatgpt-account-id").as_deref(),
+        Some(pooled_account_id)
+    );
+    assert!(
+        second_turn_request
+            .body_json()
+            .to_string()
+            .contains("POOLED_REMOTE_COMPACT_SUMMARY")
+    );
 
     Ok(())
 }

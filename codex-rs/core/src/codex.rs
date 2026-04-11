@@ -1984,10 +1984,11 @@ impl Session {
         }
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
         let account_pool_manager = SessionServices::build_account_pool_manager(
             state_db_ctx.clone(),
             config.accounts.clone(),
-            format!("codex-core:{conversation_id}"),
+            account_pool_holder_instance_id,
         );
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
@@ -6043,11 +6044,45 @@ pub(crate) async fn run_turn(
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut prewarmed_client_session = prewarmed_client_session;
+    let pooled_mode_enabled = sess.services.account_pool_manager.is_some();
+    let turn_account_selection =
+        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            match account_pool_manager.prepare_turn().await {
+                Ok(selection) => selection,
+                Err(err) => {
+                    warn!("failed to prepare account-pool lease for turn: {err:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    if pooled_mode_enabled && turn_account_selection.is_none() {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Error(ErrorEvent {
+                message: "No eligible pooled account is available for this turn.".to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        )
+        .await;
+        return None;
+    }
+    let turn_account_id_override = turn_account_selection
+        .as_ref()
+        .map(|(account_id, _reset_remote_context)| account_id.clone());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    let pre_sampling_compacted = match run_pre_sampling_compact(&sess, &turn_context).await {
+    let pre_sampling_compacted = match run_pre_sampling_compact(
+        &sess,
+        &turn_context,
+        turn_account_id_override.clone(),
+    )
+    .await
+    {
         Ok(pre_sampling_compacted) => pre_sampling_compacted,
         Err(_) => {
             error!("Failed to run pre-sampling compact");
@@ -6249,35 +6284,12 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
-    let pooled_mode_enabled = sess.services.account_pool_manager.is_some();
-    let turn_account_selection =
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            match account_pool_manager.prepare_turn().await {
-                Ok(selection) => selection,
-                Err(err) => {
-                    warn!("failed to prepare account-pool lease for turn: {err:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-    if pooled_mode_enabled && turn_account_selection.is_none() {
-        sess.send_event(
-            &turn_context,
-            EventMsg::Error(ErrorEvent {
-                message: "No eligible pooled account is available for this turn.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        )
-        .await;
-        return None;
-    }
-    if turn_account_selection.is_some() {
-        // Startup prewarm happens before turn lease selection. Drop prewarmed sessions when
-        // leased account routing is active so stale session/auth context is never reused.
-        prewarmed_client_session = None;
+    if turn_account_selection.is_some()
+        && let Some(mut client_session) = prewarmed_client_session.take()
+    {
+        // Startup prewarm happens before turn lease selection, so reset websocket state before
+        // dropping the prewarmed session to avoid caching stale auth/routing context.
+        client_session.reset_websocket_session();
     }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
@@ -6412,6 +6424,7 @@ pub(crate) async fn run_turn(
                         &sess,
                         &turn_context,
                         InitialContextInjection::BeforeLastUserMessage,
+                        turn_account_id_override.clone(),
                     )
                     .await
                     .is_err()
@@ -6580,12 +6593,14 @@ pub(crate) async fn run_turn(
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
+    account_id_override: Option<String>,
 ) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
         total_usage_tokens_before_compaction,
+        account_id_override.clone(),
     )
     .await?;
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -6595,7 +6610,13 @@ async fn run_pre_sampling_compact(
         .unwrap_or(i64::MAX);
     // Compact if the total usage tokens are greater than the auto compact limit
     if total_usage_tokens >= auto_compact_limit {
-        run_auto_compact(sess, turn_context, InitialContextInjection::DoNotInject).await?;
+        run_auto_compact(
+            sess,
+            turn_context,
+            InitialContextInjection::DoNotInject,
+            account_id_override,
+        )
+        .await?;
         pre_sampling_compacted = true;
     }
     Ok(pre_sampling_compacted)
@@ -6611,6 +6632,7 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
+    account_id_override: Option<String>,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -6639,6 +6661,7 @@ async fn maybe_run_previous_model_inline_compact(
             sess,
             &previous_model_turn_context,
             InitialContextInjection::DoNotInject,
+            account_id_override,
         )
         .await?;
         return Ok(true);
@@ -6650,12 +6673,14 @@ async fn run_auto_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    account_id_override: Option<String>,
 ) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
         run_inline_remote_auto_compact_task(
             Arc::clone(sess),
             Arc::clone(turn_context),
             initial_context_injection,
+            account_id_override,
         )
         .await?;
     } else {
