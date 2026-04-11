@@ -1984,6 +1984,11 @@ impl Session {
         }
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        let account_pool_manager = SessionServices::build_account_pool_manager(
+            state_db_ctx.clone(),
+            config.accounts.clone(),
+            format!("codex-core:{conversation_id}"),
+        );
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
@@ -2026,6 +2031,7 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
+            account_pool_manager,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
@@ -3989,6 +3995,15 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
+        if let Some(account_pool_manager) = self.services.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            if let Err(err) = account_pool_manager
+                .report_rate_limits(&new_rate_limits)
+                .await
+            {
+                warn!("failed to record account-pool rate-limit snapshot: {err:#}");
+            }
+        }
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
@@ -6234,11 +6249,35 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
+    let turn_account_selection =
+        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            match account_pool_manager.prepare_turn().await {
+                Ok(selection) => selection,
+                Err(err) => {
+                    warn!("failed to prepare account-pool lease for turn: {err:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    if turn_account_selection.is_some() {
+        // Startup prewarm happens before turn lease selection. Drop prewarmed sessions when
+        // leased account routing is active so stale session/auth context is never reused.
+        prewarmed_client_session = None;
+    }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    if let Some((account_id, reset_remote_context)) = turn_account_selection {
+        client_session.set_account_id_override(Some(account_id));
+        if reset_remote_context {
+            client_session.reset_remote_session_identity();
+        }
+    }
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
@@ -6859,7 +6898,24 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
+                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                    let mut account_pool_manager = account_pool_manager.lock().await;
+                    if let Err(err) = account_pool_manager.report_usage_limit_reached().await {
+                        warn!("failed to record account-pool usage-limit event: {err:#}");
+                    }
+                }
                 return Err(CodexErr::UsageLimitReached(e));
+            }
+            Err(err @ CodexErr::RefreshTokenFailed(_)) => {
+                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                    let mut account_pool_manager = account_pool_manager.lock().await;
+                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
+                        warn!(
+                            "failed to record account-pool unauthorized event after refresh failure: {report_err:#}"
+                        );
+                    }
+                }
+                return Err(err);
             }
             Err(err) => err,
         };

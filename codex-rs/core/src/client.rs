@@ -213,6 +213,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    account_id_override: Option<String>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -364,6 +365,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            account_id_override: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -842,6 +844,18 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        let mut client_setup = self.client.current_client_setup().await?;
+        if let Some(account_id) = self.account_id_override.clone() {
+            client_setup.api_auth.account_id = Some(account_id);
+        }
+        Ok(client_setup)
+    }
+
+    pub(crate) fn set_account_id_override(&mut self, account_id: Option<String>) {
+        self.account_id_override = account_id;
+    }
+
     fn clear_previous_response_id(&mut self) {
         self.websocket_session.last_response_rx = None;
     }
@@ -1063,7 +1077,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
-        let client_setup = self.client.current_client_setup().await.map_err(|err| {
+        let client_setup = self.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
@@ -1224,7 +1238,7 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.current_client_setup().await?;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -1313,7 +1327,7 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 &client_setup.api_auth,
