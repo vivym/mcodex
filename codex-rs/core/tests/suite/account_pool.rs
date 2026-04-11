@@ -9,9 +9,12 @@ use codex_protocol::user_input::UserInput;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_sequence;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -22,7 +25,11 @@ use http::Method;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
+use wiremock::Mock;
+use wiremock::Respond;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const PRIMARY_ACCOUNT_ID: &str = "account_id";
 const SECONDARY_ACCOUNT_ID: &str = "account_id_b";
@@ -312,6 +319,36 @@ async fn exhausted_pool_fails_closed_without_legacy_auth_fallback() -> Result<()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_pre_turn_remote_compact_failure_rotates_next_turn(
+        ResponseTemplate::new(429)
+            .insert_header("content-type", "application/json")
+            .set_body_json(json!({
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "limit reached",
+                    "resets_at": 1704067242
+                }
+            })),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_pre_turn_remote_compact_failure_rotates_next_turn(
+        ResponseTemplate::new(401)
+            .insert_header("content-type", "application/json")
+            .set_body_string("unauthorized"),
+    )
+    .await
+}
+
 fn pooled_accounts_builder() -> core_test_support::test_codex::TestCodexBuilder {
     test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
@@ -378,6 +415,120 @@ async fn seed_two_accounts(test: &TestCodex) -> Result<()> {
             account_id: SECONDARY_ACCOUNT_ID.to_string(),
         })
         .await?;
+    Ok(())
+}
+
+async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
+    compact_failure_response: ResponseTemplate,
+) -> Result<()> {
+    struct CompactSeqResponder {
+        next_call: std::sync::atomic::AtomicUsize,
+        responses: Vec<ResponseTemplate>,
+    }
+
+    impl Respond for CompactSeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .next_call
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.responses
+                .get(call_index)
+                .unwrap_or_else(|| panic!("missing compact response for call {call_index}"))
+                .clone()
+        }
+    }
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("m1", "before compact"),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 500),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("m2", "after compact"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let compact_success_response = ResponseTemplate::new(200)
+        .insert_header("content-type", "application/json")
+        .set_body_json(json!({
+            "output": [{
+                "type": "compaction",
+                "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+            }]
+        }));
+    let compact_responses = vec![compact_failure_response, compact_success_response];
+    let compact_call_count = compact_responses.len() as u64;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(CompactSeqResponder {
+            next_call: std::sync::atomic::AtomicUsize::new(0),
+            responses: compact_responses,
+        })
+        .up_to_n_times(compact_call_count)
+        .expect(compact_call_count)
+        .mount(&server)
+        .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config.model_auto_compact_token_limit = Some(120);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "seed usage for compact").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "turn with failing compact").await?;
+    assert!(
+        second_turn_error.is_some(),
+        "pre-turn compact failure should fail the current turn"
+    );
+
+    let third_turn_error = submit_turn_and_wait(&test, "turn after compact failure").await?;
+    assert!(third_turn_error.is_none());
+
+    let response_requests = response_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        2,
+        "pre-turn compact failure should not auto-replay the failed turn"
+    );
+    assert_account_ids_in_order(
+        &response_requests,
+        &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+    );
+
+    let all_requests = server.received_requests().await.unwrap_or_default();
+    let compact_request_account_ids = all_requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses/compact")
+        })
+        .map(|request| {
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_request_account_ids,
+        vec![
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(SECONDARY_ACCOUNT_ID.to_string()),
+        ],
+        "expected compact failures to mark the active account unavailable before next turn"
+    );
+
     Ok(())
 }
 
