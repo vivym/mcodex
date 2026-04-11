@@ -108,6 +108,38 @@ pub struct AccountStartupSelectionState {
     pub suppressed: bool,
 }
 
+/// Preview of what a fresh runtime would select from persisted startup state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStartupSelectionPreview {
+    pub effective_pool_id: Option<String>,
+    pub preferred_account_id: Option<String>,
+    pub suppressed: bool,
+    pub predicted_account_id: Option<String>,
+    pub eligibility: AccountStartupEligibility,
+}
+
+/// Eligibility result for fresh-runtime startup selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountStartupEligibility {
+    Suppressed,
+    MissingPool,
+    PreferredAccountSelected,
+    AutomaticAccountSelected,
+    PreferredAccountMissing,
+    PreferredAccountInOtherPool { actual_pool_id: String },
+    PreferredAccountUnhealthy,
+    PreferredAccountBusy,
+    NoEligibleAccount,
+}
+
+/// Persisted pool membership for a known account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolMembership {
+    pub account_id: String,
+    pub pool_id: String,
+    pub healthy: bool,
+}
+
 /// Full replacement update for startup selection state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountStartupSelectionUpdate {

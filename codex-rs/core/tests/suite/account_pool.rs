@@ -291,6 +291,91 @@ async fn startup_selected_pool_without_context_reuse_mints_new_remote_session_id
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppressed_startup_selection_blocks_fresh_runtime_pool_acquisition() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+            preferred_account_id: Some(PRIMARY_ACCOUNT_ID.to_string()),
+            suppressed: true,
+        })
+        .await?;
+
+    let turn_error = submit_turn_and_wait(&test, "suppressed pooled turn").await?;
+    let turn_error = turn_error.expect("suppressed fresh runtime should fail closed");
+    assert!(
+        turn_error
+            .message
+            .to_ascii_lowercase()
+            .contains("pooled account"),
+        "unexpected suppression error: {}",
+        turn_error.message
+    );
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let responses_requests = requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(
+        responses_requests, 0,
+        "suppressed fresh runtime should not acquire or use a pooled account"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preferred_startup_selection_is_used_for_fresh_runtime() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "preferred runtime"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+            preferred_account_id: Some(SECONDARY_ACCOUNT_ID.to_string()),
+            suppressed: false,
+        })
+        .await?;
+
+    let turn_error = submit_turn_and_wait(&test, "preferred pooled turn").await?;
+    assert!(turn_error.is_none());
+    assert_account_ids_in_order(&response_mock.requests(), &[SECONDARY_ACCOUNT_ID]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_pool_fails_closed_without_legacy_auth_fallback() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

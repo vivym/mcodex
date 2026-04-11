@@ -32,6 +32,7 @@ use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
 use codex_state::AccountLeaseError;
 use codex_state::AccountLeaseRecord;
+use codex_state::AccountStartupEligibility;
 use codex_state::LeaseRenewal;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
@@ -151,14 +152,55 @@ impl AccountPoolManager {
         self.renew_active_lease().await?;
 
         if self.active_lease.is_none() {
-            let Some(pool_id) = self.resolve_pool_id().await? else {
+            let startup_preview = self
+                .state_db
+                .preview_account_startup_selection(self.default_pool_id.as_deref())
+                .await?;
+            let Some(pool_id) = startup_preview.effective_pool_id.clone() else {
                 return Ok(None);
             };
-            match self
-                .state_db
-                .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
-                .await
-            {
+            let lease_result = match (
+                startup_preview.predicted_account_id.as_deref(),
+                &startup_preview.eligibility,
+            ) {
+                (Some(account_id), AccountStartupEligibility::PreferredAccountSelected) => {
+                    self.state_db
+                        .acquire_preferred_account_lease(
+                            &pool_id,
+                            account_id,
+                            &self.holder_instance_id,
+                            self.lease_ttl,
+                        )
+                        .await
+                }
+                (Some(_), AccountStartupEligibility::AutomaticAccountSelected) => {
+                    self.state_db
+                        .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
+                        .await
+                }
+                (
+                    None,
+                    AccountStartupEligibility::Suppressed
+                    | AccountStartupEligibility::MissingPool
+                    | AccountStartupEligibility::PreferredAccountMissing
+                    | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                    | AccountStartupEligibility::PreferredAccountUnhealthy
+                    | AccountStartupEligibility::PreferredAccountBusy
+                    | AccountStartupEligibility::NoEligibleAccount,
+                ) => return Ok(None),
+                (Some(account_id), eligibility) => {
+                    return Err(anyhow::anyhow!(
+                        "unexpected startup-selection preview {eligibility:?} for predicted account {account_id}"
+                    ));
+                }
+                (None, AccountStartupEligibility::PreferredAccountSelected)
+                | (None, AccountStartupEligibility::AutomaticAccountSelected) => {
+                    return Err(anyhow::anyhow!(
+                        "startup-selection preview did not include a predicted account"
+                    ));
+                }
+            };
+            match lease_result {
                 Ok(lease) => {
                     self.next_health_event_sequence = self
                         .state_db
@@ -241,19 +283,6 @@ impl AccountPoolManager {
         self.record_health_event(AccountHealthState::Unauthorized, Utc::now())
             .await
     }
-
-    async fn resolve_pool_id(&self) -> anyhow::Result<Option<String>> {
-        if self.default_pool_id.is_some() {
-            return Ok(self.default_pool_id.clone());
-        }
-
-        Ok(self
-            .state_db
-            .read_account_startup_selection()
-            .await?
-            .default_pool_id)
-    }
-
     async fn release_active_lease(&mut self) -> anyhow::Result<()> {
         if let Some(lease) = self.active_lease.as_ref() {
             let _ = self

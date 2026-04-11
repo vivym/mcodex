@@ -2,6 +2,9 @@ use super::*;
 use crate::model::AccountHealthEvent;
 use crate::model::AccountLeaseError;
 use crate::model::AccountLeaseRecord;
+use crate::model::AccountPoolMembership;
+use crate::model::AccountStartupEligibility;
+use crate::model::AccountStartupSelectionPreview;
 use crate::model::AccountStartupSelectionState;
 use crate::model::AccountStartupSelectionUpdate;
 use crate::model::LeaseKey;
@@ -99,20 +102,9 @@ impl StateRuntime {
             .begin()
             .await
             .map_err(account_lease_storage_error)?;
-
-        sqlx::query(
-            r#"
-UPDATE account_leases
-SET released_at = ?
-WHERE released_at IS NULL
-  AND expires_at <= ?
-            "#,
-        )
-        .bind(account_datetime_to_epoch_seconds(now))
-        .bind(account_datetime_to_epoch_seconds(now))
-        .execute(&mut *tx)
-        .await
-        .map_err(account_lease_storage_error)?;
+        release_expired_account_leases(&mut *tx, now)
+            .await
+            .map_err(account_lease_storage_error)?;
 
         if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id)
             .await
@@ -134,54 +126,77 @@ WHERE released_at IS NULL
             released_at: None,
         };
 
-        let result = sqlx::query(
-            r#"
-INSERT INTO account_leases (
-    lease_id,
-    account_id,
-    pool_id,
-    holder_instance_id,
-    lease_epoch,
-    acquired_at,
-    renewed_at,
-    expires_at,
-    released_at
-) SELECT
-    ?,
-    account_registry.account_id,
-    ?,
-    ?,
-    COALESCE((
-        SELECT MAX(existing.lease_epoch) + 1
-        FROM account_leases AS existing
-        WHERE existing.account_id = account_registry.account_id
-    ), 1),
-    ?,
-    ?,
-    ?,
-    NULL
-FROM account_registry
-WHERE pool_id = ?
-  AND healthy = 1
-  AND NOT EXISTS (
-      SELECT 1
-      FROM account_leases
-      WHERE account_leases.account_id = account_registry.account_id
-        AND account_leases.released_at IS NULL
-  )
-ORDER BY position ASC, account_id ASC
-LIMIT 1
-            "#,
-        )
-        .bind(&lease.lease_id)
-        .bind(&lease.pool_id)
-        .bind(&lease.holder_instance_id)
-        .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
-        .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
-        .bind(account_datetime_to_epoch_seconds(lease.expires_at))
-        .bind(pool_id)
-        .execute(&mut *tx)
-        .await;
+        let result = insert_next_eligible_lease(&mut *tx, &lease, pool_id).await;
+
+        let result = match result {
+            Ok(result) => result,
+            Err(err) if account_lease_is_contention_error(&err) => {
+                let existing_lease =
+                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id)
+                        .await
+                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
+                return match existing_lease {
+                    Some(existing_lease) => Ok(existing_lease),
+                    None => Err(AccountLeaseError::NoEligibleAccount),
+                };
+            }
+            Err(err) => return Err(account_lease_storage_error(err)),
+        };
+
+        if result.rows_affected() == 0 {
+            return Err(AccountLeaseError::NoEligibleAccount);
+        }
+
+        tx.commit().await.map_err(account_lease_storage_error)?;
+
+        let lease = load_lease(self.pool.as_ref(), &lease.lease_id)
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+            .ok_or_else(|| {
+                AccountLeaseError::Storage(format!("missing inserted lease {}", lease.lease_id))
+            })?;
+
+        Ok(lease)
+    }
+
+    pub async fn acquire_preferred_account_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        let now = Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(account_lease_storage_error)?;
+        release_expired_account_leases(&mut *tx, now)
+            .await
+            .map_err(account_lease_storage_error)?;
+
+        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id)
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+        {
+            tx.commit().await.map_err(account_lease_storage_error)?;
+            return Ok(existing_lease);
+        }
+
+        let lease = AccountLeaseRecord {
+            lease_id: Uuid::new_v4().to_string(),
+            pool_id: pool_id.to_string(),
+            account_id: account_id.to_string(),
+            holder_instance_id: holder_instance_id.to_string(),
+            lease_epoch: 0,
+            acquired_at: now,
+            renewed_at: now,
+            expires_at: now + lease_ttl,
+            released_at: None,
+        };
+
+        let result = insert_requested_lease(&mut *tx, &lease, account_id).await;
 
         let result = match result {
             Ok(result) => result,
@@ -467,6 +482,129 @@ WHERE singleton = 1
         }
     }
 
+    pub async fn preview_account_startup_selection(
+        &self,
+        configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupSelectionPreview> {
+        let selection = self.read_account_startup_selection().await?;
+        let effective_pool_id = configured_default_pool_id
+            .map(ToOwned::to_owned)
+            .or_else(|| selection.default_pool_id.clone());
+
+        if selection.suppressed {
+            return Ok(AccountStartupSelectionPreview {
+                effective_pool_id,
+                preferred_account_id: selection.preferred_account_id,
+                suppressed: true,
+                predicted_account_id: None,
+                eligibility: AccountStartupEligibility::Suppressed,
+            });
+        }
+
+        let Some(pool_id) = effective_pool_id.clone() else {
+            return Ok(AccountStartupSelectionPreview {
+                effective_pool_id: None,
+                preferred_account_id: selection.preferred_account_id,
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: AccountStartupEligibility::MissingPool,
+            });
+        };
+
+        if let Some(preferred_account_id) = selection.preferred_account_id.clone() {
+            let membership = self
+                .read_account_pool_membership(&preferred_account_id)
+                .await?;
+            let eligibility = match membership {
+                None => AccountStartupEligibility::PreferredAccountMissing,
+                Some(membership) if membership.pool_id != pool_id => {
+                    AccountStartupEligibility::PreferredAccountInOtherPool {
+                        actual_pool_id: membership.pool_id,
+                    }
+                }
+                Some(membership) if !membership.healthy => {
+                    AccountStartupEligibility::PreferredAccountUnhealthy
+                }
+                Some(_)
+                    if account_has_active_lease(
+                        self.pool.as_ref(),
+                        &preferred_account_id,
+                        Utc::now(),
+                    )
+                    .await? =>
+                {
+                    AccountStartupEligibility::PreferredAccountBusy
+                }
+                Some(_) => AccountStartupEligibility::PreferredAccountSelected,
+            };
+            let predicted_account_id = match eligibility {
+                AccountStartupEligibility::PreferredAccountSelected => {
+                    Some(preferred_account_id.clone())
+                }
+                AccountStartupEligibility::Suppressed
+                | AccountStartupEligibility::MissingPool
+                | AccountStartupEligibility::AutomaticAccountSelected
+                | AccountStartupEligibility::PreferredAccountMissing
+                | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                | AccountStartupEligibility::PreferredAccountUnhealthy
+                | AccountStartupEligibility::PreferredAccountBusy
+                | AccountStartupEligibility::NoEligibleAccount => None,
+            };
+
+            return Ok(AccountStartupSelectionPreview {
+                effective_pool_id: Some(pool_id),
+                preferred_account_id: Some(preferred_account_id),
+                suppressed: false,
+                predicted_account_id,
+                eligibility,
+            });
+        }
+
+        let predicted_account_id =
+            read_first_eligible_account_id(self.pool.as_ref(), &pool_id, Utc::now()).await?;
+        let eligibility = if predicted_account_id.is_some() {
+            AccountStartupEligibility::AutomaticAccountSelected
+        } else {
+            AccountStartupEligibility::NoEligibleAccount
+        };
+
+        Ok(AccountStartupSelectionPreview {
+            effective_pool_id: Some(pool_id),
+            preferred_account_id: None,
+            suppressed: false,
+            predicted_account_id,
+            eligibility,
+        })
+    }
+
+    pub async fn read_account_pool_membership(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountPoolMembership>> {
+        let row = sqlx::query(
+            r#"
+SELECT
+    account_id,
+    pool_id,
+    healthy
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(AccountPoolMembership {
+                account_id: row.try_get("account_id")?,
+                pool_id: row.try_get("pool_id")?,
+                healthy: row.try_get::<i64, _>("healthy")? != 0,
+            })),
+            None => Ok(None),
+        }
+    }
+
     pub async fn write_account_startup_selection(
         &self,
         update: AccountStartupSelectionUpdate,
@@ -550,6 +688,201 @@ fn account_lease_is_contention_error(err: &sqlx::Error) -> bool {
         }
         _ => false,
     }
+}
+
+async fn release_expired_account_leases<'e, E>(
+    executor: E,
+    now: DateTime<Utc>,
+) -> std::result::Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"
+UPDATE account_leases
+SET released_at = ?
+WHERE released_at IS NULL
+  AND expires_at <= ?
+        "#,
+    )
+    .bind(account_datetime_to_epoch_seconds(now))
+    .bind(account_datetime_to_epoch_seconds(now))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+async fn insert_next_eligible_lease<'e, E>(
+    executor: E,
+    lease: &AccountLeaseRecord,
+    pool_id: &str,
+) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"
+INSERT INTO account_leases (
+    lease_id,
+    account_id,
+    pool_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) SELECT
+    ?,
+    account_registry.account_id,
+    ?,
+    ?,
+    COALESCE((
+        SELECT MAX(existing.lease_epoch) + 1
+        FROM account_leases AS existing
+        WHERE existing.account_id = account_registry.account_id
+    ), 1),
+    ?,
+    ?,
+    ?,
+    NULL
+FROM account_registry
+WHERE pool_id = ?
+  AND healthy = 1
+  AND NOT EXISTS (
+      SELECT 1
+      FROM account_leases
+      WHERE account_leases.account_id = account_registry.account_id
+        AND account_leases.released_at IS NULL
+  )
+ORDER BY position ASC, account_id ASC
+LIMIT 1
+        "#,
+    )
+    .bind(&lease.lease_id)
+    .bind(&lease.pool_id)
+    .bind(&lease.holder_instance_id)
+    .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
+    .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
+    .bind(account_datetime_to_epoch_seconds(lease.expires_at))
+    .bind(pool_id)
+    .execute(executor)
+    .await
+}
+
+async fn insert_requested_lease<'e, E>(
+    executor: E,
+    lease: &AccountLeaseRecord,
+    account_id: &str,
+) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"
+INSERT INTO account_leases (
+    lease_id,
+    account_id,
+    pool_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) SELECT
+    ?,
+    account_registry.account_id,
+    ?,
+    ?,
+    COALESCE((
+        SELECT MAX(existing.lease_epoch) + 1
+        FROM account_leases AS existing
+        WHERE existing.account_id = account_registry.account_id
+    ), 1),
+    ?,
+    ?,
+    ?,
+    NULL
+FROM account_registry
+WHERE pool_id = ?
+  AND account_id = ?
+  AND healthy = 1
+  AND NOT EXISTS (
+      SELECT 1
+      FROM account_leases
+      WHERE account_leases.account_id = account_registry.account_id
+        AND account_leases.released_at IS NULL
+  )
+LIMIT 1
+        "#,
+    )
+    .bind(&lease.lease_id)
+    .bind(&lease.pool_id)
+    .bind(&lease.holder_instance_id)
+    .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
+    .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
+    .bind(account_datetime_to_epoch_seconds(lease.expires_at))
+    .bind(&lease.pool_id)
+    .bind(account_id)
+    .execute(executor)
+    .await
+}
+
+async fn account_has_active_lease<'e, E>(
+    executor: E,
+    account_id: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM account_leases
+WHERE account_id = ?
+  AND released_at IS NULL
+  AND expires_at > ?
+        "#,
+    )
+    .bind(account_id)
+    .bind(account_datetime_to_epoch_seconds(now))
+    .fetch_one(executor)
+    .await?;
+    Ok(count != 0)
+}
+
+async fn read_first_eligible_account_id<'e, E>(
+    executor: E,
+    pool_id: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<String>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_scalar(
+        r#"
+SELECT account_registry.account_id
+FROM account_registry
+WHERE pool_id = ?
+  AND healthy = 1
+  AND NOT EXISTS (
+      SELECT 1
+      FROM account_leases
+      WHERE account_leases.account_id = account_registry.account_id
+        AND account_leases.released_at IS NULL
+        AND account_leases.expires_at > ?
+  )
+ORDER BY position ASC, account_id ASC
+LIMIT 1
+        "#,
+    )
+    .bind(pool_id)
+    .bind(account_datetime_to_epoch_seconds(now))
+    .fetch_optional(executor)
+    .await
+    .map_err(Into::into)
 }
 
 async fn load_lease<'e, E>(
@@ -1410,6 +1743,88 @@ WHERE account_id = ?
         );
     }
 
+    #[tokio::test]
+    async fn preview_startup_selection_reports_suppressed_runtime_selection() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: true,
+            })
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: true,
+                predicted_account_id: None,
+                eligibility: crate::AccountStartupEligibility::Suppressed,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_startup_selection_reports_preferred_account_in_wrong_pool() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-main", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-other", "pool-other", 0, true).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-other".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-other".to_string()),
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: crate::AccountStartupEligibility::PreferredAccountInOtherPool {
+                    actual_pool_id: "pool-other".to_string(),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_preferred_account_lease_claims_requested_account() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 1, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 0, true).await;
+
+        let lease = runtime
+            .acquire_preferred_account_lease(
+                "pool-main",
+                "acct-1",
+                "inst-a",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-1");
+    }
+
     async fn test_runtime() -> Arc<StateRuntime> {
         StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
             .await
@@ -1428,6 +1843,16 @@ WHERE account_id = ?
     }
 
     async fn seed_account(runtime: &StateRuntime, account_id: &str) {
+        seed_account_in_pool(runtime, account_id, "pool-main", 0, true).await;
+    }
+
+    async fn seed_account_in_pool(
+        runtime: &StateRuntime,
+        account_id: &str,
+        pool_id: &str,
+        position: i64,
+        healthy: bool,
+    ) {
         sqlx::query(
             r#"
 INSERT INTO account_registry (
@@ -1444,12 +1869,12 @@ INSERT INTO account_registry (
             "#,
         )
         .bind(account_id)
-        .bind("pool-main")
-        .bind(0_i64)
+        .bind(pool_id)
+        .bind(position)
         .bind("chatgpt")
         .bind("chatgpt")
         .bind("workspace-main")
-        .bind(1_i64)
+        .bind(i64::from(healthy))
         .bind(1_i64)
         .bind(1_i64)
         .execute(runtime.pool.as_ref())

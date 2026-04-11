@@ -2,7 +2,8 @@ use anyhow::Context;
 use clap::Args;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_state::AccountStartupSelectionState;
+use codex_state::AccountStartupEligibility;
+use codex_state::AccountStartupSelectionPreview;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
@@ -82,7 +83,9 @@ pub(crate) async fn suppress_pooled_startup_selection_if_configured(
     if !selection.suppressed {
         runtime
             .write_account_startup_selection(AccountStartupSelectionUpdate {
-                default_pool_id: infer_default_pool_id(config, &selection),
+                default_pool_id: configured_default_pool_id(config)
+                    .map(ToOwned::to_owned)
+                    .or(selection.default_pool_id),
                 preferred_account_id: selection.preferred_account_id,
                 suppressed: true,
             })
@@ -102,10 +105,10 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
     let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account startup selection state")?;
-    let selection = runtime
-        .read_account_startup_selection()
+    let startup_preview = runtime
+        .preview_account_startup_selection(configured_default_pool_id(&config))
         .await
-        .context("read account startup selection")?;
+        .context("preview account startup selection")?;
 
     match command.subcommand {
         AccountsSubcommand::Add(_command) => {
@@ -131,20 +134,10 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AccountsSubcommand::Current => {
-            println!(
-                "effective pool: {}",
-                infer_default_pool_id(&config, &selection).unwrap_or_else(|| "none".to_string())
-            );
-            println!(
-                "preferred account: {}",
-                selection
-                    .preferred_account_id
-                    .as_deref()
-                    .unwrap_or("automatic")
-            );
+            print_preview(&startup_preview);
             println!(
                 "automatic selection: {}",
-                if selection.suppressed {
+                if startup_preview.suppressed {
                     "suppressed"
                 } else {
                     "enabled"
@@ -160,23 +153,21 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                 .map_or(0, |pools| pools.len());
             println!(
                 "suppression: {}",
-                if selection.suppressed {
+                if startup_preview.suppressed {
                     "enabled"
                 } else {
                     "disabled"
                 }
             );
-            println!(
-                "eligibility: {pool_count} configured pools; effective pool {}",
-                infer_default_pool_id(&config, &selection).unwrap_or_else(|| "none".to_string())
-            );
+            print_preview(&startup_preview);
+            println!("configured pools: {pool_count}");
             Ok(())
         }
         AccountsSubcommand::Resume => {
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: infer_default_pool_id(&config, &selection),
-                    preferred_account_id: selection.preferred_account_id,
+                    default_pool_id: startup_preview.effective_pool_id,
+                    preferred_account_id: None,
                     suppressed: false,
                 })
                 .await
@@ -185,9 +176,26 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AccountsSubcommand::Switch(command) => {
+            let Some(effective_pool_id) = startup_preview.effective_pool_id.clone() else {
+                anyhow::bail!("no effective pool is configured for pooled account selection");
+            };
+            let membership = runtime
+                .read_account_pool_membership(&command.account_id)
+                .await
+                .context("read preferred account membership")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("account `{}` is not registered", command.account_id)
+                })?;
+            if membership.pool_id != effective_pool_id {
+                anyhow::bail!(
+                    "account `{}` belongs to pool `{}`; current effective pool is `{effective_pool_id}`",
+                    command.account_id,
+                    membership.pool_id
+                );
+            }
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: infer_default_pool_id(&config, &selection),
+                    default_pool_id: Some(effective_pool_id),
                     preferred_account_id: Some(command.account_id.clone()),
                     suppressed: false,
                 })
@@ -199,13 +207,58 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
     }
 }
 
-fn infer_default_pool_id(
-    config: &Config,
-    selection: &AccountStartupSelectionState,
-) -> Option<String> {
+fn configured_default_pool_id(config: &Config) -> Option<&str> {
     config
         .accounts
         .as_ref()
-        .and_then(|accounts| accounts.default_pool.clone())
-        .or_else(|| selection.default_pool_id.clone())
+        .and_then(|accounts| accounts.default_pool.as_deref())
+}
+
+fn print_preview(preview: &AccountStartupSelectionPreview) {
+    println!(
+        "effective pool: {}",
+        preview.effective_pool_id.as_deref().unwrap_or("none")
+    );
+    println!(
+        "preferred account: {}",
+        preview
+            .preferred_account_id
+            .as_deref()
+            .unwrap_or("automatic")
+    );
+    println!(
+        "predicted account: {}",
+        preview.predicted_account_id.as_deref().unwrap_or("none")
+    );
+    println!("eligibility: {}", format_eligibility(&preview.eligibility));
+}
+
+fn format_eligibility(eligibility: &AccountStartupEligibility) -> String {
+    match eligibility {
+        AccountStartupEligibility::Suppressed => {
+            "automatic pooled selection is suppressed".to_string()
+        }
+        AccountStartupEligibility::MissingPool => "no effective pool is configured".to_string(),
+        AccountStartupEligibility::PreferredAccountSelected => {
+            "preferred account is eligible for fresh-runtime startup".to_string()
+        }
+        AccountStartupEligibility::AutomaticAccountSelected => {
+            "automatic startup selection is eligible".to_string()
+        }
+        AccountStartupEligibility::PreferredAccountMissing => {
+            "preferred account is not registered".to_string()
+        }
+        AccountStartupEligibility::PreferredAccountInOtherPool { actual_pool_id } => {
+            format!("preferred account belongs to pool `{actual_pool_id}`")
+        }
+        AccountStartupEligibility::PreferredAccountUnhealthy => {
+            "preferred account is unhealthy".to_string()
+        }
+        AccountStartupEligibility::PreferredAccountBusy => {
+            "preferred account is currently leased by another runtime".to_string()
+        }
+        AccountStartupEligibility::NoEligibleAccount => {
+            "no eligible account is available in the effective pool".to_string()
+        }
+    }
 }
