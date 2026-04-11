@@ -341,26 +341,14 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pooled_first_turn_does_not_reuse_startup_prewarm_websocket() {
+async fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
     skip_if_no_network!();
 
     let pooled_account_id = "account_id_b";
-    let server = start_websocket_server(vec![
-        vec![
-            vec![
-                ev_response_created("resp-prewarm"),
-                ev_completed("resp-prewarm"),
-            ],
-            vec![
-                ev_response_created("resp-turn-on-prewarm"),
-                ev_completed("resp-turn-on-prewarm"),
-            ],
-        ],
-        vec![vec![
-            ev_response_created("resp-turn"),
-            ev_completed("resp-turn"),
-        ]],
-    ])
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-turn"),
+        ev_completed("resp-turn"),
+    ]]])
     .await;
 
     let mut builder = test_codex()
@@ -400,7 +388,7 @@ async fn pooled_first_turn_does_not_reuse_startup_prewarm_websocket() {
         .await
         .expect("seed pooled account");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let startup_prewarm_handshake = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if !server.handshakes().is_empty() {
                 break;
@@ -408,60 +396,42 @@ async fn pooled_first_turn_does_not_reuse_startup_prewarm_websocket() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("startup prewarm should establish websocket connection");
+    .await;
+    assert!(
+        startup_prewarm_handshake.is_err(),
+        "pooled mode should not schedule startup prewarm websocket connections"
+    );
 
     test.submit_turn("hello")
         .await
         .expect("pooled turn should complete");
 
-    let connections = server.connections();
-    let prewarm_request = connections
-        .first()
-        .and_then(|requests| requests.first())
-        .expect("missing startup prewarm request")
-        .body_json();
-    assert_eq!(prewarm_request["generate"].as_bool(), Some(false));
-
     let handshakes = server.handshakes();
     assert_eq!(
         handshakes.len(),
-        2,
-        "first pooled turn must not reuse startup prewarm websocket"
+        1,
+        "pooled mode should open websocket only for the first eligible turn"
     );
     assert_eq!(
         handshakes[0].header("chatgpt-account-id").as_deref(),
-        Some("account_id")
-    );
-    assert_eq!(
-        handshakes[1].header("chatgpt-account-id").as_deref(),
         Some(pooled_account_id)
     );
+    let connections = server.connections();
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].len(), 1);
 
     server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pooled_fail_closed_turn_does_not_cache_startup_prewarm_websocket_for_later_turns() {
+async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket() {
     skip_if_no_network!();
 
     let pooled_account_id = "account_id_b";
-    let server = start_websocket_server(vec![
-        vec![
-            vec![
-                ev_response_created("resp-prewarm"),
-                ev_completed("resp-prewarm"),
-            ],
-            vec![
-                ev_response_created("resp-turn-on-prewarm"),
-                ev_completed("resp-turn-on-prewarm"),
-            ],
-        ],
-        vec![vec![
-            ev_response_created("resp-turn"),
-            ev_completed("resp-turn"),
-        ]],
-    ])
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-turn"),
+        ev_completed("resp-turn"),
+    ]]])
     .await;
 
     let mut builder = test_codex()
@@ -490,17 +460,6 @@ async fn pooled_fail_closed_turn_does_not_cache_startup_prewarm_websocket_for_la
         .build_with_websocket_server(&server)
         .await
         .expect("build websocket codex");
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if !server.handshakes().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("startup prewarm should establish websocket connection");
 
     test.codex
         .submit(Op::UserInput {
@@ -544,6 +503,10 @@ async fn pooled_fail_closed_turn_does_not_cache_startup_prewarm_websocket_for_la
         fail_closed_error.is_some(),
         "expected pooled fail-closed error when no eligible account is available"
     );
+    assert!(
+        server.handshakes().is_empty(),
+        "pooled fail-closed turn should not open a startup websocket connection"
+    );
 
     let Some(state_db) = test.codex.state_db() else {
         panic!("state db should be available in core integration tests");
@@ -562,25 +525,17 @@ async fn pooled_fail_closed_turn_does_not_cache_startup_prewarm_websocket_for_la
     let handshakes = server.handshakes();
     assert_eq!(
         handshakes.len(),
-        2,
-        "second pooled turn should establish a fresh websocket instead of reusing startup prewarm"
+        1,
+        "pooled turn should establish websocket once an eligible account is available"
     );
     assert_eq!(
         handshakes[0].header("chatgpt-account-id").as_deref(),
-        Some("account_id")
-    );
-    assert_eq!(
-        handshakes[1].header("chatgpt-account-id").as_deref(),
         Some(pooled_account_id)
     );
 
     let connections = server.connections();
-    assert_eq!(
-        connections[0].len(),
-        1,
-        "startup-prewarm websocket should not be reused after a pooled fail-closed turn"
-    );
-    assert_eq!(connections[1].len(), 1);
+    assert_eq!(connections.len(), 1);
+    assert_eq!(connections[0].len(), 1);
 
     server.shutdown().await;
 }

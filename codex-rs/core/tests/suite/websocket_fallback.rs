@@ -1,10 +1,14 @@
 use anyhow::Result;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
+use codex_login::CodexAuth;
 use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
+use codex_state::LegacyAccountImport;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -15,6 +19,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
 use tokio::time::Duration;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -69,6 +74,92 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
     // The startup prewarm request sees 426 and immediately switches the session to HTTP fallback,
     // so the first turn goes straight to HTTP with no additional websocket connect attempt.
     assert_eq!(websocket_attempts, 1);
+    assert_eq!(http_attempts, 1);
+    assert_eq!(response_mock.requests().len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let pooled_account_id = "account_id_b";
+    let server = responses::start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config({
+            let base_url = format!("{}/v1", server.uri());
+            move |config| {
+                config.model_provider.base_url = Some(base_url);
+                config.model_provider.wire_api = WireApi::Responses;
+                config.model_provider.supports_websockets = true;
+                config.model_provider.stream_max_retries = Some(2);
+                config.model_provider.request_max_retries = Some(0);
+                let mut pools = HashMap::new();
+                pools.insert(
+                    "legacy-default".to_string(),
+                    AccountPoolDefinitionToml {
+                        allow_context_reuse: Some(true),
+                        account_kinds: None,
+                    },
+                );
+                config.accounts = Some(AccountsConfigToml {
+                    backend: None,
+                    default_pool: Some("legacy-default".to_string()),
+                    proactive_switch_threshold_percent: Some(85),
+                    lease_ttl_secs: None,
+                    heartbeat_interval_secs: None,
+                    min_switch_interval_secs: None,
+                    allocation_mode: None,
+                    pools: Some(pools),
+                });
+            }
+        });
+    let test = builder.build(&server).await?;
+
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: pooled_account_id.to_string(),
+        })
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let websocket_attempts = requests
+        .iter()
+        .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    let http_attempts = requests
+        .iter()
+        .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
+        .count();
+    let websocket_attempt_account = websocket_attempts
+        .first()
+        .and_then(|request| request.headers.get("chatgpt-account-id"))
+        .and_then(|value| value.to_str().ok());
+
+    assert_eq!(websocket_attempts.len(), 1);
+    assert_eq!(websocket_attempt_account, Some(pooled_account_id));
     assert_eq!(http_attempts, 1);
     assert_eq!(response_mock.requests().len(), 1);
 
