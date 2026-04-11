@@ -6249,6 +6249,7 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
+    let pooled_mode_enabled = sess.services.account_pool_manager.is_some();
     let turn_account_selection =
         if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
             let mut account_pool_manager = account_pool_manager.lock().await;
@@ -6262,6 +6263,17 @@ pub(crate) async fn run_turn(
         } else {
             None
         };
+    if pooled_mode_enabled && turn_account_selection.is_none() {
+        sess.send_event(
+            &turn_context,
+            EventMsg::Error(ErrorEvent {
+                message: "No eligible pooled account is available for this turn.".to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        )
+        .await;
+        return None;
+    }
     if turn_account_selection.is_some() {
         // Startup prewarm happens before turn lease selection. Drop prewarmed sessions when
         // leased account routing is active so stale session/auth context is never reused.

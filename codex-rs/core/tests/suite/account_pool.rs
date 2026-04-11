@@ -17,6 +17,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use http::Method;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
@@ -197,6 +198,43 @@ async fn rotation_without_context_reuse_mints_new_remote_session_id() -> Result<
     assert_ne!(
         first_session_id, second_session_id,
         "rotation without context reuse should mint a fresh remote session id"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_pool_fails_closed_without_legacy_auth_fallback() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "no eligible pooled account turn").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "pooled mode should fail closed when no eligible account is available"
+    );
+    let error_message = first_turn_error
+        .as_ref()
+        .map(|event| event.message.to_ascii_lowercase())
+        .unwrap_or_default();
+    assert!(
+        error_message.contains("pooled account"),
+        "unexpected pooled-mode exhaustion message: {error_message}"
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    let responses_requests = requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(
+        responses_requests, 0,
+        "pooled mode should not send a fallback request with shared auth"
     );
 
     Ok(())
