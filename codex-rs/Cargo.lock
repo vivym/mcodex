@@ -1381,6 +1381,12 @@ name = "codex-account-pool"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
+ "codex-state",
+ "pretty_assertions",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

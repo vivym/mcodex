@@ -1,10 +1,27 @@
 mod backend;
+mod bootstrap;
+mod lease_lifecycle;
+mod manager;
 mod policy;
+mod selection;
 mod types;
 
 pub use backend::AccountPoolBackend;
+pub use backend::AccountPoolLeaseBackend;
+pub use backend::local::LocalAccountPoolBackend;
+pub use bootstrap::LegacyAuthBootstrap;
+pub use bootstrap::NoLegacyAuthBootstrap;
+pub use manager::AccountPoolManager;
 pub use policy::select_startup_account;
+pub use selection::evaluate_context_reuse;
 pub use types::AccountKind;
+pub use types::AccountPoolConfig;
 pub use types::AccountRecord;
+pub use types::ContextReuseDecision;
+pub use types::ContextReuseRequest;
+pub use types::HealthEventDisposition;
+pub use types::LeasedAccount;
+pub use types::RateLimitSnapshot;
 pub use types::SelectionRequest;
 pub use types::SelectionResult;
+pub use types::UsageLimitEvent;
