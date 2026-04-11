@@ -158,6 +158,7 @@ async fn open_state_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<S
         .max_connections(5)
         .connect_with(options)
         .await?;
+    account_pool::clean_up_duplicate_active_holder_leases_before_0026(&pool).await?;
     migrator.run(&pool).await?;
     let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
         .fetch_one(&pool)

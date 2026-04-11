@@ -14,6 +14,78 @@ use uuid::Uuid;
 
 const DEFAULT_ACCOUNT_LEASE_SECONDS: i64 = 300;
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
+const ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
+
+pub(super) async fn clean_up_duplicate_active_holder_leases_before_0026(
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let account_leases_exists: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table'
+  AND name = 'account_leases'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if account_leases_exists == 0 {
+        return Ok(());
+    }
+
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table'
+  AND name = '_sqlx_migrations'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if migrations_table_exists != 0 {
+        let active_holder_index_applied: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM _sqlx_migrations
+WHERE version = ?
+  AND success = 1
+            "#,
+        )
+        .bind(ACTIVE_HOLDER_INDEX_MIGRATION_VERSION)
+        .fetch_one(pool)
+        .await?;
+        if active_holder_index_applied != 0 {
+            return Ok(());
+        }
+    }
+
+    sqlx::query(
+        r#"
+WITH ranked_active_leases AS (
+    SELECT
+        lease_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY holder_instance_id
+            ORDER BY acquired_at DESC, lease_id DESC
+        ) AS row_num
+    FROM account_leases
+    WHERE released_at IS NULL
+)
+UPDATE account_leases
+SET released_at = unixepoch('now')
+WHERE lease_id IN (
+    SELECT lease_id
+    FROM ranked_active_leases
+    WHERE row_num > 1
+)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
 
 impl StateRuntime {
     pub async fn acquire_account_lease(
@@ -539,10 +611,35 @@ mod tests {
     use chrono::Utc;
     use pretty_assertions::assert_eq;
     use sqlx::SqlitePool;
+    use sqlx::migrate::Migration;
     use sqlx::migrate::Migrator;
     use sqlx::sqlite::SqliteConnectOptions;
     use std::borrow::Cow;
     use std::sync::Arc;
+
+    const ORIGINAL_ACTIVE_HOLDER_INDEX_SQL: &str = r#"CREATE UNIQUE INDEX account_leases_active_holder_idx
+ON account_leases(holder_instance_id)
+WHERE released_at IS NULL;
+"#;
+
+    fn original_0026_migrator() -> Migrator {
+        let mut migrations = STATE_MIGRATOR.migrations.to_vec();
+        let current_0026 = migrations.last().expect("current 0026 migration").clone();
+        migrations.pop();
+        migrations.push(Migration::new(
+            26,
+            current_0026.description.clone(),
+            current_0026.migration_type,
+            Cow::Borrowed(ORIGINAL_ACTIVE_HOLDER_INDEX_SQL),
+            current_0026.no_tx,
+        ));
+        Migrator {
+            migrations: Cow::Owned(migrations),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        }
+    }
 
     #[tokio::test]
     async fn acquire_exclusive_lease_rejects_second_holder() {
@@ -781,6 +878,47 @@ WHERE type = 'index'
 
         assert_eq!(active_lease_count, 1);
         assert_eq!(remaining_active_account_id, "acct-2");
+        assert_eq!(active_holder_index_exists, 1);
+
+        drop(runtime);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn init_accepts_databases_with_original_0026_already_applied() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open old state db");
+        original_0026_migrator()
+            .run(&pool)
+            .await
+            .expect("apply original 0026 state schema");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let active_holder_index_exists: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'index'
+  AND name = 'account_leases_active_holder_idx'
+            "#,
+        )
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("check active holder index");
+
         assert_eq!(active_holder_index_exists, 1);
 
         drop(runtime);
