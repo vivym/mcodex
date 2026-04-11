@@ -274,6 +274,17 @@ ON CONFLICT(account_id) DO NOTHING
         .execute(&mut *tx)
         .await?;
 
+        let default_pool_id: String = sqlx::query_scalar(
+            r#"
+SELECT pool_id
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind(&legacy_account.account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
         sqlx::query(
             r#"
 INSERT INTO account_startup_selection (
@@ -286,7 +297,7 @@ INSERT INTO account_startup_selection (
 ON CONFLICT(singleton) DO NOTHING
             "#,
         )
-        .bind(LEGACY_DEFAULT_POOL_ID)
+        .bind(default_pool_id)
         .bind(&legacy_account.account_id)
         .bind(0_i64)
         .bind(now)
@@ -666,6 +677,30 @@ WHERE account_id = ?
         .unwrap();
 
         assert_eq!(pool_id, "pool-main");
+    }
+
+    #[tokio::test]
+    async fn import_legacy_default_account_uses_existing_pool_for_startup_selection() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let selection = runtime.read_account_startup_selection().await.unwrap();
+
+        assert_eq!(
+            selection,
+            crate::AccountStartupSelectionState {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            }
+        );
     }
 
     async fn test_runtime() -> Arc<StateRuntime> {
