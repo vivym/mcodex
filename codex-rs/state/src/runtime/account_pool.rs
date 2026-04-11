@@ -42,6 +42,14 @@ WHERE released_at IS NULL
         .await
         .map_err(account_lease_storage_error)?;
 
+        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id)
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+        {
+            tx.commit().await.map_err(account_lease_storage_error)?;
+            return Ok(existing_lease);
+        }
+
         let lease = AccountLeaseRecord {
             lease_id: Uuid::new_v4().to_string(),
             pool_id: pool_id.to_string(),
@@ -106,7 +114,14 @@ LIMIT 1
         let result = match result {
             Ok(result) => result,
             Err(err) if account_lease_is_contention_error(&err) => {
-                return Err(AccountLeaseError::NoEligibleAccount);
+                let existing_lease =
+                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id)
+                        .await
+                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
+                return match existing_lease {
+                    Some(existing_lease) => Ok(existing_lease),
+                    None => Err(AccountLeaseError::NoEligibleAccount),
+                };
             }
             Err(err) => return Err(account_lease_storage_error(err)),
         };
@@ -184,12 +199,12 @@ INSERT INTO account_runtime_state (
 ) VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
     pool_id = CASE
-        WHEN excluded.last_health_event_sequence >= account_runtime_state.last_health_event_sequence
+        WHEN excluded.last_health_event_sequence > account_runtime_state.last_health_event_sequence
             THEN excluded.pool_id
         ELSE account_runtime_state.pool_id
     END,
     health_state = CASE
-        WHEN excluded.last_health_event_sequence >= account_runtime_state.last_health_event_sequence
+        WHEN excluded.last_health_event_sequence > account_runtime_state.last_health_event_sequence
             THEN excluded.health_state
         ELSE account_runtime_state.health_state
     END,
@@ -198,7 +213,7 @@ ON CONFLICT(account_id) DO UPDATE SET
         excluded.last_health_event_sequence
     ),
     last_health_event_at = CASE
-        WHEN excluded.last_health_event_sequence >= account_runtime_state.last_health_event_sequence
+        WHEN excluded.last_health_event_sequence > account_runtime_state.last_health_event_sequence
             THEN excluded.last_health_event_at
         ELSE account_runtime_state.last_health_event_at
     END,
@@ -462,6 +477,55 @@ WHERE lease_id = ?
     }
 }
 
+async fn load_active_holder_lease<'e, E>(
+    executor: E,
+    holder_instance_id: &str,
+) -> anyhow::Result<Option<AccountLeaseRecord>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(
+        r#"
+SELECT
+    lease_id,
+    pool_id,
+    account_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+FROM account_leases
+WHERE holder_instance_id = ?
+  AND released_at IS NULL
+ORDER BY acquired_at DESC, lease_id DESC
+LIMIT 1
+        "#,
+    )
+    .bind(holder_instance_id)
+    .fetch_optional(executor)
+    .await?;
+
+    match row {
+        Some(row) => Ok(Some(AccountLeaseRecord {
+            lease_id: row.try_get("lease_id")?,
+            pool_id: row.try_get("pool_id")?,
+            account_id: row.try_get("account_id")?,
+            holder_instance_id: row.try_get("holder_instance_id")?,
+            lease_epoch: row.try_get("lease_epoch")?,
+            acquired_at: account_epoch_seconds_to_datetime(row.try_get("acquired_at")?)?,
+            renewed_at: account_epoch_seconds_to_datetime(row.try_get("renewed_at")?)?,
+            expires_at: account_epoch_seconds_to_datetime(row.try_get("expires_at")?)?,
+            released_at: row
+                .try_get::<Option<i64>, _>("released_at")?
+                .map(account_epoch_seconds_to_datetime)
+                .transpose()?,
+        })),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::StateRuntime;
@@ -488,6 +552,38 @@ mod tests {
 
         assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
         assert_eq!(first.account_id, "acct-1");
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_returns_existing_active_lease_for_holder() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account(runtime.as_ref(), "acct-2").await;
+
+        let first = runtime
+            .acquire_account_lease("pool-main", "inst-a")
+            .await
+            .unwrap();
+        let second = runtime
+            .acquire_account_lease("pool-main", "inst-a")
+            .await
+            .unwrap();
+
+        let active_lease_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM account_leases
+WHERE holder_instance_id = ?
+  AND released_at IS NULL
+            "#,
+        )
+        .bind("inst-a")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(active_lease_count, 1);
     }
 
     #[tokio::test]
@@ -619,6 +715,45 @@ mod tests {
         assert_eq!(health.pool_id, "pool-new");
         assert_eq!(health.health_state, AccountHealthState::Unauthorized);
         assert_eq!(health.last_health_event_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn equal_sequence_health_event_does_not_reopen_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Unauthorized,
+                sequence_number: 2,
+                observed_at: test_timestamp(2),
+            })
+            .await
+            .unwrap();
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Healthy,
+                sequence_number: 2,
+                observed_at: test_timestamp(3),
+            })
+            .await
+            .unwrap();
+
+        let health = runtime
+            .read_account_health_state("acct-1")
+            .await
+            .unwrap()
+            .expect("persisted health state");
+        let lease = runtime.acquire_account_lease("pool-main", "inst-a").await;
+
+        assert_eq!(health.health_state, AccountHealthState::Unauthorized);
+        assert_eq!(health.last_health_event_sequence, 2);
+        assert_eq!(health.last_health_event_at, test_timestamp(2));
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
     }
 
     #[tokio::test]
