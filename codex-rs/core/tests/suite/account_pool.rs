@@ -777,6 +777,29 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         ],
         "expected compact failures to mark the active account unavailable before next turn"
     );
+    let compact_request_session_ids = all_requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses/compact")
+        })
+        .map(|request| {
+            request
+                .headers
+                .get("session_id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        compact_request_session_ids
+            .iter()
+            .all(std::option::Option::is_some),
+        "expected compact requests to include a session_id header"
+    );
+    assert_ne!(
+        compact_request_session_ids[0], compact_request_session_ids[1],
+        "rotation with allow_context_reuse=false should reset remote session identity before pre-turn compact"
+    );
 
     Ok(())
 }

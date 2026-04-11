@@ -6143,6 +6143,12 @@ pub(crate) async fn run_turn(
     let turn_account_id_override = turn_account_selection
         .as_ref()
         .map(|(account_id, _reset_remote_context)| account_id.clone());
+    let reset_remote_context_for_turn = turn_account_selection
+        .as_ref()
+        .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context);
+    if reset_remote_context_for_turn {
+        sess.services.model_client.reset_remote_session_identity();
+    }
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -6367,11 +6373,8 @@ pub(crate) async fn run_turn(
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    if let Some((account_id, reset_remote_context)) = turn_account_selection {
+    if let Some((account_id, _reset_remote_context)) = turn_account_selection {
         client_session.set_account_id_override(Some(account_id));
-        if reset_remote_context {
-            client_session.reset_remote_session_identity();
-        }
     }
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
