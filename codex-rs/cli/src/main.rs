@@ -7,10 +7,12 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
+use codex_cli::AccountsCommand;
 use codex_cli::LandlockCommand;
 use codex_cli::SeatbeltCommand;
 use codex_cli::WindowsCommand;
 use codex_cli::read_api_key_from_stdin;
+use codex_cli::run_accounts;
 use codex_cli::run_login_status;
 use codex_cli::run_login_with_api_key;
 use codex_cli::run_login_with_chatgpt;
@@ -98,6 +100,9 @@ enum Subcommand {
 
     /// Manage login.
     Login(LoginCommand),
+
+    /// Manage account pool startup selection.
+    Accounts(AccountsCommand),
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
@@ -851,6 +856,18 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+        Some(Subcommand::Accounts(mut accounts_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "accounts",
+            )?;
+            prepend_config_flags(
+                &mut accounts_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_accounts(accounts_cli).await;
         }
         Some(Subcommand::Logout(mut logout_cli)) => {
             reject_remote_mode_for_subcommand(

@@ -1,0 +1,211 @@
+use anyhow::Context;
+use clap::Args;
+use clap::Parser;
+use codex_core::config::Config;
+use codex_state::AccountStartupSelectionState;
+use codex_state::AccountStartupSelectionUpdate;
+use codex_state::StateRuntime;
+use codex_state::state_db_path;
+use codex_utils_cli::CliConfigOverrides;
+
+#[derive(Debug, Parser)]
+pub struct AccountsCommand {
+    #[clap(skip)]
+    pub config_overrides: CliConfigOverrides,
+
+    #[command(subcommand)]
+    pub subcommand: AccountsSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum AccountsSubcommand {
+    Add(AddAccountCommand),
+    List,
+    Current,
+    Status,
+    Resume,
+    Switch(SwitchAccountCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct AddAccountCommand {
+    #[arg(value_name = "ACCOUNT_ID")]
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SwitchAccountCommand {
+    #[arg(value_name = "ACCOUNT_ID")]
+    pub account_id: String,
+}
+
+pub async fn run_accounts(command: AccountsCommand) -> ! {
+    match run_accounts_impl(command).await {
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("Error managing accounts: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub(crate) async fn suppress_pooled_startup_selection_if_configured(
+    config: &Config,
+) -> anyhow::Result<bool> {
+    let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
+        accounts.default_pool.is_some()
+            || accounts
+                .pools
+                .as_ref()
+                .is_some_and(|pools| !pools.is_empty())
+    });
+    let state_path = state_db_path(config.sqlite_home.as_path());
+    if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
+        return Ok(false);
+    }
+
+    let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+        .await
+        .context("initialize account startup selection state")?;
+    let selection = runtime
+        .read_account_startup_selection()
+        .await
+        .context("read account startup selection")?;
+
+    let has_startup_selection = selection.default_pool_id.is_some()
+        || selection.preferred_account_id.is_some()
+        || selection.suppressed;
+    if !config_has_accounts && !has_startup_selection {
+        return Ok(false);
+    }
+
+    if !selection.suppressed {
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: infer_default_pool_id(config, &selection),
+                preferred_account_id: selection.preferred_account_id,
+                suppressed: true,
+            })
+            .await
+            .context("write suppressed account startup selection")?;
+    }
+
+    Ok(true)
+}
+
+async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
+    let cli_overrides = command
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+    let config = Config::load_with_cli_overrides(cli_overrides).await?;
+    let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+        .await
+        .context("initialize account startup selection state")?;
+    let selection = runtime
+        .read_account_startup_selection()
+        .await
+        .context("read account startup selection")?;
+
+    match command.subcommand {
+        AccountsSubcommand::Add(_command) => {
+            anyhow::bail!("`codex accounts add` is not implemented yet")
+        }
+        AccountsSubcommand::List => {
+            let Some(accounts) = config.accounts.as_ref() else {
+                println!("No account pools configured.");
+                return Ok(());
+            };
+            let Some(pools) = accounts.pools.as_ref() else {
+                println!("No account pools configured.");
+                return Ok(());
+            };
+            if pools.is_empty() {
+                println!("No account pools configured.");
+                return Ok(());
+            }
+
+            for pool_id in pools.keys() {
+                println!("{pool_id}");
+            }
+            Ok(())
+        }
+        AccountsSubcommand::Current => {
+            println!(
+                "effective pool: {}",
+                infer_default_pool_id(&config, &selection).unwrap_or_else(|| "none".to_string())
+            );
+            println!(
+                "preferred account: {}",
+                selection
+                    .preferred_account_id
+                    .as_deref()
+                    .unwrap_or("automatic")
+            );
+            println!(
+                "automatic selection: {}",
+                if selection.suppressed {
+                    "suppressed"
+                } else {
+                    "enabled"
+                }
+            );
+            Ok(())
+        }
+        AccountsSubcommand::Status => {
+            let pool_count = config
+                .accounts
+                .as_ref()
+                .and_then(|accounts| accounts.pools.as_ref())
+                .map_or(0, |pools| pools.len());
+            println!(
+                "suppression: {}",
+                if selection.suppressed {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "eligibility: {pool_count} configured pools; effective pool {}",
+                infer_default_pool_id(&config, &selection).unwrap_or_else(|| "none".to_string())
+            );
+            Ok(())
+        }
+        AccountsSubcommand::Resume => {
+            runtime
+                .write_account_startup_selection(AccountStartupSelectionUpdate {
+                    default_pool_id: infer_default_pool_id(&config, &selection),
+                    preferred_account_id: selection.preferred_account_id,
+                    suppressed: false,
+                })
+                .await
+                .context("clear account startup selection suppression")?;
+            println!("automatic selection resumed");
+            Ok(())
+        }
+        AccountsSubcommand::Switch(command) => {
+            runtime
+                .write_account_startup_selection(AccountStartupSelectionUpdate {
+                    default_pool_id: infer_default_pool_id(&config, &selection),
+                    preferred_account_id: Some(command.account_id.clone()),
+                    suppressed: false,
+                })
+                .await
+                .context("write preferred account startup selection")?;
+            println!("preferred account: {}", command.account_id);
+            Ok(())
+        }
+    }
+}
+
+fn infer_default_pool_id(
+    config: &Config,
+    selection: &AccountStartupSelectionState,
+) -> Option<String> {
+    config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.default_pool.clone())
+        .or_else(|| selection.default_pool_id.clone())
+}

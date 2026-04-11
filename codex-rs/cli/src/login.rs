@@ -30,6 +30,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::accounts::suppress_pooled_startup_selection_if_configured;
+
 const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
     "ChatGPT login is disabled. Use API key login instead.";
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
@@ -347,20 +349,29 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
 pub async fn run_logout(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
 
-    match logout(&config.codex_home, config.cli_auth_credentials_store_mode) {
-        Ok(true) => {
-            eprintln!("Successfully logged out");
-            std::process::exit(0);
-        }
-        Ok(false) => {
-            eprintln!("Not logged in");
-            std::process::exit(0);
-        }
+    let logout_message = match logout(&config.codex_home, config.cli_auth_credentials_store_mode) {
+        Ok(true) => "Successfully logged out",
+        Ok(false) => "Not logged in",
         Err(e) => {
             eprintln!("Error logging out: {e}");
             std::process::exit(1);
         }
+    };
+
+    let suppressed_pooled_startup =
+        match suppress_pooled_startup_selection_if_configured(&config).await {
+            Ok(suppressed) => suppressed,
+            Err(err) => {
+                eprintln!("Error suppressing automatic pooled selection: {err}");
+                std::process::exit(1);
+            }
+        };
+
+    eprintln!("{logout_message}");
+    if suppressed_pooled_startup {
+        eprintln!("automatic pooled selection suppressed");
     }
+    std::process::exit(0);
 }
 
 async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config {
