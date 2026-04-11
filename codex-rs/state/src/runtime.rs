@@ -70,6 +70,8 @@ pub use remote_control::RemoteControlEnrollmentRecord;
 // metadata, rather than the exact sum of all persisted SQLite column bytes.
 const LOG_PARTITION_SIZE_LIMIT_BYTES: i64 = 10 * 1024 * 1024;
 const LOG_PARTITION_ROW_LIMIT: i64 = 1_000;
+const ACCOUNT_LEASES_ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
+const HISTORICAL_MODIFIED_0026_CHECKSUM_HEX: &str = "C4E09A43E03215676C68CA4F357675BC1555C03C272B41ABBB92B2F71E0F381B0AA207775EE5D9D18DD4A613A216812E";
 
 #[derive(Clone)]
 pub struct StateRuntime {
@@ -159,6 +161,7 @@ async fn open_state_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<S
         .connect_with(options)
         .await?;
     account_pool::clean_up_duplicate_active_holder_leases_before_0026(&pool).await?;
+    rewrite_historical_modified_0026_checksum(&pool, migrator).await?;
     migrator.run(&pool).await?;
     let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
         .fetch_one(&pool)
@@ -177,6 +180,51 @@ async fn open_state_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<S
         .execute(&pool)
         .await;
     Ok(pool)
+}
+
+async fn rewrite_historical_modified_0026_checksum(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'table'
+  AND name = '_sqlx_migrations'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if migrations_table_exists == 0 {
+        return Ok(());
+    }
+
+    let Some(current_0026_checksum) = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == ACCOUNT_LEASES_ACTIVE_HOLDER_INDEX_MIGRATION_VERSION)
+        .map(|migration| migration.checksum.as_ref())
+    else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        r#"
+UPDATE _sqlx_migrations
+SET checksum = ?
+WHERE version = ?
+  AND success = 1
+  AND hex(checksum) = ?
+        "#,
+    )
+    .bind(current_0026_checksum)
+    .bind(ACCOUNT_LEASES_ACTIVE_HOLDER_INDEX_MIGRATION_VERSION)
+    .bind(HISTORICAL_MODIFIED_0026_CHECKSUM_HEX)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn open_logs_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<SqlitePool> {

@@ -304,7 +304,12 @@ ON CONFLICT(account_id) DO UPDATE SET
         sqlx::query(
             r#"
 UPDATE account_registry
-SET healthy = CASE
+SET pool_id = COALESCE((
+        SELECT pool_id
+        FROM account_runtime_state
+        WHERE account_runtime_state.account_id = account_registry.account_id
+    ), account_registry.pool_id),
+    healthy = CASE
         WHEN (
             SELECT health_state
             FROM account_runtime_state
@@ -622,7 +627,38 @@ ON account_leases(holder_instance_id)
 WHERE released_at IS NULL;
 "#;
 
+    const HISTORICAL_MODIFIED_0026_SQL: &str = r#"WITH ranked_active_leases AS (
+    SELECT
+        lease_id,
+        ROW_NUMBER() OVER (
+            PARTITION BY holder_instance_id
+            ORDER BY acquired_at DESC, lease_id DESC
+        ) AS row_num
+    FROM account_leases
+    WHERE released_at IS NULL
+)
+UPDATE account_leases
+SET released_at = unixepoch('now')
+WHERE lease_id IN (
+    SELECT lease_id
+    FROM ranked_active_leases
+    WHERE row_num > 1
+);
+
+CREATE UNIQUE INDEX account_leases_active_holder_idx
+ON account_leases(holder_instance_id)
+WHERE released_at IS NULL;
+"#;
+
     fn original_0026_migrator() -> Migrator {
+        migration_0026_migrator(ORIGINAL_ACTIVE_HOLDER_INDEX_SQL)
+    }
+
+    fn historical_modified_0026_migrator() -> Migrator {
+        migration_0026_migrator(HISTORICAL_MODIFIED_0026_SQL)
+    }
+
+    fn migration_0026_migrator(migration_sql: &'static str) -> Migrator {
         let mut migrations = STATE_MIGRATOR.migrations.to_vec();
         let current_0026 = migrations.last().expect("current 0026 migration").clone();
         migrations.pop();
@@ -630,7 +666,7 @@ WHERE released_at IS NULL;
             26,
             current_0026.description.clone(),
             current_0026.migration_type,
-            Cow::Borrowed(ORIGINAL_ACTIVE_HOLDER_INDEX_SQL),
+            Cow::Borrowed(migration_sql),
             current_0026.no_tx,
         ));
         Migrator {
@@ -926,6 +962,54 @@ WHERE type = 'index'
     }
 
     #[tokio::test]
+    async fn init_accepts_databases_with_historical_modified_0026_already_applied() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open old state db");
+        historical_modified_0026_migrator()
+            .run(&pool)
+            .await
+            .expect("apply historical modified 0026 state schema");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let persisted_checksum: Vec<u8> = sqlx::query_scalar(
+            r#"
+SELECT checksum
+FROM _sqlx_migrations
+WHERE version = 26
+            "#,
+        )
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("load persisted checksum");
+
+        assert_eq!(
+            persisted_checksum,
+            STATE_MIGRATOR
+                .migrations
+                .last()
+                .expect("current 0026 migration")
+                .checksum
+                .as_ref()
+        );
+
+        drop(runtime);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
     async fn stale_health_event_does_not_restore_lease_eligibility() {
         let runtime = test_runtime().await;
         seed_account(runtime.as_ref(), "acct-1").await;
@@ -1041,6 +1125,43 @@ WHERE type = 'index'
         assert_eq!(health.pool_id, "pool-new");
         assert_eq!(health.health_state, AccountHealthState::Unauthorized);
         assert_eq!(health.last_health_event_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn newer_health_event_keeps_registry_and_runtime_pool_ids_in_sync() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-new".to_string(),
+                health_state: AccountHealthState::Unauthorized,
+                sequence_number: 2,
+                observed_at: test_timestamp(2),
+            })
+            .await
+            .unwrap();
+
+        let health = runtime
+            .read_account_health_state("acct-1")
+            .await
+            .unwrap()
+            .expect("persisted health state");
+        let registry_pool_id: String = sqlx::query_scalar(
+            r#"
+SELECT pool_id
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(health.pool_id, "pool-new");
+        assert_eq!(registry_pool_id, "pool-new");
     }
 
     #[tokio::test]
