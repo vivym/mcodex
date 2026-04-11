@@ -12,7 +12,6 @@ use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
 use uuid::Uuid;
 
-const DEFAULT_ACCOUNT_LEASE_SECONDS: i64 = 300;
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 const ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
 
@@ -92,6 +91,7 @@ impl StateRuntime {
         &self,
         pool_id: &str,
         holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         let now = Utc::now();
         let mut tx = self
@@ -130,7 +130,7 @@ WHERE released_at IS NULL
             lease_epoch: 0,
             acquired_at: now,
             renewed_at: now,
-            expires_at: now + chrono::Duration::seconds(DEFAULT_ACCOUNT_LEASE_SECONDS),
+            expires_at: now + lease_ttl,
             released_at: None,
         };
 
@@ -218,8 +218,9 @@ LIMIT 1
         &self,
         lease: &LeaseKey,
         now: DateTime<Utc>,
+        lease_ttl: chrono::Duration,
     ) -> anyhow::Result<LeaseRenewal> {
-        let expires_at = now + chrono::Duration::seconds(DEFAULT_ACCOUNT_LEASE_SECONDS);
+        let expires_at = now + lease_ttl;
         let result = sqlx::query(
             r#"
 UPDATE account_leases
@@ -249,6 +250,49 @@ WHERE lease_id = ?
             Some(record) => Ok(LeaseRenewal::Renewed(record)),
             None => Ok(LeaseRenewal::Missing),
         }
+    }
+
+    pub async fn release_account_lease(
+        &self,
+        lease: &LeaseKey,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE account_leases
+SET released_at = ?
+WHERE lease_id = ?
+  AND account_id = ?
+  AND lease_epoch = ?
+  AND released_at IS NULL
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(now))
+        .bind(&lease.lease_id)
+        .bind(&lease.account_id)
+        .bind(lease.lease_epoch)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn read_account_health_event_sequence(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let sequence = sqlx::query_scalar(
+            r#"
+SELECT last_health_event_sequence
+FROM account_runtime_state
+WHERE account_id = ?
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+
+        Ok(sequence)
     }
 
     pub async fn record_account_health_event(
@@ -610,6 +654,7 @@ mod tests {
     use crate::AccountHealthEvent;
     use crate::AccountHealthState;
     use crate::AccountLeaseError;
+    use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::migrations::STATE_MIGRATOR;
     use chrono::DateTime;
@@ -683,10 +728,12 @@ WHERE released_at IS NULL;
         seed_account(runtime.as_ref(), "acct-1").await;
 
         let first = runtime
-            .acquire_account_lease("pool-main", "inst-a")
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
             .await
             .unwrap();
-        let second = runtime.acquire_account_lease("pool-main", "inst-b").await;
+        let second = runtime
+            .acquire_account_lease("pool-main", "inst-b", chrono::Duration::seconds(300))
+            .await;
 
         assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
         assert_eq!(first.account_id, "acct-1");
@@ -699,11 +746,11 @@ WHERE released_at IS NULL;
         seed_account(runtime.as_ref(), "acct-2").await;
 
         let first = runtime
-            .acquire_account_lease("pool-main", "inst-a")
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
             .await
             .unwrap();
         let second = runtime
-            .acquire_account_lease("pool-main", "inst-a")
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
             .await
             .unwrap();
 
@@ -1036,7 +1083,9 @@ WHERE version = 26
             .unwrap();
 
         let health = runtime.read_account_health_state("acct-1").await.unwrap();
-        let lease = runtime.acquire_account_lease("pool-main", "inst-a").await;
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await;
 
         assert_eq!(
             health.expect("persisted health state").health_state,
@@ -1051,18 +1100,92 @@ WHERE version = 26
         seed_account(runtime.as_ref(), "acct-1").await;
 
         let lease = runtime
-            .acquire_account_lease("pool-main", "inst-a")
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
             .await
             .unwrap();
         let renewal = runtime
             .renew_account_lease(
                 &lease.lease_key(),
                 lease.expires_at + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(300),
             )
             .await
             .unwrap();
 
         assert_eq!(renewal, crate::LeaseRenewal::Missing);
+    }
+
+    #[tokio::test]
+    async fn release_account_lease_allows_immediate_reacquisition() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let first = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        runtime
+            .release_account_lease(&first.lease_key(), test_timestamp(2))
+            .await
+            .unwrap();
+        let second = runtime
+            .acquire_account_lease("pool-main", "inst-b", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        assert_eq!(second.account_id, "acct-1");
+        assert_ne!(second.lease_id, first.lease_id);
+    }
+
+    #[tokio::test]
+    async fn read_account_health_event_sequence_returns_persisted_sequence() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::RateLimited,
+                sequence_number: 7,
+                observed_at: test_timestamp(7),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .read_account_health_event_sequence("acct-1")
+                .await
+                .unwrap(),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_and_renew_account_lease_use_requested_ttl() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let renew_at = lease.acquired_at + chrono::Duration::seconds(15);
+        let renewal = runtime
+            .renew_account_lease(&lease.lease_key(), renew_at, chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        let LeaseRenewal::Renewed(renewed) = renewal else {
+            panic!("expected renewed lease");
+        };
+
+        assert_eq!(
+            lease.expires_at - lease.acquired_at,
+            chrono::Duration::seconds(30)
+        );
+        assert_eq!(renewed.expires_at - renew_at, chrono::Duration::seconds(30));
     }
 
     #[tokio::test]
@@ -1077,8 +1200,8 @@ WHERE version = 26
         seed_account(runtime_a.as_ref(), "acct-1").await;
 
         let (first, second) = tokio::join!(
-            runtime_a.acquire_account_lease("pool-main", "inst-a"),
-            runtime_b.acquire_account_lease("pool-main", "inst-b")
+            runtime_a.acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300)),
+            runtime_b.acquire_account_lease("pool-main", "inst-b", chrono::Duration::seconds(300))
         );
 
         match (first, second) {
@@ -1195,7 +1318,9 @@ WHERE account_id = ?
             .await
             .unwrap()
             .expect("persisted health state");
-        let lease = runtime.acquire_account_lease("pool-main", "inst-a").await;
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await;
 
         assert_eq!(health.health_state, AccountHealthState::Unauthorized);
         assert_eq!(health.last_health_event_sequence, 2);

@@ -134,6 +134,12 @@ impl<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L
     }
 
     pub async fn release_active_lease(&mut self) -> anyhow::Result<()> {
+        if let Some(active_lease) = self.active_lease.as_ref() {
+            let _ = self
+                .backend
+                .release_lease(&active_lease.key(), Utc::now())
+                .await?;
+        }
         self.active_lease = None;
         self.next_health_event_sequence = 0;
         Ok(())
@@ -286,8 +292,12 @@ impl<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L
                 AccountLeaseError::Storage(_) => anyhow::anyhow!(err),
             })?;
         let leased_account = LeasedAccount::new(record);
+        self.next_health_event_sequence = self
+            .backend
+            .read_account_health_event_sequence(leased_account.account_id())
+            .await?
+            .unwrap_or(0);
         self.active_lease = Some(leased_account.clone());
-        self.next_health_event_sequence = 0;
         Ok(leased_account)
     }
 }

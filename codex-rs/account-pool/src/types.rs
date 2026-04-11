@@ -74,6 +74,10 @@ impl AccountPoolConfig {
         let safety_margin_secs = self.heartbeat_interval_secs.saturating_mul(2);
         Duration::seconds(safety_margin_secs as i64)
     }
+
+    pub fn lease_ttl_duration(&self) -> Duration {
+        Duration::seconds(self.lease_ttl_secs as i64)
+    }
 }
 
 /// Active lease bound to the current runtime instance.
@@ -105,6 +109,10 @@ impl LeasedAccount {
 
     pub fn expires_at(&self) -> DateTime<Utc> {
         self.record.expires_at
+    }
+
+    pub fn acquired_at(&self) -> DateTime<Utc> {
+        self.record.acquired_at
     }
 
     pub fn remaining_ttl(&self, now: DateTime<Utc>) -> Duration {

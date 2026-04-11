@@ -1,6 +1,7 @@
 use crate::backend::AccountPoolLeaseBackend;
 use async_trait::async_trait;
 use chrono::DateTime;
+use chrono::Duration;
 use chrono::Utc;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
@@ -16,11 +17,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct LocalAccountPoolBackend {
     runtime: Arc<StateRuntime>,
+    lease_ttl: Duration,
 }
 
 impl LocalAccountPoolBackend {
-    pub fn new(runtime: Arc<StateRuntime>) -> Self {
-        Self { runtime }
+    pub fn new(runtime: Arc<StateRuntime>, lease_ttl: Duration) -> Self {
+        Self { runtime, lease_ttl }
     }
 }
 
@@ -32,7 +34,7 @@ impl AccountPoolLeaseBackend for LocalAccountPoolBackend {
         holder_instance_id: &str,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         self.runtime
-            .acquire_account_lease(pool_id, holder_instance_id)
+            .acquire_account_lease(pool_id, holder_instance_id, self.lease_ttl)
             .await
     }
 
@@ -41,11 +43,26 @@ impl AccountPoolLeaseBackend for LocalAccountPoolBackend {
         lease: &LeaseKey,
         now: DateTime<Utc>,
     ) -> anyhow::Result<LeaseRenewal> {
-        self.runtime.renew_account_lease(lease, now).await
+        self.runtime
+            .renew_account_lease(lease, now, self.lease_ttl)
+            .await
+    }
+
+    async fn release_lease(&self, lease: &LeaseKey, now: DateTime<Utc>) -> anyhow::Result<bool> {
+        self.runtime.release_account_lease(lease, now).await
     }
 
     async fn record_health_event(&self, event: AccountHealthEvent) -> anyhow::Result<()> {
         self.runtime.record_account_health_event(event).await
+    }
+
+    async fn read_account_health_event_sequence(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        self.runtime
+            .read_account_health_event_sequence(account_id)
+            .await
     }
 
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState> {

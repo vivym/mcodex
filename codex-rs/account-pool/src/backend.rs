@@ -38,8 +38,17 @@ pub trait AccountPoolLeaseBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> anyhow::Result<LeaseRenewal>;
 
+    /// Release the lease if it still matches the current persisted epoch.
+    async fn release_lease(&self, lease: &LeaseKey, now: DateTime<Utc>) -> anyhow::Result<bool>;
+
     /// Record a lease-scoped account health event.
     async fn record_health_event(&self, event: AccountHealthEvent) -> anyhow::Result<()>;
+
+    /// Read the last persisted health-event sequence for an account.
+    async fn read_account_health_event_sequence(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<i64>>;
 
     /// Read persisted startup selection state.
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState>;
