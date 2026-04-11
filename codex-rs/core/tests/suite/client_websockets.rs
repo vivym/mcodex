@@ -1718,6 +1718,45 @@ fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &s
     prompt
 }
 
+#[test]
+fn remote_session_reset_changes_session_id_without_changing_thread_id() {
+    let provider = ModelProviderInfo {
+        name: "mock-ws".into(),
+        base_url: Some("http://localhost/v1".to_string()),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: Some(0),
+        stream_max_retries: Some(0),
+        stream_idle_timeout_ms: Some(5_000),
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: true,
+    };
+    let conversation_id = ThreadId::new();
+    let model_client = ModelClient::new(
+        /*auth_manager*/ None,
+        conversation_id,
+        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
+        provider,
+        SessionSource::Exec,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    );
+
+    let mut session = model_client.new_session();
+    let before = session.remote_session_id().to_string();
+    session.reset_remote_session_identity();
+    assert_ne!(before, session.remote_session_id().to_string());
+}
+
 fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {
     websocket_provider_with_connect_timeout(server, /*websocket_connect_timeout_ms*/ None)
 }

@@ -190,6 +190,7 @@ pub mod util;
 
 pub use client::ModelClient;
 pub use client::ModelClientSession;
+pub use client::RemoteSessionId;
 pub use client::X_CODEX_INSTALLATION_ID_HEADER;
 pub use client::X_CODEX_TURN_METADATA_HEADER;
 pub use client_common::Prompt;

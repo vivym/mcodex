@@ -24,6 +24,7 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -145,6 +146,7 @@ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
 struct ModelClientState {
     auth_manager: Option<Arc<AuthManager>>,
     conversation_id: ThreadId,
+    remote_session_id: StdMutex<RemoteSessionId>,
     window_generation: AtomicU64,
     installation_id: String,
     provider: ModelProviderInfo,
@@ -222,6 +224,26 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+}
+
+/// Transport-level session identifier used for sticky routing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RemoteSessionId(String);
+
+impl RemoteSessionId {
+    fn from_conversation_id(conversation_id: ThreadId) -> Self {
+        Self(conversation_id.to_string())
+    }
+
+    fn new() -> Self {
+        Self(ThreadId::new().to_string())
+    }
+}
+
+impl fmt::Display for RemoteSessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +338,9 @@ impl ModelClient {
             state: Arc::new(ModelClientState {
                 auth_manager,
                 conversation_id,
+                remote_session_id: StdMutex::new(RemoteSessionId::from_conversation_id(
+                    conversation_id,
+                )),
                 window_generation: AtomicU64::new(0),
                 installation_id,
                 provider,
@@ -363,6 +388,14 @@ impl ModelClient {
         let conversation_id = self.state.conversation_id;
         let window_generation = self.state.window_generation.load(Ordering::Relaxed);
         format!("{conversation_id}:{window_generation}")
+    }
+
+    fn remote_session_id(&self) -> RemoteSessionId {
+        self.state
+            .remote_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -469,7 +502,7 @@ impl ModelClient {
         }
         extra_headers.extend(self.build_responses_identity_headers());
         extra_headers.extend(build_conversation_headers(Some(
-            self.state.conversation_id.to_string(),
+            self.remote_session_id().to_string(),
         )));
         client
             .compact_input(&payload, extra_headers)
@@ -775,6 +808,7 @@ impl ModelClient {
     ) -> ApiHeaderMap {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
         let conversation_id = self.state.conversation_id.to_string();
+        let remote_session_id = self.remote_session_id().to_string();
         let mut headers = build_responses_headers(
             self.state.beta_features_header.as_deref(),
             turn_state,
@@ -783,7 +817,7 @@ impl ModelClient {
         if let Ok(header_value) = HeaderValue::from_str(&conversation_id) {
             headers.insert("x-client-request-id", header_value);
         }
-        headers.extend(build_conversation_headers(Some(conversation_id)));
+        headers.extend(build_conversation_headers(Some(remote_session_id)));
         headers.extend(self.build_responses_identity_headers());
         headers.insert(
             OPENAI_BETA_HEADER,
@@ -808,12 +842,32 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    fn clear_previous_response_id(&mut self) {
+        self.websocket_session.last_response_rx = None;
+    }
+
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.last_request = None;
-        self.websocket_session.last_response_rx = None;
+        self.clear_previous_response_id();
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
+    }
+
+    pub fn remote_session_id(&self) -> RemoteSessionId {
+        self.client.remote_session_id()
+    }
+
+    pub fn reset_remote_session_identity(&mut self) {
+        self.client.advance_window_generation();
+        *self
+            .client
+            .state
+            .remote_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RemoteSessionId::new();
+        self.reset_websocket_session();
+        self.clear_previous_response_id();
     }
 
     fn build_responses_request(
@@ -899,7 +953,7 @@ impl ModelClientSession {
         compression: Compression,
     ) -> ApiResponsesOptions {
         let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
-        let conversation_id = self.client.state.conversation_id.to_string();
+        let conversation_id = self.client.remote_session_id().to_string();
         ApiResponsesOptions {
             conversation_id: Some(conversation_id),
             session_source: Some(self.client.state.session_source.clone()),
@@ -1068,8 +1122,11 @@ impl ModelClientSession {
         };
 
         if needs_new {
+            if self.websocket_session.connection.is_some() {
+                self.reset_remote_session_identity();
+            }
             self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
+            self.clear_previous_response_id();
             let turn_state = options
                 .turn_state
                 .clone()
