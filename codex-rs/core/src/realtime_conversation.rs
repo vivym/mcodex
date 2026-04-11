@@ -600,7 +600,10 @@ pub(crate) async fn build_realtime_session_config(
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         model,
-        session_id: Some(session_id.unwrap_or_else(|| sess.conversation_id.to_string())),
+        session_id: Some(
+            session_id
+                .unwrap_or_else(|| sess.services.model_client.remote_session_id().to_string()),
+        ),
         event_parser,
         session_mode,
         voice,

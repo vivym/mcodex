@@ -1718,43 +1718,63 @@ fn prompt_with_input_and_instructions(input: Vec<ResponseItem>, instructions: &s
     prompt
 }
 
-#[test]
-fn remote_session_reset_changes_session_id_without_changing_thread_id() {
-    let provider = ModelProviderInfo {
-        name: "mock-ws".into(),
-        base_url: Some("http://localhost/v1".to_string()),
-        env_key: None,
-        env_key_instructions: None,
-        experimental_bearer_token: None,
-        auth: None,
-        wire_api: WireApi::Responses,
-        query_params: None,
-        http_headers: None,
-        env_http_headers: None,
-        request_max_retries: Some(0),
-        stream_max_retries: Some(0),
-        stream_idle_timeout_ms: Some(5_000),
-        websocket_connect_timeout_ms: None,
-        requires_openai_auth: false,
-        supports_websockets: true,
-    };
-    let conversation_id = ThreadId::new();
-    let model_client = ModelClient::new(
-        /*auth_manager*/ None,
-        conversation_id,
-        /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
-        provider,
-        SessionSource::Exec,
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_session_reset_changes_session_id_without_changing_thread_id() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![
+        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+        vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+    ])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let thread_id = harness.conversation_id.to_string();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let mut session = harness.client.new_session();
+
+    let before_remote_session_id = session.remote_session_id().to_string();
+    assert_eq!(before_remote_session_id, thread_id);
+    stream_until_complete(&mut session, &harness, &prompt).await;
+
+    session.reset_remote_session_identity();
+    let after_remote_session_id = session.remote_session_id().to_string();
+    assert_ne!(after_remote_session_id, before_remote_session_id);
+    assert_ne!(after_remote_session_id, thread_id);
+
+    stream_until_complete(&mut session, &harness, &prompt).await;
+
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(
+        handshakes[0].header(X_CLIENT_REQUEST_ID_HEADER).as_deref(),
+        Some(thread_id.as_str())
+    );
+    assert_eq!(
+        handshakes[0].header("session_id").as_deref(),
+        Some(before_remote_session_id.as_str())
+    );
+    assert_eq!(
+        handshakes[1].header(X_CLIENT_REQUEST_ID_HEADER).as_deref(),
+        Some(thread_id.as_str())
+    );
+    assert_eq!(
+        handshakes[1].header("session_id").as_deref(),
+        Some(after_remote_session_id.as_str())
     );
 
-    let mut session = model_client.new_session();
-    let before = session.remote_session_id().to_string();
-    session.reset_remote_session_identity();
-    assert_ne!(before, session.remote_session_id().to_string());
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    assert_eq!(
+        connections[0][0].body_json()["client_metadata"]["x-codex-window-id"].as_str(),
+        Some(format!("{thread_id}:0").as_str())
+    );
+    assert_eq!(
+        connections[1][0].body_json()["client_metadata"]["x-codex-window-id"].as_str(),
+        Some(format!("{thread_id}:1").as_str())
+    );
+
+    server.shutdown().await;
 }
 
 fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {

@@ -1,10 +1,13 @@
 use super::RealtimeHandoffState;
 use super::RealtimeSessionKind;
+use super::build_realtime_session_config;
 use super::realtime_text_from_handoff_request;
+use crate::codex::make_session_and_context;
 use async_channel::bounded;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
 
 #[test]
 fn extracts_text_from_handoff_request_active_transcript() {
@@ -67,4 +70,25 @@ async fn clears_active_handoff_explicitly() {
 
     *state.active_handoff.lock().await = None;
     assert_eq!(state.active_handoff.lock().await.clone(), None);
+}
+
+#[tokio::test]
+async fn build_realtime_session_config_uses_remote_session_id_after_reset() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let thread_id = session.conversation_id.to_string();
+
+    let mut model_client_session = session.services.model_client.new_session();
+    model_client_session.reset_remote_session_identity();
+    let remote_session_id = model_client_session.remote_session_id().to_string();
+    assert_ne!(remote_session_id, thread_id);
+
+    let config = build_realtime_session_config(&session, None, None, None)
+        .await
+        .expect("build realtime config");
+
+    assert_eq!(
+        config.session_id.as_deref(),
+        Some(remote_session_id.as_str())
+    );
 }

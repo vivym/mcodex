@@ -390,7 +390,7 @@ impl ModelClient {
         format!("{conversation_id}:{window_generation}")
     }
 
-    fn remote_session_id(&self) -> RemoteSessionId {
+    pub(crate) fn remote_session_id(&self) -> RemoteSessionId {
         self.state
             .remote_session_id
             .lock()
