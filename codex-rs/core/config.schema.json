@@ -6,6 +6,74 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AccountAllocationModeToml": {
+      "enum": [
+        "exclusive"
+      ],
+      "type": "string"
+    },
+    "AccountPoolBackendToml": {
+      "enum": [
+        "local"
+      ],
+      "type": "string"
+    },
+    "AccountPoolDefinitionToml": {
+      "additionalProperties": false,
+      "properties": {
+        "account_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allow_context_reuse": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "AccountsConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "allocation_mode": {
+          "$ref": "#/definitions/AccountAllocationModeToml"
+        },
+        "backend": {
+          "$ref": "#/definitions/AccountPoolBackendToml"
+        },
+        "default_pool": {
+          "type": "string"
+        },
+        "heartbeat_interval_secs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "lease_ttl_secs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "min_switch_interval_secs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pools": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AccountPoolDefinitionToml"
+          },
+          "type": "object"
+        },
+        "proactive_switch_threshold_percent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "AgentRoleToml": {
       "additionalProperties": false,
       "properties": {
@@ -2002,6 +2070,14 @@
   },
   "description": "Base config deserialized from ~/.codex/config.toml.",
   "properties": {
+    "accounts": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AccountsConfigToml"
+        }
+      ],
+      "description": "Multi-account pool settings."
+    },
     "agents": {
       "allOf": [
         {

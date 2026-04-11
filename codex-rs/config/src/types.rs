@@ -159,6 +159,38 @@ pub enum ToolSuggestDiscoverableType {
     Plugin,
 }
 
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountPoolBackendToml {
+    Local,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountAllocationModeToml {
+    Exclusive,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AccountPoolDefinitionToml {
+    pub allow_context_reuse: Option<bool>,
+    pub account_kinds: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+#[schemars(deny_unknown_fields)]
+pub struct AccountsConfigToml {
+    pub backend: Option<AccountPoolBackendToml>,
+    pub default_pool: Option<String>,
+    pub proactive_switch_threshold_percent: Option<u8>,
+    pub lease_ttl_secs: Option<u64>,
+    pub heartbeat_interval_secs: Option<u64>,
+    pub min_switch_interval_secs: Option<u64>,
+    pub allocation_mode: Option<AccountAllocationModeToml>,
+    pub pools: Option<HashMap<String, AccountPoolDefinitionToml>>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ToolSuggestDiscoverable {
@@ -740,6 +772,12 @@ impl Default for ShellEnvironmentPolicy {
             use_profile: false,
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parses_accounts_pool_config() {
+    tests::assert_parses_accounts_pool_config();
 }
 
 #[cfg(test)]
