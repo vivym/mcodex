@@ -1395,6 +1395,37 @@ impl Config {
     ) -> std::io::Result<Self> {
         validate_model_providers(&cfg.model_providers)
             .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+        if let Some(accounts) = &cfg.accounts
+            && let (Some(lease_ttl_secs), Some(heartbeat_interval_secs)) =
+                (accounts.lease_ttl_secs, accounts.heartbeat_interval_secs)
+        {
+            let safety_margin_secs = heartbeat_interval_secs.saturating_mul(2);
+
+            if lease_ttl_secs <= heartbeat_interval_secs {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "accounts.lease_ttl_secs must be greater than accounts.heartbeat_interval_secs",
+                ));
+            }
+
+            if safety_margin_secs >= lease_ttl_secs {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "derived account lease safety margin must be less than accounts.lease_ttl_secs",
+                ));
+            }
+        }
+
+        if let Some(accounts) = &cfg.accounts
+            && let (Some(lease_ttl_secs), Some(min_switch_interval_secs)) =
+                (accounts.lease_ttl_secs, accounts.min_switch_interval_secs)
+            && min_switch_interval_secs >= lease_ttl_secs
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs",
+            ));
+        }
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
         let ConfigRequirements {

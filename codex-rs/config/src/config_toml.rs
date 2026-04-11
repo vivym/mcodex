@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::permissions_toml::PermissionsToml;
 use crate::profile_toml::ConfigProfile;
+use crate::types::AccountsConfigToml;
 use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
 use crate::types::AppsConfigToml;
@@ -318,6 +319,9 @@ pub struct ConfigToml {
 
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
+
+    /// Multi-account pool settings.
+    pub accounts: Option<AccountsConfigToml>,
 
     /// User-level skill config entries keyed by SKILL.md path.
     pub skills: Option<SkillsConfig>,

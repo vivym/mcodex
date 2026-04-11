@@ -24,6 +24,7 @@ use codex_config::permissions_toml::NetworkToml;
 use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::profile_toml::ConfigProfile;
+use codex_config::types::AccountsConfigToml;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::BundledSkillsConfig;
@@ -264,6 +265,78 @@ consolidation_model = "gpt-5"
             extract_model: Some("gpt-5-mini".to_string()),
             consolidation_model: Some("gpt-5".to_string()),
         }
+    );
+}
+
+#[test]
+fn load_config_rejects_accounts_lease_ttl_not_greater_than_heartbeat_interval() {
+    let err = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            accounts: Some(AccountsConfigToml {
+                lease_ttl_secs: Some(60),
+                heartbeat_interval_secs: Some(60),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").path().to_path_buf(),
+    )
+    .expect_err("config should reject lease_ttl_secs <= heartbeat_interval_secs");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains(
+            "accounts.lease_ttl_secs must be greater than accounts.heartbeat_interval_secs"
+        )
+    );
+}
+
+#[test]
+fn load_config_rejects_accounts_lease_safety_margin_not_less_than_lease_ttl() {
+    let err = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            accounts: Some(AccountsConfigToml {
+                lease_ttl_secs: Some(50),
+                heartbeat_interval_secs: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").path().to_path_buf(),
+    )
+    .expect_err("config should reject derived safety margin >= lease_ttl_secs");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains(
+            "derived account lease safety margin must be less than accounts.lease_ttl_secs"
+        )
+    );
+}
+
+#[test]
+fn load_config_rejects_accounts_min_switch_interval_not_less_than_lease_ttl() {
+    let err = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            accounts: Some(AccountsConfigToml {
+                lease_ttl_secs: Some(90),
+                min_switch_interval_secs: Some(90),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").path().to_path_buf(),
+    )
+    .expect_err("config should reject min_switch_interval_secs >= lease_ttl_secs");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains(
+            "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs"
+        )
     );
 }
 
