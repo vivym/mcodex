@@ -6,6 +6,7 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_completed;
@@ -204,6 +205,77 @@ async fn rotation_without_context_reuse_mints_new_remote_session_id() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_selected_pool_without_context_reuse_mints_new_remote_session_id() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("x-codex-primary-used-percent", "100.0")
+                .insert_header("x-codex-primary-window-minutes", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached"
+                    }
+                })),
+            sse_with_primary_usage_percent("resp-2", 10.0),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.accounts = Some(accounts_config_without_default_pool());
+        });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "rotate-startup-selected-pool").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "turn 1 should fail with usage-limit"
+    );
+
+    let second_turn_error =
+        submit_turn_and_wait(&test, "post-rotate-startup-selected-pool").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+
+    let first_session_id = requests[0]
+        .header("session_id")
+        .expect("first request missing session_id header");
+    let second_session_id = requests[1]
+        .header("session_id")
+        .expect("second request missing session_id header");
+    assert_ne!(
+        first_session_id, second_session_id,
+        "startup-selected pool with context reuse disabled should mint a fresh remote session id"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_pool_fails_closed_without_legacy_auth_fallback() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -260,6 +332,27 @@ fn accounts_config() -> AccountsConfigToml {
     AccountsConfigToml {
         backend: None,
         default_pool: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+        proactive_switch_threshold_percent: Some(85),
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    }
+}
+
+fn accounts_config_without_default_pool() -> AccountsConfigToml {
+    let mut pools = HashMap::new();
+    pools.insert(
+        LEGACY_DEFAULT_POOL_ID.to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    AccountsConfigToml {
+        backend: None,
+        default_pool: None,
         proactive_switch_threshold_percent: Some(85),
         lease_ttl_secs: None,
         heartbeat_interval_secs: None,

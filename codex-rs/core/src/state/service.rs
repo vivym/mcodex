@@ -93,7 +93,7 @@ pub(crate) struct AccountPoolManager {
     state_db: StateDbHandle,
     default_pool_id: Option<String>,
     proactive_switch_threshold_percent: u8,
-    allow_context_reuse: bool,
+    allow_context_reuse_by_pool_id: HashMap<String, bool>,
     lease_ttl: Duration,
     holder_instance_id: String,
     active_lease: Option<AccountLeaseRecord>,
@@ -109,11 +109,12 @@ impl AccountPoolManager {
         holder_instance_id: String,
     ) -> Self {
         let default_pool_id = accounts.default_pool.clone();
-        let allow_context_reuse = default_pool_id
-            .as_ref()
-            .and_then(|pool_id| accounts.pools.as_ref().and_then(|pools| pools.get(pool_id)))
-            .and_then(|pool| pool.allow_context_reuse)
-            .unwrap_or(true);
+        let allow_context_reuse_by_pool_id = accounts
+            .pools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(pool_id, pool)| (pool_id, pool.allow_context_reuse.unwrap_or(true)))
+            .collect();
         let proactive_switch_threshold_percent =
             accounts.proactive_switch_threshold_percent.unwrap_or(85);
         let lease_ttl_secs = accounts.lease_ttl_secs.unwrap_or(300);
@@ -122,7 +123,7 @@ impl AccountPoolManager {
             state_db,
             default_pool_id,
             proactive_switch_threshold_percent,
-            allow_context_reuse,
+            allow_context_reuse_by_pool_id,
             lease_ttl: Duration::seconds(lease_ttl_secs as i64),
             holder_instance_id,
             active_lease: None,
@@ -181,11 +182,16 @@ impl AccountPoolManager {
             .as_ref()
             .context("active lease missing after account pool acquisition")?;
         let account_id = active_lease.account_id.clone();
+        let allow_context_reuse = self
+            .allow_context_reuse_by_pool_id
+            .get(&active_lease.pool_id)
+            .copied()
+            .unwrap_or(true);
         let reset_remote_context = self
             .previous_turn_account_id
             .as_deref()
             .is_some_and(|previous| previous != account_id)
-            && !self.allow_context_reuse;
+            && !allow_context_reuse;
         self.previous_turn_account_id = Some(account_id.clone());
         Ok(Some((account_id, reset_remote_context)))
     }
