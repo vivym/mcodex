@@ -534,9 +534,14 @@ mod tests {
     use crate::AccountHealthState;
     use crate::AccountLeaseError;
     use crate::LegacyAccountImport;
+    use crate::migrations::STATE_MIGRATOR;
     use chrono::DateTime;
     use chrono::Utc;
     use pretty_assertions::assert_eq;
+    use sqlx::SqlitePool;
+    use sqlx::migrate::Migrator;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -597,6 +602,189 @@ WHERE holder_instance_id = ?
             Some("acct-legacy")
         );
         assert_eq!(selection.suppressed, false);
+    }
+
+    #[tokio::test]
+    async fn init_cleans_up_duplicate_active_holder_leases_before_indexing() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let old_state_migrator = Migrator {
+            migrations: Cow::Owned(
+                STATE_MIGRATOR.migrations[..STATE_MIGRATOR.migrations.len() - 1].to_vec(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open old state db");
+        old_state_migrator
+            .run(&pool)
+            .await
+            .expect("apply pre-0026 state schema");
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind("pool-main")
+        .bind(0_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind(Option::<String>::None)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert first account");
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-2")
+        .bind("pool-main")
+        .bind(1_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind(Option::<String>::None)
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(2_i64)
+        .execute(&pool)
+        .await
+        .expect("insert second account");
+        sqlx::query(
+            r#"
+INSERT INTO account_leases (
+    lease_id,
+    account_id,
+    pool_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            "#,
+        )
+        .bind("lease-1")
+        .bind("acct-1")
+        .bind("pool-main")
+        .bind("inst-a")
+        .bind(1_i64)
+        .bind(10_i64)
+        .bind(10_i64)
+        .bind(310_i64)
+        .execute(&pool)
+        .await
+        .expect("insert first active lease");
+        sqlx::query(
+            r#"
+INSERT INTO account_leases (
+    lease_id,
+    account_id,
+    pool_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            "#,
+        )
+        .bind("lease-2")
+        .bind("acct-2")
+        .bind("pool-main")
+        .bind("inst-a")
+        .bind(1_i64)
+        .bind(20_i64)
+        .bind(20_i64)
+        .bind(320_i64)
+        .execute(&pool)
+        .await
+        .expect("insert second active lease");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let active_lease_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM account_leases
+WHERE holder_instance_id = ?
+  AND released_at IS NULL
+            "#,
+        )
+        .bind("inst-a")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("count active holder leases");
+        let remaining_active_account_id: String = sqlx::query_scalar(
+            r#"
+SELECT account_id
+FROM account_leases
+WHERE holder_instance_id = ?
+  AND released_at IS NULL
+ORDER BY acquired_at DESC, lease_id DESC
+LIMIT 1
+            "#,
+        )
+        .bind("inst-a")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("load remaining active lease");
+        let active_holder_index_exists: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM sqlite_master
+WHERE type = 'index'
+  AND name = 'account_leases_active_holder_idx'
+            "#,
+        )
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("check active holder index");
+
+        assert_eq!(active_lease_count, 1);
+        assert_eq!(remaining_active_account_id, "acct-2");
+        assert_eq!(active_holder_index_exists, 1);
+
+        drop(runtime);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
     #[tokio::test]
