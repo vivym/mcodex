@@ -251,7 +251,7 @@ async fn accounts_status_reports_suppression_and_eligibility() -> Result<()> {
     let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "status"]).await?;
     assert!(output.success);
-    assert!(output.stdout.contains("health state: unknown"));
+    assert!(output.stdout.contains("health state: healthy"));
     assert!(output.stdout.contains("eligibility"));
     Ok(())
 }
@@ -275,7 +275,7 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-main");
-    assert_eq!(json["healthState"], "unavailable");
+    assert_eq!(json["healthState"], "healthy");
     assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
     assert_eq!(json["switchReason"]["code"], "noEligibleAccount");
     assert!(json["nextEligibleAt"].as_str().is_some());

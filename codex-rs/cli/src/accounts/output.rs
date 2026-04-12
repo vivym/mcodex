@@ -2,6 +2,7 @@ use crate::accounts::diagnostics::AccountsCurrentDiagnostic;
 use crate::accounts::diagnostics::AccountsStatusDiagnostic;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountDiagnostic;
+use codex_state::AccountPoolDiagnostic;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
 
@@ -50,7 +51,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
     print_preview(&diagnostic.preview);
     println!(
         "health state: {}",
-        status_health_state(&diagnostic.preview).unwrap_or("unknown")
+        status_health_state(diagnostic.pool.as_ref()).unwrap_or("unknown")
     );
     println!("configured pools: {}", diagnostic.configured_pool_count);
 
@@ -84,7 +85,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
         "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
         "suppressed": diagnostic.preview.suppressed,
-        "healthState": status_health_state(&diagnostic.preview),
+        "healthState": status_health_state(diagnostic.pool.as_ref()),
         "switchReason": {
             "code": eligibility_code(&diagnostic.preview.eligibility),
             "reason": eligibility_reason(&diagnostic.preview.eligibility),
@@ -197,21 +198,33 @@ fn health_state(account: &AccountPoolAccountDiagnostic) -> &'static str {
     }
 }
 
-fn status_health_state(preview: &AccountStartupSelectionPreview) -> Option<&'static str> {
-    if preview.predicted_account_id.is_some() {
+fn status_health_state(pool: Option<&AccountPoolDiagnostic>) -> Option<&'static str> {
+    let pool = pool?;
+    if pool
+        .accounts
+        .iter()
+        .any(|account| health_state(account) == "healthy")
+    {
         return Some("healthy");
     }
-
-    match preview.eligibility {
-        AccountStartupEligibility::PreferredAccountUnhealthy => Some("unhealthy"),
-        AccountStartupEligibility::PreferredAccountBusy => Some("busy"),
-        AccountStartupEligibility::NoEligibleAccount => Some("unavailable"),
-        AccountStartupEligibility::Suppressed
-        | AccountStartupEligibility::MissingPool
-        | AccountStartupEligibility::PreferredAccountSelected
-        | AccountStartupEligibility::AutomaticAccountSelected
-        | AccountStartupEligibility::PreferredAccountMissing
-        | AccountStartupEligibility::PreferredAccountInOtherPool { .. } => None,
+    if pool
+        .accounts
+        .iter()
+        .any(|account| health_state(account) == "rateLimited")
+    {
+        return Some("rateLimited");
+    }
+    if pool
+        .accounts
+        .iter()
+        .any(|account| health_state(account) == "unauthorized")
+    {
+        return Some("unauthorized");
+    }
+    if pool.accounts.is_empty() {
+        None
+    } else {
+        Some("unhealthy")
     }
 }
 
