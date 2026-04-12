@@ -163,6 +163,19 @@ pub struct AccountPoolMembership {
     pub healthy: bool,
 }
 
+/// Full replacement update for one stored account registry entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRegistryEntryUpdate {
+    pub account_id: String,
+    pub pool_id: String,
+    pub position: i64,
+    pub account_kind: String,
+    pub backend_family: String,
+    pub workspace_id: Option<String>,
+    pub enabled: bool,
+    pub healthy: bool,
+}
+
 /// Full replacement update for startup selection state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountStartupSelectionUpdate {

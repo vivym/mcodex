@@ -6,6 +6,7 @@ use crate::model::AccountLeaseRecord;
 use crate::model::AccountPoolAccountDiagnostic;
 use crate::model::AccountPoolDiagnostic;
 use crate::model::AccountPoolMembership;
+use crate::model::AccountRegistryEntryUpdate;
 use crate::model::AccountStartupEligibility;
 use crate::model::AccountStartupSelectionPreview;
 use crate::model::AccountStartupSelectionState;
@@ -768,6 +769,53 @@ WHERE account_id = ?
         }
     }
 
+    pub async fn upsert_account_registry_entry(
+        &self,
+        entry: AccountRegistryEntryUpdate,
+    ) -> anyhow::Result<()> {
+        let now = account_datetime_to_epoch_seconds(Utc::now());
+
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    enabled,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    pool_id = excluded.pool_id,
+    position = excluded.position,
+    account_kind = excluded.account_kind,
+    backend_family = excluded.backend_family,
+    workspace_id = excluded.workspace_id,
+    enabled = excluded.enabled,
+    healthy = excluded.healthy,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(entry.account_id)
+        .bind(entry.pool_id)
+        .bind(entry.position)
+        .bind(entry.account_kind)
+        .bind(entry.backend_family)
+        .bind(entry.workspace_id)
+        .bind(i64::from(entry.enabled))
+        .bind(i64::from(entry.healthy))
+        .bind(now)
+        .bind(now)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn set_account_enabled(
         &self,
         account_id: &str,
@@ -1267,6 +1315,8 @@ mod tests {
     use crate::AccountHealthEvent;
     use crate::AccountHealthState;
     use crate::AccountLeaseError;
+    use crate::AccountPoolMembership;
+    use crate::AccountRegistryEntryUpdate;
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::migrations::STATE_MIGRATOR;
@@ -2294,6 +2344,72 @@ WHERE account_id = ?
                 pool_id: "pool-other".to_string(),
                 healthy: true,
                 enabled: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_account_registry_entry_writes_and_updates_membership() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-1")
+                .await
+                .unwrap(),
+            Some(AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                enabled: true,
+                healthy: true,
+            })
+        );
+
+        runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-other".to_string(),
+                position: 2,
+                account_kind: "api_key".to_string(),
+                backend_family: "responses".to_string(),
+                workspace_id: None,
+                enabled: false,
+                healthy: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(Some("pool-main"))
+                .await
+                .unwrap(),
+            Vec::<AccountPoolMembership>::new()
+        );
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(Some("pool-other"))
+                .await
+                .unwrap(),
+            vec![AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-other".to_string(),
+                enabled: false,
+                healthy: false,
             }]
         );
     }

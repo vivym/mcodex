@@ -32,6 +32,7 @@ pub use model::AccountPoolAccountDiagnostic;
 pub use model::AccountPoolDiagnostic;
 pub use model::AccountPoolHealthState;
 pub use model::AccountPoolMembership;
+pub use model::AccountRegistryEntryUpdate;
 pub use model::AccountStartupEligibility;
 pub use model::AccountStartupSelectionPreview;
 pub use model::AccountStartupSelectionState;

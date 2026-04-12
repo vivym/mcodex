@@ -14,6 +14,7 @@ pub use account_pool::AccountPoolAccountDiagnostic;
 pub use account_pool::AccountPoolDiagnostic;
 pub use account_pool::AccountPoolHealthState;
 pub use account_pool::AccountPoolMembership;
+pub use account_pool::AccountRegistryEntryUpdate;
 pub use account_pool::AccountStartupEligibility;
 pub use account_pool::AccountStartupSelectionPreview;
 pub use account_pool::AccountStartupSelectionState;

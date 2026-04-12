@@ -666,6 +666,46 @@ async fn accounts_remove_deletes_registry_entry() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_add_chatgpt_stops_at_credential_storage_gap() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "add", "chatgpt"]).await?;
+    assert!(!output.success);
+    assert!(output.stderr.contains("credential_ref"));
+    assert!(output.stderr.contains("codex login"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_chatgpt_device_auth_stops_at_credential_storage_gap() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "add", "chatgpt", "--device-auth"],
+    )
+    .await?;
+    assert!(!output.success);
+    assert!(output.stderr.contains("credential_ref"));
+    assert!(output.stderr.contains("codex login"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_api_key_stops_at_credential_storage_gap() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "add", "api-key"]).await?;
+    assert!(!output.success);
+    assert!(output.stderr.contains("credential_ref"));
+    assert!(output.stderr.contains("codex login"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_pool_assign_changes_membership_without_mutating_startup_selection() -> Result<()>
 {
     let codex_home = prepared_home().await?;

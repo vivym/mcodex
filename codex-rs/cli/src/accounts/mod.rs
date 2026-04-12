@@ -21,6 +21,8 @@ use output::print_current_text;
 use output::print_status_json;
 use output::print_status_text;
 
+const ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP: &str = "pooled credential storage keyed by `credential_ref` is not implemented yet, so `codex accounts add` cannot persist a new pooled account without mutating the shared legacy compatibility auth store. Use `codex login` only if you need to replace the single legacy default compatibility account.";
+
 #[derive(Debug, Parser)]
 pub struct AccountsCommand {
     #[clap(skip)]
@@ -49,8 +51,20 @@ pub enum AccountsSubcommand {
 
 #[derive(Debug, Args)]
 pub struct AddAccountCommand {
-    #[arg(value_name = "ACCOUNT_ID")]
-    pub account_id: Option<String>,
+    #[command(subcommand)]
+    pub subcommand: AddAccountSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum AddAccountSubcommand {
+    Chatgpt(AddChatgptAccountCommand),
+    ApiKey,
+}
+
+#[derive(Debug, Args)]
+pub struct AddChatgptAccountCommand {
+    #[arg(long = "device-auth", default_value_t = false)]
+    pub device_auth: bool,
 }
 
 #[derive(Debug, Args)]
@@ -173,9 +187,7 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         .context("initialize account startup selection state")?;
 
     match subcommand {
-        AccountsSubcommand::Add(_command) => {
-            anyhow::bail!("`codex accounts add` is not implemented yet")
-        }
+        AccountsSubcommand::Add(_command) => anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP),
         AccountsSubcommand::Enable(command) => {
             set_account_enabled(&runtime, &command.account_id, true).await
         }
