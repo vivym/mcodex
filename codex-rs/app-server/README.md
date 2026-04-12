@@ -1504,6 +1504,13 @@ When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears o
 { "method": "accountLease/updated", "params": { "accountId": "acct-1", "poolId": "legacy-default", "suppressed": false } }
 ```
 
+Field notes:
+
+- `switchReason` explains why the current preview or live lease selected its account. `suppressionReason` explains why pooled startup or live lease reuse is currently blocked. Either field may be `null`.
+- The pooled lease reason fields reuse the same camelCase codes, depending on whether the response is a startup preview or a live thread snapshot: `automaticAccountSelected`, `preferredAccountSelected`, `missingPool`, `preferredAccountMissing`, `preferredAccountInOtherPool`, `preferredAccountDisabled`, `preferredAccountUnhealthy`, `preferredAccountBusy`, `noEligibleAccount`, `durablySuppressed`, and `nonReplayableTurn`.
+- `durablySuppressed` is returned on `suppressionReason` when pooled startup was manually suppressed and remains in effect until `accountLease/resume`.
+- `nonReplayableTurn` is returned on live snapshots when the current turn could not be replayed onto the next pooled account; future turns continue on the next eligible account instead of replaying the current turn.
+
 ### 8) Rate limits (ChatGPT)
 
 ```json
