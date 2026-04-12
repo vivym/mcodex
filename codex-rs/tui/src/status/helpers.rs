@@ -1,5 +1,6 @@
 use crate::exec_command::relativize_to_home;
 use crate::status::StatusAccountDisplay;
+use crate::status::StatusAccountLeaseDisplay;
 use crate::text_formatting;
 use chrono::DateTime;
 use chrono::Local;
@@ -93,6 +94,12 @@ pub(crate) fn compose_account_display(
     account_display: Option<&StatusAccountDisplay>,
 ) -> Option<StatusAccountDisplay> {
     account_display.cloned()
+}
+
+pub(crate) fn compose_account_lease_display(
+    account_lease_display: Option<&StatusAccountLeaseDisplay>,
+) -> Option<StatusAccountLeaseDisplay> {
+    account_lease_display.cloned()
 }
 
 pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {

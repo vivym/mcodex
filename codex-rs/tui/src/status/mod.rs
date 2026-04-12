@@ -13,14 +13,18 @@ mod helpers;
 mod rate_limits;
 
 pub(crate) use account::StatusAccountDisplay;
+pub(crate) use account::StatusAccountLeaseDisplay;
 pub(crate) use card::StatusHistoryHandle;
 #[cfg(test)]
 pub(crate) use card::new_status_output;
+#[cfg(test)]
+pub(crate) use card::new_status_output_with_account_lease;
 #[cfg(test)]
 pub(crate) use card::new_status_output_with_rate_limits;
 pub(crate) use card::new_status_output_with_rate_limits_handle;
 pub(crate) use helpers::discover_agents_summary;
 pub(crate) use helpers::format_directory_display;
+pub(crate) use helpers::format_reset_timestamp;
 pub(crate) use helpers::format_tokens_compact;
 pub(crate) use helpers::plan_type_display_name;
 pub(crate) use rate_limits::RateLimitSnapshotDisplay;

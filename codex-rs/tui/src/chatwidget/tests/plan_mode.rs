@@ -1245,6 +1245,7 @@ async fn collaboration_modes_defaults_to_code_on_startup() {
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
+        status_account_lease_display: None,
         initial_workspace_role: None,
         initial_is_workspace_owner: None,
         initial_plan_type: None,

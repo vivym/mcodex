@@ -1099,6 +1099,7 @@ impl App {
             feedback: self.feedback.clone(),
             is_first_run: false,
             status_account_display: self.chat_widget.status_account_display().cloned(),
+            status_account_lease_display: self.chat_widget.status_account_lease_display().cloned(),
             initial_workspace_role: self.chat_widget.current_workspace_role(),
             initial_is_workspace_owner: self.chat_widget.current_is_workspace_owner(),
             initial_plan_type: self.chat_widget.current_plan_type(),
@@ -3658,6 +3659,7 @@ impl App {
         let has_chatgpt_account = bootstrap.has_chatgpt_account;
         let requires_openai_auth = bootstrap.requires_openai_auth;
         let status_account_display = bootstrap.status_account_display.clone();
+        let status_account_lease_display = bootstrap.account_lease_display.clone();
         let initial_workspace_role = bootstrap.workspace_role;
         let initial_is_workspace_owner = bootstrap.is_workspace_owner;
         let initial_plan_type = bootstrap.plan_type;
@@ -3709,6 +3711,7 @@ impl App {
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
+                    status_account_lease_display: status_account_lease_display.clone(),
                     initial_workspace_role,
                     initial_is_workspace_owner,
                     initial_plan_type,
@@ -3745,6 +3748,7 @@ impl App {
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
+                    status_account_lease_display: status_account_lease_display.clone(),
                     initial_workspace_role,
                     initial_is_workspace_owner,
                     initial_plan_type,
@@ -3786,6 +3790,7 @@ impl App {
                     feedback: feedback.clone(),
                     is_first_run,
                     status_account_display: status_account_display.clone(),
+                    status_account_lease_display: status_account_lease_display.clone(),
                     initial_workspace_role,
                     initial_is_workspace_owner,
                     initial_plan_type,
@@ -6752,6 +6757,7 @@ mod tests {
             feedback: codex_feedback::CodexFeedback::new(),
             is_first_run: false,
             status_account_display: None,
+            status_account_lease_display: None,
             initial_workspace_role: None,
             initial_is_workspace_owner: None,
             initial_plan_type: None,
@@ -10741,6 +10747,7 @@ guardian_approval = true
             feedback: app.feedback.clone(),
             is_first_run: false,
             status_account_display: app.chat_widget.status_account_display().cloned(),
+            status_account_lease_display: app.chat_widget.status_account_lease_display().cloned(),
             initial_workspace_role: app.chat_widget.current_workspace_role(),
             initial_is_workspace_owner: app.chat_widget.current_is_workspace_owner(),
             initial_plan_type: app.chat_widget.current_plan_type(),

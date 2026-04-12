@@ -58,6 +58,7 @@ use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
 use crate::status::RateLimitWindowDisplay;
 use crate::status::StatusAccountDisplay;
+use crate::status::StatusAccountLeaseDisplay;
 use crate::status::StatusHistoryHandle;
 use crate::status::format_directory_display;
 use crate::status::format_tokens_compact;
@@ -559,6 +560,7 @@ pub(crate) struct ChatWidgetInit {
     pub(crate) feedback: codex_feedback::CodexFeedback,
     pub(crate) is_first_run: bool,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) status_account_lease_display: Option<StatusAccountLeaseDisplay>,
     pub(crate) initial_workspace_role: Option<AppServerWorkspaceRole>,
     pub(crate) initial_is_workspace_owner: Option<bool>,
     pub(crate) initial_plan_type: Option<PlanType>,
@@ -795,6 +797,7 @@ pub(crate) struct ChatWidget {
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
+    status_account_lease_display: Option<StatusAccountLeaseDisplay>,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
@@ -4677,6 +4680,7 @@ impl ChatWidget {
             feedback,
             is_first_run,
             status_account_display,
+            status_account_lease_display,
             initial_workspace_role,
             initial_is_workspace_owner,
             initial_plan_type,
@@ -4747,6 +4751,7 @@ impl ChatWidget {
             session_header: SessionHeader::new(header_model),
             initial_user_message,
             status_account_display,
+            status_account_lease_display,
             token_info: None,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             refreshing_status_outputs: Vec::new(),
@@ -6671,6 +6676,7 @@ impl ChatWidget {
             }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
+            | ServerNotification::AccountLeaseUpdated(_)
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
@@ -7503,6 +7509,7 @@ impl ChatWidget {
         let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle(
             &self.config,
             self.status_account_display.as_ref(),
+            self.status_account_lease_display.as_ref(),
             token_info,
             total_usage,
             &self.thread_id,
@@ -9661,6 +9668,10 @@ impl ChatWidget {
         self.status_account_display.as_ref()
     }
 
+    pub(crate) fn status_account_lease_display(&self) -> Option<&StatusAccountLeaseDisplay> {
+        self.status_account_lease_display.as_ref()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn model_catalog(&self) -> Arc<ModelCatalog> {
         self.model_catalog.clone()
@@ -9934,6 +9945,15 @@ impl ChatWidget {
         self.maybe_show_pending_workspace_owner_notification_prompt();
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
+    }
+
+    pub(crate) fn update_account_lease_state(
+        &mut self,
+        status_account_lease_display: Option<StatusAccountLeaseDisplay>,
+    ) {
+        self.status_account_lease_display = status_account_lease_display;
+        self.refresh_status_surfaces();
+        self.request_redraw();
     }
 
     pub(crate) fn should_show_fast_status(

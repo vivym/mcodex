@@ -23,11 +23,13 @@ use std::path::PathBuf;
 use url::Url;
 
 use super::account::StatusAccountDisplay;
+use super::account::StatusAccountLeaseDisplay;
 use super::format::FieldFormatter;
 use super::format::line_display_width;
 use super::format::push_label;
 use super::format::truncate_line_to_width;
 use super::helpers::compose_account_display;
+use super::helpers::compose_account_lease_display;
 use super::helpers::compose_model_display;
 use super::helpers::format_directory_display;
 use super::helpers::format_tokens_compact;
@@ -111,6 +113,7 @@ struct StatusHistoryCell {
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
     account: Option<StatusAccountDisplay>,
+    account_lease: Option<StatusAccountLeaseDisplay>,
     thread_name: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
@@ -139,6 +142,45 @@ pub(crate) fn new_status_output(
     new_status_output_with_rate_limits(
         config,
         account_display,
+        /*account_lease_display*/ None,
+        token_info,
+        total_usage,
+        session_id,
+        thread_name,
+        forked_from,
+        snapshots,
+        _plan_type,
+        now,
+        model_name,
+        collaboration_mode,
+        reasoning_effort_override,
+        /*refreshing_rate_limits*/ false,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_status_output_with_account_lease(
+    config: &Config,
+    account_display: Option<&StatusAccountDisplay>,
+    account_lease_display: Option<&StatusAccountLeaseDisplay>,
+    token_info: Option<&TokenUsageInfo>,
+    total_usage: &TokenUsage,
+    session_id: &Option<ThreadId>,
+    thread_name: Option<String>,
+    forked_from: Option<ThreadId>,
+    rate_limits: Option<&RateLimitSnapshotDisplay>,
+    _plan_type: Option<PlanType>,
+    now: DateTime<Local>,
+    model_name: &str,
+    collaboration_mode: Option<&str>,
+    reasoning_effort_override: Option<Option<ReasoningEffort>>,
+) -> CompositeHistoryCell {
+    let snapshots = rate_limits.map(std::slice::from_ref).unwrap_or_default();
+    new_status_output_with_rate_limits(
+        config,
+        account_display,
+        account_lease_display,
         token_info,
         total_usage,
         session_id,
@@ -159,6 +201,7 @@ pub(crate) fn new_status_output(
 pub(crate) fn new_status_output_with_rate_limits(
     config: &Config,
     account_display: Option<&StatusAccountDisplay>,
+    account_lease_display: Option<&StatusAccountLeaseDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
@@ -175,6 +218,7 @@ pub(crate) fn new_status_output_with_rate_limits(
     new_status_output_with_rate_limits_handle(
         config,
         account_display,
+        account_lease_display,
         token_info,
         total_usage,
         session_id,
@@ -196,6 +240,7 @@ pub(crate) fn new_status_output_with_rate_limits(
 pub(crate) fn new_status_output_with_rate_limits_handle(
     config: &Config,
     account_display: Option<&StatusAccountDisplay>,
+    account_lease_display: Option<&StatusAccountLeaseDisplay>,
     token_info: Option<&TokenUsageInfo>,
     total_usage: &TokenUsage,
     session_id: &Option<ThreadId>,
@@ -214,6 +259,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     let (card, handle) = StatusHistoryCell::new(
         config,
         account_display,
+        account_lease_display,
         token_info,
         total_usage,
         session_id,
@@ -240,6 +286,7 @@ impl StatusHistoryCell {
     fn new(
         config: &Config,
         account_display: Option<&StatusAccountDisplay>,
+        account_lease_display: Option<&StatusAccountLeaseDisplay>,
         token_info: Option<&TokenUsageInfo>,
         total_usage: &TokenUsage,
         session_id: &Option<ThreadId>,
@@ -317,6 +364,7 @@ impl StatusHistoryCell {
         };
         let model_provider = format_model_provider(config);
         let account = compose_account_display(account_display);
+        let account_lease = compose_account_lease_display(account_lease_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
         let default_usage = TokenUsage::default();
@@ -356,6 +404,7 @@ impl StatusHistoryCell {
                 collaboration_mode: collaboration_mode.map(ToString::to_string),
                 model_provider,
                 account,
+                account_lease,
                 thread_name,
                 session_id,
                 forked_from,
@@ -563,6 +612,15 @@ impl HistoryCell for StatusHistoryCell {
                 "API key configured (run codex login to use ChatGPT)".to_string()
             }
         });
+        let account_lease_value =
+            self.account_lease
+                .as_ref()
+                .map(|lease| match (&lease.pool_id, &lease.account_id) {
+                    (Some(pool_id), Some(account_id)) => format!("{pool_id} / {account_id}"),
+                    (Some(pool_id), None) => pool_id.clone(),
+                    (None, Some(account_id)) => account_id.clone(),
+                    (None, None) => "managed account pool".to_string(),
+                });
 
         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
             .into_iter()
@@ -587,6 +645,34 @@ impl HistoryCell for StatusHistoryCell {
         }
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
+        }
+        if account_lease_value.is_some() {
+            push_label(&mut labels, &mut seen, "Pooled lease");
+            push_label(&mut labels, &mut seen, "Lease status");
+        }
+        if self
+            .account_lease
+            .as_ref()
+            .and_then(|lease| lease.note.as_ref())
+            .is_some()
+        {
+            push_label(&mut labels, &mut seen, "Lease note");
+        }
+        if self
+            .account_lease
+            .as_ref()
+            .and_then(|lease| lease.next_eligible_at.as_ref())
+            .is_some()
+        {
+            push_label(&mut labels, &mut seen, "Next eligible");
+        }
+        if self
+            .account_lease
+            .as_ref()
+            .and_then(|lease| lease.remote_reset.as_ref())
+            .is_some()
+        {
+            push_label(&mut labels, &mut seen, "Remote reset");
         }
         if thread_name.is_some() {
             push_label(&mut labels, &mut seen, "Thread name");
@@ -646,6 +732,26 @@ impl HistoryCell for StatusHistoryCell {
 
         if let Some(account_value) = account_value {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
+        }
+        if let Some(account_lease_value) = account_lease_value {
+            lines.push(formatter.line("Pooled lease", vec![Span::from(account_lease_value)]));
+        }
+        if let Some(account_lease) = self.account_lease.as_ref() {
+            lines.push(formatter.line(
+                "Lease status",
+                vec![Span::from(account_lease.status.clone())],
+            ));
+            if let Some(note) = account_lease.note.as_ref() {
+                lines.push(formatter.line("Lease note", vec![Span::from(note.clone())]));
+            }
+            if let Some(next_eligible_at) = account_lease.next_eligible_at.as_ref() {
+                lines.push(
+                    formatter.line("Next eligible", vec![Span::from(next_eligible_at.clone())]),
+                );
+            }
+            if let Some(remote_reset) = account_lease.remote_reset.as_ref() {
+                lines.push(formatter.line("Remote reset", vec![Span::from(remote_reset.clone())]));
+            }
         }
 
         if let Some(thread_name) = thread_name {

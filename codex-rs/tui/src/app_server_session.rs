@@ -1,11 +1,16 @@
 use crate::bottom_pane::FeedbackAudience;
 use crate::status::StatusAccountDisplay;
+use crate::status::StatusAccountLeaseDisplay;
+use crate::status::format_reset_timestamp;
 use crate::status::plan_type_display_name;
+use chrono::Local;
+use chrono::TimeZone;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -93,6 +98,8 @@ use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 
 /// Data collected during the TUI bootstrap phase that the main event loop
 /// needs to configure the UI, telemetry, and initial rate-limit prefetch.
@@ -104,6 +111,7 @@ pub(crate) struct AppServerBootstrap {
     pub(crate) account_email: Option<String>,
     pub(crate) auth_mode: Option<TelemetryAuthMode>,
     pub(crate) status_account_display: Option<StatusAccountDisplay>,
+    pub(crate) account_lease_display: Option<StatusAccountLeaseDisplay>,
     pub(crate) workspace_role: Option<codex_app_server_protocol::WorkspaceRole>,
     pub(crate) is_workspace_owner: Option<bool>,
     pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
@@ -119,7 +127,7 @@ pub(crate) struct AppServerBootstrap {
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
-    next_request_id: i64,
+    next_request_id: AtomicI64,
     remote_cwd_override: Option<PathBuf>,
 }
 
@@ -166,7 +174,7 @@ impl AppServerSession {
     pub(crate) fn new(client: AppServerClient) -> Self {
         Self {
             client,
-            next_request_id: 1,
+            next_request_id: AtomicI64::new(1),
             remote_cwd_override: None,
         }
     }
@@ -186,6 +194,13 @@ impl AppServerSession {
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let account = self.read_account().await?;
+        let account_lease_display = match self.read_account_lease_display().await {
+            Ok(display) => display,
+            Err(err) => {
+                tracing::debug!(error = %err, "accountLease/read unavailable during TUI bootstrap");
+                None
+            }
+        };
         let model_request_id = self.next_request_id();
         let models: ModelListResponse = self
             .client
@@ -271,6 +286,7 @@ impl AppServerSession {
             account_email,
             auth_mode,
             status_account_display,
+            account_lease_display,
             workspace_role,
             is_workspace_owner,
             plan_type,
@@ -297,6 +313,24 @@ impl AppServerSession {
             })
             .await
             .wrap_err("account/read failed during TUI bootstrap")
+    }
+
+    pub(crate) async fn read_account_lease_display(
+        &self,
+    ) -> Result<Option<StatusAccountLeaseDisplay>> {
+        let request_id = self.next_request_id();
+        let response: AccountLeaseReadResponse = self
+            .client
+            .request_typed(ClientRequest::AccountLeaseRead {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("accountLease/read failed during TUI bootstrap")?;
+        Ok(status_account_lease_display_from_response(
+            response,
+            Local::now(),
+        ))
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {
@@ -781,10 +815,108 @@ impl AppServerSession {
         self.client.request_handle()
     }
 
-    fn next_request_id(&mut self) -> RequestId {
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
+    fn next_request_id(&self) -> RequestId {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         RequestId::Integer(request_id)
+    }
+}
+
+fn status_account_lease_display_from_response(
+    response: AccountLeaseReadResponse,
+    captured_at: chrono::DateTime<Local>,
+) -> Option<StatusAccountLeaseDisplay> {
+    let has_visible_state = response.active
+        || response.suppressed
+        || response.pool_id.is_some()
+        || response.account_id.is_some()
+        || response.health_state.is_some()
+        || response.switch_reason.is_some()
+        || response.suppression_reason.is_some()
+        || response.transport_reset_generation.is_some()
+        || response.last_remote_context_reset_turn_id.is_some()
+        || response.next_eligible_at.is_some();
+    if !has_visible_state {
+        return None;
+    }
+
+    let next_eligible_at = response
+        .next_eligible_at
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .map(|dt| format_reset_timestamp(dt, captured_at));
+    let health = response
+        .health_state
+        .as_deref()
+        .and_then(account_lease_health_text);
+    let status_primary = if response.active {
+        "Active"
+    } else if response.suppressed {
+        "Suppressed"
+    } else if next_eligible_at.is_some() {
+        "Cooling down"
+    } else {
+        "Waiting"
+    };
+    let status = match health {
+        Some(health) if !response.suppressed => format!("{status_primary} · {health}"),
+        Some(_) | None => status_primary.to_string(),
+    };
+
+    Some(StatusAccountLeaseDisplay {
+        pool_id: response.pool_id,
+        account_id: response.account_id,
+        status,
+        note: response
+            .suppression_reason
+            .as_deref()
+            .map(account_lease_reason_text)
+            .or_else(|| {
+                response
+                    .switch_reason
+                    .as_deref()
+                    .map(account_lease_reason_text)
+            }),
+        next_eligible_at,
+        remote_reset: account_lease_remote_reset_text(
+            response.transport_reset_generation,
+            response.last_remote_context_reset_turn_id.as_deref(),
+        ),
+    })
+}
+
+fn account_lease_health_text(health_state: &str) -> Option<&'static str> {
+    match health_state {
+        "healthy" => Some("Healthy"),
+        "unhealthy" => Some("Unhealthy"),
+        "busy" => Some("Busy"),
+        "unavailable" => Some("Unavailable"),
+        _ => None,
+    }
+}
+
+fn account_lease_reason_text(reason: &str) -> String {
+    match reason {
+        "automaticAccountSelected" => "Automatic selection in use".to_string(),
+        "preferredAccountSelected" => "Preferred account selected".to_string(),
+        "missingPool" => "Configured pool is missing".to_string(),
+        "preferredAccountMissing" => "Preferred account is missing".to_string(),
+        "preferredAccountInOtherPool" => "Preferred account belongs to another pool".to_string(),
+        "preferredAccountUnhealthy" => "Preferred account is unhealthy".to_string(),
+        "preferredAccountBusy" => "Preferred account is busy".to_string(),
+        "noEligibleAccount" => "No eligible account is available".to_string(),
+        "durablySuppressed" => "Pooled startup is suppressed until resumed".to_string(),
+        _ => reason.to_string(),
+    }
+}
+
+fn account_lease_remote_reset_text(
+    generation: Option<u64>,
+    turn_id: Option<&str>,
+) -> Option<String> {
+    match (generation, turn_id) {
+        (Some(generation), Some(turn_id)) => Some(format!("gen {generation} after turn {turn_id}")),
+        (Some(generation), None) => Some(format!("gen {generation}")),
+        (None, Some(turn_id)) => Some(format!("after turn {turn_id}")),
+        (None, None) => None,
     }
 }
 
@@ -1198,6 +1330,7 @@ fn app_server_spend_control_snapshot_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1447,5 +1580,73 @@ mod tests {
                 plan: Some(ref plan),
             }) if plan == "Business"
         ));
+    }
+
+    #[test]
+    fn status_account_lease_display_from_response_hides_empty_state() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: None,
+                pool_id: None,
+                lease_id: None,
+                lease_epoch: None,
+                health_state: None,
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                next_eligible_at: None,
+            },
+            captured_at,
+        );
+
+        assert_eq!(display, None);
+    }
+
+    #[test]
+    fn status_account_lease_display_from_response_formats_pool_details() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: Some("acct-2".to_string()),
+                pool_id: Some("legacy-default".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                health_state: Some("busy".to_string()),
+                switch_reason: Some("automaticAccountSelected".to_string()),
+                suppression_reason: None,
+                transport_reset_generation: Some(2),
+                last_remote_context_reset_turn_id: Some("turn-17".to_string()),
+                next_eligible_at: Some(
+                    (captured_at + chrono::Duration::days(1))
+                        .with_timezone(&chrono::Utc)
+                        .timestamp(),
+                ),
+            },
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("legacy-default".to_string()),
+                account_id: Some("acct-2".to_string()),
+                status: "Cooling down · Busy".to_string(),
+                note: Some("Automatic selection in use".to_string()),
+                next_eligible_at: Some("03:04 on 11 Apr".to_string()),
+                remote_reset: Some("gen 2 after turn turn-17".to_string()),
+            })
+        );
     }
 }

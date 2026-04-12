@@ -153,7 +153,7 @@ impl App {
 
     async fn handle_server_notification_event(
         &mut self,
-        _app_server_client: &AppServerSession,
+        app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
         match &notification {
@@ -184,6 +184,18 @@ impl App {
                         Some(AuthMode::Chatgpt) | Some(AuthMode::ChatgptAuthTokens)
                     ),
                 );
+                return;
+            }
+            ServerNotification::AccountLeaseUpdated(_) => {
+                match app_server_client.read_account_lease_display().await {
+                    Ok(display) => self.chat_widget.update_account_lease_state(display),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to refresh pooled account status after notification"
+                        );
+                    }
+                }
                 return;
             }
             _ => {}
@@ -409,6 +421,7 @@ fn server_notification_thread_target(
         | ServerNotification::McpServerStatusUpdated(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
+        | ServerNotification::AccountLeaseUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
         | ServerNotification::AppListUpdated(_)
         | ServerNotification::DeprecationNotice(_)

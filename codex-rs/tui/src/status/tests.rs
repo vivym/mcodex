@@ -1,8 +1,10 @@
 use super::new_status_output;
+use super::new_status_output_with_account_lease;
 use super::new_status_output_with_rate_limits;
 use super::rate_limit_snapshot_display;
 use crate::history_cell::HistoryCell;
 use crate::status::StatusAccountDisplay;
+use crate::status::StatusAccountLeaseDisplay;
 use crate::test_support::PathBufExt;
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
@@ -35,6 +37,28 @@ async fn test_config(temp_home: &TempDir) -> Config {
 
 fn test_status_account_display() -> Option<StatusAccountDisplay> {
     None
+}
+
+fn test_active_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
+    Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: Some("03:14".to_string()),
+        remote_reset: None,
+    })
+}
+
+fn test_switched_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
+    Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-2".to_string()),
+        status: "Cooling down · Busy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        remote_reset: Some("gen 2 after turn turn-17".to_string()),
+    })
 }
 
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
@@ -159,6 +183,88 @@ async fn status_snapshot_includes_reasoning_details() {
         &model_slug,
         /*collaboration_mode*/ None,
         reasoning_effort_override,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_shows_active_pool_and_next_eligible_time() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output_with_account_lease(
+        &config,
+        test_status_account_display().as_ref(),
+        test_active_account_lease_display().as_ref(),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_shows_auto_switch_and_remote_reset_messages() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output_with_account_lease(
+        &config,
+        test_status_account_display().as_ref(),
+        test_switched_account_lease_display().as_ref(),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
     );
     let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
     if cfg!(windows) {
@@ -750,6 +856,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
     let composite = new_status_output_with_rate_limits(
         &config,
         /*account_display*/ None,
+        /*account_lease_display*/ None,
         Some(&token_info),
         &usage,
         &None,
@@ -998,6 +1105,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
     let composite = new_status_output_with_rate_limits(
         &config,
         /*account_display*/ None,
+        /*account_lease_display*/ None,
         Some(&token_info),
         &usage,
         &None,

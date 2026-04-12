@@ -1,4 +1,5 @@
 use super::*;
+use crate::status::StatusAccountLeaseDisplay;
 use assert_matches::assert_matches;
 
 #[tokio::test]
@@ -59,6 +60,40 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
     assert!(
         refreshed.contains("8% left"),
         "expected a future /status output to use refreshed cached limits, got: {refreshed}"
+    );
+}
+
+#[tokio::test]
+async fn status_command_renders_pooled_lease_details() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_lease_display = Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-2".to_string()),
+        status: "Cooling down · Busy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        remote_reset: Some("gen 2 after turn turn-17".to_string()),
+    });
+
+    chat.dispatch_command(SlashCommand::Status);
+
+    let rendered = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 80))
+        }
+        other => panic!("expected status output, got {other:?}"),
+    };
+    assert!(
+        rendered.contains("Pooled lease:"),
+        "expected pooled lease line, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("legacy-default / acct-2"),
+        "expected pool/account assignment, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Remote reset:"),
+        "expected remote reset line, got: {rendered}"
     );
 }
 
