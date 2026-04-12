@@ -16,6 +16,7 @@ use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
 use anyhow::Context;
+use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
@@ -91,6 +92,54 @@ impl SessionServices {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLeaseRuntimeSnapshot {
+    pub active: bool,
+    pub suppressed: bool,
+    pub account_id: Option<String>,
+    pub pool_id: Option<String>,
+    pub lease_id: Option<String>,
+    pub lease_epoch: Option<i64>,
+    pub health_state: Option<AccountHealthState>,
+    pub switch_reason: Option<AccountLeaseRuntimeReason>,
+    pub suppression_reason: Option<AccountLeaseRuntimeReason>,
+    pub transport_reset_generation: Option<u64>,
+    pub last_remote_context_reset_turn_id: Option<String>,
+    pub next_eligible_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountLeaseRuntimeReason {
+    StartupSuppressed,
+    MissingPool,
+    PreferredAccountSelected,
+    AutomaticAccountSelected,
+    PreferredAccountMissing,
+    PreferredAccountInOtherPool,
+    PreferredAccountUnhealthy,
+    PreferredAccountBusy,
+    NoEligibleAccount,
+    NonReplayableTurn,
+}
+
+impl From<&AccountStartupEligibility> for AccountLeaseRuntimeReason {
+    fn from(value: &AccountStartupEligibility) -> Self {
+        match value {
+            AccountStartupEligibility::Suppressed => Self::StartupSuppressed,
+            AccountStartupEligibility::MissingPool => Self::MissingPool,
+            AccountStartupEligibility::PreferredAccountSelected => Self::PreferredAccountSelected,
+            AccountStartupEligibility::AutomaticAccountSelected => Self::AutomaticAccountSelected,
+            AccountStartupEligibility::PreferredAccountMissing => Self::PreferredAccountMissing,
+            AccountStartupEligibility::PreferredAccountInOtherPool { .. } => {
+                Self::PreferredAccountInOtherPool
+            }
+            AccountStartupEligibility::PreferredAccountUnhealthy => Self::PreferredAccountUnhealthy,
+            AccountStartupEligibility::PreferredAccountBusy => Self::PreferredAccountBusy,
+            AccountStartupEligibility::NoEligibleAccount => Self::NoEligibleAccount,
+        }
+    }
+}
+
 pub(crate) struct AccountPoolManager {
     state_db: StateDbHandle,
     default_pool_id: Option<String>,
@@ -103,6 +152,19 @@ pub(crate) struct AccountPoolManager {
     next_health_event_sequence: i64,
     previous_turn_account_id: Option<String>,
     rotate_on_next_turn: bool,
+    switch_reason: Option<AccountLeaseRuntimeReason>,
+    suppression_reason: Option<AccountLeaseRuntimeReason>,
+    transport_reset_generation: u64,
+    last_remote_context_reset_turn_id: Option<String>,
+}
+
+pub(crate) struct AccountPoolManagerSnapshotSeed {
+    state_db: StateDbHandle,
+    active_lease: Option<AccountLeaseRecord>,
+    switch_reason: Option<AccountLeaseRuntimeReason>,
+    suppression_reason: Option<AccountLeaseRuntimeReason>,
+    transport_reset_generation: u64,
+    last_remote_context_reset_turn_id: Option<String>,
 }
 
 impl AccountPoolManager {
@@ -140,16 +202,25 @@ impl AccountPoolManager {
             next_health_event_sequence: 0,
             previous_turn_account_id: None,
             rotate_on_next_turn: false,
+            switch_reason: None,
+            suppression_reason: None,
+            transport_reset_generation: 0,
+            last_remote_context_reset_turn_id: None,
         }
     }
 
     pub(crate) async fn prepare_turn(&mut self) -> anyhow::Result<Option<(String, bool)>> {
+        let rotating_for_health_event = self.rotate_on_next_turn;
+        self.switch_reason = None;
         if self.rotate_on_next_turn {
             self.release_active_lease().await?;
             self.rotate_on_next_turn = false;
         }
 
         self.renew_active_lease().await?;
+        if self.active_lease.is_some() {
+            self.suppression_reason = None;
+        }
 
         if self.active_lease.is_none() {
             let startup_preview = self
@@ -157,47 +228,71 @@ impl AccountPoolManager {
                 .preview_account_startup_selection(self.default_pool_id.as_deref())
                 .await?;
             let Some(pool_id) = startup_preview.effective_pool_id.clone() else {
+                self.suppression_reason = Some(AccountLeaseRuntimeReason::MissingPool);
                 return Ok(None);
             };
-            let lease_result = match (
-                startup_preview.predicted_account_id.as_deref(),
-                &startup_preview.eligibility,
-            ) {
-                (Some(account_id), AccountStartupEligibility::PreferredAccountSelected) => {
-                    self.state_db
-                        .acquire_preferred_account_lease(
-                            &pool_id,
-                            account_id,
-                            &self.holder_instance_id,
-                            self.lease_ttl,
-                        )
-                        .await
-                }
-                (Some(_), AccountStartupEligibility::AutomaticAccountSelected) => {
-                    self.state_db
-                        .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
-                        .await
-                }
-                (
-                    None,
+            let selection_reason = AccountLeaseRuntimeReason::from(&startup_preview.eligibility);
+            if rotating_for_health_event
+                && matches!(
+                    startup_preview.eligibility,
                     AccountStartupEligibility::Suppressed
-                    | AccountStartupEligibility::MissingPool
-                    | AccountStartupEligibility::PreferredAccountMissing
-                    | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
-                    | AccountStartupEligibility::PreferredAccountUnhealthy
-                    | AccountStartupEligibility::PreferredAccountBusy
-                    | AccountStartupEligibility::NoEligibleAccount,
-                ) => return Ok(None),
-                (Some(account_id), eligibility) => {
-                    return Err(anyhow::anyhow!(
-                        "unexpected startup-selection preview {eligibility:?} for predicted account {account_id}"
-                    ));
-                }
-                (None, AccountStartupEligibility::PreferredAccountSelected)
-                | (None, AccountStartupEligibility::AutomaticAccountSelected) => {
-                    return Err(anyhow::anyhow!(
-                        "startup-selection preview did not include a predicted account"
-                    ));
+                )
+            {
+                self.suppression_reason = Some(selection_reason);
+                return Ok(None);
+            }
+            let lease_result = if rotating_for_health_event {
+                self.state_db
+                    .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
+                    .await
+            } else {
+                match (
+                    startup_preview.predicted_account_id.as_deref(),
+                    &startup_preview.eligibility,
+                ) {
+                    (Some(account_id), AccountStartupEligibility::PreferredAccountSelected) => {
+                        self.state_db
+                            .acquire_preferred_account_lease(
+                                &pool_id,
+                                account_id,
+                                &self.holder_instance_id,
+                                self.lease_ttl,
+                            )
+                            .await
+                    }
+                    (Some(_), AccountStartupEligibility::AutomaticAccountSelected) => {
+                        self.state_db
+                            .acquire_account_lease(
+                                &pool_id,
+                                &self.holder_instance_id,
+                                self.lease_ttl,
+                            )
+                            .await
+                    }
+                    (
+                        None,
+                        AccountStartupEligibility::Suppressed
+                        | AccountStartupEligibility::MissingPool
+                        | AccountStartupEligibility::PreferredAccountMissing
+                        | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                        | AccountStartupEligibility::PreferredAccountUnhealthy
+                        | AccountStartupEligibility::PreferredAccountBusy
+                        | AccountStartupEligibility::NoEligibleAccount,
+                    ) => {
+                        self.suppression_reason = Some(selection_reason);
+                        return Ok(None);
+                    }
+                    (Some(account_id), eligibility) => {
+                        return Err(anyhow::anyhow!(
+                            "unexpected startup-selection preview {eligibility:?} for predicted account {account_id}"
+                        ));
+                    }
+                    (None, AccountStartupEligibility::PreferredAccountSelected)
+                    | (None, AccountStartupEligibility::AutomaticAccountSelected) => {
+                        return Err(anyhow::anyhow!(
+                            "startup-selection preview did not include a predicted account"
+                        ));
+                    }
                 }
             };
             match lease_result {
@@ -207,9 +302,21 @@ impl AccountPoolManager {
                         .read_account_health_event_sequence(&lease.account_id)
                         .await?
                         .unwrap_or(0);
+                    self.suppression_reason = None;
+                    if self
+                        .previous_turn_account_id
+                        .as_deref()
+                        .is_some_and(|previous| previous != lease.account_id)
+                    {
+                        self.switch_reason =
+                            Some(AccountLeaseRuntimeReason::AutomaticAccountSelected);
+                    }
                     self.active_lease = Some(lease);
                 }
-                Err(AccountLeaseError::NoEligibleAccount) => return Ok(None),
+                Err(AccountLeaseError::NoEligibleAccount) => {
+                    self.suppression_reason = Some(AccountLeaseRuntimeReason::NoEligibleAccount);
+                    return Ok(None);
+                }
                 Err(AccountLeaseError::Storage(message)) => return Err(anyhow::anyhow!(message)),
             }
         }
@@ -231,6 +338,22 @@ impl AccountPoolManager {
             && !allow_context_reuse;
         self.previous_turn_account_id = Some(account_id.clone());
         Ok(Some((account_id, reset_remote_context)))
+    }
+
+    pub(crate) fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
+        AccountPoolManagerSnapshotSeed {
+            state_db: Arc::clone(&self.state_db),
+            active_lease: self.active_lease.clone(),
+            switch_reason: self.switch_reason,
+            suppression_reason: self.suppression_reason,
+            transport_reset_generation: self.transport_reset_generation,
+            last_remote_context_reset_turn_id: self.last_remote_context_reset_turn_id.clone(),
+        }
+    }
+
+    pub(crate) fn record_remote_context_reset(&mut self, turn_id: &str) {
+        self.transport_reset_generation += 1;
+        self.last_remote_context_reset_turn_id = Some(turn_id.to_string());
     }
 
     pub(crate) fn heartbeat_interval(&self) -> StdDuration {
@@ -315,6 +438,48 @@ impl AccountPoolManager {
             })
             .await?;
         self.rotate_on_next_turn = true;
+        self.switch_reason = Some(AccountLeaseRuntimeReason::NonReplayableTurn);
+        self.suppression_reason = None;
         Ok(())
+    }
+}
+
+impl AccountPoolManagerSnapshotSeed {
+    pub(crate) async fn snapshot(self) -> AccountLeaseRuntimeSnapshot {
+        let mut health_state = None;
+        let mut next_eligible_at = None;
+        if let Some(active_lease) = self.active_lease.as_ref()
+            && let Ok(diagnostic) = self
+                .state_db
+                .read_account_pool_diagnostic(&active_lease.pool_id, Some(&active_lease.account_id))
+                .await
+        {
+            next_eligible_at = diagnostic.next_eligible_at;
+            if let Some(account_diagnostic) = diagnostic
+                .accounts
+                .into_iter()
+                .find(|account| account.account_id == active_lease.account_id)
+            {
+                health_state = account_diagnostic.health_state;
+                next_eligible_at = account_diagnostic.next_eligible_at.or(next_eligible_at);
+            }
+        }
+        let active_lease = self.active_lease.as_ref();
+        AccountLeaseRuntimeSnapshot {
+            active: active_lease.is_some(),
+            suppressed: active_lease.is_none()
+                && self.suppression_reason == Some(AccountLeaseRuntimeReason::StartupSuppressed),
+            account_id: active_lease.map(|lease| lease.account_id.clone()),
+            pool_id: active_lease.map(|lease| lease.pool_id.clone()),
+            lease_id: active_lease.map(|lease| lease.lease_id.clone()),
+            lease_epoch: active_lease.map(|lease| lease.lease_epoch),
+            health_state,
+            switch_reason: self.switch_reason,
+            suppression_reason: self.suppression_reason,
+            transport_reset_generation: (self.transport_reset_generation != 0)
+                .then_some(self.transport_reset_generation),
+            last_remote_context_reset_turn_id: self.last_remote_context_reset_turn_id.clone(),
+            next_eligible_at,
+        }
     }
 }

@@ -10,6 +10,8 @@ pub use account_pool::AccountHealthEvent;
 pub use account_pool::AccountHealthState;
 pub use account_pool::AccountLeaseError;
 pub use account_pool::AccountLeaseRecord;
+pub use account_pool::AccountPoolAccountDiagnostic;
+pub use account_pool::AccountPoolDiagnostic;
 pub use account_pool::AccountPoolHealthState;
 pub use account_pool::AccountPoolMembership;
 pub use account_pool::AccountStartupEligibility;

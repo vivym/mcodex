@@ -1,7 +1,10 @@
 use super::*;
 use crate::model::AccountHealthEvent;
+use crate::model::AccountHealthState;
 use crate::model::AccountLeaseError;
 use crate::model::AccountLeaseRecord;
+use crate::model::AccountPoolAccountDiagnostic;
+use crate::model::AccountPoolDiagnostic;
 use crate::model::AccountPoolMembership;
 use crate::model::AccountStartupEligibility;
 use crate::model::AccountStartupSelectionPreview;
@@ -106,7 +109,7 @@ impl StateRuntime {
             .await
             .map_err(account_lease_storage_error)?;
 
-        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id)
+        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id, now)
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
         {
@@ -132,7 +135,7 @@ impl StateRuntime {
             Ok(result) => result,
             Err(err) if account_lease_is_contention_error(&err) => {
                 let existing_lease =
-                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id)
+                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now())
                         .await
                         .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
                 return match existing_lease {
@@ -176,7 +179,7 @@ impl StateRuntime {
             .await
             .map_err(account_lease_storage_error)?;
 
-        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id)
+        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id, now)
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
         {
@@ -202,7 +205,7 @@ impl StateRuntime {
             Ok(result) => result,
             Err(err) if account_lease_is_contention_error(&err) => {
                 let existing_lease =
-                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id)
+                    load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now())
                         .await
                         .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
                 return match existing_lease {
@@ -290,6 +293,147 @@ WHERE lease_id = ?
         .await?;
 
         Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn read_active_holder_lease(
+        &self,
+        holder_instance_id: &str,
+    ) -> anyhow::Result<Option<AccountLeaseRecord>> {
+        load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now()).await
+    }
+
+    pub async fn read_account_pool_diagnostic(
+        &self,
+        pool_id: &str,
+        preferred_account_id: Option<&str>,
+    ) -> anyhow::Result<AccountPoolDiagnostic> {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+SELECT
+    account_registry.account_id,
+    account_registry.pool_id,
+    account_registry.healthy,
+    account_runtime_state.health_state,
+    active_lease.lease_id,
+    active_lease.holder_instance_id,
+    active_lease.lease_epoch,
+    active_lease.acquired_at,
+    active_lease.renewed_at,
+    active_lease.expires_at,
+    active_lease.released_at
+FROM account_registry
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = account_registry.account_id
+LEFT JOIN account_leases AS active_lease
+  ON active_lease.account_id = account_registry.account_id
+ AND active_lease.pool_id = account_registry.pool_id
+ AND active_lease.released_at IS NULL
+ AND active_lease.expires_at > ?
+WHERE account_registry.pool_id = ?
+ORDER BY
+    CASE
+        WHEN ? IS NOT NULL AND account_registry.account_id = ? THEN 0
+        ELSE 1
+    END,
+    account_registry.position ASC,
+    account_registry.account_id ASC
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(now))
+        .bind(pool_id)
+        .bind(preferred_account_id)
+        .bind(preferred_account_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        let mut accounts = Vec::with_capacity(rows.len());
+        let mut any_eligible_now = false;
+        let mut next_eligible_at = None;
+        let mut preferred_account_found = false;
+        let mut preferred_account_eligible_now = false;
+        let mut preferred_account_next_eligible_at = None;
+        for row in rows {
+            let account_id: String = row.try_get("account_id")?;
+            let account_pool_id: String = row.try_get("pool_id")?;
+            let healthy = row.try_get::<i64, _>("healthy")? != 0;
+            let health_state = row
+                .try_get::<Option<String>, _>("health_state")?
+                .as_deref()
+                .map(AccountHealthState::try_from)
+                .transpose()?;
+            let active_lease = match row.try_get::<Option<String>, _>("lease_id")? {
+                Some(lease_id) => Some(AccountLeaseRecord {
+                    lease_id,
+                    pool_id: account_pool_id.clone(),
+                    account_id: account_id.clone(),
+                    holder_instance_id: row.try_get("holder_instance_id")?,
+                    lease_epoch: row.try_get("lease_epoch")?,
+                    acquired_at: account_epoch_seconds_to_datetime(row.try_get("acquired_at")?)?,
+                    renewed_at: account_epoch_seconds_to_datetime(row.try_get("renewed_at")?)?,
+                    expires_at: account_epoch_seconds_to_datetime(row.try_get("expires_at")?)?,
+                    released_at: row
+                        .try_get::<Option<i64>, _>("released_at")?
+                        .map(account_epoch_seconds_to_datetime)
+                        .transpose()?,
+                }),
+                None => None,
+            };
+            let account_next_eligible_at = active_lease.as_ref().map(|lease| lease.expires_at);
+            let is_preferred =
+                preferred_account_id.is_some_and(|preferred| preferred == account_id);
+            let eligibility = if active_lease.is_some() {
+                AccountStartupEligibility::PreferredAccountBusy
+            } else if !healthy {
+                AccountStartupEligibility::PreferredAccountUnhealthy
+            } else if is_preferred {
+                any_eligible_now = true;
+                AccountStartupEligibility::PreferredAccountSelected
+            } else {
+                any_eligible_now = true;
+                AccountStartupEligibility::AutomaticAccountSelected
+            };
+            if is_preferred {
+                preferred_account_found = true;
+                preferred_account_eligible_now = matches!(
+                    eligibility,
+                    AccountStartupEligibility::PreferredAccountSelected
+                );
+                preferred_account_next_eligible_at = account_next_eligible_at;
+            }
+            if preferred_account_id.is_none() && !any_eligible_now {
+                next_eligible_at = match (next_eligible_at, account_next_eligible_at) {
+                    (None, next) => next,
+                    (Some(current), Some(next)) => Some(current.min(next)),
+                    (current, None) => current,
+                };
+            }
+            accounts.push(AccountPoolAccountDiagnostic {
+                account_id,
+                pool_id: account_pool_id,
+                healthy,
+                active_lease,
+                health_state,
+                eligibility,
+                next_eligible_at: account_next_eligible_at,
+            });
+        }
+
+        Ok(AccountPoolDiagnostic {
+            pool_id: pool_id.to_string(),
+            accounts,
+            next_eligible_at: if preferred_account_found {
+                if preferred_account_eligible_now {
+                    None
+                } else {
+                    preferred_account_next_eligible_at
+                }
+            } else if any_eligible_now {
+                None
+            } else {
+                next_eligible_at
+            },
+        })
     }
 
     pub async fn read_account_health_event_sequence(
@@ -934,6 +1078,7 @@ WHERE lease_id = ?
 async fn load_active_holder_lease<'e, E>(
     executor: E,
     holder_instance_id: &str,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<Option<AccountLeaseRecord>>
 where
     E: Executor<'e, Database = Sqlite>,
@@ -953,11 +1098,13 @@ SELECT
 FROM account_leases
 WHERE holder_instance_id = ?
   AND released_at IS NULL
+  AND expires_at > ?
 ORDER BY acquired_at DESC, lease_id DESC
 LIMIT 1
         "#,
     )
     .bind(holder_instance_id)
+    .bind(account_datetime_to_epoch_seconds(now))
     .fetch_optional(executor)
     .await?;
 
@@ -1102,6 +1249,113 @@ WHERE holder_instance_id = ?
 
         assert_eq!(second, first);
         assert_eq!(active_lease_count, 1);
+    }
+
+    #[tokio::test]
+    async fn read_active_holder_lease_returns_current_unexpired_lease() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        let lease = runtime
+            .acquire_account_lease("team-main", "holder-1", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        let read_back = runtime.read_active_holder_lease("holder-1").await.unwrap();
+
+        assert_eq!(read_back, Some(lease));
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostics_reports_per_account_eligibility_and_next_eligible_time() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "team-main", 1, true).await;
+        let lease = runtime
+            .acquire_account_lease("team-main", "holder-1", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-2".to_string(),
+                pool_id: "team-main".to_string(),
+                health_state: AccountHealthState::RateLimited,
+                sequence_number: 1,
+                observed_at: test_timestamp(1),
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", None)
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostic.pool_id, "team-main");
+        assert_eq!(diagnostic.next_eligible_at, Some(lease.expires_at));
+        assert_eq!(diagnostic.accounts.len(), 2);
+        assert_eq!(diagnostic.accounts[0].account_id, "acct-1");
+        assert_eq!(diagnostic.accounts[0].pool_id, "team-main");
+        assert_eq!(diagnostic.accounts[0].healthy, true);
+        assert_eq!(diagnostic.accounts[0].active_lease, Some(lease.clone()));
+        assert_eq!(diagnostic.accounts[0].health_state, None);
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::PreferredAccountBusy
+        );
+        assert_eq!(
+            diagnostic.accounts[0].next_eligible_at,
+            Some(lease.expires_at)
+        );
+        assert_eq!(diagnostic.accounts[1].account_id, "acct-2");
+        assert_eq!(diagnostic.accounts[1].pool_id, "team-main");
+        assert_eq!(diagnostic.accounts[1].healthy, false);
+        assert_eq!(diagnostic.accounts[1].active_lease, None);
+        assert_eq!(
+            diagnostic.accounts[1].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
+        assert_eq!(
+            diagnostic.accounts[1].eligibility,
+            crate::AccountStartupEligibility::PreferredAccountUnhealthy
+        );
+        assert_eq!(diagnostic.accounts[1].next_eligible_at, None);
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostics_keeps_preferred_busy_account_blocked() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "team-main", 1, true).await;
+        let lease = runtime
+            .acquire_preferred_account_lease(
+                "team-main",
+                "acct-1",
+                "holder-1",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", Some("acct-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostic.pool_id, "team-main");
+        assert_eq!(diagnostic.next_eligible_at, Some(lease.expires_at));
+        assert_eq!(diagnostic.accounts.len(), 2);
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::PreferredAccountBusy
+        );
+        assert_eq!(
+            diagnostic.accounts[0].next_eligible_at,
+            Some(lease.expires_at)
+        );
+        assert_eq!(
+            diagnostic.accounts[1].eligibility,
+            crate::AccountStartupEligibility::AutomaticAccountSelected
+        );
     }
 
     #[tokio::test]

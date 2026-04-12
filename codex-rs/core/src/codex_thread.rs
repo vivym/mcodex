@@ -1,3 +1,4 @@
+use crate::AccountLeaseRuntimeSnapshot;
 use crate::agent::AgentStatus;
 use crate::codex::Codex;
 use crate::codex::SteerInputError;
@@ -198,6 +199,10 @@ impl CodexThread {
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
         self.codex.state_db()
+    }
+
+    pub async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
+        self.codex.account_lease_snapshot().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
+use codex_core::AccountLeaseRuntimeReason;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -8,6 +9,8 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_state::AccountHealthEvent;
+use codex_state::AccountHealthState;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use core_test_support::responses::ResponseMock;
@@ -42,6 +45,181 @@ use wiremock::matchers::path_regex;
 const PRIMARY_ACCOUNT_ID: &str = "account_id";
 const SECONDARY_ACCOUNT_ID: &str = "account_id_b";
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_snapshot_reports_active_lease_and_next_eligible_time() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "snapshot active lease"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .record_account_health_event(AccountHealthEvent {
+            account_id: PRIMARY_ACCOUNT_ID.to_string(),
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            health_state: AccountHealthState::Healthy,
+            sequence_number: 1,
+            observed_at: chrono::Utc::now(),
+        })
+        .await?;
+
+    let turn_error = submit_turn_and_wait(&test, "snapshot turn").await?;
+    assert!(turn_error.is_none());
+
+    let snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(snapshot.active, true);
+    assert_eq!(snapshot.suppressed, false);
+    assert_eq!(snapshot.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(snapshot.pool_id.as_deref(), Some(LEGACY_DEFAULT_POOL_ID));
+    assert!(snapshot.lease_id.is_some());
+    assert_eq!(snapshot.lease_epoch, Some(1));
+    assert_eq!(snapshot.health_state, Some(AccountHealthState::Healthy));
+    assert_eq!(snapshot.transport_reset_generation, None);
+    assert!(snapshot.next_eligible_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_snapshot_records_remote_reset_generation_when_account_changes() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("x-codex-primary-used-percent", "100.0")
+                .insert_header("x-codex-primary-window-minutes", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached"
+                    }
+                })),
+            sse_with_primary_usage_percent("resp-2", 10.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "rotate snapshot").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "turn 1 should fail with usage-limit"
+    );
+
+    let second_turn_error = submit_turn_and_wait(&test, "post-rotate snapshot").await?;
+    assert!(second_turn_error.is_none());
+
+    let snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(snapshot.account_id.as_deref(), Some(SECONDARY_ACCOUNT_ID));
+    assert_eq!(snapshot.transport_reset_generation, Some(1));
+    assert!(snapshot.last_remote_context_reset_turn_id.is_some());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_snapshot_clears_pending_non_replayable_turn_reason_after_rotation()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .insert_header("x-codex-primary-used-percent", "100.0")
+                .insert_header("x-codex-primary-window-minutes", "15")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached"
+                    }
+                })),
+            sse_with_primary_usage_percent("resp-2", 10.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "rotate snapshot").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "turn 1 should fail with usage-limit"
+    );
+
+    let first_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(first_snapshot.active, true);
+    assert_eq!(
+        first_snapshot.account_id.as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+    assert_eq!(
+        first_snapshot.switch_reason,
+        Some(AccountLeaseRuntimeReason::NonReplayableTurn)
+    );
+    assert_eq!(first_snapshot.suppression_reason, None);
+
+    let second_turn_error = submit_turn_and_wait(&test, "post-rotate snapshot").await?;
+    assert!(second_turn_error.is_none());
+
+    let second_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(second_snapshot.active, true);
+    assert_eq!(
+        second_snapshot.account_id.as_deref(),
+        Some(SECONDARY_ACCOUNT_ID)
+    );
+    assert_ne!(
+        second_snapshot.switch_reason,
+        Some(AccountLeaseRuntimeReason::NonReplayableTurn)
+    );
+    assert_eq!(second_snapshot.suppression_reason, None);
+
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion() -> Result<()> {

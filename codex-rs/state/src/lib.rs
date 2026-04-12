@@ -28,6 +28,8 @@ pub use model::AccountHealthEvent;
 pub use model::AccountHealthState;
 pub use model::AccountLeaseError;
 pub use model::AccountLeaseRecord;
+pub use model::AccountPoolAccountDiagnostic;
+pub use model::AccountPoolDiagnostic;
 pub use model::AccountPoolHealthState;
 pub use model::AccountPoolMembership;
 pub use model::AccountStartupEligibility;

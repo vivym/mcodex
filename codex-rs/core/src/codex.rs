@@ -37,6 +37,7 @@ use crate::render_skills_section;
 use crate::rollout::find_thread_name_by_id;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::skills_load_input_from_config;
+use crate::state::AccountLeaseRuntimeSnapshot;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
@@ -791,6 +792,15 @@ impl Codex {
 
     pub(crate) fn state_db(&self) -> Option<state_db::StateDbHandle> {
         self.session.state_db()
+    }
+
+    pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
+        let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
+        let snapshot_seed = {
+            let account_pool_manager = account_pool_manager.lock().await;
+            account_pool_manager.snapshot_seed()
+        };
+        Some(snapshot_seed.snapshot().await)
     }
 
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
@@ -6150,6 +6160,10 @@ pub(crate) async fn run_turn(
         .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context);
     if reset_remote_context_for_turn {
         sess.services.model_client.reset_remote_session_identity();
+        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            account_pool_manager.record_remote_context_reset(&turn_context.sub_id);
+        }
     }
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context

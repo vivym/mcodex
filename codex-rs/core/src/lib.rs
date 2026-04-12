@@ -204,6 +204,8 @@ pub use exec_policy::check_execpolicy_for_warnings;
 pub use exec_policy::format_exec_policy_error_with_source;
 pub use exec_policy::load_exec_policy;
 pub use file_watcher::FileWatcherEvent;
+pub use state::AccountLeaseRuntimeReason;
+pub use state::AccountLeaseRuntimeSnapshot;
 pub use turn_metadata::build_turn_metadata_header;
 pub mod compact;
 pub(crate) mod memory_trace;

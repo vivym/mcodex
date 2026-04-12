@@ -53,6 +53,26 @@ pub struct AccountPoolHealthState {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Read-only diagnostics for a local account pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolDiagnostic {
+    pub pool_id: String,
+    pub accounts: Vec<AccountPoolAccountDiagnostic>,
+    pub next_eligible_at: Option<DateTime<Utc>>,
+}
+
+/// Read-only diagnostics for one account in a local account pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolAccountDiagnostic {
+    pub account_id: String,
+    pub pool_id: String,
+    pub healthy: bool,
+    pub active_lease: Option<AccountLeaseRecord>,
+    pub health_state: Option<AccountHealthState>,
+    pub eligibility: AccountStartupEligibility,
+    pub next_eligible_at: Option<DateTime<Utc>>,
+}
+
 /// Monotonic health event recorded against an account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountHealthEvent {
