@@ -262,6 +262,13 @@ fn normalized_account_eligibility(
             };
         }
 
+        if preview.suppressed {
+            return EligibilityView {
+                code: "suppressed",
+                reason: eligibility_reason(&AccountStartupEligibility::Suppressed),
+            };
+        }
+
         return EligibilityView {
             code: "preferredAccountSelected",
             reason: "preferred account is selected for startup".to_string(),
@@ -295,6 +302,13 @@ fn normalized_account_eligibility(
         return EligibilityView {
             code: "unhealthy",
             reason: "account is unhealthy".to_string(),
+        };
+    }
+
+    if preview.suppressed {
+        return EligibilityView {
+            code: "suppressed",
+            reason: eligibility_reason(&AccountStartupEligibility::Suppressed),
         };
     }
 

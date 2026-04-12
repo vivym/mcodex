@@ -257,6 +257,33 @@ async fn accounts_status_reports_suppression_and_eligibility() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_status_json_suppressed_normalizes_healthy_account_eligibility() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["suppressed"], true);
+    assert_eq!(json["switchReason"]["code"], "suppressed");
+    assert_eq!(json["healthState"], "healthy");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["eligibility"]["code"], "suppressed");
+    assert_eq!(accounts[1]["eligibility"]["code"], "suppressed");
+    for account in accounts {
+        let code = account["eligibility"]["code"]
+            .as_str()
+            .expect("eligibility code");
+        assert_ne!(code, "preferredAccountSelected");
+        assert_ne!(code, "automaticAccountSelected");
+        assert_ne!(code, "eligible");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons() -> Result<()> {
     let codex_home = prepared_home().await?;
     write_startup_selection(
