@@ -51,7 +51,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
     print_preview(&diagnostic.preview);
     println!(
         "health state: {}",
-        status_health_state(diagnostic.pool.as_ref()).unwrap_or("unknown")
+        status_health_state(&diagnostic.preview, diagnostic.pool.as_ref()).unwrap_or("unknown")
     );
     println!("configured pools: {}", diagnostic.configured_pool_count);
 
@@ -85,7 +85,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
         "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
         "suppressed": diagnostic.preview.suppressed,
-        "healthState": status_health_state(diagnostic.pool.as_ref()),
+        "healthState": status_health_state(&diagnostic.preview, diagnostic.pool.as_ref()),
         "switchReason": {
             "code": eligibility_code(&diagnostic.preview.eligibility),
             "reason": eligibility_reason(&diagnostic.preview.eligibility),
@@ -198,8 +198,19 @@ fn health_state(account: &AccountPoolAccountDiagnostic) -> &'static str {
     }
 }
 
-fn status_health_state(pool: Option<&AccountPoolDiagnostic>) -> Option<&'static str> {
+fn status_health_state(
+    preview: &AccountStartupSelectionPreview,
+    pool: Option<&AccountPoolDiagnostic>,
+) -> Option<&'static str> {
+    if preview.predicted_account_id.is_some() {
+        return Some("healthy");
+    }
+
     let pool = pool?;
+    if pool.next_eligible_at.is_some() {
+        return Some("coolingDown");
+    }
+
     if pool
         .accounts
         .iter()
@@ -207,24 +218,11 @@ fn status_health_state(pool: Option<&AccountPoolDiagnostic>) -> Option<&'static 
     {
         return Some("healthy");
     }
-    if pool
-        .accounts
-        .iter()
-        .any(|account| health_state(account) == "rateLimited")
-    {
-        return Some("rateLimited");
-    }
-    if pool
-        .accounts
-        .iter()
-        .any(|account| health_state(account) == "unauthorized")
-    {
-        return Some("unauthorized");
-    }
+
     if pool.accounts.is_empty() {
         None
     } else {
-        Some("unhealthy")
+        Some("unavailable")
     }
 }
 
@@ -234,9 +232,39 @@ fn normalized_account_eligibility(
 ) -> EligibilityView {
     let is_preferred = preview.preferred_account_id.as_deref() == Some(account.account_id.as_str());
     if is_preferred {
+        if account.active_lease.is_some() {
+            return EligibilityView {
+                code: "preferredAccountBusy",
+                reason: "preferred account is currently leased by another runtime".to_string(),
+            };
+        }
+
+        match account.health_state {
+            Some(AccountHealthState::RateLimited) => {
+                return EligibilityView {
+                    code: "preferredAccountRateLimited",
+                    reason: "preferred account is rate limited".to_string(),
+                };
+            }
+            Some(AccountHealthState::Unauthorized) => {
+                return EligibilityView {
+                    code: "preferredAccountUnauthorized",
+                    reason: "preferred account is unauthorized".to_string(),
+                };
+            }
+            Some(AccountHealthState::Healthy) | None => {}
+        }
+
+        if !account.healthy {
+            return EligibilityView {
+                code: "preferredAccountUnhealthy",
+                reason: "preferred account is unhealthy".to_string(),
+            };
+        }
+
         return EligibilityView {
-            code: eligibility_code(&account.eligibility),
-            reason: eligibility_reason(&account.eligibility),
+            code: "preferredAccountSelected",
+            reason: "preferred account is selected for startup".to_string(),
         };
     }
 
@@ -245,6 +273,22 @@ fn normalized_account_eligibility(
             code: "busy",
             reason: "account is currently leased by another runtime".to_string(),
         };
+    }
+
+    match account.health_state {
+        Some(AccountHealthState::RateLimited) => {
+            return EligibilityView {
+                code: "rateLimited",
+                reason: "account is rate limited".to_string(),
+            };
+        }
+        Some(AccountHealthState::Unauthorized) => {
+            return EligibilityView {
+                code: "unauthorized",
+                reason: "account is unauthorized".to_string(),
+            };
+        }
+        Some(AccountHealthState::Healthy) | None => {}
     }
 
     if !account.healthy {

@@ -275,7 +275,7 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-main");
-    assert_eq!(json["healthState"], "healthy");
+    assert_eq!(json["healthState"], "coolingDown");
     assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
     assert_eq!(json["switchReason"]["code"], "noEligibleAccount");
     assert!(json["nextEligibleAt"].as_str().is_some());
@@ -292,8 +292,45 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
     assert!(accounts[0]["nextEligibleAt"].as_str().is_some());
     assert_eq!(accounts[1]["accountId"], "acct-2");
     assert_eq!(accounts[1]["healthState"], "rateLimited");
-    assert_eq!(accounts[1]["eligibility"]["code"], "unhealthy");
-    assert_eq!(accounts[1]["eligibility"]["reason"], "account is unhealthy");
+    assert_eq!(accounts[1]["eligibility"]["code"], "rateLimited");
+    assert_eq!(
+        accounts[1]["eligibility"]["reason"],
+        "account is rate limited"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_preserves_preferred_rate_limited_reason() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-2".to_string()),
+            suppressed: false,
+        },
+    )
+    .await?;
+    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["healthState"], "healthy");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts[0]["accountId"], "acct-2");
+    assert_eq!(
+        accounts[0]["eligibility"]["code"],
+        "preferredAccountRateLimited"
+    );
+    assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "preferred account is rate limited"
+    );
 
     Ok(())
 }
