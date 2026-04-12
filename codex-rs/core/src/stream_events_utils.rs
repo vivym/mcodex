@@ -20,6 +20,7 @@ use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolRouter;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -279,23 +280,20 @@ pub(crate) async fn handle_output_item_done(
                 .log_tool_failed("local_shell", msg);
             tracing::error!(msg);
 
-            let response = ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(msg.to_string()),
-                    ..Default::default()
-                },
+            let response = ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: msg.to_string(),
+                }],
+                end_turn: None,
+                phase: None,
             };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
-            if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
-                        &ctx.turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
-            }
+            ctx.sess
+                .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&response))
+                .await;
 
             output.needs_follow_up = true;
         }
