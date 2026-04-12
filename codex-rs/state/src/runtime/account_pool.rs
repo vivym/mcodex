@@ -826,6 +826,22 @@ ON CONFLICT(account_id) DO UPDATE SET
 
         sqlx::query(
             r#"
+DELETE FROM account_runtime_state
+WHERE account_id = ?
+  AND (
+      (? != 0 AND health_state != 'healthy')
+      OR (? = 0 AND health_state = 'healthy')
+  )
+            "#,
+        )
+        .bind(&entry.account_id)
+        .bind(i64::from(entry.healthy))
+        .bind(i64::from(entry.healthy))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
 UPDATE account_runtime_state
 SET pool_id = ?, updated_at = ?
 WHERE account_id = ?
@@ -1381,8 +1397,11 @@ mod tests {
     use crate::AccountHealthEvent;
     use crate::AccountHealthState;
     use crate::AccountLeaseError;
+    use crate::AccountPoolAccountDiagnostic;
     use crate::AccountPoolMembership;
     use crate::AccountRegistryEntryUpdate;
+    use crate::AccountStartupEligibility;
+    use crate::AccountStartupSelectionPreview;
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::migrations::STATE_MIGRATOR;
@@ -2497,18 +2516,16 @@ WHERE account_id = ?
             )
             .await
             .unwrap();
-        let health = runtime
-            .read_account_health_state("acct-1")
-            .await
-            .unwrap()
-            .expect("persisted health state");
 
         assert_eq!(renewal, LeaseRenewal::Missing);
+        assert_eq!(
+            runtime.read_account_health_state("acct-1").await.unwrap(),
+            None
+        );
         assert_eq!(
             runtime.read_active_holder_lease("inst-a").await.unwrap(),
             None
         );
-        assert_eq!(health.pool_id, "pool-other");
         assert_eq!(
             runtime
                 .read_account_pool_membership("acct-1")
@@ -2520,6 +2537,81 @@ WHERE account_id = ?
                 enabled: false,
                 healthy: false,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_account_registry_entry_changing_healthy_clears_stale_runtime_health() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Healthy,
+                sequence_number: 1,
+                observed_at: test_timestamp(1),
+            })
+            .await
+            .unwrap();
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: false,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("pool-main", Some("acct-1"))
+            .await
+            .unwrap();
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.read_account_health_state("acct-1").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            diagnostic.accounts,
+            vec![AccountPoolAccountDiagnostic {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                enabled: true,
+                healthy: false,
+                active_lease: None,
+                health_state: None,
+                eligibility: AccountStartupEligibility::PreferredAccountUnhealthy,
+                next_eligible_at: None,
+            }]
+        );
+        assert_eq!(
+            preview,
+            AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: AccountStartupEligibility::PreferredAccountUnhealthy,
+            }
         );
     }
 
@@ -2628,10 +2720,24 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
-    async fn removing_account_registry_entry_deletes_membership() {
+    async fn removing_account_registry_entry_revokes_active_lease_and_clears_runtime_health() {
         let runtime = test_runtime().await;
         seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
         seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::Healthy,
+                sequence_number: 1,
+                observed_at: test_timestamp(1),
+            })
+            .await
+            .unwrap();
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
 
         assert_eq!(
             runtime
@@ -2639,6 +2745,25 @@ WHERE account_id = ?
                 .await
                 .unwrap(),
             true
+        );
+        assert_eq!(
+            runtime
+                .renew_account_lease(
+                    &lease.lease_key(),
+                    lease.acquired_at + chrono::Duration::seconds(30),
+                    chrono::Duration::seconds(300),
+                )
+                .await
+                .unwrap(),
+            LeaseRenewal::Missing
+        );
+        assert_eq!(
+            runtime.read_account_health_state("acct-1").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime.read_active_holder_lease("inst-a").await.unwrap(),
+            None
         );
 
         assert_eq!(

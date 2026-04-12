@@ -60,6 +60,39 @@ async fn account_lease_read_reports_process_local_pool_state() -> Result<()> {
 }
 
 #[tokio::test]
+async fn account_lease_read_reports_disabled_preferred_account_preview_reason() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml(codex_home.path(), &server.uri())?;
+    let runtime = seed_default_pool_state(codex_home.path()).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some(PRIMARY_ACCOUNT_ID.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    runtime
+        .set_account_enabled(PRIMARY_ACCOUNT_ID, false)
+        .await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.active, false);
+    assert_eq!(response.account_id, None);
+    assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(
+        response.switch_reason.as_deref(),
+        Some("preferredAccountDisabled")
+    );
+    assert_eq!(response.health_state.as_deref(), Some("unavailable"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_lease_read_reports_live_active_lease_fields_after_turn_start() -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
