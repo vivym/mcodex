@@ -284,6 +284,45 @@ async fn accounts_status_json_suppressed_normalizes_healthy_account_eligibility(
 }
 
 #[tokio::test]
+async fn accounts_status_json_suppressed_preserves_hard_ineligibility_reasons() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["suppressed"], true);
+    assert_eq!(json["switchReason"]["code"], "suppressed");
+    assert_eq!(json["healthState"], "coolingDown");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["eligibility"]["code"], "preferredAccountBusy");
+    assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "preferred account is currently leased by another runtime"
+    );
+    assert_eq!(accounts[1]["accountId"], "acct-2");
+    assert_eq!(accounts[1]["eligibility"]["code"], "rateLimited");
+    assert_eq!(
+        accounts[1]["eligibility"]["reason"],
+        "account is rate limited"
+    );
+    for account in accounts {
+        let code = account["eligibility"]["code"]
+            .as_str()
+            .expect("eligibility code");
+        assert_ne!(code, "preferredAccountSelected");
+        assert_ne!(code, "automaticAccountSelected");
+        assert_ne!(code, "eligible");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons() -> Result<()> {
     let codex_home = prepared_home().await?;
     write_startup_selection(
