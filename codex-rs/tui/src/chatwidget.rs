@@ -259,6 +259,20 @@ const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
+const NO_ELIGIBLE_ACCOUNT_NOTE: &str = "No eligible account is available";
+const NON_REPLAYABLE_TURN_NOTE: &str =
+    "Current turn was not replayed; future turns will use the next eligible account";
+
+enum AccountLeaseTransitionEvent {
+    Info {
+        message: String,
+        hint: Option<String>,
+    },
+    Error {
+        message: String,
+        hint: Option<String>,
+    },
+}
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -9951,6 +9965,19 @@ impl ChatWidget {
         &mut self,
         status_account_lease_display: Option<StatusAccountLeaseDisplay>,
     ) {
+        if let Some(transition) = Self::account_lease_transition_event(
+            self.status_account_lease_display.as_ref(),
+            status_account_lease_display.as_ref(),
+        ) {
+            match transition {
+                AccountLeaseTransitionEvent::Info { message, hint } => {
+                    self.add_to_history(history_cell::new_info_event(message, hint));
+                }
+                AccountLeaseTransitionEvent::Error { message, hint } => {
+                    self.add_to_history(history_cell::new_error_event_with_hint(message, hint));
+                }
+            }
+        }
         self.status_account_lease_display = status_account_lease_display;
         self.refresh_status_surfaces();
         self.request_redraw();
@@ -10042,6 +10069,61 @@ impl ChatWidget {
             RealtimeAudioDeviceKind::Microphone => self.config.realtime_audio.microphone.clone(),
             RealtimeAudioDeviceKind::Speaker => self.config.realtime_audio.speaker.clone(),
         }
+    }
+
+    fn account_lease_transition_event(
+        previous: Option<&StatusAccountLeaseDisplay>,
+        next: Option<&StatusAccountLeaseDisplay>,
+    ) -> Option<AccountLeaseTransitionEvent> {
+        let previous = previous?;
+        let next = next?;
+        if previous == next {
+            return None;
+        }
+
+        if next.note.as_deref() == Some(NON_REPLAYABLE_TURN_NOTE)
+            && previous.note.as_deref() != Some(NON_REPLAYABLE_TURN_NOTE)
+        {
+            return Some(AccountLeaseTransitionEvent::Info {
+                message: NON_REPLAYABLE_TURN_NOTE.to_string(),
+                hint: next
+                    .next_eligible_at
+                    .as_ref()
+                    .map(|next_eligible_at| format!("Next eligible: {next_eligible_at}")),
+            });
+        }
+
+        if next.note.as_deref() == Some(NO_ELIGIBLE_ACCOUNT_NOTE)
+            && previous.note.as_deref() != Some(NO_ELIGIBLE_ACCOUNT_NOTE)
+        {
+            return Some(AccountLeaseTransitionEvent::Error {
+                message: "No eligible pooled account is available.".to_string(),
+                hint: next
+                    .next_eligible_at
+                    .as_ref()
+                    .map(|next_eligible_at| format!("Next eligible: {next_eligible_at}")),
+            });
+        }
+
+        if previous.account_id != next.account_id
+            && let Some(account_id) = next.account_id.as_deref()
+        {
+            return Some(AccountLeaseTransitionEvent::Info {
+                message: format!("Switched pooled account to {account_id}."),
+                hint: next.note.clone(),
+            });
+        }
+
+        if previous.remote_reset != next.remote_reset
+            && let Some(remote_reset) = next.remote_reset.as_deref()
+        {
+            return Some(AccountLeaseTransitionEvent::Info {
+                message: "Remote session continuity was reset.".to_string(),
+                hint: Some(format!("Remote reset: {remote_reset}")),
+            });
+        }
+
+        None
     }
 
     fn current_realtime_audio_selection_label(&self, kind: RealtimeAudioDeviceKind) -> String {

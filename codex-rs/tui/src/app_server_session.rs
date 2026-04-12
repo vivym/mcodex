@@ -900,10 +900,15 @@ fn account_lease_reason_text(reason: &str) -> String {
         "missingPool" => "Configured pool is missing".to_string(),
         "preferredAccountMissing" => "Preferred account is missing".to_string(),
         "preferredAccountInOtherPool" => "Preferred account belongs to another pool".to_string(),
+        "preferredAccountDisabled" => "Preferred account is disabled".to_string(),
         "preferredAccountUnhealthy" => "Preferred account is unhealthy".to_string(),
         "preferredAccountBusy" => "Preferred account is busy".to_string(),
         "noEligibleAccount" => "No eligible account is available".to_string(),
         "durablySuppressed" => "Pooled startup is suppressed until resumed".to_string(),
+        "nonReplayableTurn" => {
+            "Current turn was not replayed; future turns will use the next eligible account"
+                .to_string()
+        }
         _ => reason.to_string(),
     }
 }
@@ -1646,6 +1651,50 @@ mod tests {
                 note: Some("Automatic selection in use".to_string()),
                 next_eligible_at: Some("03:04 on 11 Apr".to_string()),
                 remote_reset: Some("gen 2 after turn turn-17".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_from_response_formats_non_replayable_turn_reason() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: true,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("legacy-default".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                health_state: Some("healthy".to_string()),
+                switch_reason: Some("nonReplayableTurn".to_string()),
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                next_eligible_at: Some(
+                    (captured_at + chrono::Duration::minutes(20))
+                        .with_timezone(&chrono::Utc)
+                        .timestamp(),
+                ),
+            },
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("legacy-default".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Active · Healthy".to_string(),
+                note: Some(
+                    "Current turn was not replayed; future turns will use the next eligible account"
+                        .to_string(),
+                ),
+                next_eligible_at: Some("03:24".to_string()),
+                remote_reset: None,
             })
         );
     }

@@ -61,6 +61,31 @@ fn test_switched_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
     })
 }
 
+fn test_unavailable_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
+    Some(StatusAccountLeaseDisplay {
+        pool_id: Some("team-main".to_string()),
+        account_id: None,
+        status: "Waiting · Unavailable".to_string(),
+        note: Some("No eligible account is available".to_string()),
+        next_eligible_at: Some("03:24".to_string()),
+        remote_reset: None,
+    })
+}
+
+fn test_non_replayable_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
+    Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some(
+            "Current turn was not replayed; future turns will use the next eligible account"
+                .to_string(),
+        ),
+        next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        remote_reset: None,
+    })
+}
+
 fn token_info_for(model_slug: &str, config: &Config, usage: &TokenUsage) -> TokenUsageInfo {
     let context_window =
         codex_core::test_support::construct_model_info_offline(model_slug, config).context_window;
@@ -254,6 +279,88 @@ async fn status_snapshot_shows_auto_switch_and_remote_reset_messages() {
         &config,
         test_status_account_display().as_ref(),
         test_switched_account_lease_display().as_ref(),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_shows_no_available_account_error_state() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output_with_account_lease(
+        &config,
+        test_status_account_display().as_ref(),
+        test_unavailable_account_lease_display().as_ref(),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_shows_retry_suppressed_after_non_replayable_limit_failure() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = codex_core::test_support::get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output_with_account_lease(
+        &config,
+        test_status_account_display().as_ref(),
+        test_non_replayable_account_lease_display().as_ref(),
         /*token_info*/ None,
         &usage,
         &None,

@@ -98,6 +98,114 @@ async fn status_command_renders_pooled_lease_details() {
 }
 
 #[tokio::test]
+async fn account_lease_updated_adds_automatic_switch_notice_when_account_changes() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: None,
+        remote_reset: None,
+    }));
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-2".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: None,
+        remote_reset: Some("gen 1 after turn turn-2".to_string()),
+    }));
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one switch notice");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("acct-2"),
+        "expected switched account id in notice, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Automatic selection in use"),
+        "expected switch reason in notice, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn account_lease_updated_adds_non_replayable_turn_notice() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: None,
+        remote_reset: None,
+    }));
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some(
+            "Current turn was not replayed; future turns will use the next eligible account"
+                .to_string(),
+        ),
+        next_eligible_at: Some("03:24".to_string()),
+        remote_reset: None,
+    }));
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one non-replayable notice");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Current turn was not replayed"),
+        "expected non-replayable copy, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("03:24"),
+        "expected next eligible hint, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn account_lease_updated_adds_no_eligible_account_error_notice() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic selection in use".to_string()),
+        next_eligible_at: None,
+        remote_reset: None,
+    }));
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.update_account_lease_state(Some(StatusAccountLeaseDisplay {
+        pool_id: Some("legacy-default".to_string()),
+        account_id: None,
+        status: "Waiting · Unavailable".to_string(),
+        note: Some("No eligible account is available".to_string()),
+        next_eligible_at: Some("03:24".to_string()),
+        remote_reset: None,
+    }));
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one unavailable notice");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("No eligible pooled account is available"),
+        "expected unavailable copy, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("03:24"),
+        "expected next eligible hint, got: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn status_command_renders_immediately_without_rate_limit_refresh() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
