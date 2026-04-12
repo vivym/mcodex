@@ -41,9 +41,8 @@ async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
 async fn read_startup_selection(codex_home: &TempDir) -> Result<AccountStartupSelectionState> {
     let runtime =
         StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
-    runtime
-        .read_account_startup_selection()
-        .await}
+    runtime.read_account_startup_selection().await
+}
 
 async fn write_startup_selection(
     codex_home: &TempDir,
@@ -252,6 +251,7 @@ async fn accounts_status_reports_suppression_and_eligibility() -> Result<()> {
     let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "status"]).await?;
     assert!(output.success);
+    assert!(output.stdout.contains("health state: unknown"));
     assert!(output.stdout.contains("eligibility"));
     Ok(())
 }
@@ -275,6 +275,7 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["healthState"], "unavailable");
     assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
     assert_eq!(json["switchReason"]["code"], "noEligibleAccount");
     assert!(json["nextEligibleAt"].as_str().is_some());
@@ -283,21 +284,58 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
     assert_eq!(accounts.len(), 2);
     assert_eq!(accounts[0]["accountId"], "acct-1");
     assert_eq!(accounts[0]["healthState"], "healthy");
-    assert_eq!(accounts[0]["eligibility"]["code"], "preferredAccountBusy");
+    assert_eq!(accounts[0]["eligibility"]["code"], "busy");
     assert_eq!(
         accounts[0]["eligibility"]["reason"],
-        "preferred account is currently leased by another runtime"
+        "account is currently leased by another runtime"
     );
     assert!(accounts[0]["nextEligibleAt"].as_str().is_some());
     assert_eq!(accounts[1]["accountId"], "acct-2");
     assert_eq!(accounts[1]["healthState"], "rateLimited");
+    assert_eq!(accounts[1]["eligibility"]["code"], "unhealthy");
+    assert_eq!(accounts[1]["eligibility"]["reason"], "account is unhealthy");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_distinguishes_automatic_selection_from_other_eligible_accounts()
+-> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["healthState"], "healthy");
+    assert_eq!(json["predictedAccountId"], "acct-1");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["accountId"], "acct-1");
     assert_eq!(
-        accounts[1]["eligibility"]["code"],
-        "preferredAccountUnhealthy"
+        accounts[0]["eligibility"]["code"],
+        "automaticAccountSelected"
     );
     assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "account is selected for automatic startup selection"
+    );
+    assert_eq!(accounts[1]["accountId"], "acct-2");
+    assert_eq!(accounts[1]["eligibility"]["code"], "eligible");
+    assert_eq!(
         accounts[1]["eligibility"]["reason"],
-        "preferred account is unhealthy"
+        "account is eligible for automatic startup selection"
     );
 
     Ok(())
@@ -332,6 +370,7 @@ async fn accounts_status_accepts_account_pool_override_without_persisting_it() -
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-other");
     assert_eq!(json["accountPoolOverrideId"], "team-other");
+    assert_eq!(json["healthState"], "healthy");
     assert_eq!(json["predictedAccountId"], "acct-other");
     assert_eq!(json["switchReason"]["code"], "automaticAccountSelected");
 

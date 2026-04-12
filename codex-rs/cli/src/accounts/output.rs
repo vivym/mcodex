@@ -5,6 +5,11 @@ use codex_state::AccountPoolAccountDiagnostic;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
 
+struct EligibilityView {
+    code: &'static str,
+    reason: String,
+}
+
 pub(crate) fn print_current_text(diagnostic: &AccountsCurrentDiagnostic) {
     print_preview(&diagnostic.preview);
     println!(
@@ -43,6 +48,10 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
         }
     );
     print_preview(&diagnostic.preview);
+    println!(
+        "health state: {}",
+        status_health_state(&diagnostic.preview).unwrap_or("unknown")
+    );
     println!("configured pools: {}", diagnostic.configured_pool_count);
 
     if let Some(account_pool_override_id) = diagnostic.account_pool_override_id.as_deref() {
@@ -55,11 +64,12 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
             format_optional_timestamp(pool.next_eligible_at.as_ref())
         );
         for account in &pool.accounts {
+            let eligibility = normalized_account_eligibility(account, &diagnostic.preview);
             println!(
                 "account {}: health={}, eligibility={}, next eligible at={}",
                 account.account_id,
                 health_state(account),
-                eligibility_reason(&account.eligibility),
+                eligibility.reason,
                 format_optional_timestamp(account.next_eligible_at.as_ref())
             );
         }
@@ -74,6 +84,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
         "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
         "suppressed": diagnostic.preview.suppressed,
+        "healthState": status_health_state(&diagnostic.preview),
         "switchReason": {
             "code": eligibility_code(&diagnostic.preview.eligibility),
             "reason": eligibility_reason(&diagnostic.preview.eligibility),
@@ -89,14 +100,16 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                 pool.accounts
                     .iter()
                     .map(|account| {
+                        let eligibility =
+                            normalized_account_eligibility(account, &diagnostic.preview);
                         serde_json::json!({
                             "accountId": &account.account_id,
                             "poolId": &account.pool_id,
                             "healthy": account.healthy,
                             "healthState": health_state(account),
                             "eligibility": {
-                                "code": eligibility_code(&account.eligibility),
-                                "reason": eligibility_reason(&account.eligibility),
+                                "code": eligibility.code,
+                                "reason": eligibility.reason,
                             },
                             "nextEligibleAt": format_timestamp(account.next_eligible_at.as_ref()),
                         })
@@ -181,6 +194,63 @@ fn health_state(account: &AccountPoolAccountDiagnostic) -> &'static str {
         Some(AccountHealthState::Unauthorized) => "unauthorized",
         None if account.healthy => "healthy",
         None => "unhealthy",
+    }
+}
+
+fn status_health_state(preview: &AccountStartupSelectionPreview) -> Option<&'static str> {
+    if preview.predicted_account_id.is_some() {
+        return Some("healthy");
+    }
+
+    match preview.eligibility {
+        AccountStartupEligibility::PreferredAccountUnhealthy => Some("unhealthy"),
+        AccountStartupEligibility::PreferredAccountBusy => Some("busy"),
+        AccountStartupEligibility::NoEligibleAccount => Some("unavailable"),
+        AccountStartupEligibility::Suppressed
+        | AccountStartupEligibility::MissingPool
+        | AccountStartupEligibility::PreferredAccountSelected
+        | AccountStartupEligibility::AutomaticAccountSelected
+        | AccountStartupEligibility::PreferredAccountMissing
+        | AccountStartupEligibility::PreferredAccountInOtherPool { .. } => None,
+    }
+}
+
+fn normalized_account_eligibility(
+    account: &AccountPoolAccountDiagnostic,
+    preview: &AccountStartupSelectionPreview,
+) -> EligibilityView {
+    let is_preferred = preview.preferred_account_id.as_deref() == Some(account.account_id.as_str());
+    if is_preferred {
+        return EligibilityView {
+            code: eligibility_code(&account.eligibility),
+            reason: eligibility_reason(&account.eligibility),
+        };
+    }
+
+    if account.active_lease.is_some() {
+        return EligibilityView {
+            code: "busy",
+            reason: "account is currently leased by another runtime".to_string(),
+        };
+    }
+
+    if !account.healthy {
+        return EligibilityView {
+            code: "unhealthy",
+            reason: "account is unhealthy".to_string(),
+        };
+    }
+
+    if preview.predicted_account_id.as_deref() == Some(account.account_id.as_str()) {
+        return EligibilityView {
+            code: "automaticAccountSelected",
+            reason: "account is selected for automatic startup selection".to_string(),
+        };
+    }
+
+    EligibilityView {
+        code: "eligible",
+        reason: "account is eligible for automatic startup selection".to_string(),
     }
 }
 
