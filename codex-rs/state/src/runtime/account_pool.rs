@@ -313,6 +313,7 @@ WHERE lease_id = ?
 SELECT
     account_registry.account_id,
     account_registry.pool_id,
+    account_registry.enabled,
     account_registry.healthy,
     account_runtime_state.health_state,
     active_lease.lease_id,
@@ -356,6 +357,7 @@ ORDER BY
         for row in rows {
             let account_id: String = row.try_get("account_id")?;
             let account_pool_id: String = row.try_get("pool_id")?;
+            let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
             let health_state = row
                 .try_get::<Option<String>, _>("health_state")?
@@ -379,13 +381,21 @@ ORDER BY
                 }),
                 None => None,
             };
-            let account_next_eligible_at = active_lease.as_ref().map(|lease| lease.expires_at);
+            let account_next_eligible_at = if enabled && healthy {
+                active_lease.as_ref().map(|lease| lease.expires_at)
+            } else {
+                None
+            };
             let is_preferred =
                 preferred_account_id.is_some_and(|preferred| preferred == account_id);
-            let eligibility = if active_lease.is_some() {
+            let eligibility = if is_preferred && !enabled {
+                AccountStartupEligibility::PreferredAccountDisabled
+            } else if active_lease.is_some() {
                 AccountStartupEligibility::PreferredAccountBusy
             } else if !healthy {
                 AccountStartupEligibility::PreferredAccountUnhealthy
+            } else if !enabled {
+                AccountStartupEligibility::NoEligibleAccount
             } else if is_preferred {
                 any_eligible_now = true;
                 AccountStartupEligibility::PreferredAccountSelected
@@ -411,6 +421,7 @@ ORDER BY
             accounts.push(AccountPoolAccountDiagnostic {
                 account_id,
                 pool_id: account_pool_id,
+                enabled,
                 healthy,
                 active_lease,
                 health_state,
@@ -550,10 +561,11 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    enabled,
     healthy,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO NOTHING
             "#,
         )
@@ -563,6 +575,7 @@ ON CONFLICT(account_id) DO NOTHING
         .bind("chatgpt")
         .bind("chatgpt")
         .bind(Option::<String>::None)
+        .bind(1_i64)
         .bind(1_i64)
         .bind(now)
         .bind(now)
@@ -666,6 +679,9 @@ WHERE singleton = 1
                         actual_pool_id: membership.pool_id,
                     }
                 }
+                Some(membership) if !membership.enabled => {
+                    AccountStartupEligibility::PreferredAccountDisabled
+                }
                 Some(membership) if !membership.healthy => {
                     AccountStartupEligibility::PreferredAccountUnhealthy
                 }
@@ -690,6 +706,7 @@ WHERE singleton = 1
                 | AccountStartupEligibility::AutomaticAccountSelected
                 | AccountStartupEligibility::PreferredAccountMissing
                 | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                | AccountStartupEligibility::PreferredAccountDisabled
                 | AccountStartupEligibility::PreferredAccountUnhealthy
                 | AccountStartupEligibility::PreferredAccountBusy
                 | AccountStartupEligibility::NoEligibleAccount => None,
@@ -730,6 +747,7 @@ WHERE singleton = 1
 SELECT
     account_id,
     pool_id,
+    enabled,
     healthy
 FROM account_registry
 WHERE account_id = ?
@@ -743,10 +761,122 @@ WHERE account_id = ?
             Some(row) => Ok(Some(AccountPoolMembership {
                 account_id: row.try_get("account_id")?,
                 pool_id: row.try_get("pool_id")?,
+                enabled: row.try_get::<i64, _>("enabled")? != 0,
                 healthy: row.try_get::<i64, _>("healthy")? != 0,
             })),
             None => Ok(None),
         }
+    }
+
+    pub async fn set_account_enabled(
+        &self,
+        account_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE account_registry
+SET enabled = ?, updated_at = ?
+WHERE account_id = ?
+            "#,
+        )
+        .bind(i64::from(enabled))
+        .bind(account_datetime_to_epoch_seconds(Utc::now()))
+        .bind(account_id)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn remove_account_registry_entry(&self, account_id: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind(account_id)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() != 0)
+    }
+
+    pub async fn assign_account_pool(
+        &self,
+        account_id: &str,
+        pool_id: &str,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
+
+        let result = sqlx::query(
+            r#"
+UPDATE account_registry
+SET pool_id = ?, updated_at = ?
+WHERE account_id = ?
+            "#,
+        )
+        .bind(pool_id)
+        .bind(updated_at)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+UPDATE account_runtime_state
+SET pool_id = ?, updated_at = ?
+WHERE account_id = ?
+            "#,
+        )
+        .bind(pool_id)
+        .bind(updated_at)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn list_account_pool_memberships(
+        &self,
+        pool_id: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountPoolMembership>> {
+        let rows = sqlx::query(
+            r#"
+SELECT
+    account_id,
+    pool_id,
+    enabled,
+    healthy
+FROM account_registry
+WHERE (? IS NULL OR pool_id = ?)
+ORDER BY pool_id ASC, position ASC, account_id ASC
+            "#,
+        )
+        .bind(pool_id)
+        .bind(pool_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(AccountPoolMembership {
+                    account_id: row.try_get("account_id")?,
+                    pool_id: row.try_get("pool_id")?,
+                    enabled: row.try_get::<i64, _>("enabled")? != 0,
+                    healthy: row.try_get::<i64, _>("healthy")? != 0,
+                })
+            })
+            .collect()
     }
 
     pub async fn write_account_startup_selection(
@@ -892,6 +1022,7 @@ INSERT INTO account_leases (
     NULL
 FROM account_registry
 WHERE pool_id = ?
+  AND enabled = 1
   AND healthy = 1
   AND NOT EXISTS (
       SELECT 1
@@ -951,6 +1082,7 @@ INSERT INTO account_leases (
 FROM account_registry
 WHERE pool_id = ?
   AND account_id = ?
+  AND enabled = 1
   AND healthy = 1
   AND NOT EXISTS (
       SELECT 1
@@ -1010,6 +1142,7 @@ where
 SELECT account_registry.account_id
 FROM account_registry
 WHERE pool_id = ?
+  AND enabled = 1
   AND healthy = 1
   AND NOT EXISTS (
       SELECT 1
@@ -1185,8 +1318,12 @@ WHERE released_at IS NULL;
 
     fn migration_0026_migrator(migration_sql: &'static str) -> Migrator {
         let mut migrations = STATE_MIGRATOR.migrations.to_vec();
-        let current_0026 = migrations.last().expect("current 0026 migration").clone();
-        migrations.pop();
+        let current_0026_index = migrations
+            .iter()
+            .position(|migration| migration.version == 26)
+            .expect("current 0026 migration");
+        let current_0026 = migrations[current_0026_index].clone();
+        migrations.remove(current_0026_index);
         migrations.push(Migration::new(
             26,
             current_0026.description.clone(),
@@ -1380,7 +1517,14 @@ WHERE holder_instance_id = ?
         let state_path = super::state_db_path(codex_home.as_path());
         let old_state_migrator = Migrator {
             migrations: Cow::Owned(
-                STATE_MIGRATOR.migrations[..STATE_MIGRATOR.migrations.len() - 1].to_vec(),
+                STATE_MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| {
+                        migration.version < super::ACTIVE_HOLDER_INDEX_MIGRATION_VERSION
+                    })
+                    .cloned()
+                    .collect(),
             ),
             ignore_missing: false,
             locking: true,
@@ -1633,7 +1777,8 @@ WHERE version = 26
             persisted_checksum,
             STATE_MIGRATOR
                 .migrations
-                .last()
+                .iter()
+                .find(|migration| migration.version == 26)
                 .expect("current 0026 migration")
                 .checksum
                 .as_ref()
@@ -2061,6 +2206,134 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn preview_startup_selection_reports_disabled_preferred_account() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+        runtime.set_account_enabled("acct-1", false).await.unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: crate::AccountStartupEligibility::PreferredAccountDisabled,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_startup_selection_skips_disabled_accounts_for_automatic_selection() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime.set_account_enabled("acct-1", false).await.unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-2".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn list_memberships_reflects_assignment_and_enabled_state() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+
+        runtime
+            .assign_account_pool("acct-2", "pool-other")
+            .await
+            .unwrap();
+        runtime.set_account_enabled("acct-1", false).await.unwrap();
+
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(Some("pool-main"))
+                .await
+                .unwrap(),
+            vec![crate::AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                healthy: true,
+                enabled: false,
+            }]
+        );
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(Some("pool-other"))
+                .await
+                .unwrap(),
+            vec![crate::AccountPoolMembership {
+                account_id: "acct-2".to_string(),
+                pool_id: "pool-other".to_string(),
+                healthy: true,
+                enabled: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_account_registry_entry_deletes_membership() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+
+        assert_eq!(
+            runtime
+                .remove_account_registry_entry("acct-1")
+                .await
+                .unwrap(),
+            true
+        );
+
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(Some("pool-main"))
+                .await
+                .unwrap(),
+            vec![crate::AccountPoolMembership {
+                account_id: "acct-2".to_string(),
+                pool_id: "pool-main".to_string(),
+                healthy: true,
+                enabled: true,
+            }]
+        );
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-1")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn acquire_preferred_account_lease_claims_requested_account() {
         let runtime = test_runtime().await;
         seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 1, true).await;
@@ -2116,10 +2389,11 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    enabled,
     healthy,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(account_id)
@@ -2128,6 +2402,7 @@ INSERT INTO account_registry (
         .bind("chatgpt")
         .bind("chatgpt")
         .bind("workspace-main")
+        .bind(1_i64)
         .bind(i64::from(healthy))
         .bind(1_i64)
         .bind(1_i64)

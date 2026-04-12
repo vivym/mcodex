@@ -1,0 +1,2 @@
+ALTER TABLE account_registry
+ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;

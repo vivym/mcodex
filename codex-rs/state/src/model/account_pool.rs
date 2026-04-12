@@ -66,6 +66,7 @@ pub struct AccountPoolDiagnostic {
 pub struct AccountPoolAccountDiagnostic {
     pub account_id: String,
     pub pool_id: String,
+    pub enabled: bool,
     pub healthy: bool,
     pub active_lease: Option<AccountLeaseRecord>,
     pub health_state: Option<AccountHealthState>,
@@ -147,6 +148,7 @@ pub enum AccountStartupEligibility {
     AutomaticAccountSelected,
     PreferredAccountMissing,
     PreferredAccountInOtherPool { actual_pool_id: String },
+    PreferredAccountDisabled,
     PreferredAccountUnhealthy,
     PreferredAccountBusy,
     NoEligibleAccount,
@@ -157,6 +159,7 @@ pub enum AccountStartupEligibility {
 pub struct AccountPoolMembership {
     pub account_id: String,
     pub pool_id: String,
+    pub enabled: bool,
     pub healthy: bool,
 }
 
