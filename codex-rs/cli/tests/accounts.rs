@@ -43,8 +43,16 @@ async fn read_startup_selection(codex_home: &TempDir) -> Result<AccountStartupSe
         StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
     runtime
         .read_account_startup_selection()
-        .await
-        .map_err(Into::into)
+        .await}
+
+async fn write_startup_selection(
+    codex_home: &TempDir,
+    update: AccountStartupSelectionUpdate,
+) -> Result<()> {
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime.write_account_startup_selection(update).await?;
+    Ok(())
 }
 
 fn seed_chatgpt_auth(codex_home: &Path) -> Result<()> {
@@ -129,6 +137,81 @@ INSERT INTO account_registry (
     Ok(())
 }
 
+async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let expires_at = now + 300;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_leases (
+    lease_id,
+    pool_id,
+    account_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("lease-1")
+    .bind("team-main")
+    .bind("acct-1")
+    .bind("holder-1")
+    .bind(0_i64)
+    .bind(now)
+    .bind(now)
+    .bind(expires_at)
+    .bind(Option::<i64>::None)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_runtime_state (
+    account_id,
+    pool_id,
+    health_state,
+    last_health_event_sequence,
+    last_health_event_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("acct-2")
+    .bind("team-main")
+    .bind("rate_limited")
+    .bind(1_i64)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+UPDATE account_registry
+SET healthy = 0,
+    updated_at = ?
+WHERE account_id = ?
+        "#,
+    )
+    .bind(now)
+    .bind("acct-2")
+    .execute(&pool)
+    .await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn login_status_reads_legacy_auth_view_only() -> Result<()> {
     let codex_home = prepared_home().await?;
@@ -149,11 +232,118 @@ async fn accounts_current_reports_predicted_pool_selection() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_current_json_reports_startup_preview() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    let output = run_codex(&codex_home, &["accounts", "current", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["preferredAccountId"], "acct-1");
+    assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
+    assert_eq!(json["suppressed"], true);
+    assert_eq!(json["eligibility"]["code"], "suppressed");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_status_reports_suppression_and_eligibility() -> Result<()> {
     let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "status"]).await?;
     assert!(output.success);
     assert!(output.stdout.contains("eligibility"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
+    assert_eq!(json["switchReason"]["code"], "noEligibleAccount");
+    assert!(json["nextEligibleAt"].as_str().is_some());
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["healthState"], "healthy");
+    assert_eq!(accounts[0]["eligibility"]["code"], "preferredAccountBusy");
+    assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "preferred account is currently leased by another runtime"
+    );
+    assert!(accounts[0]["nextEligibleAt"].as_str().is_some());
+    assert_eq!(accounts[1]["accountId"], "acct-2");
+    assert_eq!(accounts[1]["healthState"], "rateLimited");
+    assert_eq!(
+        accounts[1]["eligibility"]["code"],
+        "preferredAccountUnhealthy"
+    );
+    assert_eq!(
+        accounts[1]["eligibility"]["reason"],
+        "preferred account is unhealthy"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_accepts_account_pool_override_without_persisting_it() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "team-other",
+            "status",
+            "--json",
+        ],
+    )
+    .await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-other");
+    assert_eq!(json["accountPoolOverrideId"], "team-other");
+    assert_eq!(json["predictedAccountId"], "acct-other");
+    assert_eq!(json["switchReason"]["code"], "automaticAccountSelected");
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
+
     Ok(())
 }
 

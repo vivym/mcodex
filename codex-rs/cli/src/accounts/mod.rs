@@ -1,18 +1,28 @@
+mod diagnostics;
+mod output;
+
 use anyhow::Context;
 use clap::Args;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_state::AccountStartupEligibility;
-use codex_state::AccountStartupSelectionPreview;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
+use diagnostics::read_current_diagnostic;
+use diagnostics::read_status_diagnostic;
+use output::print_current_json;
+use output::print_current_text;
+use output::print_status_json;
+use output::print_status_text;
 
 #[derive(Debug, Parser)]
 pub struct AccountsCommand {
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+
+    #[arg(long = "account-pool", value_name = "POOL_ID")]
+    pub account_pool: Option<String>,
 
     #[command(subcommand)]
     pub subcommand: AccountsSubcommand,
@@ -22,8 +32,8 @@ pub struct AccountsCommand {
 pub enum AccountsSubcommand {
     Add(AddAccountCommand),
     List,
-    Current,
-    Status,
+    Current(CurrentAccountCommand),
+    Status(StatusAccountCommand),
     Resume,
     Switch(SwitchAccountCommand),
 }
@@ -32,6 +42,18 @@ pub enum AccountsSubcommand {
 pub struct AddAccountCommand {
     #[arg(value_name = "ACCOUNT_ID")]
     pub account_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CurrentAccountCommand {
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct StatusAccountCommand {
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -95,24 +117,20 @@ pub(crate) async fn suppress_pooled_startup_selection_if_configured(
 }
 
 async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
-    let cli_overrides = command
-        .config_overrides
+    let AccountsCommand {
+        config_overrides,
+        account_pool,
+        subcommand,
+    } = command;
+    let cli_overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
     let config = Config::load_with_cli_overrides(cli_overrides).await?;
     let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account startup selection state")?;
-    let selection = runtime
-        .read_account_startup_selection()
-        .await
-        .context("read account startup selection")?;
-    let startup_preview = runtime
-        .preview_account_startup_selection(configured_default_pool_id(&config))
-        .await
-        .context("preview account startup selection")?;
 
-    match command.subcommand {
+    match subcommand {
         AccountsSubcommand::Add(_command) => {
             anyhow::bail!("`codex accounts add` is not implemented yet")
         }
@@ -135,37 +153,33 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        AccountsSubcommand::Current => {
-            print_preview(&startup_preview);
-            println!(
-                "automatic selection: {}",
-                if startup_preview.suppressed {
-                    "suppressed"
-                } else {
-                    "enabled"
-                }
-            );
+        AccountsSubcommand::Current(current_command) => {
+            let diagnostic = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
+                .await
+                .context("read account startup preview")?;
+            if current_command.json {
+                print_current_json(&diagnostic)?;
+            } else {
+                print_current_text(&diagnostic);
+            }
             Ok(())
         }
-        AccountsSubcommand::Status => {
-            let pool_count = config
-                .accounts
-                .as_ref()
-                .and_then(|accounts| accounts.pools.as_ref())
-                .map_or(0, |pools| pools.len());
-            println!(
-                "suppression: {}",
-                if startup_preview.suppressed {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-            print_preview(&startup_preview);
-            println!("configured pools: {pool_count}");
+        AccountsSubcommand::Status(status_command) => {
+            let diagnostic = read_status_diagnostic(&runtime, &config, account_pool.as_deref())
+                .await
+                .context("read account startup status")?;
+            if status_command.json {
+                print_status_json(&diagnostic)?;
+            } else {
+                print_status_text(&diagnostic);
+            }
             Ok(())
         }
         AccountsSubcommand::Resume => {
+            let selection = runtime
+                .read_account_startup_selection()
+                .await
+                .context("read account startup selection")?;
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
                     default_pool_id: selection.default_pool_id,
@@ -178,7 +192,10 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AccountsSubcommand::Switch(command) => {
-            let Some(effective_pool_id) = startup_preview.effective_pool_id.clone() else {
+            let current = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
+                .await
+                .context("read account startup preview")?;
+            let Some(effective_pool_id) = current.preview.effective_pool_id.clone() else {
                 anyhow::bail!("no effective pool is configured for pooled account selection");
             };
             let membership = runtime
@@ -195,9 +212,13 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                     membership.pool_id
                 );
             }
+            let selection = runtime
+                .read_account_startup_selection()
+                .await
+                .context("read account startup selection")?;
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: Some(effective_pool_id),
+                    default_pool_id: selection.default_pool_id,
                     preferred_account_id: Some(command.account_id.clone()),
                     suppressed: false,
                 })
@@ -205,62 +226,6 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                 .context("write preferred account startup selection")?;
             println!("preferred account: {}", command.account_id);
             Ok(())
-        }
-    }
-}
-
-fn configured_default_pool_id(config: &Config) -> Option<&str> {
-    config
-        .accounts
-        .as_ref()
-        .and_then(|accounts| accounts.default_pool.as_deref())
-}
-
-fn print_preview(preview: &AccountStartupSelectionPreview) {
-    println!(
-        "effective pool: {}",
-        preview.effective_pool_id.as_deref().unwrap_or("none")
-    );
-    println!(
-        "preferred account: {}",
-        preview
-            .preferred_account_id
-            .as_deref()
-            .unwrap_or("automatic")
-    );
-    println!(
-        "predicted account: {}",
-        preview.predicted_account_id.as_deref().unwrap_or("none")
-    );
-    println!("eligibility: {}", format_eligibility(&preview.eligibility));
-}
-
-fn format_eligibility(eligibility: &AccountStartupEligibility) -> String {
-    match eligibility {
-        AccountStartupEligibility::Suppressed => {
-            "automatic pooled selection is suppressed".to_string()
-        }
-        AccountStartupEligibility::MissingPool => "no effective pool is configured".to_string(),
-        AccountStartupEligibility::PreferredAccountSelected => {
-            "preferred account is eligible for fresh-runtime startup".to_string()
-        }
-        AccountStartupEligibility::AutomaticAccountSelected => {
-            "automatic startup selection is eligible".to_string()
-        }
-        AccountStartupEligibility::PreferredAccountMissing => {
-            "preferred account is not registered".to_string()
-        }
-        AccountStartupEligibility::PreferredAccountInOtherPool { actual_pool_id } => {
-            format!("preferred account belongs to pool `{actual_pool_id}`")
-        }
-        AccountStartupEligibility::PreferredAccountUnhealthy => {
-            "preferred account is unhealthy".to_string()
-        }
-        AccountStartupEligibility::PreferredAccountBusy => {
-            "preferred account is currently leased by another runtime".to_string()
-        }
-        AccountStartupEligibility::NoEligibleAccount => {
-            "no eligible account is available in the effective pool".to_string()
         }
     }
 }
