@@ -116,6 +116,7 @@ pub enum AccountLeaseRuntimeReason {
     AutomaticAccountSelected,
     PreferredAccountMissing,
     PreferredAccountInOtherPool,
+    PreferredAccountDisabled,
     PreferredAccountUnhealthy,
     PreferredAccountBusy,
     NoEligibleAccount,
@@ -133,6 +134,7 @@ impl From<&AccountStartupEligibility> for AccountLeaseRuntimeReason {
             AccountStartupEligibility::PreferredAccountInOtherPool { .. } => {
                 Self::PreferredAccountInOtherPool
             }
+            AccountStartupEligibility::PreferredAccountDisabled => Self::PreferredAccountDisabled,
             AccountStartupEligibility::PreferredAccountUnhealthy => Self::PreferredAccountUnhealthy,
             AccountStartupEligibility::PreferredAccountBusy => Self::PreferredAccountBusy,
             AccountStartupEligibility::NoEligibleAccount => Self::NoEligibleAccount,
@@ -275,6 +277,7 @@ impl AccountPoolManager {
                         | AccountStartupEligibility::MissingPool
                         | AccountStartupEligibility::PreferredAccountMissing
                         | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                        | AccountStartupEligibility::PreferredAccountDisabled
                         | AccountStartupEligibility::PreferredAccountUnhealthy
                         | AccountStartupEligibility::PreferredAccountBusy
                         | AccountStartupEligibility::NoEligibleAccount,

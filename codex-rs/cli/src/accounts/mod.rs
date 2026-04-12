@@ -1,4 +1,5 @@
 mod diagnostics;
+mod mutate;
 mod output;
 
 use anyhow::Context;
@@ -11,6 +12,10 @@ use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
 use diagnostics::read_current_diagnostic;
 use diagnostics::read_status_diagnostic;
+use mutate::assign_account_pool;
+use mutate::list_account_pools;
+use mutate::remove_account;
+use mutate::set_account_enabled;
 use output::print_current_json;
 use output::print_current_text;
 use output::print_status_json;
@@ -31,7 +36,11 @@ pub struct AccountsCommand {
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountsSubcommand {
     Add(AddAccountCommand),
+    Enable(AccountToggleCommand),
+    Disable(AccountToggleCommand),
+    Remove(RemoveAccountCommand),
     List,
+    Pool(PoolCommand),
     Current(CurrentAccountCommand),
     Status(StatusAccountCommand),
     Resume,
@@ -51,6 +60,18 @@ pub struct CurrentAccountCommand {
 }
 
 #[derive(Debug, Args)]
+pub struct AccountToggleCommand {
+    #[arg(value_name = "ACCOUNT_ID")]
+    pub account_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RemoveAccountCommand {
+    #[arg(value_name = "ACCOUNT_ID")]
+    pub account_id: String,
+}
+
+#[derive(Debug, Args)]
 pub struct StatusAccountCommand {
     #[arg(long = "json", default_value_t = false)]
     pub json: bool,
@@ -60,6 +81,27 @@ pub struct StatusAccountCommand {
 pub struct SwitchAccountCommand {
     #[arg(value_name = "ACCOUNT_ID")]
     pub account_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolCommand {
+    #[command(subcommand)]
+    pub subcommand: PoolSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum PoolSubcommand {
+    List,
+    Assign(PoolAssignCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct PoolAssignCommand {
+    #[arg(value_name = "ACCOUNT_ID")]
+    pub account_id: String,
+
+    #[arg(value_name = "POOL_ID")]
+    pub pool_id: String,
 }
 
 pub async fn run_accounts(command: AccountsCommand) -> ! {
@@ -134,6 +176,13 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         AccountsSubcommand::Add(_command) => {
             anyhow::bail!("`codex accounts add` is not implemented yet")
         }
+        AccountsSubcommand::Enable(command) => {
+            set_account_enabled(&runtime, &command.account_id, true).await
+        }
+        AccountsSubcommand::Disable(command) => {
+            set_account_enabled(&runtime, &command.account_id, false).await
+        }
+        AccountsSubcommand::Remove(command) => remove_account(&runtime, &command.account_id).await,
         AccountsSubcommand::List => {
             let Some(accounts) = config.accounts.as_ref() else {
                 println!("No account pools configured.");
@@ -153,6 +202,12 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        AccountsSubcommand::Pool(command) => match command.subcommand {
+            PoolSubcommand::List => list_account_pools(&runtime).await,
+            PoolSubcommand::Assign(command) => {
+                assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
+            }
+        },
         AccountsSubcommand::Current(current_command) => {
             let diagnostic = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
                 .await

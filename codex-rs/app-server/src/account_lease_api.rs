@@ -221,6 +221,9 @@ fn selection_reasons(eligibility: &AccountStartupEligibility) -> (Option<String>
         AccountStartupEligibility::PreferredAccountInOtherPool { .. } => {
             (Some("preferredAccountInOtherPool".to_string()), None)
         }
+        AccountStartupEligibility::PreferredAccountDisabled => {
+            (Some("preferredAccountDisabled".to_string()), None)
+        }
         AccountStartupEligibility::PreferredAccountUnhealthy => {
             (Some("preferredAccountUnhealthy".to_string()), None)
         }
@@ -242,6 +245,7 @@ fn health_state_for_preview(
     }
 
     match eligibility {
+        AccountStartupEligibility::PreferredAccountDisabled => Some("unavailable".to_string()),
         AccountStartupEligibility::PreferredAccountUnhealthy => Some("unhealthy".to_string()),
         AccountStartupEligibility::PreferredAccountBusy => Some("busy".to_string()),
         AccountStartupEligibility::NoEligibleAccount => Some("unavailable".to_string()),
@@ -277,6 +281,9 @@ fn runtime_reason_to_wire_string(reason: AccountLeaseRuntimeReason) -> String {
         AccountLeaseRuntimeReason::PreferredAccountMissing => "preferredAccountMissing".to_string(),
         AccountLeaseRuntimeReason::PreferredAccountInOtherPool => {
             "preferredAccountInOtherPool".to_string()
+        }
+        AccountLeaseRuntimeReason::PreferredAccountDisabled => {
+            "preferredAccountDisabled".to_string()
         }
         AccountLeaseRuntimeReason::PreferredAccountUnhealthy => {
             "preferredAccountUnhealthy".to_string()

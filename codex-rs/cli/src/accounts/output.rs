@@ -67,8 +67,9 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
         for account in &pool.accounts {
             let eligibility = normalized_account_eligibility(account, &diagnostic.preview);
             println!(
-                "account {}: health={}, eligibility={}, next eligible at={}",
+                "account {}: enabled={}, health={}, eligibility={}, next eligible at={}",
                 account.account_id,
+                account.enabled,
                 health_state(account),
                 eligibility.reason,
                 format_optional_timestamp(account.next_eligible_at.as_ref())
@@ -106,6 +107,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                         serde_json::json!({
                             "accountId": &account.account_id,
                             "poolId": &account.pool_id,
+                            "enabled": account.enabled,
                             "healthy": account.healthy,
                             "healthState": health_state(account),
                             "eligibility": {
@@ -152,6 +154,7 @@ fn eligibility_code(eligibility: &AccountStartupEligibility) -> &'static str {
         AccountStartupEligibility::PreferredAccountInOtherPool { .. } => {
             "preferredAccountInOtherPool"
         }
+        AccountStartupEligibility::PreferredAccountDisabled => "preferredAccountDisabled",
         AccountStartupEligibility::PreferredAccountUnhealthy => "preferredAccountUnhealthy",
         AccountStartupEligibility::PreferredAccountBusy => "preferredAccountBusy",
         AccountStartupEligibility::NoEligibleAccount => "noEligibleAccount",
@@ -175,6 +178,9 @@ fn eligibility_reason(eligibility: &AccountStartupEligibility) -> String {
         }
         AccountStartupEligibility::PreferredAccountInOtherPool { actual_pool_id } => {
             format!("preferred account belongs to pool `{actual_pool_id}`")
+        }
+        AccountStartupEligibility::PreferredAccountDisabled => {
+            "preferred account is disabled".to_string()
         }
         AccountStartupEligibility::PreferredAccountUnhealthy => {
             "preferred account is unhealthy".to_string()
@@ -214,7 +220,7 @@ fn status_health_state(
     if pool
         .accounts
         .iter()
-        .any(|account| health_state(account) == "healthy")
+        .any(|account| account.enabled && health_state(account) == "healthy")
     {
         return Some("healthy");
     }
@@ -232,6 +238,13 @@ fn normalized_account_eligibility(
 ) -> EligibilityView {
     let is_preferred = preview.preferred_account_id.as_deref() == Some(account.account_id.as_str());
     if is_preferred {
+        if !account.enabled {
+            return EligibilityView {
+                code: "preferredAccountDisabled",
+                reason: "preferred account is disabled".to_string(),
+            };
+        }
+
         if account.active_lease.is_some() {
             return EligibilityView {
                 code: "preferredAccountBusy",
@@ -272,6 +285,13 @@ fn normalized_account_eligibility(
         return EligibilityView {
             code: "preferredAccountSelected",
             reason: "preferred account is selected for startup".to_string(),
+        };
+    }
+
+    if !account.enabled {
+        return EligibilityView {
+            code: "disabled",
+            reason: "account is disabled".to_string(),
         };
     }
 

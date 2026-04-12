@@ -54,6 +54,15 @@ async fn write_startup_selection(
     Ok(())
 }
 
+async fn read_pool_membership(
+    codex_home: &TempDir,
+    account_id: &str,
+) -> Result<Option<codex_state::AccountPoolMembership>> {
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime.read_account_pool_membership(account_id).await
+}
+
 fn seed_chatgpt_auth(codex_home: &Path) -> Result<()> {
     let auth_json = serde_json::json!({
         "tokens": {
@@ -445,6 +454,110 @@ async fn accounts_status_json_distinguishes_automatic_selection_from_other_eligi
 }
 
 #[tokio::test]
+async fn accounts_disable_excludes_account_from_automatic_selection_and_reports_enabled()
+-> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let disable = run_codex(&codex_home, &["accounts", "disable", "acct-1"]).await?;
+    assert!(disable.success, "stderr: {}", disable.stderr);
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["predictedAccountId"], "acct-2");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["enabled"], false);
+    assert_eq!(accounts[0]["eligibility"]["code"], "disabled");
+    assert_eq!(accounts[1]["accountId"], "acct-2");
+    assert_eq!(accounts[1]["enabled"], true);
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .enabled,
+        false
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_enable_restores_automatic_selection() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let disable = run_codex(&codex_home, &["accounts", "disable", "acct-1"]).await?;
+    assert!(disable.success, "stderr: {}", disable.stderr);
+    let enable = run_codex(&codex_home, &["accounts", "enable", "acct-1"]).await?;
+    assert!(enable.success, "stderr: {}", enable.stderr);
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["predictedAccountId"], "acct-1");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["enabled"], true);
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .enabled,
+        true
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_current_json_reports_disabled_preferred_account_reason() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let disable = run_codex(&codex_home, &["accounts", "disable", "acct-1"]).await?;
+    assert!(disable.success, "stderr: {}", disable.stderr);
+
+    let output = run_codex(&codex_home, &["accounts", "current", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
+    assert_eq!(json["eligibility"]["code"], "preferredAccountDisabled");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_status_accepts_account_pool_override_without_persisting_it() -> Result<()> {
     let codex_home = prepared_home().await?;
     write_startup_selection(
@@ -537,6 +650,60 @@ async fn accounts_switch_sets_preferred_account_override() -> Result<()> {
     let selection = read_startup_selection(&codex_home).await?;
     assert_eq!(selection.preferred_account_id.as_deref(), Some("acct-2"));
     assert!(!selection.suppressed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_remove_deletes_registry_entry() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "remove", "acct-2"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    assert_eq!(read_pool_membership(&codex_home, "acct-2").await?, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_assign_changes_membership_without_mutating_startup_selection() -> Result<()>
+{
+    let codex_home = prepared_home().await?;
+    let before = read_startup_selection(&codex_home).await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "pool", "assign", "acct-2", "team-other"],
+    )
+    .await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-2")
+            .await?
+            .expect("membership")
+            .pool_id,
+        "team-other"
+    );
+    assert_eq!(read_startup_selection(&codex_home).await?, before);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_list_reports_known_pool_ids_from_registry_state() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "pool", "list"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let lines = output
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec!["team-main", "team-other"]);
+
     Ok(())
 }
 
