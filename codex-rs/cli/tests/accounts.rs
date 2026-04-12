@@ -25,6 +25,13 @@ async fn prepared_home() -> Result<TempDir> {
     Ok(codex_home)
 }
 
+async fn prepared_migrated_home() -> Result<TempDir> {
+    let codex_home = TempDir::new()?;
+    seed_chatgpt_auth(codex_home.path())?;
+    seed_migrated_state(codex_home.path()).await?;
+    Ok(codex_home)
+}
+
 async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
     let output = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
         .env("CODEX_HOME", codex_home.path())
@@ -105,6 +112,21 @@ async fn seed_state(codex_home: &Path) -> Result<()> {
             default_pool_id: Some("team-main".to_string()),
             preferred_account_id: Some("acct-1".to_string()),
             suppressed: true,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn seed_migrated_state(codex_home: &Path) -> Result<()> {
+    let runtime = StateRuntime::init(codex_home.to_path_buf(), "test-provider".to_string()).await?;
+    let pool =
+        SqlitePool::connect(&format!("sqlite://{}", state_db_path(codex_home).display())).await?;
+    seed_account(&pool, "acct-legacy", "legacy-default", 0).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some("acct-legacy".to_string()),
+            suppressed: false,
         })
         .await?;
     Ok(())
@@ -240,6 +262,26 @@ async fn accounts_current_reports_predicted_pool_selection() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_list_lists_registered_accounts_and_marks_migrated_source() -> Result<()> {
+    let codex_home = prepared_migrated_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "list"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let lines = output
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec!["acct-legacy pool=legacy-default enabled=true healthy=true source=migrated"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_current_json_reports_startup_preview() -> Result<()> {
     let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "current", "--json"]).await?;
@@ -288,6 +330,27 @@ async fn accounts_status_json_suppressed_normalizes_healthy_account_eligibility(
         assert_ne!(code, "automaticAccountSelected");
         assert_ne!(code, "eligible");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_marks_migrated_effective_pool_and_account_source() -> Result<()> {
+    let codex_home = prepared_migrated_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "legacy-default");
+    assert_eq!(json["effectivePoolSource"], "migrated");
+    assert_eq!(json["predictedAccountId"], "acct-legacy");
+
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["accountId"], "acct-legacy");
+    assert_eq!(accounts[0]["poolId"], "legacy-default");
+    assert_eq!(accounts[0]["source"], "migrated");
 
     Ok(())
 }

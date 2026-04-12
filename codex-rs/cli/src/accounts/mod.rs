@@ -14,6 +14,7 @@ use diagnostics::read_current_diagnostic;
 use diagnostics::read_status_diagnostic;
 use mutate::assign_account_pool;
 use mutate::list_account_pools;
+use mutate::list_accounts;
 use mutate::remove_account;
 use mutate::set_account_enabled;
 use output::print_current_json;
@@ -195,25 +196,7 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             set_account_enabled(&runtime, &command.account_id, false).await
         }
         AccountsSubcommand::Remove(command) => remove_account(&runtime, &command.account_id).await,
-        AccountsSubcommand::List => {
-            let Some(accounts) = config.accounts.as_ref() else {
-                println!("No account pools configured.");
-                return Ok(());
-            };
-            let Some(pools) = accounts.pools.as_ref() else {
-                println!("No account pools configured.");
-                return Ok(());
-            };
-            if pools.is_empty() {
-                println!("No account pools configured.");
-                return Ok(());
-            }
-
-            for pool_id in pools.keys() {
-                println!("{pool_id}");
-            }
-            Ok(())
-        }
+        AccountsSubcommand::List => list_accounts(&runtime).await,
         AccountsSubcommand::Pool(command) => match command.subcommand {
             PoolSubcommand::List => list_account_pools(&runtime).await,
             PoolSubcommand::Assign(command) => {

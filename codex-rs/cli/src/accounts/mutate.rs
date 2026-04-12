@@ -1,6 +1,36 @@
 use anyhow::Context;
 use codex_state::StateRuntime;
 
+const MIGRATED_ACCOUNT_SOURCE: &str = "migrated";
+const MIGRATED_POOL_ID: &str = "legacy-default";
+
+pub(super) async fn list_accounts(runtime: &StateRuntime) -> anyhow::Result<()> {
+    let memberships = runtime
+        .list_account_pool_memberships(None)
+        .await
+        .context("list registered accounts")?;
+
+    if memberships.is_empty() {
+        println!("No accounts registered.");
+        return Ok(());
+    }
+
+    for membership in memberships {
+        let source = account_source(&membership.pool_id);
+        let source_suffix = source.map_or_else(String::new, |source| format!(" source={source}"));
+        println!(
+            "{} pool={} enabled={} healthy={}{}",
+            membership.account_id,
+            membership.pool_id,
+            membership.enabled,
+            membership.healthy,
+            source_suffix
+        );
+    }
+
+    Ok(())
+}
+
 pub(super) async fn set_account_enabled(
     runtime: &StateRuntime,
     account_id: &str,
@@ -71,4 +101,8 @@ pub(super) async fn assign_account_pool(
 
     println!("account {account_id}: pool {pool_id}");
     Ok(())
+}
+
+fn account_source(pool_id: &str) -> Option<&'static str> {
+    (pool_id == MIGRATED_POOL_ID).then_some(MIGRATED_ACCOUNT_SOURCE)
 }
