@@ -741,6 +741,18 @@ async fn accounts_add_chatgpt_stops_at_credential_storage_gap() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_add_without_mode_stops_at_credential_storage_gap() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "add"]).await?;
+    assert!(!output.success);
+    assert!(output.stderr.contains("credential_ref"));
+    assert!(output.stderr.contains("codex login"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_add_chatgpt_device_auth_stops_at_credential_storage_gap() -> Result<()> {
     let codex_home = prepared_home().await?;
 

@@ -150,6 +150,66 @@ async fn account_lease_snapshot_records_remote_reset_generation_when_account_cha
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_snapshot_clears_revoked_live_lease_after_external_disable() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "snapshot revoked lease"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+
+    let turn_error = submit_turn_and_wait(&test, "snapshot revoked lease").await?;
+    assert!(turn_error.is_none());
+
+    let active_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(active_snapshot.active, true);
+    assert_eq!(
+        active_snapshot.account_id.as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+    assert!(active_snapshot.lease_id.is_some());
+    assert_eq!(active_snapshot.lease_epoch, Some(1));
+
+    assert!(
+        state_db
+            .set_account_enabled(PRIMARY_ACCOUNT_ID, false)
+            .await?,
+        "external disable should update the pooled account state"
+    );
+
+    let snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(snapshot.active, false);
+    assert_eq!(snapshot.account_id, None);
+    assert_eq!(snapshot.lease_id, None);
+    assert_eq!(snapshot.lease_epoch, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_lease_snapshot_clears_pending_non_replayable_turn_reason_after_rotation()
 -> Result<()> {
     skip_if_no_network!(Ok(()));

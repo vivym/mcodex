@@ -53,7 +53,7 @@ pub enum AccountsSubcommand {
 #[derive(Debug, Args)]
 pub struct AddAccountCommand {
     #[command(subcommand)]
-    pub subcommand: AddAccountSubcommand,
+    pub subcommand: Option<AddAccountSubcommand>,
 }
 
 #[derive(Debug, clap::Subcommand)]

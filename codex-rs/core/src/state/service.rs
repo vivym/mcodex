@@ -162,6 +162,7 @@ pub(crate) struct AccountPoolManager {
 
 pub(crate) struct AccountPoolManagerSnapshotSeed {
     state_db: StateDbHandle,
+    holder_instance_id: String,
     active_lease: Option<AccountLeaseRecord>,
     switch_reason: Option<AccountLeaseRuntimeReason>,
     suppression_reason: Option<AccountLeaseRuntimeReason>,
@@ -346,6 +347,7 @@ impl AccountPoolManager {
     pub(crate) fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
         AccountPoolManagerSnapshotSeed {
             state_db: Arc::clone(&self.state_db),
+            holder_instance_id: self.holder_instance_id.clone(),
             active_lease: self.active_lease.clone(),
             switch_reason: self.switch_reason,
             suppression_reason: self.suppression_reason,
@@ -451,23 +453,35 @@ impl AccountPoolManagerSnapshotSeed {
     pub(crate) async fn snapshot(self) -> AccountLeaseRuntimeSnapshot {
         let mut health_state = None;
         let mut next_eligible_at = None;
-        if let Some(active_lease) = self.active_lease.as_ref()
+        let active_lease = if self.active_lease.is_some() {
+            self.state_db
+                .read_active_holder_lease(&self.holder_instance_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if let Some(diagnostic_lease) = active_lease.as_ref().or(self.active_lease.as_ref())
             && let Ok(diagnostic) = self
                 .state_db
-                .read_account_pool_diagnostic(&active_lease.pool_id, Some(&active_lease.account_id))
+                .read_account_pool_diagnostic(
+                    &diagnostic_lease.pool_id,
+                    Some(&diagnostic_lease.account_id),
+                )
                 .await
         {
             next_eligible_at = diagnostic.next_eligible_at;
             if let Some(account_diagnostic) = diagnostic
                 .accounts
                 .into_iter()
-                .find(|account| account.account_id == active_lease.account_id)
+                .find(|account| account.account_id == diagnostic_lease.account_id)
             {
                 health_state = account_diagnostic.health_state;
                 next_eligible_at = account_diagnostic.next_eligible_at.or(next_eligible_at);
             }
         }
-        let active_lease = self.active_lease.as_ref();
+        let active_lease = active_lease.as_ref();
         AccountLeaseRuntimeSnapshot {
             active: active_lease.is_some(),
             suppressed: active_lease.is_none()
