@@ -4,7 +4,10 @@ use anyhow::Context;
 use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_core::AccountLeaseRuntimeReason;
+use codex_core::AccountLeaseRuntimeSnapshot;
 use codex_core::config::Config;
+use codex_state::AccountHealthState;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
 use codex_state::AccountStartupSelectionUpdate;
@@ -19,7 +22,12 @@ pub(crate) fn pooled_mode_is_configured(config: &Config) -> bool {
 
 pub(crate) async fn read_account_lease(
     config: &Config,
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
 ) -> Result<AccountLeaseReadResponse, JSONRPCErrorError> {
+    if let Some(live_snapshot) = live_snapshot {
+        return Ok(account_lease_response_from_runtime_snapshot(&live_snapshot));
+    }
+
     let Some(state_db) = maybe_open_state_db(config).await? else {
         return Ok(empty_account_lease_response());
     };
@@ -31,6 +39,12 @@ pub(crate) async fn read_account_lease(
         .map_err(internal_error)?;
 
     Ok(account_lease_response_from_preview(preview))
+}
+
+pub(crate) fn account_lease_updated_notification_from_runtime_snapshot(
+    live_snapshot: &AccountLeaseRuntimeSnapshot,
+) -> AccountLeaseUpdatedNotification {
+    account_lease_response_from_runtime_snapshot(live_snapshot).into()
 }
 
 pub(crate) async fn resume_account_lease(
@@ -164,6 +178,33 @@ fn account_lease_response_from_preview(
     }
 }
 
+fn account_lease_response_from_runtime_snapshot(
+    live_snapshot: &AccountLeaseRuntimeSnapshot,
+) -> AccountLeaseReadResponse {
+    AccountLeaseReadResponse {
+        active: live_snapshot.active,
+        suppressed: live_snapshot.suppressed,
+        account_id: live_snapshot.account_id.clone(),
+        pool_id: live_snapshot.pool_id.clone(),
+        lease_id: live_snapshot.lease_id.clone(),
+        lease_epoch: live_snapshot
+            .lease_epoch
+            .and_then(|epoch| u64::try_from(epoch).ok()),
+        health_state: live_snapshot_health_state(live_snapshot.health_state),
+        switch_reason: live_snapshot
+            .switch_reason
+            .map(runtime_reason_to_wire_string),
+        suppression_reason: live_snapshot
+            .suppression_reason
+            .map(runtime_reason_to_wire_string),
+        transport_reset_generation: live_snapshot.transport_reset_generation,
+        last_remote_context_reset_turn_id: live_snapshot.last_remote_context_reset_turn_id.clone(),
+        next_eligible_at: live_snapshot
+            .next_eligible_at
+            .map(|timestamp| timestamp.timestamp()),
+    }
+}
+
 fn selection_reasons(eligibility: &AccountStartupEligibility) -> (Option<String>, Option<String>) {
     match eligibility {
         AccountStartupEligibility::Suppressed => (None, Some("durablySuppressed".to_string())),
@@ -210,6 +251,39 @@ fn health_state_for_preview(
         | AccountStartupEligibility::AutomaticAccountSelected
         | AccountStartupEligibility::PreferredAccountMissing
         | AccountStartupEligibility::PreferredAccountInOtherPool { .. } => None,
+    }
+}
+
+fn live_snapshot_health_state(health_state: Option<AccountHealthState>) -> Option<String> {
+    match health_state {
+        Some(AccountHealthState::Healthy) => Some("healthy".to_string()),
+        Some(AccountHealthState::RateLimited) | Some(AccountHealthState::Unauthorized) => {
+            Some("unhealthy".to_string())
+        }
+        None => None,
+    }
+}
+
+fn runtime_reason_to_wire_string(reason: AccountLeaseRuntimeReason) -> String {
+    match reason {
+        AccountLeaseRuntimeReason::StartupSuppressed => "durablySuppressed".to_string(),
+        AccountLeaseRuntimeReason::MissingPool => "missingPool".to_string(),
+        AccountLeaseRuntimeReason::PreferredAccountSelected => {
+            "preferredAccountSelected".to_string()
+        }
+        AccountLeaseRuntimeReason::AutomaticAccountSelected => {
+            "automaticAccountSelected".to_string()
+        }
+        AccountLeaseRuntimeReason::PreferredAccountMissing => "preferredAccountMissing".to_string(),
+        AccountLeaseRuntimeReason::PreferredAccountInOtherPool => {
+            "preferredAccountInOtherPool".to_string()
+        }
+        AccountLeaseRuntimeReason::PreferredAccountUnhealthy => {
+            "preferredAccountUnhealthy".to_string()
+        }
+        AccountLeaseRuntimeReason::PreferredAccountBusy => "preferredAccountBusy".to_string(),
+        AccountLeaseRuntimeReason::NoEligibleAccount => "noEligibleAccount".to_string(),
+        AccountLeaseRuntimeReason::NonReplayableTurn => "nonReplayableTurn".to_string(),
     }
 }
 

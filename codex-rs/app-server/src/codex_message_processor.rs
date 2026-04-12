@@ -1690,6 +1690,22 @@ impl CodexMessageProcessor {
         Ok(())
     }
 
+    async fn single_loaded_thread(&self) -> Option<Arc<CodexThread>> {
+        let thread_ids = self.thread_manager.list_thread_ids().await;
+        let [thread_id] = thread_ids.as_slice() else {
+            return None;
+        };
+
+        self.thread_manager.get_thread(*thread_id).await.ok()
+    }
+
+    async fn single_loaded_thread_account_lease_snapshot(
+        &self,
+    ) -> Option<codex_core::AccountLeaseRuntimeSnapshot> {
+        let thread = self.single_loaded_thread().await?;
+        thread.account_lease_snapshot().await
+    }
+
     pub(crate) async fn account_lease_read(
         &self,
         request_id: ConnectionRequestId,
@@ -1700,7 +1716,8 @@ impl CodexMessageProcessor {
             return;
         }
 
-        match account_lease_api::read_account_lease(self.config.as_ref()).await {
+        let live_snapshot = self.single_loaded_thread_account_lease_snapshot().await;
+        match account_lease_api::read_account_lease(self.config.as_ref(), live_snapshot).await {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }
@@ -7769,12 +7786,20 @@ impl CodexMessageProcessor {
                             conversation_id,
                             conversation.clone(),
                             thread_manager.clone(),
-                            thread_outgoing,
+                            thread_outgoing.clone(),
                             thread_state.clone(),
                             thread_watch_manager.clone(),
                             api_version,
                             fallback_model_provider.clone(),
                             codex_home.as_path(),
+                        )
+                        .await;
+
+                        maybe_emit_account_lease_updated_notification(
+                            &event.msg,
+                            &conversation,
+                            &thread_state,
+                            &thread_outgoing,
                         )
                         .await;
                     }
@@ -8279,6 +8304,36 @@ mod thread_list_cwd_filter_tests {
         );
         Ok(())
     }
+}
+
+async fn maybe_emit_account_lease_updated_notification(
+    event: &EventMsg,
+    conversation: &Arc<CodexThread>,
+    thread_state: &Arc<Mutex<ThreadState>>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    if !event_can_change_account_lease_notification(event) {
+        return;
+    }
+
+    let Some(live_snapshot) = conversation.account_lease_snapshot().await else {
+        return;
+    };
+    let notification =
+        account_lease_api::account_lease_updated_notification_from_runtime_snapshot(&live_snapshot);
+    let notification = {
+        let mut thread_state = thread_state.lock().await;
+        thread_state.take_changed_account_lease_notification(notification)
+    };
+    if let Some(notification) = notification {
+        outgoing
+            .send_server_notification(ServerNotification::AccountLeaseUpdated(notification))
+            .await;
+    }
+}
+
+fn event_can_change_account_lease_notification(event: &EventMsg) -> bool {
+    matches!(event, EventMsg::TurnStarted(_) | EventMsg::Error(_))
 }
 
 #[allow(clippy::too_many_arguments)]

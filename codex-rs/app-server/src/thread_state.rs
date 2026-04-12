@@ -1,5 +1,6 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
+use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::Turn;
@@ -62,6 +63,7 @@ pub(crate) struct ThreadState {
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     listener_thread: Option<Weak<CodexThread>>,
+    last_account_lease_notification: Option<AccountLeaseUpdatedNotification>,
 }
 
 impl ThreadState {
@@ -94,6 +96,7 @@ impl ThreadState {
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
+        self.last_account_lease_notification = None;
     }
 
     pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
@@ -120,6 +123,18 @@ impl ThreadState {
         {
             self.current_turn_history.reset();
         }
+    }
+
+    pub(crate) fn take_changed_account_lease_notification(
+        &mut self,
+        notification: AccountLeaseUpdatedNotification,
+    ) -> Option<AccountLeaseUpdatedNotification> {
+        if self.last_account_lease_notification.as_ref() == Some(&notification) {
+            return None;
+        }
+
+        self.last_account_lease_notification = Some(notification.clone());
+        Some(notification)
     }
 }
 

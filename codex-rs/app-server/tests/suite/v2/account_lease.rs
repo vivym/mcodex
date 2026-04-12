@@ -10,25 +10,37 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::encode_id_token;
 use app_test_support::to_response;
 use codex_app_server_protocol::AccountLeaseReadResponse;
+use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::UserInput;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const PRIMARY_ACCOUNT_ID: &str = "acct-1";
+const SECONDARY_ACCOUNT_ID: &str = "acct-2";
 
 #[tokio::test]
 async fn account_lease_read_reports_process_local_pool_state() -> Result<()> {
@@ -43,6 +55,35 @@ async fn account_lease_read_reports_process_local_pool_state() -> Result<()> {
     let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
     assert_eq!(response.suppressed, false);
     assert_eq!(response.health_state.as_deref(), Some("healthy"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_reports_live_active_lease_fields_after_turn_start() -> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_default_pool_state(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread(&mut mcp).await?;
+    let _turn = start_turn(&mut mcp, &thread.id, "lease me").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.active, true);
+    assert_eq!(response.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+    assert!(response.lease_id.is_some());
+    assert_eq!(response.lease_epoch, Some(1));
 
     Ok(())
 }
@@ -69,6 +110,70 @@ async fn account_lease_updated_emits_on_resume() -> Result<()> {
         mcp.next_notification_method().await?,
         "accountLease/updated"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot() -> Result<()> {
+    let server = create_rate_limit_then_success_server().await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_two_accounts(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread(&mut mcp).await?;
+
+    let _first_turn = start_turn(&mut mcp, &thread.id, "hit the limit").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("error"),
+    )
+    .await??;
+    mcp.clear_message_buffer();
+
+    let second_turn = start_turn(&mut mcp, &thread.id, "rotate to the next account").await?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "accountLease/updated for rotated account",
+            |notification| {
+                notification.method == "accountLease/updated"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("accountId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(SECONDARY_ACCOUNT_ID)
+            },
+        ),
+    )
+    .await??;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(updated.account_id.as_deref(), Some(SECONDARY_ACCOUNT_ID));
+    assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(updated.suppressed, false);
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed for rotated account turn",
+            |notification| {
+                notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(second_turn.id.as_str())
+            },
+        ),
+    )
+    .await??;
 
     Ok(())
 }
@@ -103,6 +208,72 @@ async fn account_lease_resume_preserves_persisted_default_pool() -> Result<()> {
     );
     assert_eq!(selection.preferred_account_id, None);
     assert_eq!(selection.suppressed, false);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -> Result<()> {
+    let server = create_rate_limit_then_success_server().await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_two_accounts(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread(&mut mcp).await?;
+    let _first_turn = start_turn(&mut mcp, &thread.id, "rate limit me").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("error"),
+    )
+    .await??;
+
+    let after_failure: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(
+        after_failure.account_id.as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+    assert_eq!(
+        after_failure.switch_reason.as_deref(),
+        Some("nonReplayableTurn")
+    );
+
+    mcp.clear_message_buffer();
+    let second_turn = start_turn(&mut mcp, &thread.id, "recover on another account").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed for recovered turn",
+            |notification| {
+                notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(second_turn.id.as_str())
+            },
+        ),
+    )
+    .await??;
+
+    let after_rotation: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(
+        after_rotation.account_id.as_deref(),
+        Some(SECONDARY_ACCOUNT_ID)
+    );
+    assert_eq!(
+        after_rotation.switch_reason.as_deref(),
+        Some("automaticAccountSelected")
+    );
+    assert_eq!(after_rotation.transport_reset_generation, Some(1));
+    assert_eq!(
+        after_rotation.last_remote_context_reset_turn_id.as_deref(),
+        Some(second_turn.id.as_str())
+    );
 
     Ok(())
 }
@@ -241,6 +412,102 @@ async fn seed_default_pool_state(codex_home: &std::path::Path) -> Result<Arc<Sta
         })
         .await?;
     Ok(runtime)
+}
+
+async fn seed_two_accounts(codex_home: &std::path::Path) -> Result<Arc<StateRuntime>> {
+    let runtime = seed_default_pool_state(codex_home).await?;
+    runtime
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: SECONDARY_ACCOUNT_ID.to_string(),
+        })
+        .await?;
+    Ok(runtime)
+}
+
+async fn start_thread(mcp: &mut McpProcess) -> Result<codex_app_server_protocol::Thread> {
+    let thread_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(response)?;
+    Ok(thread)
+}
+
+async fn start_turn(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    text: &str,
+) -> Result<codex_app_server_protocol::Turn> {
+    let request_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let TurnStartResponse { turn } = to_response(response)?;
+    Ok(turn)
+}
+
+async fn create_rate_limit_then_success_server() -> wiremock::MockServer {
+    struct SeqResponder {
+        call_count: std::sync::atomic::AtomicUsize,
+        responses: Vec<ResponseTemplate>,
+    }
+
+    impl Respond for SeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.responses
+                .get(call_index)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing mock response for call {call_index}"))
+        }
+    }
+
+    let server = core_test_support::responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(SeqResponder {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            responses: vec![
+                ResponseTemplate::new(429)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("x-codex-primary-used-percent", "100.0")
+                    .insert_header("x-codex-primary-window-minutes", "15")
+                    .set_body_json(json!({
+                        "error": {
+                            "type": "usage_limit_reached",
+                            "message": "limit reached",
+                            "resets_at": 1704067242
+                        }
+                    })),
+                core_test_support::responses::sse_response(core_test_support::responses::sse(
+                    vec![
+                        core_test_support::responses::ev_response_created("resp-2"),
+                        core_test_support::responses::ev_assistant_message("msg-2", "Done"),
+                        core_test_support::responses::ev_completed("resp-2"),
+                    ],
+                )),
+            ],
+        })
+        .mount(&server)
+        .await;
+    server
 }
 
 fn create_pooled_config_toml(

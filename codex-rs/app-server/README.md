@@ -1378,10 +1378,10 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `accountLease/read` — read pooled startup-selection status for the current process. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
+- `accountLease/read` — read pooled lease status for the current process. When exactly one pooled thread is loaded, the response prefers that thread's live lease snapshot and otherwise falls back to startup-selection preview state. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
 - `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType`, `workspaceRole`, and `isWorkspaceOwner`.
-- `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes.
+- `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes or when a loaded pooled thread's live lease notification state changes.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, success, error? }`.
