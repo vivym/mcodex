@@ -172,6 +172,15 @@ async fn account_lease_snapshot_clears_revoked_live_lease_after_external_disable
             "state db should be available in core integration tests"
         ));
     };
+    state_db
+        .record_account_health_event(AccountHealthEvent {
+            account_id: PRIMARY_ACCOUNT_ID.to_string(),
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            health_state: AccountHealthState::Healthy,
+            sequence_number: 1,
+            observed_at: chrono::Utc::now(),
+        })
+        .await?;
 
     let turn_error = submit_turn_and_wait(&test, "snapshot revoked lease").await?;
     assert!(turn_error.is_none());
@@ -188,6 +197,11 @@ async fn account_lease_snapshot_clears_revoked_live_lease_after_external_disable
     );
     assert!(active_snapshot.lease_id.is_some());
     assert_eq!(active_snapshot.lease_epoch, Some(1));
+    assert_eq!(
+        active_snapshot.health_state,
+        Some(AccountHealthState::Healthy)
+    );
+    assert!(active_snapshot.next_eligible_at.is_some());
 
     assert!(
         state_db
@@ -203,8 +217,11 @@ async fn account_lease_snapshot_clears_revoked_live_lease_after_external_disable
         .expect("pooled session should expose lease snapshot");
     assert_eq!(snapshot.active, false);
     assert_eq!(snapshot.account_id, None);
+    assert_eq!(snapshot.pool_id, None);
     assert_eq!(snapshot.lease_id, None);
     assert_eq!(snapshot.lease_epoch, None);
+    assert_eq!(snapshot.health_state, None);
+    assert_eq!(snapshot.next_eligible_at, None);
 
     Ok(())
 }

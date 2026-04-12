@@ -32,6 +32,12 @@ async fn prepared_migrated_home() -> Result<TempDir> {
     Ok(codex_home)
 }
 
+async fn prepared_legacy_auth_only_home() -> Result<TempDir> {
+    let codex_home = TempDir::new()?;
+    seed_chatgpt_auth(codex_home.path())?;
+    Ok(codex_home)
+}
+
 async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
     let output = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
         .env("CODEX_HOME", codex_home.path())
@@ -276,6 +282,45 @@ async fn accounts_list_lists_registered_accounts_and_marks_migrated_source() -> 
     assert_eq!(
         lines,
         vec!["acct-legacy pool=legacy-default enabled=true healthy=true source=migrated"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_list_bootstraps_legacy_auth_into_pooled_state() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "list"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let lines = output
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec!["acct-1 pool=legacy-default enabled=true healthy=true source=migrated"]
+    );
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        }
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership"),
+        codex_state::AccountPoolMembership {
+            account_id: "acct-1".to_string(),
+            pool_id: "legacy-default".to_string(),
+            enabled: true,
+            healthy: true,
+        }
     );
 
     Ok(())

@@ -462,7 +462,7 @@ impl AccountPoolManagerSnapshotSeed {
         } else {
             None
         };
-        if let Some(diagnostic_lease) = active_lease.as_ref().or(self.active_lease.as_ref())
+        if let Some(diagnostic_lease) = active_lease.as_ref()
             && let Ok(diagnostic) = self
                 .state_db
                 .read_account_pool_diagnostic(

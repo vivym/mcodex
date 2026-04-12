@@ -6,7 +6,10 @@ use anyhow::Context;
 use clap::Args;
 use clap::Parser;
 use codex_core::config::Config;
+use codex_login::AuthManager;
+use codex_login::LegacyAuthView;
 use codex_state::AccountStartupSelectionUpdate;
+use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
@@ -186,6 +189,7 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
     let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account startup selection state")?;
+    bootstrap_from_legacy_auth_if_needed(&runtime, &config).await?;
 
     match subcommand {
         AccountsSubcommand::Add(_command) => anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP),
@@ -278,4 +282,37 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn bootstrap_from_legacy_auth_if_needed(
+    runtime: &StateRuntime,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let startup_selection = runtime
+        .read_account_startup_selection()
+        .await
+        .context("read account startup selection")?;
+    if startup_selection.default_pool_id.is_some()
+        || startup_selection.preferred_account_id.is_some()
+        || startup_selection.suppressed
+    {
+        return Ok(());
+    }
+
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true);
+    let legacy_auth_view = LegacyAuthView::new(&auth_manager);
+    let Some(account_id) = legacy_auth_view
+        .current()
+        .await
+        .and_then(|auth| auth.get_account_id())
+    else {
+        return Ok(());
+    };
+
+    runtime
+        .import_legacy_default_account(LegacyAccountImport { account_id })
+        .await
+        .context("bootstrap pooled state from legacy auth")?;
+    Ok(())
 }
