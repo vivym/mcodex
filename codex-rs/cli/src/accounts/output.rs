@@ -3,11 +3,9 @@ use crate::accounts::diagnostics::AccountsStatusDiagnostic;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountDiagnostic;
 use codex_state::AccountPoolDiagnostic;
+use codex_state::AccountSource;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
-
-const MIGRATED_ACCOUNT_SOURCE: &str = "migrated";
-const MIGRATED_POOL_ID: &str = "legacy-default";
 
 struct EligibilityView {
     code: &'static str,
@@ -51,7 +49,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
             "disabled"
         }
     );
-    print_status_preview(&diagnostic.preview);
+    print_status_preview(&diagnostic.preview, effective_pool_source(diagnostic));
     println!(
         "health state: {}",
         status_health_state(&diagnostic.preview, diagnostic.pool.as_ref()).unwrap_or("unknown")
@@ -76,7 +74,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
                 health_state(account),
                 eligibility.reason,
                 format_optional_timestamp(account.next_eligible_at.as_ref()),
-                source_suffix(account.pool_id.as_str())
+                source_suffix(account.source)
             );
         }
     }
@@ -87,11 +85,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "accountPoolOverrideId": diagnostic.account_pool_override_id.as_deref(),
         "configuredPoolCount": diagnostic.configured_pool_count,
         "effectivePoolId": diagnostic.preview.effective_pool_id.as_deref(),
-        "effectivePoolSource": diagnostic
-            .preview
-            .effective_pool_id
-            .as_deref()
-            .and_then(account_source),
+        "effectivePoolSource": effective_pool_source(diagnostic).map(AccountSource::as_str),
         "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
         "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
         "suppressed": diagnostic.preview.suppressed,
@@ -116,7 +110,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                         serde_json::json!({
                             "accountId": &account.account_id,
                             "poolId": &account.pool_id,
-                            "source": account_source(account.pool_id.as_str()),
+                            "source": account.source.map(AccountSource::as_str),
                             "enabled": account.enabled,
                             "healthy": account.healthy,
                             "healthState": health_state(account),
@@ -154,14 +148,14 @@ fn print_preview(preview: &AccountStartupSelectionPreview) {
     println!("eligibility: {}", eligibility_reason(&preview.eligibility));
 }
 
-fn print_status_preview(preview: &AccountStartupSelectionPreview) {
+fn print_status_preview(
+    preview: &AccountStartupSelectionPreview,
+    effective_pool_source: Option<AccountSource>,
+) {
     let effective_pool = preview.effective_pool_id.as_deref().unwrap_or("none");
     println!(
         "effective pool: {effective_pool}{}",
-        preview
-            .effective_pool_id
-            .as_deref()
-            .map_or_else(String::new, source_suffix)
+        source_suffix(effective_pool_source)
     );
     println!(
         "preferred account: {}",
@@ -265,12 +259,21 @@ fn status_health_state(
     }
 }
 
-fn account_source(pool_id: &str) -> Option<&'static str> {
-    (pool_id == MIGRATED_POOL_ID).then_some(MIGRATED_ACCOUNT_SOURCE)
+fn effective_pool_source(diagnostic: &AccountsStatusDiagnostic) -> Option<AccountSource> {
+    let selected_account_id = diagnostic
+        .preview
+        .preferred_account_id
+        .as_deref()
+        .or(diagnostic.preview.predicted_account_id.as_deref())?;
+    let pool = diagnostic.pool.as_ref()?;
+    pool.accounts
+        .iter()
+        .find(|account| account.account_id == selected_account_id)
+        .and_then(|account| account.source)
 }
 
-fn source_suffix(pool_id: &str) -> String {
-    account_source(pool_id).map_or_else(String::new, |source| format!(" source={source}"))
+fn source_suffix(source: Option<AccountSource>) -> String {
+    source.map_or_else(String::new, |source| format!(" source={}", source.as_str()))
 }
 
 fn normalized_account_eligibility(

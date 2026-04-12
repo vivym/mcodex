@@ -66,6 +66,7 @@ pub struct AccountPoolDiagnostic {
 pub struct AccountPoolAccountDiagnostic {
     pub account_id: String,
     pub pool_id: String,
+    pub source: Option<AccountSource>,
     pub enabled: bool,
     pub healthy: bool,
     pub active_lease: Option<AccountLeaseRecord>,
@@ -154,11 +155,37 @@ pub enum AccountStartupEligibility {
     NoEligibleAccount,
 }
 
+/// Provenance recorded for an account in the local registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSource {
+    Migrated,
+}
+
+impl AccountSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Migrated => "migrated",
+        }
+    }
+}
+
+impl TryFrom<&str> for AccountSource {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value {
+            "migrated" => Ok(Self::Migrated),
+            other => Err(anyhow::anyhow!("unknown account source: {other}")),
+        }
+    }
+}
+
 /// Persisted pool membership for a known account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountPoolMembership {
     pub account_id: String,
     pub pool_id: String,
+    pub source: Option<AccountSource>,
     pub enabled: bool,
     pub healthy: bool,
 }

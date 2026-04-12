@@ -182,6 +182,10 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         account_pool,
         subcommand,
     } = command;
+    if matches!(subcommand, AccountsSubcommand::Add(_)) {
+        anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP);
+    }
+
     let cli_overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;

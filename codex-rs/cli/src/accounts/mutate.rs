@@ -1,8 +1,6 @@
 use anyhow::Context;
+use codex_state::AccountSource;
 use codex_state::StateRuntime;
-
-const MIGRATED_ACCOUNT_SOURCE: &str = "migrated";
-const MIGRATED_POOL_ID: &str = "legacy-default";
 
 pub(super) async fn list_accounts(runtime: &StateRuntime) -> anyhow::Result<()> {
     let memberships = runtime
@@ -16,15 +14,13 @@ pub(super) async fn list_accounts(runtime: &StateRuntime) -> anyhow::Result<()> 
     }
 
     for membership in memberships {
-        let source = account_source(&membership.pool_id);
-        let source_suffix = source.map_or_else(String::new, |source| format!(" source={source}"));
         println!(
             "{} pool={} enabled={} healthy={}{}",
             membership.account_id,
             membership.pool_id,
             membership.enabled,
             membership.healthy,
-            source_suffix
+            source_suffix(membership.source)
         );
     }
 
@@ -103,6 +99,6 @@ pub(super) async fn assign_account_pool(
     Ok(())
 }
 
-fn account_source(pool_id: &str) -> Option<&'static str> {
-    (pool_id == MIGRATED_POOL_ID).then_some(MIGRATED_ACCOUNT_SOURCE)
+fn source_suffix(source: Option<AccountSource>) -> String {
+    source.map_or_else(String::new, |source| format!(" source={}", source.as_str()))
 }

@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use codex_state::AccountStartupSelectionState;
 use codex_state::AccountStartupSelectionUpdate;
+use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use pretty_assertions::assert_eq;
@@ -125,14 +126,9 @@ async fn seed_state(codex_home: &Path) -> Result<()> {
 
 async fn seed_migrated_state(codex_home: &Path) -> Result<()> {
     let runtime = StateRuntime::init(codex_home.to_path_buf(), "test-provider".to_string()).await?;
-    let pool =
-        SqlitePool::connect(&format!("sqlite://{}", state_db_path(codex_home).display())).await?;
-    seed_account(&pool, "acct-legacy", "legacy-default", 0).await?;
     runtime
-        .write_account_startup_selection(AccountStartupSelectionUpdate {
-            default_pool_id: Some("legacy-default".to_string()),
-            preferred_account_id: Some("acct-legacy".to_string()),
-            suppressed: false,
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: "acct-legacy".to_string(),
         })
         .await?;
     Ok(())
@@ -318,10 +314,39 @@ async fn accounts_list_bootstraps_legacy_auth_into_pooled_state() -> Result<()> 
         codex_state::AccountPoolMembership {
             account_id: "acct-1".to_string(),
             pool_id: "legacy-default".to_string(),
+            source: Some(codex_state::AccountSource::Migrated),
             enabled: true,
             healthy: true,
         }
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_failures_leave_legacy_auth_only_home_unbootstrapped() -> Result<()> {
+    for args in [
+        vec!["accounts", "add"],
+        vec!["accounts", "add", "chatgpt"],
+        vec!["accounts", "add", "chatgpt", "--device-auth"],
+        vec!["accounts", "add", "api-key"],
+    ] {
+        let codex_home = prepared_legacy_auth_only_home().await?;
+
+        let output = run_codex(&codex_home, &args).await?;
+        assert!(!output.success, "stdout: {}", output.stdout);
+        assert!(
+            output.stderr.contains(
+                "pooled credential storage keyed by `credential_ref` is not implemented yet"
+            ),
+            "stderr: {}",
+            output.stderr
+        );
+        assert!(
+            !state_db_path(codex_home.path()).exists(),
+            "state db should not be created for {args:?}"
+        );
+    }
 
     Ok(())
 }
@@ -396,6 +421,105 @@ async fn accounts_status_json_marks_migrated_effective_pool_and_account_source()
     assert_eq!(accounts[0]["accountId"], "acct-legacy");
     assert_eq!(accounts[0]["poolId"], "legacy-default");
     assert_eq!(accounts[0]["source"], "migrated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_list_keeps_migrated_source_after_reassignment() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: "acct-1".to_string(),
+        })
+        .await?;
+    runtime.assign_account_pool("acct-1", "team-main").await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        })
+        .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "list"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert_eq!(
+        output
+            .stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>(),
+        vec!["acct-1 pool=team-main enabled=true healthy=true source=migrated"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_keeps_migrated_source_after_reassignment() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: "acct-1".to_string(),
+        })
+        .await?;
+    runtime.assign_account_pool("acct-1", "team-main").await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        })
+        .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["effectivePoolSource"], "migrated");
+    assert_eq!(json["accounts"][0]["poolId"], "team-main");
+    assert_eq!(json["accounts"][0]["source"], "migrated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_does_not_infer_migrated_from_legacy_default_pool_id() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    seed_account(&pool, "acct-local", "pool-main", 0).await?;
+    runtime
+        .assign_account_pool("acct-local", "legacy-default")
+        .await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some("acct-local".to_string()),
+            suppressed: false,
+        })
+        .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "legacy-default");
+    assert_eq!(json["effectivePoolSource"], serde_json::Value::Null);
+    assert_eq!(json["accounts"][0]["accountId"], "acct-local");
+    assert_eq!(json["accounts"][0]["poolId"], "legacy-default");
+    assert_eq!(json["accounts"][0]["source"], serde_json::Value::Null);
 
     Ok(())
 }

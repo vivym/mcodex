@@ -7,6 +7,7 @@ use crate::model::AccountPoolAccountDiagnostic;
 use crate::model::AccountPoolDiagnostic;
 use crate::model::AccountPoolMembership;
 use crate::model::AccountRegistryEntryUpdate;
+use crate::model::AccountSource;
 use crate::model::AccountStartupEligibility;
 use crate::model::AccountStartupSelectionPreview;
 use crate::model::AccountStartupSelectionState;
@@ -314,6 +315,7 @@ WHERE lease_id = ?
 SELECT
     account_registry.account_id,
     account_registry.pool_id,
+    account_registry.source,
     account_registry.enabled,
     account_registry.healthy,
     account_runtime_state.health_state,
@@ -358,6 +360,11 @@ ORDER BY
         for row in rows {
             let account_id: String = row.try_get("account_id")?;
             let account_pool_id: String = row.try_get("pool_id")?;
+            let source = row
+                .try_get::<Option<String>, _>("source")?
+                .as_deref()
+                .map(AccountSource::try_from)
+                .transpose()?;
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
             let health_state = row
@@ -422,6 +429,7 @@ ORDER BY
             accounts.push(AccountPoolAccountDiagnostic {
                 account_id,
                 pool_id: account_pool_id,
+                source,
                 enabled,
                 healthy,
                 active_lease,
@@ -564,10 +572,12 @@ INSERT INTO account_registry (
     workspace_id,
     enabled,
     healthy,
+    source,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(account_id) DO NOTHING
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    source = COALESCE(account_registry.source, excluded.source)
             "#,
         )
         .bind(&legacy_account.account_id)
@@ -578,6 +588,7 @@ ON CONFLICT(account_id) DO NOTHING
         .bind(Option::<String>::None)
         .bind(1_i64)
         .bind(1_i64)
+        .bind(AccountSource::Migrated.as_str())
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -603,7 +614,13 @@ INSERT INTO account_startup_selection (
     suppressed,
     updated_at
 ) VALUES (1, ?, ?, ?, ?)
-ON CONFLICT(singleton) DO NOTHING
+ON CONFLICT(singleton) DO UPDATE SET
+    default_pool_id = excluded.default_pool_id,
+    preferred_account_id = excluded.preferred_account_id,
+    updated_at = excluded.updated_at
+WHERE account_startup_selection.default_pool_id IS NULL
+  AND account_startup_selection.preferred_account_id IS NULL
+  AND account_startup_selection.suppressed = 0
             "#,
         )
         .bind(default_pool_id)
@@ -748,6 +765,7 @@ WHERE singleton = 1
 SELECT
     account_id,
     pool_id,
+    source,
     enabled,
     healthy
 FROM account_registry
@@ -762,6 +780,11 @@ WHERE account_id = ?
             Some(row) => Ok(Some(AccountPoolMembership {
                 account_id: row.try_get("account_id")?,
                 pool_id: row.try_get("pool_id")?,
+                source: row
+                    .try_get::<Option<String>, _>("source")?
+                    .as_deref()
+                    .map(AccountSource::try_from)
+                    .transpose()?,
                 enabled: row.try_get::<i64, _>("enabled")? != 0,
                 healthy: row.try_get::<i64, _>("healthy")? != 0,
             })),
@@ -962,6 +985,7 @@ WHERE account_id = ?
 SELECT
     account_id,
     pool_id,
+    source,
     enabled,
     healthy
 FROM account_registry
@@ -979,6 +1003,11 @@ ORDER BY pool_id ASC, position ASC, account_id ASC
                 Ok(AccountPoolMembership {
                     account_id: row.try_get("account_id")?,
                     pool_id: row.try_get("pool_id")?,
+                    source: row
+                        .try_get::<Option<String>, _>("source")?
+                        .as_deref()
+                        .map(AccountSource::try_from)
+                        .transpose()?,
                     enabled: row.try_get::<i64, _>("enabled")? != 0,
                     healthy: row.try_get::<i64, _>("healthy")? != 0,
                 })
@@ -1400,6 +1429,7 @@ mod tests {
     use crate::AccountPoolAccountDiagnostic;
     use crate::AccountPoolMembership;
     use crate::AccountRegistryEntryUpdate;
+    use crate::AccountSource;
     use crate::AccountStartupEligibility;
     use crate::AccountStartupSelectionPreview;
     use crate::LeaseRenewal;
@@ -2227,6 +2257,33 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn import_legacy_default_account_fills_existing_empty_startup_selection_row() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate::default())
+            .await
+            .unwrap();
+        runtime
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-legacy".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let selection = runtime.read_account_startup_selection().await.unwrap();
+
+        assert_eq!(
+            selection,
+            crate::AccountStartupSelectionState {
+                default_pool_id: Some("legacy-default".to_string()),
+                preferred_account_id: Some("acct-legacy".to_string()),
+                suppressed: false,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn import_legacy_default_account_preserves_existing_pool_membership() {
         let runtime = test_runtime().await;
         seed_account(runtime.as_ref(), "acct-1").await;
@@ -2251,6 +2308,14 @@ WHERE account_id = ?
         .unwrap();
 
         assert_eq!(pool_id, "pool-main");
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-1")
+                .await
+                .unwrap()
+                .and_then(|membership| membership.source),
+            Some(AccountSource::Migrated)
+        );
     }
 
     #[tokio::test]
@@ -2274,6 +2339,61 @@ WHERE account_id = ?
                 preferred_account_id: Some("acct-1".to_string()),
                 suppressed: false,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn migrated_account_source_survives_reassignment() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-legacy".to_string(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .assign_account_pool("acct-legacy", "pool-user")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-legacy")
+                .await
+                .unwrap(),
+            Some(AccountPoolMembership {
+                account_id: "acct-legacy".to_string(),
+                pool_id: "pool-user".to_string(),
+                source: Some(AccountSource::Migrated),
+                enabled: true,
+                healthy: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn assigning_local_account_to_legacy_default_pool_does_not_mark_it_migrated() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-local").await;
+
+        runtime
+            .assign_account_pool("acct-local", "legacy-default")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-local")
+                .await
+                .unwrap(),
+            Some(AccountPoolMembership {
+                account_id: "acct-local".to_string(),
+                pool_id: "legacy-default".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
         );
     }
 
@@ -2534,6 +2654,7 @@ WHERE account_id = ?
             Some(AccountPoolMembership {
                 account_id: "acct-1".to_string(),
                 pool_id: "pool-other".to_string(),
+                source: None,
                 enabled: false,
                 healthy: false,
             })
@@ -2595,6 +2716,7 @@ WHERE account_id = ?
             vec![AccountPoolAccountDiagnostic {
                 account_id: "acct-1".to_string(),
                 pool_id: "pool-main".to_string(),
+                source: None,
                 enabled: true,
                 healthy: false,
                 active_lease: None,
@@ -2635,6 +2757,7 @@ WHERE account_id = ?
             vec![crate::AccountPoolMembership {
                 account_id: "acct-1".to_string(),
                 pool_id: "pool-main".to_string(),
+                source: None,
                 healthy: true,
                 enabled: false,
             }]
@@ -2647,6 +2770,7 @@ WHERE account_id = ?
             vec![crate::AccountPoolMembership {
                 account_id: "acct-2".to_string(),
                 pool_id: "pool-other".to_string(),
+                source: None,
                 healthy: true,
                 enabled: true,
             }]
@@ -2679,6 +2803,7 @@ WHERE account_id = ?
             Some(AccountPoolMembership {
                 account_id: "acct-1".to_string(),
                 pool_id: "pool-main".to_string(),
+                source: None,
                 enabled: true,
                 healthy: true,
             })
@@ -2713,6 +2838,7 @@ WHERE account_id = ?
             vec![AccountPoolMembership {
                 account_id: "acct-1".to_string(),
                 pool_id: "pool-other".to_string(),
+                source: None,
                 enabled: false,
                 healthy: false,
             }]
@@ -2774,6 +2900,7 @@ WHERE account_id = ?
             vec![crate::AccountPoolMembership {
                 account_id: "acct-2".to_string(),
                 pool_id: "pool-main".to_string(),
+                source: None,
                 healthy: true,
                 enabled: true,
             }]
