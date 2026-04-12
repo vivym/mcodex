@@ -898,6 +898,41 @@ async fn accounts_remove_deletes_registry_entry() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_remove_clears_missing_preferred_override_and_falls_back() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let remove = run_codex(&codex_home, &["accounts", "remove", "acct-1"]).await?;
+    assert!(remove.success, "stderr: {}", remove.stderr);
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
+
+    let output = run_codex(&codex_home, &["accounts", "current", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["predictedAccountId"], "acct-2");
+    assert_eq!(json["eligibility"]["code"], "automaticAccountSelected");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_add_chatgpt_stops_at_credential_storage_gap() -> Result<()> {
     let codex_home = prepared_home().await?;
 

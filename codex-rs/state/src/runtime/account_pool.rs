@@ -577,7 +577,11 @@ INSERT INTO account_registry (
     updated_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
-    source = COALESCE(account_registry.source, excluded.source)
+    source = CASE
+        WHEN account_registry.source IS NOT NULL THEN account_registry.source
+        WHEN account_registry.pool_id = 'legacy-default' THEN account_registry.source
+        ELSE excluded.source
+    END
             "#,
         )
         .bind(&legacy_account.account_id)
@@ -918,6 +922,8 @@ WHERE account_id = ?
     }
 
     pub async fn remove_account_registry_entry(&self, account_id: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
         let result = sqlx::query(
             r#"
 DELETE FROM account_registry
@@ -925,9 +931,24 @@ WHERE account_id = ?
             "#,
         )
         .bind(account_id)
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await?;
 
+        if result.rows_affected() != 0 {
+            sqlx::query(
+                r#"
+UPDATE account_startup_selection
+SET preferred_account_id = NULL, updated_at = ?
+WHERE preferred_account_id = ?
+                "#,
+            )
+            .bind(updated_at)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(result.rows_affected() != 0)
     }
 
@@ -2406,6 +2427,40 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn import_legacy_default_account_preserves_ambiguous_legacy_default_membership_source() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(
+            runtime.as_ref(),
+            "acct-local",
+            super::LEGACY_DEFAULT_POOL_ID,
+            0,
+            true,
+        )
+        .await;
+
+        runtime
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-local".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-local")
+                .await
+                .unwrap(),
+            Some(AccountPoolMembership {
+                account_id: "acct-local".to_string(),
+                pool_id: super::LEGACY_DEFAULT_POOL_ID.to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn import_legacy_default_account_uses_existing_pool_for_startup_selection() {
         let runtime = test_runtime().await;
         seed_account(runtime.as_ref(), "acct-1").await;
@@ -2998,6 +3053,50 @@ WHERE account_id = ?
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_preferred_account_clears_startup_override_and_falls_back() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .remove_account_registry_entry("acct-1")
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            runtime.read_account_startup_selection().await.unwrap(),
+            crate::AccountStartupSelectionState {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        assert_eq!(
+            runtime
+                .preview_account_startup_selection(None)
+                .await
+                .unwrap(),
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-2".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
         );
     }
 
