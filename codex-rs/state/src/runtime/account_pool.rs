@@ -1449,6 +1449,7 @@ mod tests {
 ON account_leases(holder_instance_id)
 WHERE released_at IS NULL;
 "#;
+    const ACCOUNT_REGISTRY_SOURCE_MIGRATION_VERSION: i64 = 28;
 
     const HISTORICAL_MODIFIED_0026_SQL: &str = r#"WITH ranked_active_leases AS (
     SELECT
@@ -1671,6 +1672,92 @@ WHERE holder_instance_id = ?
             Some("acct-legacy")
         );
         assert_eq!(selection.suppressed, false);
+    }
+
+    #[tokio::test]
+    async fn init_does_not_relabel_pre_0028_manual_legacy_default_account_as_migrated() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let old_state_migrator = Migrator {
+            migrations: Cow::Owned(
+                STATE_MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| {
+                        migration.version < ACCOUNT_REGISTRY_SOURCE_MIGRATION_VERSION
+                    })
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open old state db");
+        old_state_migrator
+            .run(&pool)
+            .await
+            .expect("apply pre-0028 state schema");
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    enabled,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-local")
+        .bind("legacy-default")
+        .bind(0_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind("workspace-main")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert pre-0028 manual legacy-default account");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-local")
+                .await
+                .expect("read account pool membership"),
+            Some(AccountPoolMembership {
+                account_id: "acct-local".to_string(),
+                pool_id: "legacy-default".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+
+        drop(runtime);
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
     #[tokio::test]
