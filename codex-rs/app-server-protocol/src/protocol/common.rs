@@ -494,6 +494,14 @@ client_request_definitions! {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::LogoutAccountResponse,
     },
+    AccountLeaseRead => "accountLease/read" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::AccountLeaseReadResponse,
+    },
+    AccountLeaseResume => "accountLease/resume" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::AccountLeaseResumeResponse,
+    },
 
     GetAccountRateLimits => "account/rateLimits/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
@@ -994,6 +1002,7 @@ server_notification_definitions! {
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     McpServerStatusUpdated => "mcpServer/startupStatus/updated" (v2::McpServerStatusUpdatedNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
+    AccountLeaseUpdated => "accountLease/updated" (v2::AccountLeaseUpdatedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AddCreditsNudgeEmailCompleted => "account/addCreditsNudgeEmail/completed" (v2::AddCreditsNudgeEmailNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
@@ -1378,6 +1387,42 @@ mod tests {
     }
 
     #[test]
+    fn serialize_account_lease_read() -> Result<()> {
+        let request = ClientRequest::AccountLeaseRead {
+            request_id: RequestId::Integer(1),
+            params: None,
+        };
+        assert_eq!(request.id(), &RequestId::Integer(1));
+        assert_eq!(request.method(), "accountLease/read");
+        assert_eq!(
+            json!({
+                "method": "accountLease/read",
+                "id": 1,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_lease_resume() -> Result<()> {
+        let request = ClientRequest::AccountLeaseResume {
+            request_id: RequestId::Integer(2),
+            params: None,
+        };
+        assert_eq!(request.id(), &RequestId::Integer(2));
+        assert_eq!(request.method(), "accountLease/resume");
+        assert_eq!(
+            json!({
+                "method": "accountLease/resume",
+                "id": 2,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn serialize_client_response() -> Result<()> {
         let response = ClientResponse::ThreadStart {
             request_id: RequestId::Integer(7),
@@ -1552,7 +1597,7 @@ mod tests {
     #[test]
     fn serialize_account_login_chatgpt_auth_tokens() -> Result<()> {
         let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(6),
+            request_id: RequestId::Integer(8),
             params: v2::LoginAccountParams::ChatgptAuthTokens {
                 access_token: "access-token".to_string(),
                 chatgpt_account_id: "org-123".to_string(),
@@ -1562,7 +1607,7 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "account/login/start",
-                "id": 6,
+                "id": 8,
                 "params": {
                     "type": "chatgptAuthTokens",
                     "accessToken": "access-token",
@@ -1578,7 +1623,7 @@ mod tests {
     #[test]
     fn serialize_get_account() -> Result<()> {
         let request = ClientRequest::GetAccount {
-            request_id: RequestId::Integer(6),
+            request_id: RequestId::Integer(9),
             params: v2::GetAccountParams {
                 refresh_token: false,
             },
@@ -1586,7 +1631,7 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "account/read",
-                "id": 6,
+                "id": 9,
                 "params": {
                     "refreshToken": false
                 }
@@ -1895,6 +1940,28 @@ mod tests {
                     "status": {
                         "type": "idle"
                     },
+                }
+            }),
+            serde_json::to_value(&notification)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_lease_updated_notification() -> Result<()> {
+        let notification =
+            ServerNotification::AccountLeaseUpdated(v2::AccountLeaseUpdatedNotification {
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("pool-main".to_string()),
+                suppressed: false,
+            });
+        assert_eq!(
+            json!({
+                "method": "accountLease/updated",
+                "params": {
+                    "accountId": "acct-1",
+                    "poolId": "pool-main",
+                    "suppressed": false
                 }
             }),
             serde_json::to_value(&notification)?,

@@ -5,6 +5,29 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AccountLeaseUpdatedNotification": {
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppressed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "suppressed"
+      ],
+      "type": "object"
+    },
     "AccountLoginCompletedNotification": {
       "properties": {
         "error": {
@@ -4747,6 +4770,26 @@
         "params"
       ],
       "title": "Account/updatedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "accountLease/updated"
+          ],
+          "title": "AccountLease/updatedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountLeaseUpdatedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "AccountLease/updatedNotification",
       "type": "object"
     },
     {

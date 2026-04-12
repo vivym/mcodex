@@ -1763,6 +1763,32 @@ pub struct GetAccountResponse {
     pub requires_openai_auth: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountLeaseReadResponse {
+    pub active: bool,
+    pub suppressed: bool,
+    pub account_id: Option<String>,
+    pub pool_id: Option<String>,
+    pub lease_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub lease_epoch: Option<u64>,
+    pub health_state: Option<String>,
+    pub switch_reason: Option<String>,
+    pub suppression_reason: Option<String>,
+    #[ts(type = "number | null")]
+    pub transport_reset_generation: Option<u64>,
+    pub last_remote_context_reset_turn_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub next_eligible_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountLeaseResumeResponse {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -3687,6 +3713,25 @@ pub struct AccountUpdatedNotification {
     pub plan_type: Option<PlanType>,
     pub workspace_role: Option<WorkspaceRole>,
     pub is_workspace_owner: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountLeaseUpdatedNotification {
+    pub account_id: Option<String>,
+    pub pool_id: Option<String>,
+    pub suppressed: bool,
+}
+
+impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
+    fn from(value: AccountLeaseReadResponse) -> Self {
+        Self {
+            account_id: value.account_id,
+            pool_id: value.pool_id,
+            suppressed: value.suppressed,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

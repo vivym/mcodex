@@ -291,6 +291,32 @@ impl McpProcess {
             .await
     }
 
+    /// Send an `accountLease/read` JSON-RPC request.
+    pub async fn send_account_lease_read_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountLease/read", /*params*/ None)
+            .await
+    }
+
+    /// Send an `accountLease/resume` JSON-RPC request.
+    pub async fn send_account_lease_resume_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountLease/resume", /*params*/ None)
+            .await
+    }
+
+    /// Send `accountLease/read` and wait for the response.
+    pub async fn read_account_lease(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_lease_read_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    /// Send `accountLease/resume` and wait for the response.
+    pub async fn account_lease_resume(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_lease_resume_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
     /// Send an `account/read` JSON-RPC request.
     pub async fn send_get_account_request(
         &mut self,
@@ -1155,6 +1181,15 @@ impl McpProcess {
 
     pub async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.read_stream_until_message(|_| true).await
+    }
+
+    pub async fn next_notification_method(&mut self) -> anyhow::Result<String> {
+        loop {
+            let message = self.read_next_message().await?;
+            if let JSONRPCMessage::Notification(notification) = message {
+                return Ok(notification.method);
+            }
+        }
     }
 
     /// Clears any buffered messages so future reads only consider new stream items.

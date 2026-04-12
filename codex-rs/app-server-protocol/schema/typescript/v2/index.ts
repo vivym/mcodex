@@ -1,6 +1,9 @@
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 export type { Account } from "./Account";
+export type { AccountLeaseReadResponse } from "./AccountLeaseReadResponse";
+export type { AccountLeaseResumeResponse } from "./AccountLeaseResumeResponse";
+export type { AccountLeaseUpdatedNotification } from "./AccountLeaseUpdatedNotification";
 export type { AccountLoginCompletedNotification } from "./AccountLoginCompletedNotification";
 export type { AccountRateLimitsUpdatedNotification } from "./AccountRateLimitsUpdatedNotification";
 export type { AccountUpdatedNotification } from "./AccountUpdatedNotification";

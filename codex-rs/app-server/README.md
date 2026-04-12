@@ -1378,7 +1378,10 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
+- `accountLease/read` — read pooled startup-selection status for the current process. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
+- `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType`, `workspaceRole`, and `isWorkspaceOwner`.
+- `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, success, error? }`.
@@ -1470,13 +1473,42 @@ Field notes:
 { "method": "account/logout", "id": 6 }
 { "id": 6, "result": {} }
 { "method": "account/updated", "params": { "authMode": null, "planType": null, "workspaceRole": null, "isWorkspaceOwner": null } }
+{ "method": "accountLease/updated", "params": { "accountId": null, "poolId": "legacy-default", "suppressed": true } }
 ```
 
-### 7) Rate limits (ChatGPT)
+When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears only that in-memory auth context and does not durably suppress pooled startup selection.
+
+### 7) Pooled lease status
 
 ```json
-{ "method": "account/rateLimits/read", "id": 7 }
-{ "id": 7, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null } } }
+{ "method": "accountLease/read", "id": 7 }
+{
+  "id": 7,
+  "result": {
+    "active": true,
+    "suppressed": false,
+    "accountId": "acct-1",
+    "poolId": "legacy-default",
+    "leaseId": null,
+    "leaseEpoch": null,
+    "healthState": "healthy",
+    "switchReason": "automaticAccountSelected",
+    "suppressionReason": null,
+    "transportResetGeneration": null,
+    "lastRemoteContextResetTurnId": null,
+    "nextEligibleAt": null
+  }
+}
+{ "method": "accountLease/resume", "id": 8 }
+{ "id": 8, "result": {} }
+{ "method": "accountLease/updated", "params": { "accountId": "acct-1", "poolId": "legacy-default", "suppressed": false } }
+```
+
+### 8) Rate limits (ChatGPT)
+
+```json
+{ "method": "account/rateLimits/read", "id": 9 }
+{ "id": 9, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null } } }
 { "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
 ```
 

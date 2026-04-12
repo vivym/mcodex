@@ -4689,6 +4689,52 @@
         },
         "method": {
           "enum": [
+            "accountLease/read"
+          ],
+          "title": "AccountLease/readRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "AccountLease/readRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountLease/resume"
+          ],
+          "title": "AccountLease/resumeRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "AccountLease/resumeRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
             "account/rateLimits/read"
           ],
           "title": "Account/rateLimits/readRequestMethod",

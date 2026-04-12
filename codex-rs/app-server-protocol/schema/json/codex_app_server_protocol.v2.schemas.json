@@ -49,6 +49,118 @@
         }
       ]
     },
+    "AccountLeaseReadResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "healthState": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastRemoteContextResetTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "leaseEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "leaseId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nextEligibleAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppressed": {
+          "type": "boolean"
+        },
+        "suppressionReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "switchReason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transportResetGeneration": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "active",
+        "suppressed"
+      ],
+      "title": "AccountLeaseReadResponse",
+      "type": "object"
+    },
+    "AccountLeaseResumeResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "AccountLeaseResumeResponse",
+      "type": "object"
+    },
+    "AccountLeaseUpdatedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suppressed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "suppressed"
+      ],
+      "title": "AccountLeaseUpdatedNotification",
+      "type": "object"
+    },
     "AccountLoginCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -2004,6 +2116,52 @@
             "method"
           ],
           "title": "Account/logoutRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountLease/read"
+              ],
+              "title": "AccountLease/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "AccountLease/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountLease/resume"
+              ],
+              "title": "AccountLease/resumeRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "AccountLease/resumeRequest",
           "type": "object"
         },
         {
@@ -9323,6 +9481,26 @@
             "params"
           ],
           "title": "Account/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "accountLease/updated"
+              ],
+              "title": "AccountLease/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountLeaseUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "AccountLease/updatedNotification",
           "type": "object"
         },
         {

@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "accountId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active": {
+      "type": "boolean"
+    },
+    "healthState": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "lastRemoteContextResetTurnId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "leaseEpoch": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "leaseId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nextEligibleAt": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "poolId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "suppressed": {
+      "type": "boolean"
+    },
+    "suppressionReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "switchReason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "transportResetGeneration": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "active",
+    "suppressed"
+  ],
+  "title": "AccountLeaseReadResponse",
+  "type": "object"
+}

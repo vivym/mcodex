@@ -357,6 +357,7 @@ impl MessageProcessor {
                 self.handle_client_request(
                     request_id.clone(),
                     codex_request,
+                    transport,
                     session,
                     /*outbound_initialized*/ None,
                     request_context.clone(),
@@ -401,6 +402,7 @@ impl MessageProcessor {
                 self.handle_client_request(
                     request_id.clone(),
                     request,
+                    AppServerTransport::Off,
                     session,
                     Some(outbound_initialized),
                     request_context.clone(),
@@ -527,6 +529,7 @@ impl MessageProcessor {
         &self,
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
+        transport: AppServerTransport,
         session: &mut ConnectionSessionState,
         // `Some(...)` means the caller wants initialize to immediately mark the
         // connection outbound-ready. Websocket JSON-RPC calls pass `None` so
@@ -839,6 +842,34 @@ impl MessageProcessor {
                     params,
                 )
                 .await;
+            }
+            ClientRequest::AccountLeaseRead {
+                request_id,
+                params: _,
+            } => {
+                self.codex_message_processor
+                    .account_lease_read(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        transport,
+                    )
+                    .await;
+            }
+            ClientRequest::AccountLeaseResume {
+                request_id,
+                params: _,
+            } => {
+                self.codex_message_processor
+                    .account_lease_resume(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        transport,
+                    )
+                    .await;
             }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not

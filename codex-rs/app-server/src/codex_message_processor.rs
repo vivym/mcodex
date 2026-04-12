@@ -1,3 +1,4 @@
+use crate::account_lease_api;
 use crate::bespoke_event_handling::apply_bespoke_event_handling;
 use crate::bespoke_event_handling::maybe_emit_hook_prompt_item_completed;
 use crate::command_exec::CommandExecManager;
@@ -18,11 +19,13 @@ use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
+use crate::transport::AppServerTransport;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AccountLeaseResumeResponse;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AppInfo;
@@ -474,6 +477,12 @@ enum RefreshTokenRequestOutcome {
     NotAttemptedOrSucceeded,
     FailedTransiently,
     FailedPermanently,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogoutOutcome {
+    current_auth_method: Option<AuthMode>,
+    runtime_local_chatgpt_auth_tokens: bool,
 }
 
 pub(crate) struct CodexMessageProcessorArgs {
@@ -1020,6 +1029,26 @@ impl CodexMessageProcessor {
                 params: _,
             } => {
                 self.logout_v2(to_connection_request_id(request_id)).await;
+            }
+            ClientRequest::AccountLeaseRead {
+                request_id,
+                params: _,
+            } => {
+                self.account_lease_read(
+                    to_connection_request_id(request_id),
+                    AppServerTransport::Off,
+                )
+                .await;
+            }
+            ClientRequest::AccountLeaseResume {
+                request_id,
+                params: _,
+            } => {
+                self.account_lease_resume(
+                    to_connection_request_id(request_id),
+                    AppServerTransport::Off,
+                )
+                .await;
             }
             ClientRequest::CancelLoginAccount { request_id, params } => {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
@@ -1634,7 +1663,77 @@ impl CodexMessageProcessor {
         self.spawn_live_workspace_role_update(self.auth_manager.auth_cached());
     }
 
-    async fn logout_common(&self) -> std::result::Result<Option<AuthMode>, JSONRPCErrorError> {
+    async fn validate_account_lease_runtime(
+        &self,
+        transport: AppServerTransport,
+    ) -> std::result::Result<(), JSONRPCErrorError> {
+        if !account_lease_api::pooled_mode_is_configured(self.config.as_ref()) {
+            return Ok(());
+        }
+
+        if matches!(transport, AppServerTransport::WebSocket { .. }) {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: "pooled lease mode is only supported for stdio".to_string(),
+                data: None,
+            });
+        }
+
+        if self.thread_manager.list_thread_ids().await.len() > 1 {
+            return Err(JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: "pooled mode requires one loaded thread".to_string(),
+                data: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn account_lease_read(
+        &self,
+        request_id: ConnectionRequestId,
+        transport: AppServerTransport,
+    ) {
+        if let Err(error) = self.validate_account_lease_runtime(transport).await {
+            self.outgoing.send_error(request_id, error).await;
+            return;
+        }
+
+        match account_lease_api::read_account_lease(self.config.as_ref()).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn account_lease_resume(
+        &self,
+        request_id: ConnectionRequestId,
+        transport: AppServerTransport,
+    ) {
+        if let Err(error) = self.validate_account_lease_runtime(transport).await {
+            self.outgoing.send_error(request_id, error).await;
+            return;
+        }
+
+        match account_lease_api::resume_account_lease(self.config.as_ref()).await {
+            Ok(notification) => {
+                self.outgoing
+                    .send_response(request_id, AccountLeaseResumeResponse {})
+                    .await;
+                self.outgoing
+                    .send_server_notification(ServerNotification::AccountLeaseUpdated(notification))
+                    .await;
+            }
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+            }
+        }
+    }
+
+    async fn logout_common(&self) -> std::result::Result<LogoutOutcome, JSONRPCErrorError> {
+        let runtime_local_chatgpt_auth_tokens = self.auth_manager.is_external_chatgpt_auth_active();
+
         // Cancel any active login attempt.
         {
             let mut guard = self.active_login.lock().await;
@@ -1652,22 +1751,42 @@ impl CodexMessageProcessor {
         }
 
         // Reflect the current auth method after logout (likely None).
-        Ok(self
-            .auth_manager
-            .auth_cached()
-            .as_ref()
-            .map(CodexAuth::api_auth_mode))
+        Ok(LogoutOutcome {
+            current_auth_method: self
+                .auth_manager
+                .auth_cached()
+                .as_ref()
+                .map(CodexAuth::api_auth_mode),
+            runtime_local_chatgpt_auth_tokens,
+        })
     }
 
     async fn logout_v2(&self, request_id: ConnectionRequestId) {
         match self.logout_common().await {
-            Ok(current_auth_method) => {
+            Ok(outcome) => {
+                let account_lease_notification = if outcome.runtime_local_chatgpt_auth_tokens {
+                    None
+                } else {
+                    match account_lease_api::suppress_account_lease_on_logout(self.config.as_ref())
+                        .await
+                    {
+                        Ok(notification) => notification,
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed to durably suppress pooled account startup selection after logout: {}",
+                                error.message
+                            );
+                            None
+                        }
+                    }
+                };
+
                 self.outgoing
                     .send_response(request_id, LogoutAccountResponse {})
                     .await;
 
                 let payload_v2 = AccountUpdatedNotification {
-                    auth_mode: current_auth_method,
+                    auth_mode: outcome.current_auth_method,
                     plan_type: None,
                     workspace_role: None,
                     is_workspace_owner: None,
@@ -1675,6 +1794,13 @@ impl CodexMessageProcessor {
                 self.outgoing
                     .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
                     .await;
+                if let Some(notification) = account_lease_notification {
+                    self.outgoing
+                        .send_server_notification(ServerNotification::AccountLeaseUpdated(
+                            notification,
+                        ))
+                        .await;
+                }
             }
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -5601,7 +5727,7 @@ impl CodexMessageProcessor {
     }
 
     async fn unload_thread_without_subscribers(
-        &mut self,
+        &self,
         thread_id: ThreadId,
         thread: Arc<CodexThread>,
     ) {
