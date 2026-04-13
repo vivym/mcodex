@@ -440,29 +440,83 @@ async fn accounts_import_legacy_without_explicit_pool_uses_legacy_default() -> R
 }
 
 #[tokio::test]
-async fn accounts_add_failures_leave_legacy_auth_only_home_unbootstrapped() -> Result<()> {
-    for args in [
-        vec!["accounts", "add"],
-        vec!["accounts", "add", "chatgpt"],
-        vec!["accounts", "add", "chatgpt", "--device-auth"],
-        vec!["accounts", "add", "api-key"],
-    ] {
-        let codex_home = prepared_legacy_auth_only_home().await?;
+async fn accounts_add_chatgpt_without_pool_fails_before_auth_and_suggests_configuring_a_pool()
+-> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
 
-        let output = run_codex(&codex_home, &args).await?;
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(
-            output.stderr.contains(
-                "pooled credential storage keyed by `credential_ref` is not implemented yet"
-            ),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(
-            !state_db_path(codex_home.path()).exists(),
-            "state db should not be created for {args:?}"
-        );
-    }
+    let output = run_codex(&codex_home, &["accounts", "add", "chatgpt"]).await?;
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("configure a pool"));
+    assert!(!output.stderr.contains("credential_ref"));
+    assert!(
+        !state_db_path(codex_home.path()).exists(),
+        "state db should not be created for accounts add chatgpt"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_without_mode_without_pool_fails_before_auth_and_suggests_configuring_a_pool()
+-> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "add"]).await?;
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("configure a pool"));
+    assert!(!output.stderr.contains("credential_ref"));
+    assert!(
+        !state_db_path(codex_home.path()).exists(),
+        "state db should not be created for accounts add"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_chatgpt_device_auth_without_pool_fails_before_auth_and_suggests_configuring_a_pool()
+-> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "add", "chatgpt", "--device-auth"],
+    )
+    .await?;
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("configure a pool"));
+    assert!(!output.stderr.contains("credential_ref"));
+    assert!(
+        !state_db_path(codex_home.path()).exists(),
+        "state db should not be created for accounts add chatgpt --device-auth"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_api_key_reports_phase_one_unsupported() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "add", "api-key"]).await?;
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("phase 1"));
+    assert!(output.stderr.contains("chatgpt"));
+    assert!(!output.stderr.contains("credential_ref"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_add_api_key_reports_phase_one_unsupported_without_loading_config() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+    std::fs::write(codex_home.path().join("config.toml"), "not valid toml = [")?;
+
+    let output = run_codex(&codex_home, &["accounts", "add", "api-key"]).await?;
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("phase 1"));
+    assert!(output.stderr.contains("chatgpt"));
+    assert!(!output.stderr.contains("TOML"));
 
     Ok(())
 }
@@ -1044,58 +1098,6 @@ async fn accounts_remove_clears_missing_preferred_override_and_falls_back() -> R
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["predictedAccountId"], "acct-2");
     assert_eq!(json["eligibility"]["code"], "automaticAccountSelected");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn accounts_add_chatgpt_stops_at_credential_storage_gap() -> Result<()> {
-    let codex_home = prepared_home().await?;
-
-    let output = run_codex(&codex_home, &["accounts", "add", "chatgpt"]).await?;
-    assert!(!output.success);
-    assert!(output.stderr.contains("credential_ref"));
-    assert!(output.stderr.contains("codex login"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn accounts_add_without_mode_stops_at_credential_storage_gap() -> Result<()> {
-    let codex_home = prepared_home().await?;
-
-    let output = run_codex(&codex_home, &["accounts", "add"]).await?;
-    assert!(!output.success);
-    assert!(output.stderr.contains("credential_ref"));
-    assert!(output.stderr.contains("codex login"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn accounts_add_chatgpt_device_auth_stops_at_credential_storage_gap() -> Result<()> {
-    let codex_home = prepared_home().await?;
-
-    let output = run_codex(
-        &codex_home,
-        &["accounts", "add", "chatgpt", "--device-auth"],
-    )
-    .await?;
-    assert!(!output.success);
-    assert!(output.stderr.contains("credential_ref"));
-    assert!(output.stderr.contains("codex login"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn accounts_add_api_key_stops_at_credential_storage_gap() -> Result<()> {
-    let codex_home = prepared_home().await?;
-
-    let output = run_codex(&codex_home, &["accounts", "add", "api-key"]).await?;
-    assert!(!output.success);
-    assert!(output.stderr.contains("credential_ref"));
-    assert!(output.stderr.contains("codex login"));
 
     Ok(())
 }

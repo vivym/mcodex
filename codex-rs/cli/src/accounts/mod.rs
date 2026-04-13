@@ -22,9 +22,10 @@ use output::print_current_json;
 use output::print_current_text;
 use output::print_status_json;
 use output::print_status_text;
+use registration::add_chatgpt_account;
+use registration::api_key_add_is_unsupported;
 use registration::import_legacy_account;
-
-const ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP: &str = "pooled credential storage keyed by `credential_ref` is not implemented yet, so `codex accounts add` cannot persist a new pooled account without mutating the shared legacy compatibility auth store. Use `codex login` only if you need to replace the single legacy default compatibility account.";
+use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 pub struct AccountsCommand {
@@ -188,14 +189,33 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         account_pool,
         subcommand,
     } = command;
-    if matches!(subcommand, AccountsSubcommand::Add(_)) {
-        anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP);
+    if let AccountsSubcommand::Add(command) = &subcommand
+        && matches!(command.subcommand, Some(AddAccountSubcommand::ApiKey))
+    {
+        return api_key_add_is_unsupported().map(|_| ());
     }
 
     let cli_overrides = config_overrides
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
     let config = Config::load_with_cli_overrides(cli_overrides).await?;
+
+    if matches!(subcommand, AccountsSubcommand::Add(_))
+        && account_pool.is_none() {
+            let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
+                accounts.default_pool.is_some()
+                    || accounts
+                        .pools
+                        .as_ref()
+                        .is_some_and(|pools| !pools.is_empty())
+            });
+            let state_path = state_db_path(config.sqlite_home.as_path());
+            if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
+                anyhow::bail!(
+                    "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
+                );
+            }
+        }
 
     if matches!(subcommand, AccountsSubcommand::List) {
         let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
@@ -211,12 +231,41 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         }
     }
 
-    let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
-        .await
-        .context("initialize account startup selection state")?;
+    let runtime = Arc::new(
+        StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+            .await
+            .context("initialize account startup selection state")?,
+    );
 
     match subcommand {
-        AccountsSubcommand::Add(_command) => anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP),
+        AccountsSubcommand::Add(command) => {
+            let registered = match command.subcommand {
+                None => {
+                    add_chatgpt_account(&runtime, &config, account_pool.as_deref(), false).await?
+                }
+                Some(AddAccountSubcommand::Chatgpt(command)) => {
+                    add_chatgpt_account(
+                        &runtime,
+                        &config,
+                        account_pool.as_deref(),
+                        command.device_auth,
+                    )
+                    .await?
+                }
+                Some(AddAccountSubcommand::ApiKey) => {
+                    return api_key_add_is_unsupported().map(|_| ());
+                }
+            };
+            debug_assert!(
+                !registered.provider_account_id.is_empty(),
+                "registered ChatGPT provider account id should not be empty"
+            );
+            println!(
+                "registered account: {} pool={}",
+                registered.account_id, registered.pool_id
+            );
+            Ok(())
+        }
         AccountsSubcommand::ImportLegacy(command) => {
             let imported = import_legacy_account(
                 &runtime,
