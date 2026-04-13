@@ -14,8 +14,12 @@ use codex_account_pool::RegisteredAccountRegistration;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
 use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::ChatgptManagedRegistrationTokens;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_state::LegacyAccountImport;
 use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
@@ -118,6 +122,21 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
+    async fn lease_lifecycle_register_account_preserves_existing_backend_private_auth_on_conflict()
+    {
+        register_account_preserves_existing_backend_private_auth_on_conflict()
+            .await
+            .expect("conflicting registration should not clear existing auth");
+    }
+
+    #[tokio::test]
+    async fn lease_lifecycle_register_account_returns_actual_persisted_row_for_existing_account() {
+        register_account_returns_actual_persisted_row_for_existing_account()
+            .await
+            .expect("register account should return the persisted row");
+    }
+
+    #[tokio::test]
     async fn lease_lifecycle_stale_session_fails_after_epoch_supersession() {
         stale_lease_scoped_session_fails_after_epoch_supersession()
             .await
@@ -132,10 +151,11 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
-    async fn lease_lifecycle_register_account_cleans_backend_private_auth_on_db_failure() {
-        register_account_cleans_backend_private_auth_on_db_failure()
+    async fn lease_lifecycle_register_account_cleans_new_backend_private_auth_on_persistence_failure()
+     {
+        register_account_cleans_new_backend_private_auth_on_persistence_failure()
             .await
-            .expect("failed registration should clean up backend-private auth");
+            .expect("failed registration should clean up new backend-private auth");
     }
 }
 
@@ -279,7 +299,7 @@ pub(crate) async fn register_account_persists_backend_private_auth_for_pooled_ac
     Ok(())
 }
 
-pub(crate) async fn register_account_cleans_backend_private_auth_on_db_failure()
+pub(crate) async fn register_account_preserves_existing_backend_private_auth_on_conflict()
 -> anyhow::Result<()> {
     let harness = fixture_with_legacy_auth("acct-legacy").await;
     let backend = LocalAccountPoolBackend::new(
@@ -288,35 +308,177 @@ pub(crate) async fn register_account_cleans_backend_private_auth_on_db_failure()
     );
     harness
         .runtime
-        .upsert_registered_account(pooled_registration_request(
-            "acct-a",
-            "backend-handle-1",
-            "fingerprint-a",
-        ))
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-existing".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            backend_account_handle: "backend-handle-1".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-1".to_string(),
+            display_name: Some("Existing ChatGPT".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
         .await?;
+
+    let auth_home = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts")
+        .join("backend-handle-1");
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token("acct-existing"))?,
+                access_token: "existing-access".to_string(),
+                refresh_token: "existing-refresh".to_string(),
+                account_id: Some("acct-existing".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let err = backend
+        .register_account(RegisteredAccountRegistration {
+            request: RegisteredAccountUpsert {
+                account_id: "acct-conflict".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: None,
+                backend_account_handle: "backend-handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Conflicting ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "legacy-default".to_string(),
+                    position: 1,
+                }),
+            },
+            pooled_registration_tokens: Some(ChatgptManagedRegistrationTokens {
+                id_token: fake_access_token("acct-conflict"),
+                access_token: "managed-access".to_string().into(),
+                refresh_token: "managed-refresh".to_string().into(),
+                account_id: "acct-other".to_string(),
+            }),
+        })
+        .await
+        .expect_err("conflicting registration should fail");
+    assert!(
+        err.to_string()
+            .contains("account id mismatch between token claims and extracted account id"),
+        "unexpected error: {err}"
+    );
+
+    let auth = CodexAuth::from_auth_storage(&auth_home, AuthCredentialsStoreMode::File)?
+        .expect("existing backend-private auth should remain");
+    assert_eq!(auth.get_account_id(), Some("acct-existing".to_string()));
+    Ok(())
+}
+
+pub(crate) async fn register_account_returns_actual_persisted_row_for_existing_account()
+-> anyhow::Result<()> {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
     harness
         .runtime
-        .upsert_registered_account(pooled_registration_request(
-            "acct-b",
-            "backend-handle-2",
-            "fingerprint-b",
-        ))
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-existing".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            backend_account_handle: "backend-handle-1".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-1".to_string(),
+            display_name: Some("Existing ChatGPT".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
         .await?;
-    let request = pooled_registration("acct-new", "backend-handle-1", "fingerprint-b");
+
+    let returned = backend
+        .register_account(RegisteredAccountRegistration {
+            request: RegisteredAccountUpsert {
+                account_id: "acct-new".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: None,
+                backend_account_handle: "backend-handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Reused ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "legacy-default".to_string(),
+                    position: 1,
+                }),
+            },
+            pooled_registration_tokens: None,
+        })
+        .await?;
+    let persisted = harness
+        .runtime
+        .read_registered_account("acct-existing")
+        .await?
+        .expect("existing account should remain persisted");
+
+    assert_eq!(returned, persisted);
+    Ok(())
+}
+
+pub(crate) async fn register_account_cleans_new_backend_private_auth_on_persistence_failure()
+-> anyhow::Result<()> {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    let request = pooled_registration("acct-new", "backend-handle-new", "fingerprint-new");
     let auth_home = harness
         .runtime
         .codex_home()
         .join(".pooled-auth/backends/local/accounts")
         .join(request.request.backend_account_handle.as_str());
 
+    fs::remove_dir_all(&auth_home).ok();
+    fs::create_dir_all(auth_home.parent().expect("auth namespace parent"))?;
+    fs::write(&auth_home, "blocking-file")?;
+
     let err = backend
         .register_account(request)
         .await
         .expect_err("registration should fail");
-    assert!(err.to_string().contains("conflicting registered accounts"));
+    assert!(err.to_string().contains("File exists") || err.to_string().contains("Not a directory"));
+
+    assert_eq!(
+        harness.runtime.read_registered_account("acct-new").await?,
+        None
+    );
     assert!(
         !auth_home.exists(),
-        "backend-private auth should be cleaned up"
+        "new backend-private auth should be cleaned up"
     );
     Ok(())
 }

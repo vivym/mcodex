@@ -49,10 +49,12 @@ impl LocalAccountPoolBackend {
         backend_account_handle: &str,
     ) -> anyhow::Result<()> {
         let auth_home = self.backend_private_auth_home(backend_account_handle);
-        match fs::remove_dir_all(&auth_home) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
+        match fs::symlink_metadata(&auth_home) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&auth_home)?,
+            Ok(_) => fs::remove_file(&auth_home)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
+        Ok(())
     }
 }
