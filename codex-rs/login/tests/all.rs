@@ -30,3 +30,9 @@ async fn pooled_registration_browser_returns_tokens_without_writing_shared_auth(
     suite::pooled_registration::pooled_browser_registration_returns_tokens_without_writing_shared_auth()
         .await;
 }
+
+#[tokio::test]
+async fn pooled_registration_failure_completes_without_hanging() {
+    suite::pooled_registration::pooled_browser_registration_failure_completes_without_hanging()
+        .await;
+}

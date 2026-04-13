@@ -1380,6 +1380,7 @@ dependencies = [
 name = "codex-account-pool"
 version = "0.0.0"
 dependencies = [
+ "age",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -2328,6 +2329,7 @@ dependencies = [
 name = "codex-login"
 version = "0.0.0"
 dependencies = [
+ "age",
  "anyhow",
  "async-trait",
  "base64 0.22.1",

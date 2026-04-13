@@ -6,6 +6,7 @@ use codex_login::pooled_registration::run_pooled_browser_registration;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::net::TcpListener;
+use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -83,5 +84,45 @@ pub(crate) async fn pooled_browser_registration_returns_tokens_without_writing_s
         .expect("pooled browser registration should succeed");
 
     assert_eq!(tokens.account_id, "acct-1");
+    assert!(!codex_home.path().join("auth.json").exists());
+}
+
+pub(crate) async fn pooled_browser_registration_failure_completes_without_hanging() {
+    let codex_home = tempdir().expect("create tempdir");
+    let mock_server = MockServer::start().await;
+    let jwt = make_jwt(json!({
+        "https://api.openai.com/auth": {}
+    }));
+
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": jwt,
+            "access_token": "access-token-1",
+            "refresh_token": "refresh-token-1"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let port = reserve_port();
+    let opts = test_server_options(codex_home.path(), mock_server.uri(), port);
+    let join = tokio::spawn(async move { run_pooled_browser_registration(opts).await });
+
+    let client = reqwest::Client::new();
+    let callback = format!("http://127.0.0.1:{port}/auth/callback?code=abc&state=test-state");
+
+    let response = client
+        .get(&callback)
+        .send()
+        .await
+        .expect("send callback request");
+    assert!(response.status().is_success());
+
+    let completed = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("registration flow should complete instead of hanging")
+        .expect("task should complete");
+
+    assert!(completed.is_err());
     assert!(!codex_home.path().join("auth.json").exists());
 }

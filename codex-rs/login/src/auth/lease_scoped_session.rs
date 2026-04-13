@@ -4,6 +4,8 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use codex_config::types::AuthCredentialsStoreMode;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 /// Binding that ties a session to the account and lease that created it.
@@ -48,6 +50,14 @@ impl LocalLeaseScopedAuthSession {
             }
         };
 
+        let lease_epoch = read_lease_epoch_marker(self.auth_home.as_path())?;
+        if lease_epoch != self.binding.lease_epoch {
+            bail!(
+                "pooled auth lease epoch mismatch for backend account {}",
+                self.binding.backend_account_handle
+            );
+        }
+
         let account_id = auth
             .get_account_id()
             .ok_or_else(|| anyhow!("pooled auth is missing an account id"))?;
@@ -64,6 +74,30 @@ impl LocalLeaseScopedAuthSession {
     fn leased_turn_auth_from_current(&self) -> Result<LeasedTurnAuth> {
         Ok(LeasedTurnAuth::from_codex_auth(self.load_bound_auth()?))
     }
+}
+
+pub fn write_lease_epoch_marker(auth_home: &Path, lease_epoch: u64) -> Result<()> {
+    fs::create_dir_all(auth_home)?;
+    fs::write(lease_epoch_marker_path(auth_home), lease_epoch.to_string())?;
+    Ok(())
+}
+
+pub fn clear_lease_epoch_marker(auth_home: &Path) -> Result<()> {
+    match fs::remove_file(lease_epoch_marker_path(auth_home)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_lease_epoch_marker(auth_home: &Path) -> Result<u64> {
+    let marker = fs::read_to_string(lease_epoch_marker_path(auth_home))?;
+    let lease_epoch = marker.trim().parse::<u64>()?;
+    Ok(lease_epoch)
+}
+
+fn lease_epoch_marker_path(auth_home: &Path) -> PathBuf {
+    auth_home.join("lease_epoch")
 }
 
 impl LeaseScopedAuthSession for LocalLeaseScopedAuthSession {

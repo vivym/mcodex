@@ -1,14 +1,19 @@
 use base64::Engine;
+use chrono::Utc;
 use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::LeasedTurnAuth;
 use codex_login::LegacyAuthView;
+use codex_login::TokenData;
 use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth::LocalLeaseScopedAuthSession;
-use codex_login::auth::login_with_chatgpt_auth_tokens;
+use codex_login::auth::write_lease_epoch_marker;
 use codex_login::login_with_api_key;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use tempfile::tempdir;
@@ -70,30 +75,35 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_r
         lease_epoch: 1,
     };
 
-    login_with_chatgpt_auth_tokens(
+    save_auth(
         auth_home.as_path(),
-        &fake_access_token("acct-1"),
-        "acct-1",
-        None,
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token("acct-1"))?,
+                access_token: "managed-access".to_string(),
+                refresh_token: "managed-refresh".to_string(),
+                account_id: Some("acct-1".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
     )?;
+    write_lease_epoch_marker(auth_home.as_path(), 1)?;
     let session = LocalLeaseScopedAuthSession::new(binding, auth_home.clone());
     assert_eq!(
         session.refresh_leased_turn_auth()?.account_id(),
         Some("acct-1".to_string())
     );
 
-    login_with_chatgpt_auth_tokens(
-        auth_home.as_path(),
-        &fake_access_token("acct-2"),
-        "acct-2",
-        None,
-    )?;
+    write_lease_epoch_marker(auth_home.as_path(), 2)?;
 
     let err = session
         .refresh_leased_turn_auth()
-        .expect_err("rebinding should fail closed");
+        .expect_err("stale lease should fail closed");
     assert!(
-        err.to_string().contains("rebinding"),
+        err.to_string().contains("lease epoch mismatch"),
         "unexpected error: {err}"
     );
 

@@ -9,6 +9,7 @@ use std::time::Instant;
 use crate::pkce::PkceCodes;
 use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 use crate::server::ServerOptions;
+use age::secrecy::ExposeSecret;
 use codex_client::build_reqwest_client_with_custom_ca;
 use std::io;
 
@@ -180,8 +181,8 @@ pub async fn complete_device_code_login(
         &opts.codex_home,
         /*api_key*/ None,
         tokens.id_token,
-        tokens.access_token,
-        tokens.refresh_token,
+        tokens.access_token.expose_secret().to_string(),
+        tokens.refresh_token.expose_secret().to_string(),
         opts.cli_auth_credentials_store_mode,
     )
     .await

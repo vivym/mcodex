@@ -121,7 +121,6 @@ impl LeasedAccount {
     pub fn remaining_ttl(&self, now: DateTime<Utc>) -> Duration {
         self.record.expires_at - now
     }
-
 }
 
 /// Lease grant that carries the lease snapshot and a lease-scoped auth session.

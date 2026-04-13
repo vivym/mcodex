@@ -3,6 +3,7 @@ use crate::types::LeaseGrant;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_login::ChatgptManagedRegistrationTokens;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
 use codex_state::AccountStartupSelectionState;
@@ -62,6 +63,7 @@ pub trait AccountPoolControlPlane: Send + Sync {
     async fn register_account(
         &self,
         request: RegisteredAccountUpsert,
+        pooled_registration_tokens: Option<ChatgptManagedRegistrationTokens>,
     ) -> anyhow::Result<RegisteredAccountRecord>;
 
     /// Delete a pooled account record by account identifier.

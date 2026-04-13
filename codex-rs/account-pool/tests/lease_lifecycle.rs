@@ -1,6 +1,7 @@
 use chrono::Duration;
 use chrono::Utc;
 use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::AccountPoolControlPlane;
 use codex_account_pool::AccountPoolExecutionBackend;
 use codex_account_pool::AccountPoolManager;
 use codex_account_pool::HealthEventDisposition;
@@ -10,8 +11,12 @@ use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::RateLimitSnapshot;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
-use codex_login::auth::login_with_chatgpt_auth_tokens;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::ChatgptManagedRegistrationTokens;
+use codex_login::CodexAuth;
 use codex_state::LegacyAccountImport;
+use codex_state::RegisteredAccountMembership;
+use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -98,6 +103,20 @@ mod lease_lifecycle {
         assert_eq!(selection.preferred_account_id, None);
         assert_eq!(selection.suppressed, false);
         assert_eq!(harness.bootstrap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lease_lifecycle_register_account_persists_backend_private_auth_for_pooled_accounts() {
+        register_account_persists_backend_private_auth_for_pooled_accounts()
+            .await
+            .expect("register account should persist backend-private auth");
+    }
+
+    #[tokio::test]
+    async fn lease_lifecycle_stale_session_fails_after_epoch_supersession() {
+        stale_lease_scoped_session_fails_after_epoch_supersession()
+            .await
+            .expect("stale session should fail after epoch supersession");
     }
 }
 
@@ -213,6 +232,87 @@ async fn local_lease_scoped_session_refresh_preserves_stable_account_identity() 
     assert_eq!(refreshed.account_id(), Some(before));
 }
 
+pub(crate) async fn register_account_persists_backend_private_auth_for_pooled_accounts()
+-> anyhow::Result<()> {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    let request = RegisteredAccountUpsert {
+        account_id: "acct-1".to_string(),
+        backend_id: "local".to_string(),
+        backend_family: "local".to_string(),
+        workspace_id: None,
+        backend_account_handle: "backend-handle-1".to_string(),
+        account_kind: "chatgpt".to_string(),
+        provider_fingerprint: "fingerprint-1".to_string(),
+        display_name: Some("Managed ChatGPT".to_string()),
+        source: None,
+        enabled: true,
+        healthy: true,
+        membership: Some(RegisteredAccountMembership {
+            pool_id: "legacy-default".to_string(),
+            position: 1,
+        }),
+    };
+    let tokens = ChatgptManagedRegistrationTokens {
+        id_token: fake_access_token("acct-1"),
+        access_token: "managed-access".to_string().into(),
+        refresh_token: "managed-refresh".to_string().into(),
+        account_id: "acct-1".to_string(),
+    };
+
+    let record = backend.register_account(request, Some(tokens)).await?;
+
+    let auth_home = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(record.backend_account_handle.as_str());
+    let auth = CodexAuth::from_auth_storage(&auth_home, AuthCredentialsStoreMode::File)?
+        .expect("pooled auth should be persisted");
+
+    assert_eq!(record.backend_account_handle, "backend-handle-1");
+    assert_eq!(auth.get_account_id(), Some("acct-1".to_string()));
+    Ok(())
+}
+
+pub(crate) async fn stale_lease_scoped_session_fails_after_epoch_supersession() -> anyhow::Result<()>
+{
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let grant = seed_local_lease_session(&harness, "holder-a")
+        .await
+        .expect("seed local lease session");
+
+    grant
+        .auth_session
+        .refresh_leased_turn_auth()
+        .expect("initial refresh should succeed");
+
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    backend
+        .release_lease(&grant.key(), Utc::now())
+        .await
+        .expect("release stale lease");
+    let renewed = backend
+        .acquire_lease("legacy-default", "holder-b")
+        .await
+        .expect("reacquire lease with higher epoch");
+    assert_eq!(renewed.account_id(), grant.account_id());
+
+    let err = grant
+        .auth_session
+        .refresh_leased_turn_auth()
+        .expect_err("stale session should fail after epoch supersession");
+    assert!(err.to_string().contains("lease"), "unexpected error: {err}");
+
+    Ok(())
+}
+
 async fn seed_local_lease_session(
     harness: &TestHarness,
     holder_instance_id: &str,
@@ -221,21 +321,15 @@ async fn seed_local_lease_session(
         harness.runtime.clone(),
         default_config().lease_ttl_duration(),
     );
+    backend
+        .register_account(
+            pooled_account_registration_request("acct-legacy", "backend-handle-legacy"),
+            Some(pooled_account_registration_tokens("acct-legacy")),
+        )
+        .await?;
     let grant = backend
         .acquire_lease("legacy-default", holder_instance_id)
         .await?;
-    let binding = grant.auth_session.binding().clone();
-    let auth_home = harness
-        .runtime
-        .codex_home()
-        .join(".pooled-auth/backends/local/accounts")
-        .join(binding.backend_account_handle);
-    login_with_chatgpt_auth_tokens(
-        auth_home.as_path(),
-        &fake_access_token(binding.account_id.as_str()),
-        binding.account_id.as_str(),
-        None,
-    )?;
 
     Ok(grant)
 }
@@ -324,6 +418,38 @@ fn default_config() -> AccountPoolConfig {
     AccountPoolConfig {
         default_pool_id: Some("legacy-default".to_string()),
         ..AccountPoolConfig::default()
+    }
+}
+
+fn pooled_account_registration_request(
+    account_id: &str,
+    backend_account_handle: &str,
+) -> RegisteredAccountUpsert {
+    RegisteredAccountUpsert {
+        account_id: account_id.to_string(),
+        backend_id: "local".to_string(),
+        backend_family: "local".to_string(),
+        workspace_id: None,
+        backend_account_handle: backend_account_handle.to_string(),
+        account_kind: "chatgpt".to_string(),
+        provider_fingerprint: format!("fingerprint-{account_id}"),
+        display_name: Some("Managed ChatGPT".to_string()),
+        source: None,
+        enabled: true,
+        healthy: true,
+        membership: Some(RegisteredAccountMembership {
+            pool_id: "legacy-default".to_string(),
+            position: 1,
+        }),
+    }
+}
+
+fn pooled_account_registration_tokens(account_id: &str) -> ChatgptManagedRegistrationTokens {
+    ChatgptManagedRegistrationTokens {
+        id_token: fake_access_token(account_id),
+        access_token: "managed-access".to_string().into(),
+        refresh_token: "managed-refresh".to_string().into(),
+        account_id: account_id.to_string(),
     }
 }
 

@@ -31,6 +31,7 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
+use age::secrecy::SecretString;
 use base64::Engine;
 use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
@@ -879,8 +880,8 @@ pub(crate) fn build_chatgpt_managed_registration_tokens(
 
     Ok(ChatgptManagedRegistrationTokens {
         id_token,
-        access_token,
-        refresh_token,
+        access_token: SecretString::from(access_token),
+        refresh_token: SecretString::from(refresh_token),
         account_id,
     })
 }
