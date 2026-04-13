@@ -9,7 +9,6 @@ use std::time::Instant;
 use crate::pkce::PkceCodes;
 use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 use crate::server::ServerOptions;
-use age::secrecy::ExposeSecret;
 use codex_client::build_reqwest_client_with_custom_ca;
 use std::io;
 
@@ -176,13 +175,13 @@ pub async fn complete_device_code_login(
     opts: ServerOptions,
     device_code: DeviceCode,
 ) -> std::io::Result<()> {
-    let tokens = complete_device_code_registration(opts.clone(), device_code).await?;
+    let tokens = exchange_device_code_tokens(opts.clone(), device_code).await?;
     crate::server::persist_tokens_async(
         &opts.codex_home,
         /*api_key*/ None,
         tokens.id_token,
-        tokens.access_token.expose_secret().to_string(),
-        tokens.refresh_token.expose_secret().to_string(),
+        tokens.access_token,
+        tokens.refresh_token,
         opts.cli_auth_credentials_store_mode,
     )
     .await
@@ -200,13 +199,18 @@ pub async fn complete_pooled_device_code_registration(
     opts: ServerOptions,
     device_code: DeviceCode,
 ) -> std::io::Result<ChatgptManagedRegistrationTokens> {
-    complete_device_code_registration(opts, device_code).await
+    let tokens = exchange_device_code_tokens(opts, device_code).await?;
+    crate::server::build_chatgpt_managed_registration_tokens(
+        tokens.id_token,
+        tokens.access_token,
+        tokens.refresh_token,
+    )
 }
 
-async fn complete_device_code_registration(
+async fn exchange_device_code_tokens(
     opts: ServerOptions,
     device_code: DeviceCode,
-) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+) -> std::io::Result<crate::server::ExchangedTokens> {
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let base_url = opts.issuer.trim_end_matches('/');
     let api_base_url = format!("{base_url}/api/accounts");
@@ -242,12 +246,7 @@ async fn complete_device_code_registration(
     ) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
-
-    crate::server::build_chatgpt_managed_registration_tokens(
-        tokens.id_token,
-        tokens.access_token,
-        tokens.refresh_token,
-    )
+    Ok(tokens)
 }
 
 pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {

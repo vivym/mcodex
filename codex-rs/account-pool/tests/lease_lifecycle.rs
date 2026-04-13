@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use base64::Engine;
 use chrono::Duration;
 use chrono::Utc;
@@ -25,8 +27,6 @@ use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
-use serde::Serialize;
-use serde_json::json;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -35,7 +35,7 @@ use tempfile::TempDir;
 
 #[tokio::test]
 async fn ensure_active_lease_reuses_sticky_account_until_threshold() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let harness = fixture_with_registered_account("acct-legacy").await;
     let mut manager = harness
         .manager("test-holder", default_config())
         .expect("create manager");
@@ -59,7 +59,7 @@ async fn ensure_active_lease_reuses_sticky_account_until_threshold() {
 
 #[tokio::test]
 async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let harness = fixture_with_registered_account("acct-legacy").await;
     let mut manager = harness
         .manager("test-holder", default_config())
         .expect("create manager");
@@ -157,11 +157,19 @@ mod lease_lifecycle {
             .await
             .expect("failed registration should clean up new backend-private auth");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_registered_account_preserves_registry_when_backend_cleanup_fails() {
+        super::delete_registered_account_preserves_registry_when_backend_cleanup_fails()
+            .await
+            .expect("backend cleanup failure should not drop local registry state");
+    }
 }
 
 #[tokio::test]
 async fn release_active_lease_persists_release_and_allows_immediate_reacquire() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let harness = fixture_with_registered_account("acct-legacy").await;
     let mut first = harness
         .manager("holder-a", default_config())
         .expect("create first manager");
@@ -188,7 +196,7 @@ async fn release_active_lease_persists_release_and_allows_immediate_reacquire() 
 
 #[tokio::test]
 async fn rehydrated_existing_lease_seeds_next_health_event_sequence() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let harness = fixture_with_registered_account("acct-legacy").await;
     let mut first = harness
         .manager("holder-a", default_config())
         .expect("create first manager");
@@ -225,7 +233,7 @@ async fn rehydrated_existing_lease_seeds_next_health_event_sequence() {
 
 #[tokio::test]
 async fn configured_lease_ttl_is_used_for_acquire_and_renew() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let harness = fixture_with_registered_account("acct-legacy").await;
     let config = AccountPoolConfig {
         lease_ttl_secs: 30,
         heartbeat_interval_secs: 10,
@@ -640,6 +648,59 @@ pub(crate) async fn acquire_lease_releases_lease_when_marker_write_fails() -> an
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) async fn delete_registered_account_preserves_registry_when_backend_cleanup_fails()
+-> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    backend
+        .register_account(pooled_registration(
+            "acct-legacy",
+            "backend-handle-legacy",
+            "fingerprint-legacy",
+        ))
+        .await?;
+
+    let auth_root = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts");
+    let original_mode = fs::metadata(&auth_root)?.permissions().mode();
+    let mut restricted = fs::metadata(&auth_root)?.permissions();
+    restricted.set_mode(0o500);
+    fs::set_permissions(&auth_root, restricted)?;
+
+    let delete_result = backend.delete_registered_account("acct-legacy").await;
+
+    let mut restored = fs::metadata(&auth_root)?.permissions();
+    restored.set_mode(original_mode);
+    fs::set_permissions(&auth_root, restored)?;
+
+    let err = delete_result.expect_err("backend cleanup should fail");
+    assert!(
+        err.to_string()
+            .contains("failed to delete backend-private auth")
+            || err.to_string().contains("Permission denied")
+            || err.to_string().contains("permission denied"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        harness
+            .runtime
+            .read_registered_account("acct-legacy")
+            .await?
+            .is_some(),
+        "local registry entry should remain after backend cleanup failure"
+    );
+
+    Ok(())
+}
+
 async fn seed_local_lease_session(
     harness: &TestHarness,
     holder_instance_id: &str,
@@ -704,6 +765,23 @@ async fn fixture_with_legacy_auth(account_id: &str) -> TestHarness {
     }
 }
 
+async fn fixture_with_registered_account(account_id: &str) -> TestHarness {
+    let harness = fixture_with_legacy_auth(account_id).await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    backend
+        .register_account(pooled_registration(
+            account_id,
+            &format!("backend-handle-{account_id}"),
+            &format!("fingerprint-{account_id}"),
+        ))
+        .await
+        .unwrap_or_else(|err| panic!("register pooled account failed: {err}"));
+    harness
+}
+
 #[derive(Clone)]
 struct TestLegacyBootstrap {
     account_id: Option<String>,
@@ -760,12 +838,7 @@ fn pooled_registration(
             backend_account_handle,
             provider_fingerprint,
         ),
-        pooled_registration_tokens: Some(ChatgptManagedRegistrationTokens {
-            id_token: fake_access_token(account_id),
-            access_token: "managed-access".to_string().into(),
-            refresh_token: "managed-refresh".to_string().into(),
-            account_id: account_id.to_string(),
-        }),
+        pooled_registration_tokens: Some(fake_registration_tokens(account_id)),
     }
 }
 
@@ -794,17 +867,24 @@ fn pooled_registration_request(
 }
 
 fn fake_access_token(chatgpt_account_id: &str) -> String {
-    #[derive(Serialize)]
-    struct Header {
-        alg: &'static str,
-        typ: &'static str,
-    }
+    make_chatgpt_jwt(chatgpt_account_id)
+}
 
-    let header = Header {
-        alg: "none",
-        typ: "JWT",
-    };
-    let payload = json!({
+fn fake_registration_tokens(chatgpt_account_id: &str) -> ChatgptManagedRegistrationTokens {
+    ChatgptManagedRegistrationTokens {
+        id_token: make_chatgpt_jwt(chatgpt_account_id),
+        access_token: format!("access-token-{chatgpt_account_id}").into(),
+        refresh_token: format!("refresh-token-{chatgpt_account_id}").into(),
+        account_id: chatgpt_account_id.to_string(),
+    }
+}
+
+fn make_chatgpt_jwt(chatgpt_account_id: &str) -> String {
+    let header = serde_json::json!({
+        "alg": "none",
+        "typ": "JWT",
+    });
+    let payload = serde_json::json!({
         "email": "user@example.com",
         "email_verified": true,
         "https://api.openai.com/auth": {
@@ -814,8 +894,12 @@ fn fake_access_token(chatgpt_account_id: &str) -> String {
         },
     });
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
-    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+        panic!("serialize header: {err}");
+    }));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+        panic!("serialize payload: {err}");
+    }));
     let signature_b64 = b64(b"sig");
     format!("{header_b64}.{payload_b64}.{signature_b64}")
 }

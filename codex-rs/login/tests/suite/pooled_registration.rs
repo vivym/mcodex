@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use base64::Engine;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::CLIENT_ID;
@@ -118,11 +120,15 @@ pub(crate) async fn pooled_browser_registration_failure_completes_without_hangin
         .expect("send callback request");
     assert!(response.status().is_success());
 
-    let completed = tokio::time::timeout(Duration::from_secs(5), join)
+    let err = tokio::time::timeout(Duration::from_secs(2), join)
         .await
-        .expect("registration flow should complete instead of hanging")
-        .expect("task should complete");
-
-    assert!(completed.is_err());
+        .expect("registration flow should return instead of hanging")
+        .expect("task should complete")
+        .expect_err("pooled browser registration should fail");
+    assert!(
+        err.to_string()
+            .contains("registration tokens are missing chatgpt_account_id"),
+        "unexpected error: {err}"
+    );
     assert!(!codex_home.path().join("auth.json").exists());
 }

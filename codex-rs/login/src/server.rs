@@ -53,6 +53,9 @@ use tracing::warn;
 
 use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 
+type RegistrationCompletion = Arc<AsyncMutex<Option<RegistrationCompletionSender>>>;
+type RegistrationCompletionSender = oneshot::Sender<io::Result<ChatgptManagedRegistrationTokens>>;
+
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
@@ -149,14 +152,12 @@ pub(crate) async fn run_browser_login_for_registration(
         .await
         .map_err(|err| io::Error::other(format!("registration completion dropped: {err}")))?;
     server.block_until_done().await?;
-    Ok(tokens)
+    tokens
 }
 
 fn run_login_server_impl(
     opts: ServerOptions,
-    registration_completion: Option<
-        Arc<AsyncMutex<Option<oneshot::Sender<ChatgptManagedRegistrationTokens>>>>,
-    >,
+    registration_completion: Option<RegistrationCompletion>,
 ) -> io::Result<LoginServer> {
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
@@ -295,9 +296,7 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
-    registration_completion: Option<
-        Arc<AsyncMutex<Option<oneshot::Sender<ChatgptManagedRegistrationTokens>>>>,
-    >,
+    registration_completion: Option<RegistrationCompletion>,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -390,13 +389,14 @@ async fn process_request(
                         ) {
                             Ok(tokens) => tokens,
                             Err(err) => {
+                                let message = format!(
+                                    "Sign-in completed but pooled registration failed: {err}"
+                                );
                                 if let Some(sender) = completion.lock().await.take() {
-                                    drop(sender);
+                                    let _ = sender.send(Err(io::Error::other(err.to_string())));
                                 }
                                 return login_error_response(
-                                    &format!(
-                                        "Sign-in completed but pooled registration failed: {err}"
-                                    ),
+                                    &message,
                                     io::ErrorKind::Other,
                                     Some("pooled_registration_failed"),
                                     /*error_description*/ None,
@@ -405,7 +405,7 @@ async fn process_request(
                         };
                         let mut completion = completion.lock().await;
                         if let Some(sender) = completion.take() {
-                            let _ = sender.send(registration_tokens);
+                            let _ = sender.send(Ok(registration_tokens));
                         }
 
                         let body = include_str!("assets/success.html");

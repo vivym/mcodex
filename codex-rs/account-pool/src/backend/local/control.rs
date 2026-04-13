@@ -115,7 +115,27 @@ impl AccountPoolControlPlane for LocalAccountPoolBackend {
     }
 
     async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool> {
-        self.runtime.remove_account_registry_entry(account_id).await
+        let Some(registered_account) = self.runtime.read_registered_account(account_id).await?
+        else {
+            return Ok(false);
+        };
+        self.clear_backend_private_auth_namespace(&registered_account.backend_account_handle)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to delete backend-private auth for account {} handle {}",
+                    registered_account.account_id, registered_account.backend_account_handle
+                )
+            })?;
+        self.runtime
+            .remove_account_registry_entry(account_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "backend-private auth was deleted for account {} handle {}; local registry cleanup failed",
+                    registered_account.account_id, registered_account.backend_account_handle
+                )
+            })
     }
 }
 
@@ -272,16 +292,5 @@ impl LocalAccountPoolBackend {
             }),
             last_refresh: Some(Utc::now()),
         })
-    }
-
-    pub(crate) async fn persist_pooled_registration_tokens(
-        &self,
-        backend_account_handle: &str,
-        tokens: &ChatgptManagedRegistrationTokens,
-    ) -> anyhow::Result<()> {
-        let auth_home = self.backend_private_auth_home(backend_account_handle);
-        let auth = self.build_pooled_registration_auth(tokens)?;
-        save_auth(&auth_home, &auth, AuthCredentialsStoreMode::File)?;
-        Ok(())
     }
 }
