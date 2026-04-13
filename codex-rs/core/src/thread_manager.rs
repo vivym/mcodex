@@ -914,6 +914,7 @@ impl ThreadManagerState {
             metrics_service_name,
             inherited_shell_snapshot,
             inherited_exec_policy,
+            inherited_lease_auth_session: None,
             user_shell_override,
             parent_trace,
         })

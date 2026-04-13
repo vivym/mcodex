@@ -15,7 +15,11 @@ use crate::config_loader::NetworkDomainPermissionsToml;
 use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
 use crate::test_support;
+use base64::Engine;
 use codex_config::config_toml::ConfigToml;
+use codex_login::LeasedTurnAuth;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -46,6 +50,7 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use insta::Settings;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -760,6 +765,146 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
             )
         );
     });
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_review_session_inherits_parent_lease_auth() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    struct TestLeaseScopedAuthSession {
+        binding: LeaseAuthBinding,
+    }
+
+    impl TestLeaseScopedAuthSession {
+        fn new(account_id: &str) -> Self {
+            Self {
+                binding: LeaseAuthBinding {
+                    account_id: account_id.to_string(),
+                    backend_account_handle: format!("handle-{account_id}"),
+                    lease_epoch: 1,
+                },
+            }
+        }
+    }
+
+    impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+        fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            self.refresh_leased_turn_auth()
+        }
+
+        fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            Ok(LeasedTurnAuth::chatgpt(
+                self.binding.account_id.clone(),
+                fake_access_token(&self.binding.account_id),
+            ))
+        }
+
+        fn binding(&self) -> &LeaseAuthBinding {
+            &self.binding
+        }
+
+        fn ensure_current(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake_access_token(chatgpt_account_id: &str) -> String {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "email_verified": true,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-12345",
+                "chatgpt_account_id": chatgpt_account_id,
+            },
+        });
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+            panic!("serialize header: {err}");
+        }));
+        let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+            panic!("serialize payload: {err}");
+        }));
+        let signature_b64 = b64(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
+
+    let server = start_mock_server().await;
+    let guardian_assessment = serde_json::json!({
+        "risk_level": "low",
+        "user_authorization": "high",
+        "outcome": "allow",
+        "rationale": "Inherited lease auth is present.",
+    })
+    .to_string();
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-guardian"),
+            ev_assistant_message("msg-guardian", &guardian_assessment),
+            ev_completed("resp-guardian"),
+        ]),
+    )
+    .await;
+
+    let (session, turn) = guardian_test_session_and_turn(&server).await;
+    session
+        .services
+        .lease_auth
+        .replace_current(Some(Arc::new(TestLeaseScopedAuthSession::new(
+            "guardian-pooled-account",
+        ))));
+    let session = Arc::new(session);
+    seed_guardian_parent_history(&session, &turn).await;
+
+    let prompt = build_guardian_prompt_items(
+        session.as_ref(),
+        Some("Use the parent session lease".to_string()),
+        GuardianApprovalRequest::Shell {
+            id: "shell-guardian-auth".to_string(),
+            command: vec!["git".to_string(), "status".to_string()],
+            cwd: PathBuf::from("/repo/codex-rs/core"),
+            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            justification: Some("Check inherited auth on the guardian session.".to_string()),
+        },
+    )
+    .await?;
+
+    let outcome = run_guardian_review_session_for_test(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        prompt,
+        guardian_output_schema(),
+        /*external_cancel*/ None,
+    )
+    .await;
+    let GuardianReviewOutcome::Completed(Ok(assessment)) = outcome else {
+        panic!("expected guardian assessment");
+    };
+    assert_eq!(assessment.outcome, GuardianAssessmentOutcome::Allow);
+
+    let request = request_log.single_request();
+    assert_eq!(
+        request.header("chatgpt-account-id").as_deref(),
+        Some("guardian-pooled-account")
+    );
+    assert_eq!(
+        request.header("authorization").as_deref(),
+        Some(format!("Bearer {}", fake_access_token("guardian-pooled-account")).as_str())
+    );
 
     Ok(())
 }

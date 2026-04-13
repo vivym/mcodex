@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_config::types::AccountsConfigToml;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
 use codex_protocol::ThreadId;
@@ -234,11 +235,6 @@ async fn conversation_start_audio_text_close_round_trip() -> Result<()> {
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    assert!(
-        server
-            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
-            .await
-    );
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -599,22 +595,28 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
 
     skip_if_no_network!(Ok(()));
 
-    let server = start_websocket_server(vec![
-        vec![],
-        vec![vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_env", "instructions": "backend prompt" }
-        })]],
-    ])
+    let server = start_websocket_server(vec![vec![vec![json!({
+        "type": "session.updated",
+        "session": { "id": "sess_env", "instructions": "backend prompt" }
+    })]]])
     .await;
 
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            // Suppress responses-websocket startup prewarm so this server only services realtime.
+            config.accounts = Some(AccountsConfigToml {
+                backend: None,
+                default_pool: None,
+                proactive_switch_threshold_percent: None,
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: None,
+            });
+        });
     let test = builder.build_with_websocket_server(&server).await?;
-    assert!(
-        server
-            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
-            .await
-    );
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -643,8 +645,20 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
     .await;
     assert_eq!(session_updated, "sess_env");
 
+    let env_key_handshake = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(handshake) = server.handshakes().into_iter().find(|handshake| {
+                handshake.header("authorization").as_deref() == Some("Bearer env-realtime-key")
+            }) {
+                break handshake;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for realtime handshake with env API key");
     assert_eq!(
-        server.handshakes()[1].header("authorization").as_deref(),
+        env_key_handshake.header("authorization").as_deref(),
         Some("Bearer env-realtime-key")
     );
 

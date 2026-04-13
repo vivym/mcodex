@@ -123,6 +123,11 @@ async fn start_review_conversation(
     (run_codex_thread_one_shot(
         sub_agent_config,
         session.auth_manager(),
+        session
+            .clone_session()
+            .services
+            .lease_auth
+            .current_session(),
         session.models_manager(),
         input,
         session.clone_session(),
@@ -300,7 +305,94 @@ fn normalize_review_template_line_endings(template: &str) -> Cow<'_, str> {
 mod tests {
     use super::normalize_review_template_line_endings;
     use super::render_review_exit_success;
+    use super::start_review_conversation;
+    use crate::codex::make_session_and_context;
+    use crate::tasks::SessionTaskContext;
+    use base64::Engine;
+    use codex_login::LeasedTurnAuth;
+    use codex_login::auth::LeaseAuthBinding;
+    use codex_login::auth::LeaseScopedAuthSession;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::user_input::UserInput;
+    use core_test_support::responses::ev_assistant_message;
+    use core_test_support::responses::ev_completed;
+    use core_test_support::responses::ev_response_created;
+    use core_test_support::responses::mount_sse_once;
+    use core_test_support::responses::sse;
+    use core_test_support::responses::start_mock_server;
+    use core_test_support::skip_if_no_network;
     use pretty_assertions::assert_eq;
+    use serde::Serialize;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct TestLeaseScopedAuthSession {
+        binding: LeaseAuthBinding,
+    }
+
+    impl TestLeaseScopedAuthSession {
+        fn new(account_id: &str) -> Self {
+            Self {
+                binding: LeaseAuthBinding {
+                    account_id: account_id.to_string(),
+                    backend_account_handle: format!("handle-{account_id}"),
+                    lease_epoch: 1,
+                },
+            }
+        }
+    }
+
+    impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+        fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            self.refresh_leased_turn_auth()
+        }
+
+        fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            Ok(LeasedTurnAuth::chatgpt(
+                self.binding.account_id.clone(),
+                fake_access_token(&self.binding.account_id),
+            ))
+        }
+
+        fn binding(&self) -> &LeaseAuthBinding {
+            &self.binding
+        }
+
+        fn ensure_current(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake_access_token(chatgpt_account_id: &str) -> String {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "email_verified": true,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-12345",
+                "chatgpt_account_id": chatgpt_account_id,
+            },
+        });
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+            panic!("serialize header: {err}");
+        }));
+        let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+            panic!("serialize payload: {err}");
+        }));
+        let signature_b64 = b64(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
 
     #[test]
     fn render_review_exit_success_replaces_results_placeholder() {
@@ -315,6 +407,74 @@ mod tests {
         assert_eq!(
             normalize_review_template_line_endings("<user_action>\r\n  <results>\r\n  None.\r\n"),
             "<user_action>\n  <results>\n  None.\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_conversation_inherits_parent_lease_auth() {
+        skip_if_no_network!();
+
+        let server = start_mock_server().await;
+        let review_json = serde_json::json!({
+            "findings": [],
+            "overall_correctness": "good",
+            "overall_explanation": "review complete",
+            "overall_confidence_score": 0.9
+        })
+        .to_string();
+        let request_log = mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created("resp-review"),
+                ev_assistant_message("msg-review", &review_json),
+                ev_completed("resp-review"),
+            ]),
+        )
+        .await;
+
+        let (mut session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+        let config = Arc::new(config);
+        let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
+            config.codex_home.clone(),
+            Arc::clone(&session.services.auth_manager),
+            config.model_provider.clone(),
+        ));
+        session.services.models_manager = models_manager;
+        session.services.lease_auth.replace_current(Some(Arc::new(
+            TestLeaseScopedAuthSession::new("review-pooled-account"),
+        )));
+        turn.config = Arc::clone(&config);
+        turn.provider = config.model_provider.clone();
+        let session = Arc::new(session);
+
+        let receiver = start_review_conversation(
+            Arc::new(SessionTaskContext::new(Arc::clone(&session))),
+            Arc::new(turn),
+            vec![UserInput::Text {
+                text: "review with inherited lease auth".to_string(),
+                text_elements: Vec::new(),
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("review conversation should start");
+
+        while let Ok(event) = receiver.recv().await {
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                break;
+            }
+        }
+
+        let request = request_log.single_request();
+        assert_eq!(
+            request.header("chatgpt-account-id").as_deref(),
+            Some("review-pooled-account")
+        );
+        assert_eq!(
+            request.header("authorization").as_deref(),
+            Some(format!("Bearer {}", fake_access_token("review-pooled-account")).as_str())
         );
     }
 }

@@ -48,6 +48,7 @@ use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
 use crate::mcp_tool_call::lookup_mcp_tool_metadata;
 use codex_login::AuthManager;
+use codex_login::auth::LeaseScopedAuthSession;
 use codex_models_manager::manager::ModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
@@ -64,6 +65,7 @@ use crate::codex::completed_session_loop_termination;
 pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
+    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
@@ -92,6 +94,7 @@ pub(crate) async fn run_codex_thread_interactive(
         persist_extended_history: false,
         metrics_service_name: None,
         inherited_shell_snapshot: None,
+        inherited_lease_auth_session,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_trace: None,
@@ -158,6 +161,7 @@ pub(crate) async fn run_codex_thread_interactive(
 pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
+    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
@@ -173,6 +177,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let io = run_codex_thread_interactive(
         config,
         auth_manager,
+        inherited_lease_auth_session,
         models_manager,
         parent_session,
         parent_ctx,

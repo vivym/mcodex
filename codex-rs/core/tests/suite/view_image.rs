@@ -4,7 +4,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
-use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
@@ -25,7 +24,6 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_models_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -1324,10 +1322,8 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
 async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
-    // Use MockServer directly (not start_mock_server) so the first /models request returns our
-    // text-only model. start_mock_server mounts empty models first, causing get_model_info to
-    // fall back to model_info_from_slug with default_input_modalities (Text+Image), which would
-    // incorrectly allow view_image.
+    // Build with an explicit model catalog so `get_model_info` cannot fall back to the default
+    // built-in metadata, which would incorrectly allow `view_image`.
     let server = MockServer::builder()
         .body_print_limit(BodyPrintLimit::Limited(80_000))
         .start()
@@ -1368,19 +1364,12 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     };
-    mount_models_once(
-        &server,
-        ModelsResponse {
+    let mut builder = test_codex().with_config(|config| {
+        config.model = Some(model_slug.to_string());
+        config.model_catalog = Some(ModelsResponse {
             models: vec![text_only_model],
-        },
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            config.model = Some(model_slug.to_string());
         });
+    });
     let test = builder.build_remote_aware(&server).await?;
     let TestCodex { codex, config, .. } = &test;
 
@@ -1431,14 +1420,19 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
 
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
-    let output_text = mock
-        .single_request()
+    let req = mock.single_request();
+    let body_with_tool_output = req.body_json();
+    let output_text = req
         .function_call_output_content_and_success(call_id)
         .and_then(|(content, _)| content)
         .expect("output text present");
     assert_eq!(
         output_text,
         "view_image is not allowed because you do not support image inputs"
+    );
+    assert!(
+        find_image_message(&body_with_tool_output).is_none(),
+        "text-only models should not produce an input_image message"
     );
 
     Ok(())

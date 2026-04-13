@@ -73,6 +73,7 @@ use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
 use codex_login::AuthProvider;
 use codex_login::CodexAuth;
+use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
 use codex_mcp::McpConnectionManager;
@@ -434,6 +435,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
+    pub(crate) inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
 }
@@ -487,6 +489,7 @@ impl Codex {
             inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
+            inherited_lease_auth_session,
             parent_trace: _,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
@@ -677,6 +680,7 @@ impl Codex {
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
+            inherited_lease_auth_session,
             environment,
         )
         .await
@@ -1634,6 +1638,7 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
+        inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
         environment: Option<Arc<Environment>>,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
@@ -2017,13 +2022,18 @@ impl Session {
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
+        lease_auth.replace_current(inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let account_pool_manager = SessionServices::build_account_pool_manager(
-            state_db_ctx.clone(),
-            config.accounts.clone(),
-            config.codex_home.clone(),
-            account_pool_holder_instance_id,
-        );
+        let account_pool_manager = if inherited_lease_auth_session.is_some() {
+            None
+        } else {
+            SessionServices::build_account_pool_manager(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                config.codex_home.clone(),
+                account_pool_holder_instance_id,
+            )
+        };
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
