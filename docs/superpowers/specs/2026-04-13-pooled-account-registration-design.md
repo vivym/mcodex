@@ -113,7 +113,6 @@ This surface is responsible for leases, health, and live runtime auth only.
 Used by CLI and app-server management paths:
 
 - `register_account(RegisterAccountRequest) -> RegisteredAccount`
-- `import_legacy_account(...)`
 - `list_accounts(...)`
 - `assign_pool(account_id, pool_id)`
 - `set_enabled(account_id, enabled)`
@@ -122,6 +121,11 @@ Used by CLI and app-server management paths:
 - `read_pool_status(...)`
 
 This surface is responsible for registration, membership, and operator-visible metadata only.
+
+Legacy compatibility migration is intentionally outside the backend-neutral control plane.
+`accounts import-legacy` should be implemented by a local-only migration/helper path that inspects
+legacy auth, derives provider identity, and then calls ordinary control-plane registration and pool
+assignment primitives.
 
 ### 4. Return a refresh-capable leased auth session from lease acquisition
 
@@ -132,8 +136,20 @@ That session is responsible for:
 
 - yielding a `LeasedTurnAuth` snapshot for request execution,
 - supporting managed refresh or backend-mediated refresh for the lease lifetime,
-- and exposing an adapter that can satisfy phase 1 `AuthManager`-shaped consumers until those
-  consumers are fully migrated off the shared compatibility manager.
+- exposing stable lease binding metadata so consumers can verify which account/lease they are using,
+- and failing closed once the lease is released or rotated away.
+
+Execution-plane rules must be explicit:
+
+- request-path code consumes only immutable `LeasedTurnAuth` snapshots
+- request retries must not consult a shared `AuthManager` or mutable auth storage mid-turn
+- lease-scoped refresh may rotate tokens only for the same stable `account_id` and
+  `backend_account_handle`
+- any identity change terminates the current lease and requires a fresh `LeaseGrant`
+
+Phase 1 may temporarily ship a legacy-only bridge that adapts a lease-scoped session to
+`AuthManager`-shaped consumers that have not migrated yet, but that adapter is not part of the
+backend-neutral execution contract and must not be used by request-path retry logic.
 
 That contract should be stable across backends:
 
@@ -143,8 +159,9 @@ That contract should be stable across backends:
   derive `LeasedTurnAuth` snapshots from that session
 
 `LeasedTurnAuth` remains the request-path snapshot, but it is no longer the entire lease contract.
-This prevents `codex-core` from depending on storage-specific credential lookup rules while still
-preserving refresh behavior for phase 1 consumers that are not yet request-path-only.
+Long-lived non-request consumers must hold a lease-scoped session that becomes invalid when the
+lease is released or rotated. Rebinding is done by installing a new `LeaseGrant`, never by silently
+mutating an old session to point at a different account.
 
 ### 5. Keep local pooled credentials in a backend-private namespace
 
@@ -234,11 +251,36 @@ Pool assignment should live in a dedicated table such as `account_pool_membershi
 - `assigned_at`
 - `updated_at`
 
+Required invariants:
+
+- `account_id` is unique in `account_pool_membership` so one account belongs to at most one pool
+- `FOREIGN KEY(account_id) REFERENCES account_registry(account_id) ON DELETE CASCADE`
+- if assignment history is needed, keep it in a separate audit table rather than allowing multiple
+  live membership rows
+
 This allows:
 
 - registered but currently unassigned accounts,
 - later assignment into a pool,
 - clean migration toward future enterprise-managed account catalogs.
+
+### Transition from `account_registry.pool_id`
+
+The new membership table needs an explicit cutover plan because the current runtime still reads
+`account_registry.pool_id`, `position`, and `account_runtime_state.pool_id` directly.
+
+Recommended transition:
+
+1. add `account_pool_membership` and backfill it from the existing `account_registry.pool_id` and
+   `position` columns
+2. treat `account_pool_membership` as the new source of truth
+3. keep `account_registry.pool_id` and `position` as synchronized compatibility columns for one
+   transition slice while readers and writers migrate
+4. keep `account_runtime_state.pool_id` synchronized from the resolved membership/pool binding
+   until health, diagnostics, and snapshot readers stop depending on it
+5. remove compatibility reads and then drop the legacy columns in a later cleanup change
+
+The implementation should not leave both representations as independent writable sources.
 
 ## Core Types
 
@@ -249,7 +291,7 @@ pub struct RegisterAccountRequest {
     pub backend_id: String,
     pub display_name: Option<String>,
     pub credential_input: CredentialInput,
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: String,
 }
 
 pub enum CredentialInput {
@@ -276,9 +318,17 @@ pub struct RegisteredAccount {
     pub enabled: bool,
 }
 
+pub struct LeaseAuthBinding {
+    pub account_id: String,
+    pub backend_account_handle: String,
+    pub lease_epoch: u64,
+}
+
 pub trait LeaseScopedAuthSession: Send + Sync {
     fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth>;
-    fn auth_manager_adapter(&self) -> Arc<AuthManager>;
+    fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth>;
+    fn binding(&self) -> &LeaseAuthBinding;
+    fn ensure_current(&self) -> anyhow::Result<()>;
 }
 
 pub struct LeaseGrant {
@@ -297,6 +347,10 @@ remain the same.
 `ChatgptManagedRegistrationTokens` intentionally mirrors provider-level OAuth exchange output rather
 than the local `auth.json` persistence schema. The backend may transform it into any backend-private
 storage representation it needs.
+
+`LeaseScopedAuthSession` is intentionally backend-neutral. Any temporary `AuthManager` bridge must
+wrap this session outside the common contract rather than extending the trait with storage-shaped
+methods.
 
 ## CLI Semantics
 
@@ -328,6 +382,8 @@ If a one-time compatibility migration remains in the product, it must behave equ
 `accounts import-legacy` and record completion so that routine startup no longer performs implicit
 imports.
 
+This command is a local compatibility helper, not a backend-neutral control-plane verb.
+
 ## Idempotency, Dedupe, and Failure Handling
 
 ### Uniqueness
@@ -357,6 +413,26 @@ returning failure.
 If compensation also fails, surface a partial-failure error that includes enough information for
 manual cleanup.
 
+### Crash-safe pending registration
+
+In-process compensation is not enough on its own. Before contacting the backend, the caller should
+persist a pending-registration record keyed by `idempotency_key` that captures:
+
+- requested backend
+- provider kind
+- target pool assignment intent
+- registration start time
+
+On success, the record is finalized and removed or marked complete with the resulting
+`backend_account_handle` and `account_id`.
+
+On retry or process restart, the control plane reconciles any pending record before starting a new
+registration attempt. This prevents orphaned backend registrations after crashes.
+
+Operator-visible `accounts add ...` and `accounts import-legacy` flows should always generate and
+persist a stable `idempotency_key` before contacting the backend. The shared control-plane request
+shape therefore treats `idempotency_key` as required.
+
 ### Removal and logout semantics
 
 `accounts remove` must route through the control plane and clean up both:
@@ -376,8 +452,10 @@ Recommended behavior:
 
 `logout` remains a legacy compatibility command:
 
+- it revokes any active process-local pooled lease
 - it clears legacy compatibility auth
-- it may continue to suppress automatic pooled startup selection
+- it enables durable default-startup suppression only for managed or persisted legacy auth modes
+- it remains runtime-local and non-durable for ephemeral `chatgptAuthTokens`-style auth
 - it must not delete pooled registrations or backend-private pooled credential namespaces
 
 ## Migration Strategy
@@ -386,13 +464,18 @@ Recommended sequence:
 
 1. Add backend-neutral control-plane and execution-plane contracts without changing user-visible
    behavior, and retire steady-state legacy auto-import from runtime and generic CLI startup.
-2. Extend schema for `backend_id`, `backend_account_handle`, `provider_fingerprint`, and
-   `account_pool_membership`.
-3. Change execution to consume `LeaseGrant { auth_session }`, with a lease-scoped auth session that
-   can still satisfy phase 1 refresh-capable `AuthManager` consumers.
-4. Enable `accounts add chatgpt`, `accounts add chatgpt --device-auth`, and
+2. Extend schema for `backend_id`, `backend_account_handle`, `provider_fingerprint`,
+   `account_pool_membership`, and a crash-recovery `pending_account_registration` journal.
+3. Backfill `account_pool_membership` from existing `account_registry.pool_id` data and keep the
+   legacy columns synchronized as compatibility fields while readers and writers migrate.
+4. Change execution to consume `LeaseGrant { auth_session }`, with request-path code using only
+   `LeasedTurnAuth` snapshots and non-request consumers holding invalidation-aware lease-scoped
+   sessions.
+5. Add a legacy-only bridge for remaining `AuthManager`-shaped consumers that cannot move in the
+   same slice, and remove request-path reliance on `AuthManager` retry/reload behavior.
+6. Enable `accounts add chatgpt`, `accounts add chatgpt --device-auth`, and
    `accounts import-legacy`.
-5. Add `accounts add api-key` as a follow-up slice if needed.
+7. Add `accounts add api-key` as a follow-up slice if needed.
 
 This keeps the highest-risk auth materialization change isolated from the CLI surface change.
 
@@ -408,10 +491,14 @@ Verify:
 - idempotent re-add
 - explicit legacy import behavior
 - no steady-state implicit legacy import during routine startup
+- one-account-one-membership constraints
+- membership backfill and synchronized compatibility-column behavior during cutover
 - membership assignment semantics
 - compensation delete on persistence failure
+- crash recovery for pending registrations keyed by `idempotency_key`
 - `accounts remove` deletes backend-owned credential state or fails explicitly
-- `logout` does not delete pooled backend-owned credential state
+- `logout` revokes the active pooled lease, applies durable suppression only for legacy modes, and
+  does not delete pooled backend-owned credential state
 - registered-but-unassigned accounts do not participate in automatic selection
 
 ### 2. Execution-plane tests
@@ -421,8 +508,11 @@ Verify:
 - lease acquisition returns a leased auth session that yields usable `LeasedTurnAuth`
 - local pooled auth loads from backend-private namespaces
 - managed refresh continues to work for lease-private auth sessions
-- phase 1 `AuthManager`-shaped consumers can read from the leased auth session without falling back
-  to the shared legacy manager
+- request retries stay on lease-scoped snapshots and do not reload from the shared legacy manager
+- lease-scoped sessions fail closed on release/rotation and require rebinding via a new `LeaseGrant`
+- refresh preserves stable account identity for the full lease lifetime
+- phase 1 `AuthManager`-shaped bridge consumers can read from the leased auth session without
+  falling back to the shared legacy manager
 - automatic future-turn rotation still works after the new lease grant path
 - exclusive lease behavior still prevents multiple local instances from sharing one account
 

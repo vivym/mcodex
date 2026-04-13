@@ -104,6 +104,13 @@ This keeps the existing auth code understandable and reduces conflicts with upst
 
 ### 3. Use process-local auth materialization for leased requests
 
+Detailed control-plane and execution-plane contract shape for this area is superseded by
+`2026-04-13-pooled-account-registration-design.md`, which is the normative source for pooled
+registration and auth materialization behavior. This section should now be read as historical
+rationale only. In particular, earlier shorthand references to `credential_ref` are obsolete and
+should now be read as either a backend-owned opaque account handle or a lease-scoped auth session
+returned by lease acquisition.
+
 Multi-account state must not be encoded by changing `auth.json` into a multi-account container,
 and leased request paths must not depend on a shared mutable `auth.json` slot.
 
@@ -111,8 +118,8 @@ Instead:
 
 - account-pool state is stored separately
 - each process materializes its selected account into a process-local auth view for request
-  execution, ideally by constructing `CodexAuth` directly from `credential_ref` or by using a
-  per-instance ephemeral auth store
+  execution by acquiring a lease-scoped auth session and deriving `LeasedTurnAuth` snapshots or an
+  equivalent process-local auth view from that session
 - shared `auth.json` is retained only as a legacy compatibility surface for single-account flows
   and explicit compatibility commands
 - upstream code that assumes one current account can continue to operate inside a single process,
