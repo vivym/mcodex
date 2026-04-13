@@ -86,6 +86,11 @@ that account.
 
 The runtime should never interpret this handle directly.
 
+For the phase 1 local backend, this handle must also be safe to use as a path component.
+That means the backend, not the caller, is responsible for emitting a filesystem-safe handle format
+such as restricted ASCII or a deterministic encoding of provider identity. Raw provider account ids
+must not be joined into backend-private auth paths directly.
+
 This addendum supersedes earlier shorthand references to `credential_ref` in the broader design.
 Those references should now be read as one of:
 
@@ -173,6 +178,11 @@ For each local pooled account, derive a backend-private auth namespace such as:
 
 That namespace may continue using the existing file/keyring/auto storage implementations, because
 those are already keyed by `codex_home`.
+
+In phase 1, the local ChatGPT registration path should preserve provider account identity in
+provider metadata and dedupe fields, while storing credentials under the backend-generated safe
+`backend_account_handle`. The handle is therefore stable for the backend, but not a raw provider id
+that callers may interpret.
 
 This yields two desirable properties:
 
@@ -326,7 +336,6 @@ pub enum CredentialInput {
     ChatgptManaged {
         oauth_tokens: ChatgptManagedRegistrationTokens,
     },
-    ApiKey { api_key: SecretString, label: Option<String> },
 }
 
 pub struct ChatgptManagedRegistrationTokens {
@@ -369,6 +378,10 @@ pub struct LeaseGrant {
 }
 ```
 
+Phase 1 only needs the `ChatgptManaged` registration input. API-key-backed registration can extend
+this request shape in a follow-up slice once `accounts add api-key` has a real caller and quota
+semantics.
+
 The exact type names may change during implementation, but the boundary responsibilities should
 remain the same.
 
@@ -389,10 +402,16 @@ methods.
 Recommended behavior:
 
 - if a pool is specified, register the account and assign it to that pool
-- if no pool is specified but `default_pool` exists, assign it there
-- if no pool target exists, register successfully but leave the account unassigned
+- if no pool is specified, resolve the current effective pool using the same preview/override rules
+  as the other `codex accounts` commands
+- if no pool target exists after that resolution, fail and instruct the operator to configure a
+  pool or pass `--account-pool`
 - when registration sees an already-known account, treat the operation as idempotent rather than
   creating a duplicate record
+
+Registered-but-unassigned accounts remain a valid internal control-plane shape for future
+enterprise import flows, but they are not created by the phase 1 operator-facing `accounts add`
+command.
 
 ### `accounts import-legacy`
 
@@ -425,9 +444,10 @@ The control plane should enforce:
 
 Recommended behavior:
 
-- same account, no pool target: return existing account successfully
-- same account, same pool target: succeed as a no-op
-- same account, currently unassigned, new pool target: assign and succeed
+- operator-visible `accounts add` first resolves a pool target; if none exists, fail before backend
+  registration starts
+- same account, same resolved pool target: succeed as a no-op
+- same account, currently unassigned, new resolved pool target: assign and succeed
 - same account, different existing pool target: fail with guidance to use `accounts pool assign`
 
 ### Registration rollback
@@ -443,8 +463,9 @@ manual cleanup.
 
 ### Crash-safe pending registration
 
-In-process compensation is not enough on its own. Before contacting the backend, the caller should
-persist a pending-registration record keyed by `idempotency_key` that captures:
+In-process compensation is not enough on its own. Before contacting the account-pool backend for
+registration, the caller should persist a pending-registration record keyed by `idempotency_key`
+that captures:
 
 - requested backend
 - provider kind
@@ -460,6 +481,13 @@ registration attempt. This prevents orphaned backend registrations after crashes
 Operator-visible `accounts add ...` and `accounts import-legacy` flows should always generate and
 persist a stable `idempotency_key` before contacting the backend. The shared control-plane request
 shape therefore treats `idempotency_key` as required.
+
+For fresh ChatGPT registration, the browser/device auth handshake happens before this journal step.
+Once the provider returns a stable account identity and the CLI has resolved the target pool, the
+CLI writes a deterministic key such as
+`chatgpt-add:<backend_id>:<provider_account_id>:<target_pool_id>` and only then calls
+`register_account`. A per-run random UUID is not sufficient because it defeats crash recovery and
+duplicate suppression for the same operator intent.
 
 ### Removal and logout semantics
 
