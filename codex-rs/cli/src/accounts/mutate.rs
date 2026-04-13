@@ -1,6 +1,10 @@
 use anyhow::Context;
+use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::AccountPoolControlPlane;
+use codex_account_pool::LocalAccountPoolBackend;
 use codex_state::AccountSource;
 use codex_state::StateRuntime;
+use std::sync::Arc;
 
 pub(super) async fn list_accounts(runtime: &StateRuntime) -> anyhow::Result<()> {
     let memberships = runtime
@@ -45,9 +49,16 @@ pub(super) async fn set_account_enabled(
     Ok(())
 }
 
-pub(super) async fn remove_account(runtime: &StateRuntime, account_id: &str) -> anyhow::Result<()> {
-    let removed = runtime
-        .remove_account_registry_entry(account_id)
+pub(super) async fn remove_account(
+    runtime: &Arc<StateRuntime>,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    let backend = LocalAccountPoolBackend::new(
+        Arc::clone(runtime),
+        AccountPoolConfig::default().lease_ttl_duration(),
+    );
+    let removed = backend
+        .delete_registered_account(account_id)
         .await
         .with_context(|| format!("remove account `{account_id}`"))?;
     if !removed {

@@ -337,6 +337,28 @@ async fn accounts_list_no_longer_bootstraps_legacy_auth_into_pooled_state() -> R
 }
 
 #[tokio::test]
+async fn accounts_remove_deletes_backend_private_auth_namespace() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    let auth_home = codex_home
+        .path()
+        .join(".pooled-auth/backends/local/accounts")
+        .join("acct-1");
+    std::fs::create_dir_all(&auth_home)?;
+    std::fs::write(auth_home.join("marker.txt"), "backend-private-auth")?;
+
+    let output = run_codex(&codex_home, &["accounts", "remove", "acct-1"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    assert_eq!(read_pool_membership(&codex_home, "acct-1").await?, None);
+    assert!(
+        !auth_home.exists(),
+        "backend-private auth namespace should be removed"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_import_legacy_registers_and_assigns_legacy_account_explicitly() -> Result<()> {
     let codex_home = prepared_legacy_auth_only_home().await?;
 
