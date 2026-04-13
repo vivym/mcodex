@@ -14,7 +14,10 @@ use codex_login::TokenData;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_state::RegisteredAccountRecord;
+use codex_state::RegisteredAccountUpsert;
 use std::fs;
+use std::path::Component;
+use std::path::Path;
 use std::path::PathBuf;
 
 struct StagedPooledRegistrationAuth {
@@ -34,6 +37,23 @@ impl AccountPoolControlPlane for LocalAccountPoolBackend {
             request,
             pooled_registration_tokens,
         } = request;
+        let mut raw_backend_account_handle_to_cleanup = None;
+        let request = if let Some(tokens) = pooled_registration_tokens.as_ref() {
+            let normalized_backend_account_handle =
+                LocalAccountPoolBackend::normalized_chatgpt_backend_account_handle(
+                    tokens.account_id.as_str(),
+                );
+            if request.backend_account_handle != normalized_backend_account_handle {
+                raw_backend_account_handle_to_cleanup =
+                    Some(request.backend_account_handle.clone());
+            }
+            RegisteredAccountUpsert {
+                backend_account_handle: normalized_backend_account_handle,
+                ..request
+            }
+        } else {
+            request
+        };
         let staged_auth = if let Some(tokens) = pooled_registration_tokens.as_ref() {
             Some(
                 self.stage_pooled_registration_auth(
@@ -108,6 +128,20 @@ impl AccountPoolControlPlane for LocalAccountPoolBackend {
             eprintln!(
                 "failed to remove backup backend-private auth after successful registration for {}: {err}",
                 registered_account.backend_account_handle
+            );
+        }
+        if let Some(raw_backend_account_handle) = raw_backend_account_handle_to_cleanup.as_deref()
+            && !raw_backend_account_handle.is_empty()
+            && Path::new(raw_backend_account_handle)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            && let Err(err) = self
+                .clear_backend_private_auth_namespace(raw_backend_account_handle)
+                .await
+        {
+            eprintln!(
+                "failed to remove legacy raw backend-private auth after successful registration for {} raw handle {}: {err}",
+                registered_account.account_id, raw_backend_account_handle
             );
         }
 

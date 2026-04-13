@@ -21,6 +21,15 @@ impl LocalAccountPoolBackend {
         Self { runtime, lease_ttl }
     }
 
+    pub(crate) fn normalized_chatgpt_backend_account_handle(provider_account_id: &str) -> String {
+        let encoded_provider_account_id = provider_account_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("chatgpt-{encoded_provider_account_id}")
+    }
+
     pub(crate) fn backend_private_auth_home(&self, backend_account_handle: &str) -> PathBuf {
         self.runtime
             .codex_home()
