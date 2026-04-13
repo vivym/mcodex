@@ -483,6 +483,12 @@ WHERE account_id = ?
         let mut tx = self.pool.begin().await?;
         let updated_at = account_datetime_to_epoch_seconds(Utc::now());
         let observed_at = account_datetime_to_epoch_seconds(event.observed_at);
+        let has_membership = super::account_pool_control::read_account_pool_membership_row(
+            &mut *tx,
+            &event.account_id,
+        )
+        .await?
+        .is_some();
 
         sqlx::query(
             r#"
@@ -526,7 +532,7 @@ ON CONFLICT(account_id) DO UPDATE SET
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
+        let update_registry_query = if has_membership {
             r#"
 UPDATE account_registry
 SET pool_id = COALESCE((
@@ -545,38 +551,56 @@ SET pool_id = COALESCE((
     END,
     updated_at = ?
 WHERE account_id = ?
-            "#,
-        )
-        .bind(updated_at)
-        .bind(&event.account_id)
-        .execute(&mut *tx)
-        .await?;
-
-        let runtime_pool_id: Option<String> = sqlx::query_scalar(
+            "#
+        } else {
             r#"
+UPDATE account_registry
+SET healthy = CASE
+        WHEN (
+            SELECT health_state
+            FROM account_runtime_state
+            WHERE account_runtime_state.account_id = account_registry.account_id
+        ) = 'healthy'
+            THEN 1
+        ELSE 0
+    END,
+    updated_at = ?
+WHERE account_id = ?
+            "#
+        };
+        sqlx::query(update_registry_query)
+            .bind(updated_at)
+            .bind(&event.account_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if has_membership {
+            let runtime_pool_id: Option<String> = sqlx::query_scalar(
+                r#"
 SELECT pool_id
 FROM account_runtime_state
 WHERE account_id = ?
             "#,
-        )
-        .bind(&event.account_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(pool_id) = runtime_pool_id {
-            let position = super::account_pool_control::read_account_pool_position(
-                &mut *tx,
-                &event.account_id,
             )
-            .await?
-            .unwrap_or(0);
-            super::account_pool_control::sync_account_membership_compat(
-                &mut tx,
-                &event.account_id,
-                &pool_id,
-                position,
-                updated_at,
-            )
+            .bind(&event.account_id)
+            .fetch_optional(&mut *tx)
             .await?;
+            if let Some(pool_id) = runtime_pool_id {
+                let position = super::account_pool_control::read_account_pool_position(
+                    &mut *tx,
+                    &event.account_id,
+                )
+                .await?
+                .unwrap_or(0);
+                super::account_pool_control::sync_account_membership_compat(
+                    &mut tx,
+                    &event.account_id,
+                    &pool_id,
+                    position,
+                    updated_at,
+                )
+                .await?;
+            }
         }
 
         tx.commit().await?;
@@ -3394,6 +3418,60 @@ WHERE account_id = ?
         .expect("read compat columns");
 
         assert_eq!(compat_columns, ("".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn health_events_do_not_reassign_unassigned_registered_accounts() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-unassigned".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-unassigned".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-unassigned".to_string(),
+                display_name: Some("Holding".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: None,
+            })
+            .await
+            .expect("upsert unassigned registered account");
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-unassigned".to_string(),
+                pool_id: "team-main".to_string(),
+                sequence_number: 1,
+                health_state: AccountHealthState::RateLimited,
+                observed_at: test_timestamp(1),
+            })
+            .await
+            .expect("record health event");
+
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-unassigned")
+                .await
+                .expect("read membership"),
+            None
+        );
+        let compat_columns: (String, i64, bool) = sqlx::query_as(
+            r#"
+SELECT pool_id, position, healthy
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-unassigned")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("read compat columns");
+
+        assert_eq!(compat_columns, ("".to_string(), 0, false));
     }
 
     #[tokio::test]
