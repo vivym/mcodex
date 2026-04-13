@@ -194,6 +194,7 @@ async fn add_chatgpt_account_with_dependencies(
             .context("run ChatGPT browser registration")?
     };
     let provider_account_id = tokens.account_id.clone();
+    let requested_account_id = chatgpt_local_account_id(&provider_account_id);
     let idempotency_key = format!("chatgpt-add:local:{provider_account_id}:{pool_id}");
 
     reconcile_pending_add_registration(runtime.as_ref(), &idempotency_key, control_plane).await?;
@@ -209,7 +210,12 @@ async fn add_chatgpt_account_with_dependencies(
     }
 
     let provider_fingerprint = provider_fingerprint(&provider_account_id);
+    let existing_requested_account = runtime
+        .read_registered_account(&requested_account_id)
+        .await?;
     let existing_memberships = runtime.list_account_pool_memberships(None).await?;
+    let mut same_pool_existing_position = None;
+    let mut same_pool_existing_account_id = None;
     for membership in existing_memberships {
         let Some(registered) = runtime
             .read_registered_account(&membership.account_id)
@@ -225,6 +231,15 @@ async fn add_chatgpt_account_with_dependencies(
                 "provider identity `{provider_account_id}` is already registered in pool `{}`; use `codex accounts pool assign` if you need to move it",
                 membership.pool_id
             );
+        }
+        if same_pool_existing_account_id.is_none() {
+            same_pool_existing_position = Some(
+                runtime
+                    .read_account_pool_position(&membership.account_id)
+                    .await?
+                    .unwrap_or(0),
+            );
+            same_pool_existing_account_id = Some(membership.account_id);
         }
     }
 
@@ -248,7 +263,7 @@ async fn add_chatgpt_account_with_dependencies(
     let registration_result = control_plane
         .register_account(RegisteredAccountRegistration {
             request: RegisteredAccountUpsert {
-                account_id: chatgpt_local_account_id(&provider_account_id),
+                account_id: requested_account_id.clone(),
                 backend_id: "local".to_string(),
                 backend_family: "chatgpt".to_string(),
                 workspace_id: Some(provider_account_id.clone()),
@@ -261,7 +276,7 @@ async fn add_chatgpt_account_with_dependencies(
                 healthy: true,
                 membership: Some(RegisteredAccountMembership {
                     pool_id: pool_id.clone(),
-                    position: 0,
+                    position: same_pool_existing_position.unwrap_or(0),
                 }),
             },
             pooled_registration_tokens: Some(tokens),
@@ -278,6 +293,11 @@ async fn add_chatgpt_account_with_dependencies(
             return Err(err);
         }
     };
+    let reused_existing_account = existing_requested_account.as_ref().is_some_and(|account| {
+        account.provider_fingerprint == provider_fingerprint
+            || account.backend_account_handle == provider_account_id
+    }) || same_pool_existing_account_id.is_some()
+        || registered.account_id != requested_account_id;
 
     if let Err(err) = finalizer
         .finalize_pending_account_registration(
@@ -288,6 +308,15 @@ async fn add_chatgpt_account_with_dependencies(
         )
         .await
     {
+        if reused_existing_account {
+            runtime
+                .clear_pending_account_registration(&idempotency_key)
+                .await
+                .context(
+                    "clear pending ChatGPT registration after finalize failure on existing account",
+                )?;
+            return Err(err);
+        }
         match control_plane
             .delete_registered_account(registered.account_id.as_str())
             .await
@@ -797,6 +826,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_chatgpt_registration_preserves_existing_same_pool_position_on_rerun() -> Result<()>
+    {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let provider_account_id = "provider-acct-new";
+        harness
+            .runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-local-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some(provider_account_id.to_string()),
+                backend_account_handle: provider_account_id.to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint(provider_account_id),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 7,
+                }),
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success(provider_account_id);
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.account_id, "acct-local-1");
+        let registration_requests = control_plane.registration_requests();
+        assert_eq!(registration_requests.len(), 1);
+        assert_eq!(
+            registration_requests[0].request,
+            RegisteredAccountUpsert {
+                account_id: chatgpt_local_account_id(provider_account_id),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some(provider_account_id.to_string()),
+                backend_account_handle: provider_account_id.to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint(provider_account_id),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 7,
+                }),
+            }
+        );
+        assert_eq!(
+            registration_requests[0]
+                .pooled_registration_tokens
+                .as_ref()
+                .map(|tokens| tokens.account_id.as_str()),
+            Some(provider_account_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reconcile_pending_add_registration_finalizes_existing_local_account() -> Result<()> {
         let harness = RegistrationHarness::with_registered_account(
             "acct-local-1",
@@ -920,6 +1021,115 @@ mod tests {
         assert_eq!(
             control_plane.deleted_account_ids(),
             vec!["acct-local-70726f76696465722d616363742d6e6577".to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_finalize_failure_keeps_existing_same_pool_account()
+    -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let provider_account_id = "provider-acct-new";
+        harness
+            .runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-local-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some(provider_account_id.to_string()),
+                backend_account_handle: provider_account_id.to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint(provider_account_id),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 7,
+                }),
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success(provider_account_id);
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+        let finalizer = FailingPendingFinalizer::once("finalize failed");
+
+        let err = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &finalizer,
+        )
+        .await
+        .expect_err("finalize failure should preserve existing same-pool account");
+
+        assert!(err.to_string().contains("finalize failed"));
+        assert!(control_plane.deleted_account_ids().is_empty());
+        assert_eq!(
+            harness
+                .runtime
+                .read_registered_account("acct-local-1")
+                .await?
+                .expect("existing account should be preserved")
+                .account_id,
+            "acct-local-1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_finalize_failure_compensates_unrelated_requested_id_collision()
+    -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let provider_account_id = "provider-acct-new";
+        let requested_account_id = chatgpt_local_account_id(provider_account_id);
+        harness
+            .runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: requested_account_id.clone(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("provider-acct-old".to_string()),
+                backend_account_handle: "provider-acct-old".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint("provider-acct-old"),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: None,
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success(provider_account_id);
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+        let finalizer = FailingPendingFinalizer::once("finalize failed");
+
+        let err = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &finalizer,
+        )
+        .await
+        .expect_err("unrelated requested-id collision should still compensate");
+
+        assert!(err.to_string().contains("finalize failed"));
+        assert_eq!(
+            control_plane.deleted_account_ids(),
+            vec![requested_account_id.clone()]
+        );
+        assert_eq!(
+            harness
+                .runtime
+                .read_registered_account(&requested_account_id)
+                .await?,
+            None
         );
         Ok(())
     }
@@ -1105,6 +1315,7 @@ allow_context_reuse = false
         runtime: Arc<StateRuntime>,
         next_account_id: Mutex<u32>,
         deleted_account_ids: Mutex<Vec<String>>,
+        registration_requests: Mutex<Vec<RegisteredAccountRegistration>>,
     }
 
     impl RuntimeBackedControlPlane {
@@ -1113,11 +1324,19 @@ allow_context_reuse = false
                 runtime,
                 next_account_id: Mutex::new(1),
                 deleted_account_ids: Mutex::new(Vec::new()),
+                registration_requests: Mutex::new(Vec::new()),
             }
         }
 
         fn deleted_account_ids(&self) -> Vec<String> {
             self.deleted_account_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn registration_requests(&self) -> Vec<RegisteredAccountRegistration> {
+            self.registration_requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
@@ -1129,6 +1348,10 @@ allow_context_reuse = false
             &self,
             mut request: RegisteredAccountRegistration,
         ) -> anyhow::Result<RegisteredAccountRecord> {
+            self.registration_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
             if request.request.account_id.is_empty() {
                 let mut next_account_id = self
                     .next_account_id

@@ -1045,6 +1045,14 @@ WHERE preferred_account_id = ?
             })
     }
 
+    pub async fn read_account_pool_position(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        super::account_pool_control::read_account_pool_position(self.pool.as_ref(), account_id)
+            .await
+    }
+
     pub async fn write_account_startup_selection(
         &self,
         update: AccountStartupSelectionUpdate,
