@@ -3537,6 +3537,72 @@ FROM account_registry
     }
 
     #[tokio::test]
+    async fn upsert_registered_account_preserves_existing_source_when_replayed_without_one() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: Some(AccountSource::Migrated),
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
+            })
+            .await
+            .expect("create migrated registered account");
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-2".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary Replay".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
+            })
+            .await
+            .expect("replay registered account without source");
+
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-1")
+                .await
+                .expect("read canonical registered account"),
+            Some(RegisteredAccountRecord {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary Replay".to_string()),
+                source: Some(AccountSource::Migrated),
+                enabled: true,
+                healthy: true,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_account_registry_entry_writes_and_updates_membership() {
         let runtime = test_runtime().await;
 

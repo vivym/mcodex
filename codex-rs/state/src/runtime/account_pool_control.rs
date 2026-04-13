@@ -350,7 +350,7 @@ ON CONFLICT(account_id) DO UPDATE SET
     display_name = excluded.display_name,
     enabled = excluded.enabled,
     healthy = excluded.healthy,
-    source = excluded.source,
+    source = COALESCE(excluded.source, account_registry.source),
     updated_at = excluded.updated_at
             "#,
         )
