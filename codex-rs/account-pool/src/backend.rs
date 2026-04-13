@@ -8,7 +8,8 @@ use codex_state::AccountLeaseRecord;
 use codex_state::AccountStartupSelectionState;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
-use codex_state::LegacyAccountImport;
+use codex_state::RegisteredAccountRecord;
+use codex_state::RegisteredAccountUpsert;
 
 pub mod local;
 
@@ -23,7 +24,7 @@ pub trait AccountPoolBackend {
 
 /// Runtime state backend for local lease lifecycle operations.
 #[async_trait]
-pub trait AccountPoolLeaseBackend: Send + Sync {
+pub trait AccountPoolExecutionBackend: Send + Sync {
     /// Acquire (or rehydrate) the current holder lease for a pool.
     async fn acquire_lease(
         &self,
@@ -52,10 +53,17 @@ pub trait AccountPoolLeaseBackend: Send + Sync {
 
     /// Read persisted startup selection state.
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState>;
+}
 
-    /// Import a legacy default account into pooled state.
-    async fn import_legacy_default_account(
+/// Control-plane backend for pooled account registration and deletion.
+#[async_trait]
+pub trait AccountPoolControlPlane: Send + Sync {
+    /// Register or update a pooled account record.
+    async fn register_account(
         &self,
-        legacy_account: LegacyAccountImport,
-    ) -> anyhow::Result<()>;
+        request: RegisteredAccountUpsert,
+    ) -> anyhow::Result<RegisteredAccountRecord>;
+
+    /// Delete a pooled account record by account identifier.
+    async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool>;
 }

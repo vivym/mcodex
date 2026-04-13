@@ -1,15 +1,13 @@
 mod diagnostics;
 mod mutate;
 mod output;
+mod registration;
 
 use anyhow::Context;
 use clap::Args;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_login::AuthManager;
-use codex_login::LegacyAuthView;
 use codex_state::AccountStartupSelectionUpdate;
-use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
@@ -24,6 +22,7 @@ use output::print_current_json;
 use output::print_current_text;
 use output::print_status_json;
 use output::print_status_text;
+use registration::import_legacy_account;
 
 const ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP: &str = "pooled credential storage keyed by `credential_ref` is not implemented yet, so `codex accounts add` cannot persist a new pooled account without mutating the shared legacy compatibility auth store. Use `codex login` only if you need to replace the single legacy default compatibility account.";
 
@@ -42,6 +41,7 @@ pub struct AccountsCommand {
 #[derive(Debug, clap::Subcommand)]
 pub enum AccountsSubcommand {
     Add(AddAccountCommand),
+    ImportLegacy(ImportLegacyCommand),
     Enable(AccountToggleCommand),
     Disable(AccountToggleCommand),
     Remove(RemoveAccountCommand),
@@ -69,6 +69,12 @@ pub enum AddAccountSubcommand {
 pub struct AddChatgptAccountCommand {
     #[arg(long = "device-auth", default_value_t = false)]
     pub device_auth: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportLegacyCommand {
+    #[arg(long = "pool", value_name = "POOL_ID")]
+    pub pool: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -190,13 +196,41 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         .parse_overrides()
         .map_err(anyhow::Error::msg)?;
     let config = Config::load_with_cli_overrides(cli_overrides).await?;
+
+    if matches!(subcommand, AccountsSubcommand::List) {
+        let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
+            accounts.default_pool.is_some()
+                || accounts
+                    .pools
+                    .as_ref()
+                    .is_some_and(|pools| !pools.is_empty())
+        });
+        let state_path = state_db_path(config.sqlite_home.as_path());
+        if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
+            return Ok(());
+        }
+    }
+
     let runtime = StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account startup selection state")?;
-    bootstrap_from_legacy_auth_if_needed(&runtime, &config).await?;
 
     match subcommand {
         AccountsSubcommand::Add(_command) => anyhow::bail!(ACCOUNTS_ADD_CREDENTIAL_STORAGE_GAP),
+        AccountsSubcommand::ImportLegacy(command) => {
+            let imported = import_legacy_account(
+                &runtime,
+                &config,
+                command.pool.as_deref(),
+                account_pool.as_deref(),
+            )
+            .await?;
+            println!(
+                "imported legacy account: {} pool={}",
+                imported.account_id, imported.pool_id
+            );
+            Ok(())
+        }
         AccountsSubcommand::Enable(command) => {
             set_account_enabled(&runtime, &command.account_id, true).await
         }
@@ -286,37 +320,4 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-async fn bootstrap_from_legacy_auth_if_needed(
-    runtime: &StateRuntime,
-    config: &Config,
-) -> anyhow::Result<()> {
-    let startup_selection = runtime
-        .read_account_startup_selection()
-        .await
-        .context("read account startup selection")?;
-    if startup_selection.default_pool_id.is_some()
-        || startup_selection.preferred_account_id.is_some()
-        || startup_selection.suppressed
-    {
-        return Ok(());
-    }
-
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true);
-    let legacy_auth_view = LegacyAuthView::new(&auth_manager);
-    let Some(account_id) = legacy_auth_view
-        .current()
-        .await
-        .and_then(|auth| auth.get_account_id())
-    else {
-        return Ok(());
-    };
-
-    runtime
-        .import_legacy_default_account(LegacyAccountImport { account_id })
-        .await
-        .context("bootstrap pooled state from legacy auth")?;
-    Ok(())
 }

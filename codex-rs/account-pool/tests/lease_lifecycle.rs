@@ -64,32 +64,38 @@ async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
     );
 }
 
-#[tokio::test]
-async fn bootstrap_imports_legacy_default_only_once() {
-    let harness = fixture_with_legacy_auth("acct-legacy").await;
-    let mut manager = harness
-        .manager("test-holder", default_config())
-        .expect("create manager");
+mod lease_lifecycle {
+    use pretty_assertions::assert_eq;
 
-    manager
-        .bootstrap_from_legacy_auth()
-        .await
-        .expect("first bootstrap");
-    manager
-        .bootstrap_from_legacy_auth()
-        .await
-        .expect("second bootstrap");
+    use super::*;
 
-    let selection = manager
-        .read_startup_selection_for_test()
-        .await
-        .expect("read startup selection");
+    #[tokio::test]
+    async fn ensure_active_lease_does_not_bootstrap_legacy_auth_when_startup_state_is_empty() {
+        let harness = fixture_with_legacy_auth("acct-legacy").await;
+        let mut manager = harness
+            .manager("test-holder", default_config())
+            .expect("create manager");
 
-    assert_eq!(
-        selection.preferred_account_id.as_deref(),
-        Some("acct-legacy")
-    );
-    assert_eq!(harness.bootstrap_calls.load(Ordering::SeqCst), 1);
+        let err = manager
+            .ensure_active_lease(SelectionRequest::default())
+            .await
+            .expect_err("legacy auth should not bootstrap pooled state implicitly");
+
+        assert!(
+            err.to_string().contains("no eligible account"),
+            "unexpected error: {err}"
+        );
+
+        let selection = manager
+            .read_startup_selection_for_test()
+            .await
+            .expect("read startup selection");
+
+        assert_eq!(selection.default_pool_id, None);
+        assert_eq!(selection.preferred_account_id, None);
+        assert_eq!(selection.suppressed, false);
+        assert_eq!(harness.bootstrap_calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -215,10 +221,11 @@ impl TestHarness {
 }
 
 async fn fixture_with_legacy_auth(account_id: &str) -> TestHarness {
-    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let tempdir =
+        tempfile::tempdir().unwrap_or_else(|err| panic!("create tempdir failed: {err}"));
     let runtime = StateRuntime::init(tempdir.path().to_path_buf(), "test-provider".to_string())
         .await
-        .expect("initialize runtime");
+        .unwrap_or_else(|err| panic!("initialize runtime failed: {err}"));
     let (_, bootstrap_calls) = TestLegacyBootstrap::with_legacy_account(account_id);
     TestHarness {
         runtime,

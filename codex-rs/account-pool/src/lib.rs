@@ -7,7 +7,8 @@ mod selection;
 mod types;
 
 pub use backend::AccountPoolBackend;
-pub use backend::AccountPoolLeaseBackend;
+pub use backend::AccountPoolControlPlane;
+pub use backend::AccountPoolExecutionBackend;
 pub use backend::local::LocalAccountPoolBackend;
 pub use bootstrap::LegacyAuthBootstrap;
 pub use bootstrap::NoLegacyAuthBootstrap;

@@ -77,6 +77,14 @@ async fn read_pool_membership(
     runtime.read_account_pool_membership(account_id).await
 }
 
+async fn read_compat_migration_state(
+    codex_home: &TempDir,
+) -> Result<codex_state::AccountCompatMigrationState> {
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    runtime.read_account_compat_migration_state().await
+}
+
 fn seed_chatgpt_auth(codex_home: &Path) -> Result<()> {
     let auth_json = serde_json::json!({
         "tokens": {
@@ -149,10 +157,13 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    backend_id,
+    backend_account_handle,
+    provider_fingerprint,
     healthy,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(account_id)
@@ -161,7 +172,29 @@ INSERT INTO account_registry (
     .bind("chatgpt")
     .bind("chatgpt")
     .bind("workspace-main")
+    .bind("local")
+    .bind(account_id)
+    .bind(format!("test:{account_id}"))
     .bind(1_i64)
+    .bind(1_i64)
+    .bind(1_i64)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_pool_membership (
+    account_id,
+    pool_id,
+    position,
+    assigned_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(account_id)
+    .bind(pool_id)
+    .bind(position)
     .bind(1_i64)
     .bind(1_i64)
     .execute(pool)
@@ -284,25 +317,41 @@ async fn accounts_list_lists_registered_accounts_and_marks_migrated_source() -> 
 }
 
 #[tokio::test]
-async fn accounts_list_bootstraps_legacy_auth_into_pooled_state() -> Result<()> {
+async fn accounts_list_no_longer_bootstraps_legacy_auth_into_pooled_state() -> Result<()> {
     let codex_home = prepared_legacy_auth_only_home().await?;
 
     let output = run_codex(&codex_home, &["accounts", "list"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
 
-    let lines = output
-        .stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        lines,
-        vec!["acct-1 pool=legacy-default enabled=true healthy=true source=migrated"]
-    );
+    assert!(output.stdout.trim().is_empty(), "stdout: {}", output.stdout);
+    assert!(!state_db_path(codex_home.path()).exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_registers_and_assigns_legacy_account_explicitly() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "team-main",
+            "import-legacy",
+            "--pool",
+            "team-main",
+        ],
+    )
+    .await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("acct-1"));
+
     assert_eq!(
         read_startup_selection(&codex_home).await?,
         AccountStartupSelectionState {
-            default_pool_id: Some("legacy-default".to_string()),
+            default_pool_id: Some("team-main".to_string()),
             preferred_account_id: Some("acct-1".to_string()),
             suppressed: false,
         }
@@ -313,10 +362,16 @@ async fn accounts_list_bootstraps_legacy_auth_into_pooled_state() -> Result<()> 
             .expect("membership"),
         codex_state::AccountPoolMembership {
             account_id: "acct-1".to_string(),
-            pool_id: "legacy-default".to_string(),
+            pool_id: "team-main".to_string(),
             source: Some(codex_state::AccountSource::Migrated),
             enabled: true,
             healthy: true,
+        }
+    );
+    assert_eq!(
+        read_compat_migration_state(&codex_home).await?,
+        codex_state::AccountCompatMigrationState {
+            legacy_import_completed: true,
         }
     );
 

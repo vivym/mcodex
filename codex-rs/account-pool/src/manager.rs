@@ -1,4 +1,4 @@
-use crate::backend::AccountPoolLeaseBackend;
+use crate::backend::AccountPoolExecutionBackend;
 use crate::bootstrap::LegacyAuthBootstrap;
 use crate::lease_lifecycle::LeaseHealthEvent;
 use crate::types::AccountPoolConfig;
@@ -21,7 +21,7 @@ enum LeaseRenewalDisposition {
     Missing { pool_id: String },
 }
 
-pub struct AccountPoolManager<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> {
+pub struct AccountPoolManager<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> {
     backend: B,
     legacy_bootstrap: L,
     config: AccountPoolConfig,
@@ -31,7 +31,7 @@ pub struct AccountPoolManager<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap
     bootstrapped_legacy_auth: bool,
 }
 
-impl<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L> {
+impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L> {
     pub fn new(
         backend: B,
         legacy_bootstrap: L,
@@ -65,9 +65,7 @@ impl<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L
             return Ok(());
         }
 
-        if let Some(auth) = self.legacy_bootstrap.current_legacy_auth().await? {
-            self.backend.import_legacy_default_account(auth).await?;
-        }
+        let _ = self.legacy_bootstrap.current_legacy_auth().await?;
 
         self.bootstrapped_legacy_auth = true;
         Ok(())
@@ -77,8 +75,6 @@ impl<B: AccountPoolLeaseBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L
         &mut self,
         request: SelectionRequest,
     ) -> anyhow::Result<LeasedAccount> {
-        self.bootstrap_from_legacy_auth().await?;
-
         let now = request.now.unwrap_or_else(Utc::now);
         if self.active_lease.is_some() {
             match self.try_renew_active_lease_if_needed(now).await? {
