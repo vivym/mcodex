@@ -1,8 +1,15 @@
 use anyhow::Result;
+use base64::Engine;
+use chrono::Utc;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_core::AccountLeaseRuntimeReason;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -29,10 +36,13 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
+use core_test_support::wait_for_event_with_timeout;
 use http::Method;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -393,6 +403,9 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
             ResponseTemplate::new(401)
                 .insert_header("content-type", "application/json")
                 .set_body_string("unauthorized"),
+            ResponseTemplate::new(401)
+                .insert_header("content-type", "application/json")
+                .set_body_string("unauthorized"),
             sse_with_primary_usage_percent("resp-2", 11.0),
         ],
     )
@@ -414,8 +427,134 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
     assert!(second_turn_error.is_none());
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 2, "expected one request per turn");
-    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected one in-turn unauthorized retry before next-turn rotation"
+    );
+    assert_account_ids_in_order(
+        &requests,
+        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_retry_uses_leased_auth_session_not_shared_auth_manager() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    struct UnauthorizedThenRefreshedLeaseResponder {
+        next_call: std::sync::atomic::AtomicUsize,
+        codex_home: std::path::PathBuf,
+    }
+
+    impl Respond for UnauthorizedThenRefreshedLeaseResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .next_call
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match call_index {
+                0 => {
+                    write_pooled_auth(
+                        self.codex_home.as_path(),
+                        PRIMARY_ACCOUNT_ID,
+                        PRIMARY_ACCOUNT_ID,
+                        "pooled-access-refreshed",
+                    )
+                    .unwrap_or_else(|err| panic!("refresh pooled auth for retry: {err}"));
+                    ResponseTemplate::new(401)
+                        .insert_header("content-type", "application/json")
+                        .set_body_string("unauthorized")
+                }
+                1 => sse_with_primary_usage_percent("resp-1", 11.0),
+                _ => panic!("unexpected responses request {call_index}"),
+            }
+        }
+    }
+
+    let server = start_mock_server().await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    write_shared_auth(
+        shared_home.path(),
+        "shared-account",
+        "shared-access-initial",
+    )?;
+    let shared_auth =
+        CodexAuth::from_auth_storage(shared_home.path(), AuthCredentialsStoreMode::File)?
+            .expect("expected shared auth from tempdir");
+
+    let mut builder = pooled_accounts_builder()
+        .with_home(Arc::clone(&shared_home))
+        .with_auth(shared_auth);
+    let test = builder.build(&server).await?;
+    seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        PRIMARY_ACCOUNT_ID,
+        PRIMARY_ACCOUNT_ID,
+        "pooled-access-stale",
+    )?;
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(UnauthorizedThenRefreshedLeaseResponder {
+            next_call: std::sync::atomic::AtomicUsize::new(0),
+            codex_home: test.codex_home_path().to_path_buf(),
+        })
+        .mount(&server)
+        .await;
+
+    let turn_error = submit_turn_and_wait(&test, "unauthorized retry").await?;
+    assert!(turn_error.is_none());
+
+    let response_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 2);
+
+    let account_ids = response_requests
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        account_ids,
+        vec![
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(PRIMARY_ACCOUNT_ID.to_string())
+        ]
+    );
+
+    let auth_headers = response_requests
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        auth_headers,
+        vec![
+            Some("Bearer pooled-access-stale".to_string()),
+            Some("Bearer pooled-access-refreshed".to_string())
+        ]
+    );
 
     Ok(())
 }
@@ -802,6 +941,210 @@ async fn shutdown_releases_active_lease_for_next_runtime() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_request_uses_lease_scoped_auth_session_not_shared_auth_snapshot() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let shared_home = Arc::new(TempDir::new()?);
+    write_shared_auth(
+        shared_home.path(),
+        "shared-account",
+        "shared-access-initial",
+    )?;
+    let shared_auth =
+        CodexAuth::from_auth_storage(shared_home.path(), AuthCredentialsStoreMode::File)?
+            .expect("expected shared auth from tempdir");
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "lease auth turn"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder()
+        .with_home(Arc::clone(&shared_home))
+        .with_auth(shared_auth);
+    let test = builder.build(&server).await?;
+    seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        PRIMARY_ACCOUNT_ID,
+        PRIMARY_ACCOUNT_ID,
+        "pooled-access-primary",
+    )?;
+
+    let turn_error = submit_turn_and_wait(&test, "lease auth turn").await?;
+    assert!(turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one pooled request");
+    let response_auth_headers = requests
+        .iter()
+        .map(|request| request.header("authorization"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_auth_headers,
+        vec![Some("Bearer pooled-access-primary".to_string())],
+        "pooled request should use the lease-scoped auth snapshot instead of shared auth"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_request_ignores_shared_external_auth_when_lease_is_active() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    #[derive(Debug)]
+    struct FixedExternalApiKeyAuth {
+        api_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl codex_login::ExternalAuth for FixedExternalApiKeyAuth {
+        fn auth_mode(&self) -> codex_app_server_protocol::AuthMode {
+            codex_app_server_protocol::AuthMode::ApiKey
+        }
+
+        async fn resolve(&self) -> std::io::Result<Option<codex_login::ExternalAuthTokens>> {
+            Ok(Some(codex_login::ExternalAuthTokens::access_token_only(
+                self.api_key.clone(),
+            )))
+        }
+
+        async fn refresh(
+            &self,
+            _context: codex_login::ExternalAuthRefreshContext,
+        ) -> std::io::Result<codex_login::ExternalAuthTokens> {
+            Ok(codex_login::ExternalAuthTokens::access_token_only(
+                self.api_key.clone(),
+            ))
+        }
+    }
+
+    let server = start_mock_server().await;
+    let shared_home = Arc::new(TempDir::new()?);
+    let mut builder = pooled_accounts_builder().with_home(Arc::clone(&shared_home));
+    let test = builder.build(&server).await?;
+    seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+    let pooled_auth_home = test
+        .codex_home_path()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(PRIMARY_ACCOUNT_ID);
+    write_chatgpt_auth(
+        pooled_auth_home.as_path(),
+        PRIMARY_ACCOUNT_ID,
+        "pooled-access-initial",
+    )?;
+    test.thread_manager
+        .auth_manager()
+        .set_external_auth(Arc::new(FixedExternalApiKeyAuth {
+            api_key: "shared-external-api-key".to_string(),
+        }));
+
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("m1", "lease auth turn"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let turn_error = submit_turn_and_wait(&test, "lease auth turn").await?;
+    assert!(turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one pooled request");
+    let auth_headers = requests
+        .iter()
+        .map(|request| request.header("authorization"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        auth_headers,
+        vec![Some("Bearer pooled-access-initial".to_string())]
+    );
+
+    let account_ids = requests
+        .iter()
+        .map(|request| request.header("chatgpt-account-id"))
+        .collect::<Vec<_>>();
+    assert_eq!(account_ids, vec![Some(PRIMARY_ACCOUNT_ID.to_string())]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_response_sequence(
+        &server,
+        vec![
+            sse_with_primary_usage_percent("resp-1", 92.0),
+            sse_with_primary_usage_percent("resp-2", 15.0),
+        ],
+    )
+    .await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    write_shared_auth(
+        shared_home.path(),
+        "shared-account",
+        "shared-access-initial",
+    )?;
+    let shared_auth =
+        CodexAuth::from_auth_storage(shared_home.path(), AuthCredentialsStoreMode::File)?
+            .expect("expected shared auth from tempdir");
+
+    let mut builder = pooled_accounts_builder()
+        .with_home(Arc::clone(&shared_home))
+        .with_auth(shared_auth);
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        PRIMARY_ACCOUNT_ID,
+        PRIMARY_ACCOUNT_ID,
+        "pooled-access-primary",
+    )?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        SECONDARY_ACCOUNT_ID,
+        SECONDARY_ACCOUNT_ID,
+        "pooled-access-secondary",
+    )?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "near-limit turn").await?;
+    assert!(first_turn_error.is_none());
+    assert_eq!(
+        test.codex
+            .current_lease_bridge_account_id()
+            .await
+            .as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+
+    let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
+    assert!(second_turn_error.is_none());
+    assert_eq!(
+        test.codex
+            .current_lease_bridge_account_id()
+            .await
+            .as_deref(),
+        Some(SECONDARY_ACCOUNT_ID)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -909,10 +1252,14 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
         contender_turn_error.message
     );
 
-    wait_for_event(&first.codex, |event| match event {
-        EventMsg::TurnComplete(event) => event.turn_id == first_turn_id,
-        _ => false,
-    })
+    wait_for_event_with_timeout(
+        &first.codex,
+        |event| match event {
+            EventMsg::TurnComplete(event) => event.turn_id == first_turn_id,
+            _ => false,
+        },
+        Duration::from_secs(30),
+    )
     .await;
 
     let requests = server.received_requests().await.unwrap_or_default();
@@ -1089,11 +1436,17 @@ async fn seed_account(test: &TestCodex, account_id: &str) -> Result<()> {
             account_id: account_id.to_string(),
         })
         .await?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        account_id,
+        account_id,
+        &format!("pooled-access-{account_id}"),
+    )?;
     Ok(())
 }
 
 async fn wait_for_compact_request(mock_response: &ResponseMock) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if !mock_response.requests().is_empty() {
             return;
@@ -1302,4 +1655,68 @@ async fn submit_turn_and_wait(
             _ => {}
         }
     }
+}
+
+fn write_shared_auth(codex_home: &Path, account_id: &str, access_token: &str) -> Result<()> {
+    write_chatgpt_auth(codex_home, account_id, access_token)
+}
+
+fn write_pooled_auth(
+    codex_home: &Path,
+    backend_account_handle: &str,
+    account_id: &str,
+    access_token: &str,
+) -> Result<()> {
+    let auth_home = codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    write_chatgpt_auth(auth_home.as_path(), account_id, access_token)
+}
+
+fn write_chatgpt_auth(auth_home: &Path, account_id: &str, access_token: &str) -> Result<()> {
+    save_auth(
+        auth_home,
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token(account_id))?,
+                access_token: access_token.to_string(),
+                refresh_token: format!("refresh-{account_id}"),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 =
+        b64(&serde_json::to_vec(&header).unwrap_or_else(|err| panic!("serialize header: {err}")));
+    let payload_b64 =
+        b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| panic!("serialize payload: {err}")));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use base64::Engine;
 use chrono::Utc;
 use codex_login::AuthCredentialsStoreMode;
@@ -117,6 +119,55 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_r
         .expect_err("rebound auth should fail closed");
     assert!(
         err.to_string().contains("rebinding"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_lease_epoch_supersession()
+-> anyhow::Result<()> {
+    let codex_home = tempdir().expect("create tempdir");
+    let backend_account_handle = "backend-handle-1";
+    let auth_home = codex_home
+        .path()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    let binding = LeaseAuthBinding {
+        account_id: "acct-1".to_string(),
+        backend_account_handle: backend_account_handle.to_string(),
+        lease_epoch: 1,
+    };
+
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token("acct-1"))?,
+                access_token: "managed-access".to_string(),
+                refresh_token: "managed-refresh".to_string(),
+                account_id: Some("acct-1".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+    LocalLeaseScopedAuthSession::write_lease_epoch_marker(auth_home.as_path(), 1)?;
+    let session = LocalLeaseScopedAuthSession::new(binding, auth_home.clone());
+    assert_eq!(
+        session.refresh_leased_turn_auth()?.account_id(),
+        Some("acct-1".to_string())
+    );
+
+    LocalLeaseScopedAuthSession::write_lease_epoch_marker(auth_home.as_path(), 2)?;
+
+    let err = session
+        .refresh_leased_turn_auth()
+        .expect_err("superseded lease epoch should fail closed");
+    assert!(
+        err.to_string().contains("lease epoch"),
         "unexpected error: {err}"
     );
 

@@ -1,7 +1,14 @@
 use anyhow::Result;
+use base64::Engine;
+use chrono::Utc;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
+use codex_login::AuthCredentialsStoreMode;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::auth::AuthDotJson;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -19,7 +26,9 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use std::collections::HashMap;
+use std::path::Path;
 use tokio::time::Duration;
 use tokio::time::timeout;
 use wiremock::Mock;
@@ -141,6 +150,12 @@ async fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websock
             account_id: pooled_account_id.to_string(),
         })
         .await?;
+    write_pooled_auth(
+        test.codex_home_path(),
+        pooled_account_id,
+        pooled_account_id,
+        &format!("pooled-access-{pooled_account_id}"),
+    )?;
 
     test.submit_turn("hello").await?;
 
@@ -164,6 +179,64 @@ async fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websock
     assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
+}
+
+fn write_pooled_auth(
+    codex_home: &Path,
+    backend_account_handle: &str,
+    account_id: &str,
+    access_token: &str,
+) -> Result<()> {
+    let auth_home = codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token(account_id))?,
+                access_token: access_token.to_string(),
+                refresh_token: format!("refresh-{account_id}"),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+        panic!("serialize header: {err}");
+    }));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+        panic!("serialize payload: {err}");
+    }));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

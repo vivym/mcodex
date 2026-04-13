@@ -1,3 +1,4 @@
+mod auth_provider;
 pub mod default_client;
 pub mod error;
 mod storage;
@@ -9,6 +10,11 @@ mod leased_auth;
 mod legacy_auth_view;
 mod manager;
 
+pub use auth_provider::AuthProvider;
+pub use auth_provider::AuthRecovery;
+pub use auth_provider::AuthRecoveryStepResult;
+pub use auth_provider::RefreshingAuthProvider;
+pub use auth_provider::SharedAuthProvider;
 pub use error::RefreshTokenFailedError;
 pub use error::RefreshTokenFailedReason;
 pub use lease_scoped_session::LeaseAuthBinding;

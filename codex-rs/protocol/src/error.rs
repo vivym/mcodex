@@ -220,6 +220,9 @@ impl CodexErr {
             CodexErr::RetryLimit(_) => CodexErrorInfo::ResponseTooManyFailedAttempts {
                 http_status_code: self.http_status_code_value(),
             },
+            CodexErr::UnexpectedStatus(err) if err.status == StatusCode::UNAUTHORIZED => {
+                CodexErrorInfo::Unauthorized
+            }
             CodexErr::ConnectionFailed(_) => CodexErrorInfo::HttpConnectionFailed {
                 http_status_code: self.http_status_code_value(),
             },

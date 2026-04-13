@@ -2,13 +2,21 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use base64::Engine;
+use chrono::Utc;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_core::compact::SUMMARY_PREFIX;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -38,6 +46,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use serde_json::json;
 use wiremock::ResponseTemplate;
 
@@ -115,6 +124,77 @@ async fn start_remote_realtime_server() -> responses::WebSocketTestServer {
         vec![],
     ]])
     .await
+}
+
+async fn seed_pooled_legacy_account(harness: &TestCodexHarness, account_id: &str) -> Result<()> {
+    let codex = harness.test().codex.clone();
+    let Some(state_db) = codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: account_id.to_string(),
+        })
+        .await?;
+    write_pooled_auth(harness.test().codex_home_path(), account_id, account_id)?;
+    Ok(())
+}
+
+fn write_pooled_auth(
+    codex_home: &Path,
+    backend_account_handle: &str,
+    account_id: &str,
+) -> Result<()> {
+    let auth_home = codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token(account_id))?,
+                access_token: format!("pooled-access-{account_id}"),
+                refresh_token: format!("refresh-{account_id}"),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 =
+        b64(&serde_json::to_vec(&header).unwrap_or_else(|err| panic!("serialize header: {err}")));
+    let payload_b64 =
+        b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| panic!("serialize payload: {err}")));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<()> {
@@ -379,16 +459,7 @@ async fn pooled_manual_remote_compact_uses_leased_account_for_compact_and_follow
     .await?;
     let codex = harness.test().codex.clone();
 
-    let Some(state_db) = codex.state_db() else {
-        return Err(anyhow::anyhow!(
-            "state db should be available in core integration tests"
-        ));
-    };
-    state_db
-        .import_legacy_default_account(LegacyAccountImport {
-            account_id: pooled_account_id.to_string(),
-        })
-        .await?;
+    seed_pooled_legacy_account(&harness, pooled_account_id).await?;
 
     let responses_mock = responses::mount_sse_sequence(
         harness.server(),
@@ -559,16 +630,7 @@ async fn pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_foll
     .await?;
     let codex = harness.test().codex.clone();
 
-    let Some(state_db) = codex.state_db() else {
-        return Err(anyhow::anyhow!(
-            "state db should be available in core integration tests"
-        ));
-    };
-    state_db
-        .import_legacy_default_account(LegacyAccountImport {
-            account_id: pooled_account_id.to_string(),
-        })
-        .await?;
+    seed_pooled_legacy_account(&harness, pooled_account_id).await?;
 
     let initial_turn_request_mock = responses::mount_sse_once(
         harness.server(),

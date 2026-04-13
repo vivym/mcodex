@@ -205,6 +205,11 @@ impl CodexThread {
         self.codex.account_lease_snapshot().await
     }
 
+    #[doc(hidden)]
+    pub async fn current_lease_bridge_account_id(&self) -> Option<String> {
+        self.codex.current_lease_bridge_account_id().await
+    }
+
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
     }

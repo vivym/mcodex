@@ -21,7 +21,7 @@ use super::remote::enable_remote_plugin;
 use super::remote::fetch_remote_featured_plugin_ids;
 use super::remote::fetch_remote_plugin_status;
 use super::remote::uninstall_remote_plugin;
-use super::startup_sync::start_startup_remote_plugin_sync_once;
+use super::startup_sync::start_startup_remote_plugin_sync_once_with_auth_provider;
 use super::store::PluginInstallResult as StorePluginInstallResult;
 use super::store::PluginStore;
 use super::store::PluginStoreError;
@@ -47,7 +47,9 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::PluginConfig;
 use codex_features::Feature;
 use codex_login::AuthManager;
+use codex_login::AuthProvider;
 use codex_login::CodexAuth;
+use codex_login::SharedAuthProvider;
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
 use codex_plugin::PluginId;
@@ -1028,19 +1030,30 @@ impl PluginsManager {
         config: &Config,
         auth_manager: Arc<AuthManager>,
     ) {
+        self.maybe_start_plugin_startup_tasks_for_config_with_auth_provider(
+            config,
+            Arc::new(SharedAuthProvider::new(auth_manager)),
+        );
+    }
+
+    pub fn maybe_start_plugin_startup_tasks_for_config_with_auth_provider(
+        self: &Arc<Self>,
+        config: &Config,
+        auth_provider: Arc<dyn AuthProvider>,
+    ) {
         if config.features.enabled(Feature::Plugins) {
             self.start_curated_repo_sync();
-            start_startup_remote_plugin_sync_once(
+            start_startup_remote_plugin_sync_once_with_auth_provider(
                 Arc::clone(self),
                 self.codex_home.clone(),
                 config.clone(),
-                auth_manager.clone(),
+                Arc::clone(&auth_provider),
             );
 
             let config = config.clone();
             let manager = Arc::clone(self);
             tokio::spawn(async move {
-                let auth = auth_manager.auth().await;
+                let auth = auth_provider.auth().await;
                 if let Err(err) = manager
                     .featured_plugin_ids_for_config(&config, auth.as_ref())
                     .await

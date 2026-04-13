@@ -38,9 +38,17 @@ impl SessionTask for CompactTask {
             if let Some(account_pool_manager) = session.services.account_pool_manager.as_ref() {
                 let mut account_pool_manager = account_pool_manager.lock().await;
                 match account_pool_manager.prepare_turn().await {
-                    Ok(selection) => selection,
+                    Ok(selection) => {
+                        session.services.lease_auth.replace_current(
+                            selection
+                                .as_ref()
+                                .map(|selection| std::sync::Arc::clone(&selection.auth_session)),
+                        );
+                        selection
+                    }
                     Err(err) => {
                         warn!("failed to prepare account-pool lease for compact task: {err:#}");
+                        session.services.lease_auth.clear();
                         None
                     }
                 }
@@ -66,7 +74,7 @@ impl SessionTask for CompactTask {
 
         let turn_account_id_override = turn_account_selection
             .as_ref()
-            .map(|(account_id, _reset_remote_context)| account_id.clone());
+            .map(|selection| selection.account_id.clone());
         let _account_pool_lease_heartbeat = crate::codex::start_account_pool_lease_heartbeat(
             &session,
             turn_account_selection.is_some(),
@@ -76,7 +84,7 @@ impl SessionTask for CompactTask {
         let _ = if use_remote_compact {
             if turn_account_selection
                 .as_ref()
-                .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context)
+                .is_some_and(|selection| selection.reset_remote_context)
             {
                 session
                     .services

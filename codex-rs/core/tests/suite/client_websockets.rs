@@ -1,4 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+use base64::Engine;
+use chrono::Utc;
 use codex_api::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use codex_api::WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY;
 use codex_config::types::AccountPoolDefinitionToml;
@@ -10,6 +12,10 @@ use codex_core::ResponseEvent;
 use codex_core::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 use codex_features::Feature;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::auth::AuthDotJson;
+use codex_login::save_auth;
+use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_otel::MetricsClient;
@@ -47,8 +53,10 @@ use core_test_support::wait_for_event;
 use futures::StreamExt;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -381,12 +389,32 @@ async fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
     let Some(state_db) = test.codex.state_db() else {
         panic!("state db should be available in core integration tests");
     };
-    state_db
-        .import_legacy_default_account(LegacyAccountImport {
-            account_id: pooled_account_id.to_string(),
-        })
-        .await
-        .expect("seed pooled account");
+    let mut imported = false;
+    for _ in 0..20 {
+        match state_db
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: pooled_account_id.to_string(),
+            })
+            .await
+        {
+            Ok(()) => {
+                imported = true;
+                break;
+            }
+            Err(err) if err.to_string().contains("database is locked") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => panic!("seed pooled account: {err:#}"),
+        }
+    }
+    assert!(imported, "seed pooled account should eventually succeed");
+    write_pooled_auth(
+        test.codex_home_path(),
+        pooled_account_id,
+        pooled_account_id,
+        &format!("pooled-access-{pooled_account_id}"),
+    )
+    .expect("write pooled auth");
 
     let startup_prewarm_handshake = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -500,12 +528,26 @@ async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused()
         })
         .await
         .expect("seed primary pooled account");
+    write_pooled_auth(
+        test.codex_home_path(),
+        "account_id",
+        "account_id",
+        "pooled-access-account_id",
+    )
+    .expect("write primary pooled auth");
     state_db
         .import_legacy_default_account(LegacyAccountImport {
             account_id: "account_id_b".to_string(),
         })
         .await
         .expect("seed secondary pooled account");
+    write_pooled_auth(
+        test.codex_home_path(),
+        "account_id_b",
+        "account_id_b",
+        "pooled-access-account_id_b",
+    )
+    .expect("write secondary pooled auth");
 
     test.submit_turn("near-limit websocket turn")
         .await
@@ -630,12 +672,32 @@ async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_we
     let Some(state_db) = test.codex.state_db() else {
         panic!("state db should be available in core integration tests");
     };
-    state_db
-        .import_legacy_default_account(LegacyAccountImport {
-            account_id: pooled_account_id.to_string(),
-        })
-        .await
-        .expect("seed pooled account");
+    let mut imported = false;
+    for _ in 0..20 {
+        match state_db
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: pooled_account_id.to_string(),
+            })
+            .await
+        {
+            Ok(()) => {
+                imported = true;
+                break;
+            }
+            Err(err) if err.to_string().contains("database is locked") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => panic!("seed pooled account: {err:#}"),
+        }
+    }
+    assert!(imported, "seed pooled account should eventually succeed");
+    write_pooled_auth(
+        test.codex_home_path(),
+        pooled_account_id,
+        pooled_account_id,
+        &format!("pooled-access-{pooled_account_id}"),
+    )
+    .expect("write pooled auth");
 
     test.submit_turn("turn after pooled account is added")
         .await
@@ -657,6 +719,64 @@ async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_we
     assert_eq!(connections[0].len(), 1);
 
     server.shutdown().await;
+}
+
+fn write_pooled_auth(
+    codex_home: &Path,
+    backend_account_handle: &str,
+    account_id: &str,
+    access_token: &str,
+) -> anyhow::Result<()> {
+    let auth_home = codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token(account_id))?,
+                access_token: access_token.to_string(),
+                refresh_token: format!("refresh-{account_id}"),
+                account_id: Some(account_id.to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        codex_login::AuthCredentialsStoreMode::File,
+    )?;
+    Ok(())
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+        panic!("serialize header: {err}");
+    }));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+        panic!("serialize payload: {err}");
+    }));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2195,6 +2315,7 @@ async fn websocket_harness_with_provider_options(
     let summary = ReasoningSummary::Auto;
     let client = ModelClient::new(
         /*auth_manager*/ None,
+        /*lease_auth*/ None,
         conversation_id,
         /*installation_id*/ TEST_INSTALLATION_ID.to_string(),
         provider.clone(),

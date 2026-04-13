@@ -71,6 +71,7 @@ use codex_hooks::HookResult;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_login::AuthManager;
+use codex_login::AuthProvider;
 use codex_login::CodexAuth;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
@@ -803,6 +804,16 @@ impl Codex {
         Some(snapshot_seed.snapshot().await)
     }
 
+    pub(crate) async fn current_auth(&self) -> Option<CodexAuth> {
+        self.session.current_auth().await
+    }
+
+    pub(crate) async fn current_lease_bridge_account_id(&self) -> Option<String> {
+        self.current_auth()
+            .await
+            .and_then(|auth| auth.get_account_id())
+    }
+
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
@@ -1296,6 +1307,16 @@ pub(crate) struct AppServerClientMetadata {
 }
 
 impl Session {
+    pub(crate) fn auth_bridge(&self) -> crate::lease_auth::SessionLeaseAuthBridge {
+        self.services
+            .lease_auth
+            .bridge(Arc::clone(&self.services.auth_manager))
+    }
+
+    pub(crate) async fn current_auth(&self) -> Option<CodexAuth> {
+        self.auth_bridge().auth().await
+    }
+
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
         AppServerClientMetadata {
@@ -1995,9 +2016,12 @@ impl Session {
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
+        let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
+        let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
         let account_pool_manager = SessionServices::build_account_pool_manager(
             state_db_ctx.clone(),
             config.accounts.clone(),
+            config.codex_home.clone(),
             account_pool_holder_instance_id,
         );
         let services = SessionServices {
@@ -2018,8 +2042,8 @@ impl Session {
             ),
             shell_zsh_path: config.zsh_path.clone(),
             main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
-            analytics_events_client: AnalyticsEventsClient::new(
-                Arc::clone(&auth_manager),
+            analytics_events_client: AnalyticsEventsClient::new_with_auth_provider(
+                lease_auth_provider,
                 config.chatgpt_base_url.trim_end_matches('/').to_string(),
                 config.analytics_enabled,
             ),
@@ -2043,8 +2067,10 @@ impl Session {
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             account_pool_manager,
+            lease_auth: Arc::clone(&lease_auth),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
+                Some(lease_auth),
                 conversation_id,
                 installation_id,
                 session_configuration.provider.clone(),
@@ -4496,7 +4522,7 @@ impl Session {
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
-        let auth = self.services.auth_manager.auth().await;
+        let auth = self.current_auth().await;
         let config = self.get_config().await;
         let mcp_config = config.to_mcp_config(self.services.plugins_manager.as_ref());
         let tool_plugin_provenance = self
@@ -4862,6 +4888,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
         if let Err(err) = account_pool_manager.release_for_shutdown().await {
             warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
         }
+        sess.services.lease_auth.clear();
     }
     debug!("Agent loop exited");
 }
@@ -5356,7 +5383,7 @@ mod handlers {
 
     pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String) {
         let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
-        let auth = sess.services.auth_manager.auth().await;
+        let auth = sess.current_auth().await;
         let mcp_servers = sess
             .services
             .mcp_manager
@@ -5747,6 +5774,7 @@ mod handlers {
             if let Err(err) = account_pool_manager.release_for_shutdown().await {
                 warn!("failed to release account-pool lease during shutdown: {err:#}");
             }
+            sess.services.lease_auth.clear();
         }
         sess.guardian_review_session.shutdown().await;
         info!("Shutting down Codex instance");
@@ -6123,9 +6151,17 @@ pub(crate) async fn run_turn(
         if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
             let mut account_pool_manager = account_pool_manager.lock().await;
             match account_pool_manager.prepare_turn().await {
-                Ok(selection) => selection,
+                Ok(selection) => {
+                    sess.services.lease_auth.replace_current(
+                        selection
+                            .as_ref()
+                            .map(|selection| Arc::clone(&selection.auth_session)),
+                    );
+                    selection
+                }
                 Err(err) => {
                     warn!("failed to prepare account-pool lease for turn: {err:#}");
+                    sess.services.lease_auth.clear();
                     None
                 }
             }
@@ -6154,10 +6190,10 @@ pub(crate) async fn run_turn(
     .await;
     let turn_account_id_override = turn_account_selection
         .as_ref()
-        .map(|(account_id, _reset_remote_context)| account_id.clone());
+        .map(|selection| selection.account_id.clone());
     let reset_remote_context_for_turn = turn_account_selection
         .as_ref()
-        .is_some_and(|(_account_id, reset_remote_context)| *reset_remote_context);
+        .is_some_and(|selection| selection.reset_remote_context);
     if reset_remote_context_for_turn {
         sess.services.model_client.reset_remote_session_identity();
         if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
@@ -6389,8 +6425,8 @@ pub(crate) async fn run_turn(
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    if let Some((account_id, _reset_remote_context)) = turn_account_selection {
-        client_session.set_account_id_override(Some(account_id));
+    if let Some(turn_account_selection) = turn_account_selection {
+        client_session.set_account_id_override(Some(turn_account_selection.account_id));
     }
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
@@ -7044,6 +7080,22 @@ async fn run_sampling_request(
                 }
                 return Err(err);
             }
+            Err(
+                err @ CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
+                    status: http::StatusCode::UNAUTHORIZED,
+                    ..
+                }),
+            ) => {
+                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                    let mut account_pool_manager = account_pool_manager.lock().await;
+                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
+                        warn!(
+                            "failed to record account-pool unauthorized event after 401 response: {report_err:#}"
+                        );
+                    }
+                }
+                return Err(err);
+            }
             Err(err) => err,
         };
 
@@ -7146,7 +7198,7 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let discoverable_tools = if apps_enabled && turn_context.tools_config.tool_suggest {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(

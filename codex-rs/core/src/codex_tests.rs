@@ -259,6 +259,7 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
 fn test_model_client_session() -> crate::client::ModelClientSession {
     crate::client::ModelClient::new(
         /*auth_manager*/ None,
+        /*lease_auth*/ None,
         ThreadId::try_from("00000000-0000-4000-8000-000000000001")
             .expect("test thread id should be valid"),
         /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
@@ -2888,8 +2889,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
+            None,
             conversation_id,
             /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
             session_configuration.provider.clone(),
@@ -3734,8 +3737,10 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
+            None,
             conversation_id,
             /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
             session_configuration.provider.clone(),

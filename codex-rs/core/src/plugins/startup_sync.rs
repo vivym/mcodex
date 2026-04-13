@@ -16,7 +16,7 @@ use tracing::warn;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use codex_login::AuthManager;
+use codex_login::AuthProvider;
 use codex_login::default_client::build_reqwest_client;
 
 use super::PluginsManager;
@@ -229,11 +229,11 @@ fn sync_openai_plugins_repo_via_backup_archive(
     Ok(export_version)
 }
 
-pub(super) fn start_startup_remote_plugin_sync_once(
+pub(super) fn start_startup_remote_plugin_sync_once_with_auth_provider(
     manager: Arc<PluginsManager>,
     codex_home: PathBuf,
     config: Config,
-    auth_manager: Arc<AuthManager>,
+    auth_provider: Arc<dyn AuthProvider>,
 ) {
     let marker_path = startup_remote_plugin_sync_marker_path(codex_home.as_path());
     if marker_path.is_file() {
@@ -253,7 +253,7 @@ pub(super) fn start_startup_remote_plugin_sync_once(
             return;
         }
 
-        let auth = auth_manager.auth().await;
+        let auth = auth_provider.auth().await;
         match manager
             .sync_plugins_from_remote(&config, auth.as_ref(), /*additive_only*/ true)
             .await

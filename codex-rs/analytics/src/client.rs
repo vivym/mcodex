@@ -17,6 +17,8 @@ use crate::reducer::AnalyticsReducer;
 use codex_app_server_protocol::ClientResponse;
 use codex_app_server_protocol::InitializeParams;
 use codex_login::AuthManager;
+use codex_login::AuthProvider;
+use codex_login::SharedAuthProvider;
 use codex_login::default_client::create_client;
 use codex_plugin::PluginTelemetryMetadata;
 use std::collections::HashSet;
@@ -43,14 +45,17 @@ pub struct AnalyticsEventsClient {
 }
 
 impl AnalyticsEventsQueue {
-    pub(crate) fn new(auth_manager: Arc<AuthManager>, base_url: String) -> Self {
+    pub(crate) fn new_with_auth_provider(
+        auth_provider: Arc<dyn AuthProvider>,
+        base_url: String,
+    ) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
-                send_track_events(&auth_manager, &base_url, events).await;
+                send_track_events(&auth_provider, &base_url, events).await;
             }
         });
         Self {
@@ -107,8 +112,20 @@ impl AnalyticsEventsClient {
         base_url: String,
         analytics_enabled: Option<bool>,
     ) -> Self {
+        Self::new_with_auth_provider(
+            Arc::new(SharedAuthProvider::new(auth_manager)),
+            base_url,
+            analytics_enabled,
+        )
+    }
+
+    pub fn new_with_auth_provider(
+        auth_provider: Arc<dyn AuthProvider>,
+        base_url: String,
+        analytics_enabled: Option<bool>,
+    ) -> Self {
         Self {
-            queue: AnalyticsEventsQueue::new(Arc::clone(&auth_manager), base_url),
+            queue: AnalyticsEventsQueue::new_with_auth_provider(auth_provider, base_url),
             analytics_enabled,
         }
     }
@@ -230,14 +247,14 @@ impl AnalyticsEventsClient {
 }
 
 async fn send_track_events(
-    auth_manager: &AuthManager,
+    auth_provider: &Arc<dyn AuthProvider>,
     base_url: &str,
     events: Vec<TrackEventRequest>,
 ) {
     if events.is_empty() {
         return;
     }
-    let Some(auth) = auth_manager.auth().await else {
+    let Some(auth) = auth_provider.auth().await else {
         return;
     };
     if !auth.is_chatgpt_auth() {

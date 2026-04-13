@@ -26,6 +26,14 @@ async fn auth_seams_local_lease_scoped_session_refresh_fails_closed_on_account_r
 }
 
 #[tokio::test]
+async fn auth_seams_local_lease_scoped_session_refresh_fails_closed_on_lease_epoch_supersession() {
+    suite::auth_seams::local_lease_scoped_session_refresh_fails_closed_on_lease_epoch_supersession(
+    )
+    .await
+    .expect("expected lease epoch failure test to pass");
+}
+
+#[tokio::test]
 async fn pooled_registration_browser_returns_tokens_without_writing_shared_auth() {
     suite::pooled_registration::pooled_browser_registration_returns_tokens_without_writing_shared_auth()
         .await;

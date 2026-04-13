@@ -60,9 +60,12 @@ use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
+use codex_login::AuthRecovery;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
-use codex_login::UnauthorizedRecovery;
+use codex_login::RefreshingAuthProvider;
+use codex_login::SharedAuthProvider;
+use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::default_client::build_reqwest_client;
 use codex_otel::SessionTelemetry;
 use codex_otel::current_span_w3c_trace_context;
@@ -101,6 +104,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
+use crate::lease_auth::SessionLeaseAuth;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::CoreAuthProvider;
 use codex_api::map_api_error;
@@ -145,6 +149,7 @@ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
 #[derive(Debug)]
 struct ModelClientState {
     auth_manager: Option<Arc<AuthManager>>,
+    lease_auth: Option<Arc<SessionLeaseAuth>>,
     conversation_id: ThreadId,
     remote_session_id: StdMutex<RemoteSessionId>,
     window_generation: AtomicU64,
@@ -213,6 +218,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     account_id_override: Option<String>,
     /// Turn state for sticky routing.
     ///
@@ -322,6 +328,7 @@ impl ModelClient {
     /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
     pub fn new(
         auth_manager: Option<Arc<AuthManager>>,
+        lease_auth: Option<Arc<SessionLeaseAuth>>,
         conversation_id: ThreadId,
         installation_id: String,
         provider: ModelProviderInfo,
@@ -339,6 +346,7 @@ impl ModelClient {
         Self {
             state: Arc::new(ModelClientState {
                 auth_manager,
+                lease_auth,
                 conversation_id,
                 remote_session_id: StdMutex::new(RemoteSessionId::from_conversation_id(
                     conversation_id,
@@ -366,13 +374,14 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            lease_auth_session: self
+                .state
+                .lease_auth
+                .as_ref()
+                .and_then(|lease_auth| lease_auth.current_session()),
             account_id_override: None,
             turn_state: Arc::new(OnceLock::new()),
         }
-    }
-
-    pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
-        self.state.auth_manager.clone()
     }
 
     pub(crate) fn set_window_generation(&self, window_generation: u64) {
@@ -709,9 +718,21 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
-        let auth = match self.state.auth_manager.as_ref() {
-            Some(manager) => manager.auth().await,
-            None => None,
+        let auth = if let Some(lease_auth) = self.state.lease_auth.as_ref()
+            && let Some(lease_auth_session) = lease_auth.current_session()
+        {
+            Some(
+                lease_auth_session
+                    .leased_turn_auth()
+                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?
+                    .auth()
+                    .clone(),
+            )
+        } else {
+            match self.state.auth_manager.as_ref() {
+                Some(manager) => manager.auth().await,
+                None => None,
+            }
         };
         let api_provider = self
             .state
@@ -859,11 +880,48 @@ impl Drop for ModelClientSession {
 
 impl ModelClientSession {
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
-        let mut client_setup = self.client.current_client_setup().await?;
+        let mut client_setup = if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
+            let auth = Some(
+                lease_auth_session
+                    .leased_turn_auth()
+                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?
+                    .auth()
+                    .clone(),
+            );
+            let api_provider = self
+                .client
+                .state
+                .provider
+                .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+            let api_auth = auth_provider_from_auth(auth.clone(), &self.client.state.provider)?;
+            CurrentClientSetup {
+                auth,
+                api_provider,
+                api_auth,
+            }
+        } else {
+            self.client.current_client_setup().await?
+        };
         if let Some(account_id) = self.account_id_override.clone() {
             client_setup.api_auth.account_id = Some(account_id);
         }
         Ok(client_setup)
+    }
+
+    fn current_auth_recovery(&self) -> Option<Box<dyn AuthRecovery>> {
+        if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
+            return Some(Box::new(crate::lease_auth::LeaseSessionAuthRecovery::new(
+                Arc::clone(lease_auth_session),
+            )));
+        }
+
+        self.client
+            .state
+            .auth_manager
+            .as_ref()
+            .and_then(|auth_manager| {
+                SharedAuthProvider::new(Arc::clone(auth_manager)).unauthorized_recovery()
+            })
     }
 
     pub(crate) fn set_account_id_override(&mut self, account_id: Option<String>) {
@@ -1256,10 +1314,7 @@ impl ModelClientSession {
             return Ok(stream);
         }
 
-        let auth_manager = self.client.state.auth_manager.clone();
-        let mut auth_recovery = auth_manager
-            .as_ref()
-            .map(AuthManager::unauthorized_recovery);
+        let mut auth_recovery = self.current_auth_recovery();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.current_client_setup().await?;
@@ -1344,11 +1399,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
     ) -> Result<WebsocketStreamOutcome> {
-        let auth_manager = self.client.state.auth_manager.clone();
-
-        let mut auth_recovery = auth_manager
-            .as_ref()
-            .map(AuthManager::unauthorized_recovery);
+        let mut auth_recovery = self.current_auth_recovery();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.current_client_setup().await?;
@@ -1813,7 +1864,7 @@ struct WebsocketConnectParams<'a> {
 
 async fn handle_unauthorized(
     transport: TransportError,
-    auth_recovery: &mut Option<UnauthorizedRecovery>,
+    auth_recovery: &mut Option<Box<dyn AuthRecovery>>,
     session_telemetry: &SessionTelemetry,
 ) -> Result<UnauthorizedRecoveryExecution> {
     let debug = extract_response_debug_context(&transport);

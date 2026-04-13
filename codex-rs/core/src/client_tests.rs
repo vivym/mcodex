@@ -7,8 +7,14 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use crate::lease_auth::SessionLeaseAuth;
+use anyhow::bail;
 use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
+use codex_login::CodexAuth;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
+use codex_login::auth::LeasedTurnAuth;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
@@ -18,11 +24,22 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
+    test_model_client_with_lease_auth(session_source, /*lease_auth*/ None)
+}
+
+fn test_model_client_with_lease_auth(
+    session_source: SessionSource,
+    lease_auth: Option<Arc<SessionLeaseAuth>>,
+) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
         /*auth_manager*/ None,
+        lease_auth,
         ThreadId::new(),
         /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider,
@@ -32,6 +49,48 @@ fn test_model_client(session_source: SessionSource) -> ModelClient {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
     )
+}
+
+struct SnapshotOnlyLeaseScopedAuthSession {
+    binding: LeaseAuthBinding,
+    leased_calls: AtomicUsize,
+    refresh_calls: AtomicUsize,
+}
+
+impl SnapshotOnlyLeaseScopedAuthSession {
+    fn new(account_id: &str) -> Self {
+        Self {
+            binding: LeaseAuthBinding {
+                account_id: account_id.to_string(),
+                backend_account_handle: format!("handle-{account_id}"),
+                lease_epoch: 1,
+            },
+            leased_calls: AtomicUsize::new(0),
+            refresh_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl LeaseScopedAuthSession for SnapshotOnlyLeaseScopedAuthSession {
+    fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        self.leased_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(LeasedTurnAuth::new(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ))
+    }
+
+    fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        bail!("request path must use leased auth snapshots without refresh")
+    }
+
+    fn binding(&self) -> &LeaseAuthBinding {
+        &self.binding
+    }
+
+    fn ensure_current(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 fn test_model_info() -> ModelInfo {
@@ -149,6 +208,26 @@ async fn summarize_memories_returns_empty_for_empty_input() {
         .await
         .expect("empty summarize request should succeed");
     assert_eq!(output.len(), 0);
+}
+
+#[tokio::test]
+async fn direct_request_setup_uses_leased_auth_snapshot_without_refresh() {
+    let lease_auth = Arc::new(SessionLeaseAuth::default());
+    let lease_session = Arc::new(SnapshotOnlyLeaseScopedAuthSession::new("account_id"));
+    lease_auth.replace_current(Some(lease_session.clone()));
+    let client = test_model_client_with_lease_auth(SessionSource::Cli, Some(lease_auth));
+
+    let client_setup = client
+        .current_client_setup()
+        .await
+        .expect("direct request setup should use the leased auth snapshot");
+
+    assert_eq!(
+        client_setup.api_auth.account_id.as_deref(),
+        Some("account_id")
+    );
+    assert_eq!(lease_session.leased_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(lease_session.refresh_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

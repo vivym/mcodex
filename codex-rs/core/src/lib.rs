@@ -43,7 +43,10 @@ mod hook_runtime;
 mod installation_id;
 pub(crate) mod instructions;
 pub(crate) mod landlock;
+mod lease_auth;
 pub use landlock::spawn_command_under_linux_sandbox;
+#[doc(hidden)]
+pub use lease_auth::SessionLeaseAuth;
 pub(crate) mod mcp;
 mod mcp_skill_dependencies;
 mod mcp_tool_approval_templates;

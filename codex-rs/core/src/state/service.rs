@@ -24,6 +24,9 @@ use codex_config::types::AccountsConfigToml;
 use codex_exec_server::Environment;
 use codex_hooks::Hooks;
 use codex_login::AuthManager;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
+use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_mcp::McpConnectionManager;
 use codex_models_manager::manager::ModelsManager;
 use codex_otel::SessionTelemetry;
@@ -70,6 +73,7 @@ pub(crate) struct SessionServices {
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) account_pool_manager: Option<Arc<Mutex<AccountPoolManager>>>,
+    pub(crate) lease_auth: Arc<crate::lease_auth::SessionLeaseAuth>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
@@ -80,6 +84,7 @@ impl SessionServices {
     pub(crate) fn build_account_pool_manager(
         state_db: Option<StateDbHandle>,
         accounts: Option<AccountsConfigToml>,
+        codex_home: PathBuf,
         holder_instance_id: String,
     ) -> Option<Arc<Mutex<AccountPoolManager>>> {
         let state_db = state_db?;
@@ -87,6 +92,7 @@ impl SessionServices {
         Some(Arc::new(Mutex::new(AccountPoolManager::new(
             state_db,
             accounts,
+            codex_home,
             holder_instance_id,
         ))))
     }
@@ -144,13 +150,14 @@ impl From<&AccountStartupEligibility> for AccountLeaseRuntimeReason {
 
 pub(crate) struct AccountPoolManager {
     state_db: StateDbHandle,
+    codex_home: PathBuf,
     default_pool_id: Option<String>,
     proactive_switch_threshold_percent: u8,
     allow_context_reuse_by_pool_id: HashMap<String, bool>,
     lease_ttl: Duration,
     heartbeat_interval: StdDuration,
     holder_instance_id: String,
-    active_lease: Option<AccountLeaseRecord>,
+    active_lease: Option<ActiveAccountLease>,
     next_health_event_sequence: i64,
     previous_turn_account_id: Option<String>,
     rotate_on_next_turn: bool,
@@ -170,10 +177,23 @@ pub(crate) struct AccountPoolManagerSnapshotSeed {
     last_remote_context_reset_turn_id: Option<String>,
 }
 
+#[derive(Clone)]
+struct ActiveAccountLease {
+    record: AccountLeaseRecord,
+    auth_session: Arc<dyn LeaseScopedAuthSession>,
+}
+
+pub(crate) struct TurnAccountSelection {
+    pub(crate) account_id: String,
+    pub(crate) reset_remote_context: bool,
+    pub(crate) auth_session: Arc<dyn LeaseScopedAuthSession>,
+}
+
 impl AccountPoolManager {
     fn new(
         state_db: StateDbHandle,
         accounts: AccountsConfigToml,
+        codex_home: PathBuf,
         holder_instance_id: String,
     ) -> Self {
         let default_pool_id = accounts.default_pool.clone();
@@ -195,6 +215,7 @@ impl AccountPoolManager {
 
         Self {
             state_db,
+            codex_home,
             default_pool_id,
             proactive_switch_threshold_percent,
             allow_context_reuse_by_pool_id,
@@ -212,7 +233,7 @@ impl AccountPoolManager {
         }
     }
 
-    pub(crate) async fn prepare_turn(&mut self) -> anyhow::Result<Option<(String, bool)>> {
+    pub(crate) async fn prepare_turn(&mut self) -> anyhow::Result<Option<TurnAccountSelection>> {
         let rotating_for_health_event = self.rotate_on_next_turn;
         self.switch_reason = None;
         if self.rotate_on_next_turn {
@@ -301,6 +322,7 @@ impl AccountPoolManager {
             };
             match lease_result {
                 Ok(lease) => {
+                    let auth_session = self.create_auth_session(&lease).await?;
                     self.next_health_event_sequence = self
                         .state_db
                         .read_account_health_event_sequence(&lease.account_id)
@@ -315,7 +337,10 @@ impl AccountPoolManager {
                         self.switch_reason =
                             Some(AccountLeaseRuntimeReason::AutomaticAccountSelected);
                     }
-                    self.active_lease = Some(lease);
+                    self.active_lease = Some(ActiveAccountLease {
+                        record: lease,
+                        auth_session,
+                    });
                 }
                 Err(AccountLeaseError::NoEligibleAccount) => {
                     self.suppression_reason = Some(AccountLeaseRuntimeReason::NoEligibleAccount);
@@ -329,10 +354,10 @@ impl AccountPoolManager {
             .active_lease
             .as_ref()
             .context("active lease missing after account pool acquisition")?;
-        let account_id = active_lease.account_id.clone();
+        let account_id = active_lease.record.account_id.clone();
         let allow_context_reuse = self
             .allow_context_reuse_by_pool_id
-            .get(&active_lease.pool_id)
+            .get(&active_lease.record.pool_id)
             .copied()
             .unwrap_or(true);
         let reset_remote_context = self
@@ -341,14 +366,18 @@ impl AccountPoolManager {
             .is_some_and(|previous| previous != account_id)
             && !allow_context_reuse;
         self.previous_turn_account_id = Some(account_id.clone());
-        Ok(Some((account_id, reset_remote_context)))
+        Ok(Some(TurnAccountSelection {
+            account_id,
+            reset_remote_context,
+            auth_session: Arc::clone(&active_lease.auth_session),
+        }))
     }
 
     pub(crate) fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
         AccountPoolManagerSnapshotSeed {
             state_db: Arc::clone(&self.state_db),
             holder_instance_id: self.holder_instance_id.clone(),
-            active_lease: self.active_lease.clone(),
+            active_lease: self.active_lease.as_ref().map(|lease| lease.record.clone()),
             switch_reason: self.switch_reason,
             suppression_reason: self.suppression_reason,
             transport_reset_generation: self.transport_reset_generation,
@@ -369,13 +398,17 @@ impl AccountPoolManager {
         if let Some(active_lease) = self.active_lease.clone() {
             match self
                 .state_db
-                .renew_account_lease(&active_lease.lease_key(), Utc::now(), self.lease_ttl)
+                .renew_account_lease(&active_lease.record.lease_key(), Utc::now(), self.lease_ttl)
                 .await?
             {
                 LeaseRenewal::Renewed(record) => {
-                    self.active_lease = Some(record);
+                    self.active_lease = Some(ActiveAccountLease {
+                        record,
+                        auth_session: active_lease.auth_session,
+                    });
                 }
                 LeaseRenewal::Missing => {
+                    self.clear_auth_marker(&active_lease.record).await?;
                     self.active_lease = None;
                     self.next_health_event_sequence = 0;
                 }
@@ -415,8 +448,9 @@ impl AccountPoolManager {
         if let Some(lease) = self.active_lease.as_ref() {
             let _ = self
                 .state_db
-                .release_account_lease(&lease.lease_key(), Utc::now())
+                .release_account_lease(&lease.record.lease_key(), Utc::now())
                 .await?;
+            self.clear_auth_marker(&lease.record).await?;
         }
         self.active_lease = None;
         self.next_health_event_sequence = 0;
@@ -435,8 +469,8 @@ impl AccountPoolManager {
         self.next_health_event_sequence += 1;
         self.state_db
             .record_account_health_event(AccountHealthEvent {
-                account_id: active_lease.account_id.clone(),
-                pool_id: active_lease.pool_id.clone(),
+                account_id: active_lease.record.account_id.clone(),
+                pool_id: active_lease.record.pool_id.clone(),
                 health_state,
                 sequence_number: self.next_health_event_sequence,
                 observed_at,
@@ -446,6 +480,51 @@ impl AccountPoolManager {
         self.switch_reason = Some(AccountLeaseRuntimeReason::NonReplayableTurn);
         self.suppression_reason = None;
         Ok(())
+    }
+
+    async fn create_auth_session(
+        &self,
+        lease: &AccountLeaseRecord,
+    ) -> anyhow::Result<Arc<dyn LeaseScopedAuthSession>> {
+        let registered_account = self
+            .state_db
+            .read_registered_account(&lease.account_id)
+            .await?
+            .context("registered account missing for acquired lease")?;
+        let auth_home = self.backend_private_auth_home(&registered_account.backend_account_handle);
+        let binding = LeaseAuthBinding {
+            account_id: lease.account_id.clone(),
+            backend_account_handle: registered_account.backend_account_handle,
+            lease_epoch: lease.lease_epoch as u64,
+        };
+        LocalLeaseScopedAuthSession::write_lease_epoch_marker(
+            auth_home.as_path(),
+            binding.lease_epoch,
+        )?;
+        Ok(Arc::new(LocalLeaseScopedAuthSession::new(
+            binding, auth_home,
+        )))
+    }
+
+    async fn clear_auth_marker(&self, lease: &AccountLeaseRecord) -> anyhow::Result<()> {
+        let Some(registered_account) = self
+            .state_db
+            .read_registered_account(&lease.account_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        LocalLeaseScopedAuthSession::clear_lease_epoch_marker(
+            self.backend_private_auth_home(&registered_account.backend_account_handle)
+                .as_path(),
+        )?;
+        Ok(())
+    }
+
+    fn backend_private_auth_home(&self, backend_account_handle: &str) -> PathBuf {
+        self.codex_home
+            .join(".pooled-auth/backends/local/accounts")
+            .join(backend_account_handle)
     }
 }
 

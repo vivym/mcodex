@@ -1,9 +1,11 @@
 use super::*;
 use crate::config::CONFIG_TOML_FILE;
+use crate::lease_auth::SessionLeaseAuth;
 use crate::plugins::test_support::TEST_CURATED_PLUGIN_SHA;
 use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_file;
 use crate::plugins::test_support::write_openai_curated_marketplace;
+use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use pretty_assertions::assert_eq;
 use std::io::Write;
@@ -672,12 +674,14 @@ enabled = false
     let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let auth_manager =
         AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let lease_auth = Arc::new(SessionLeaseAuth::default());
+    let auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
 
-    start_startup_remote_plugin_sync_once(
+    start_startup_remote_plugin_sync_once_with_auth_provider(
         Arc::clone(&manager),
         tmp.path().to_path_buf(),
         config,
-        auth_manager,
+        auth_provider,
     );
 
     let marker_path = tmp.path().join(STARTUP_REMOTE_PLUGIN_SYNC_MARKER_FILE);

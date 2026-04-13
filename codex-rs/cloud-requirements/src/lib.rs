@@ -24,6 +24,8 @@ use codex_core::util::backoff;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
+use codex_login::RefreshingAuthProvider;
+use codex_login::SharedAuthProvider;
 use codex_protocol::account::PlanType;
 use hmac::Hmac;
 use hmac::Mac;
@@ -246,7 +248,7 @@ impl RequirementsFetcher for BackendRequirementsFetcher {
 
 #[derive(Clone)]
 struct CloudRequirementsService {
-    auth_manager: Arc<AuthManager>,
+    auth_provider: Arc<dyn RefreshingAuthProvider>,
     fetcher: Arc<dyn RequirementsFetcher>,
     cache_path: PathBuf,
     timeout: Duration,
@@ -259,8 +261,22 @@ impl CloudRequirementsService {
         codex_home: PathBuf,
         timeout: Duration,
     ) -> Self {
+        Self::new_with_auth_provider(
+            Arc::new(SharedAuthProvider::new(auth_manager)),
+            fetcher,
+            codex_home,
+            timeout,
+        )
+    }
+
+    fn new_with_auth_provider(
+        auth_provider: Arc<dyn RefreshingAuthProvider>,
+        fetcher: Arc<dyn RequirementsFetcher>,
+        codex_home: PathBuf,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            auth_manager,
+            auth_provider,
             fetcher,
             cache_path: codex_home.join(CLOUD_REQUIREMENTS_CACHE_FILENAME),
             timeout,
@@ -324,7 +340,7 @@ impl CloudRequirementsService {
     }
 
     async fn fetch(&self) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self.auth_provider.auth().await else {
             return Ok(None);
         };
         let Some(plan_type) = auth.account_plan_type() else {
@@ -363,7 +379,7 @@ impl CloudRequirementsService {
     ) -> Result<Option<ConfigRequirementsToml>, CloudRequirementsLoadError> {
         let mut attempt = 1;
         let mut last_status_code: Option<u16> = None;
-        let mut auth_recovery = self.auth_manager.unauthorized_recovery();
+        let mut auth_recovery = self.auth_provider.unauthorized_recovery();
 
         while attempt <= CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
             let contents = match self.fetcher.fetch_requirements(&auth).await {
@@ -395,15 +411,35 @@ impl CloudRequirementsService {
                 }) => {
                     last_status_code = status_code;
                     emit_fetch_attempt_metric(trigger, attempt, "unauthorized", status_code);
-                    if auth_recovery.has_next() {
+                    if auth_recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.has_next())
+                    {
                         tracing::warn!(
                             attempt,
                             max_attempts = CLOUD_REQUIREMENTS_MAX_ATTEMPTS,
                             "Cloud requirements request was unauthorized; attempting auth recovery"
                         );
+                        let Some(auth_recovery) = auth_recovery.as_mut() else {
+                            tracing::error!(
+                                "Auth recovery disappeared before cloud requirements retry"
+                            );
+                            emit_fetch_final_metric(
+                                trigger,
+                                "error",
+                                "auth_recovery_missing_handler",
+                                attempt,
+                                status_code,
+                            );
+                            return Err(CloudRequirementsLoadError::new(
+                                CloudRequirementsLoadErrorCode::Auth,
+                                status_code,
+                                CLOUD_REQUIREMENTS_AUTH_RECOVERY_FAILED_MESSAGE,
+                            ));
+                        };
                         match auth_recovery.next().await {
                             Ok(_) => {
-                                let Some(refreshed_auth) = self.auth_manager.auth().await else {
+                                let Some(refreshed_auth) = self.auth_provider.auth().await else {
                                     tracing::error!(
                                         "Auth recovery succeeded but no auth is available for cloud requirements"
                                     );
@@ -544,7 +580,7 @@ impl CloudRequirementsService {
     }
 
     async fn refresh_cache(&self) -> bool {
-        let Some(auth) = self.auth_manager.auth().await else {
+        let Some(auth) = self.auth_provider.auth().await else {
             return false;
         };
         let Some(plan_type) = auth.account_plan_type() else {
@@ -691,12 +727,30 @@ pub fn cloud_requirements_loader(
     chatgpt_base_url: String,
     codex_home: PathBuf,
 ) -> CloudRequirementsLoader {
-    let service = CloudRequirementsService::new(
+    cloud_requirements_loader_from_service(CloudRequirementsService::new(
         auth_manager,
         Arc::new(BackendRequirementsFetcher::new(chatgpt_base_url)),
         codex_home,
         CLOUD_REQUIREMENTS_TIMEOUT,
-    );
+    ))
+}
+
+pub fn cloud_requirements_loader_with_auth_provider(
+    auth_provider: Arc<dyn RefreshingAuthProvider>,
+    chatgpt_base_url: String,
+    codex_home: PathBuf,
+) -> CloudRequirementsLoader {
+    cloud_requirements_loader_from_service(CloudRequirementsService::new_with_auth_provider(
+        auth_provider,
+        Arc::new(BackendRequirementsFetcher::new(chatgpt_base_url)),
+        codex_home,
+        CLOUD_REQUIREMENTS_TIMEOUT,
+    ))
+}
+
+fn cloud_requirements_loader_from_service(
+    service: CloudRequirementsService,
+) -> CloudRequirementsLoader {
     let refresh_service = service.clone();
     let task = tokio::spawn(async move { service.fetch_with_timeout().await });
     let refresh_task =
