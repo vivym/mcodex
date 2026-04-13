@@ -26,6 +26,7 @@ pub use account_pool::LeaseRenewal;
 pub use account_pool::LegacyAccountImport;
 pub use account_pool::NewPendingAccountRegistration;
 pub use account_pool::PendingAccountRegistration;
+pub use account_pool::RegisteredAccountMembership;
 pub use account_pool::RegisteredAccountRecord;
 pub use account_pool::RegisteredAccountUpsert;
 pub use agent_job::AgentJob;

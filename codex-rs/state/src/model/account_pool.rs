@@ -206,6 +206,13 @@ pub struct RegisteredAccountRecord {
     pub healthy: bool,
 }
 
+/// Membership assignment to persist for a registered account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAccountMembership {
+    pub pool_id: String,
+    pub position: i64,
+}
+
 /// Full replacement update for one registered pooled account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredAccountUpsert {
@@ -220,8 +227,7 @@ pub struct RegisteredAccountUpsert {
     pub source: Option<AccountSource>,
     pub enabled: bool,
     pub healthy: bool,
-    pub pool_id: String,
-    pub position: i64,
+    pub membership: Option<RegisteredAccountMembership>,
 }
 
 /// Crash-recovery journal entry for an in-flight registration.
@@ -233,6 +239,7 @@ pub struct PendingAccountRegistration {
     pub target_pool_id: Option<String>,
     pub backend_account_handle: Option<String>,
     pub account_id: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 /// Creation params for a crash-recovery journal entry.

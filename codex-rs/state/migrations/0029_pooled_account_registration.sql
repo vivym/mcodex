@@ -45,6 +45,7 @@ CREATE TABLE pending_account_registration (
     target_pool_id TEXT,
     backend_account_handle TEXT,
     account_id TEXT,
+    completed_at INTEGER,
     started_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );

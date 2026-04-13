@@ -1462,6 +1462,7 @@ mod tests {
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::NewPendingAccountRegistration;
+    use crate::RegisteredAccountMembership;
     use crate::RegisteredAccountRecord;
     use crate::RegisteredAccountUpsert;
     use crate::migrations::STATE_MIGRATOR;
@@ -3084,8 +3085,54 @@ WHERE account_id = ?
                 target_pool_id: Some("team-main".to_string()),
                 backend_account_handle: None,
                 account_id: None,
+                completed_at: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn finalized_pending_registration_is_not_listed_as_active_and_remains_reconcilable() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "idem-1".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: None,
+                account_id: None,
+            })
+            .await
+            .expect("create pending registration");
+        runtime
+            .finalize_pending_account_registration("idem-1", "handle-1", "acct-1")
+            .await
+            .expect("finalize pending registration");
+
+        assert_eq!(
+            runtime
+                .list_pending_account_registrations()
+                .await
+                .expect("list active pending registrations"),
+            Vec::<crate::PendingAccountRegistration>::new()
+        );
+        let finalized = runtime
+            .read_pending_account_registration("idem-1")
+            .await
+            .expect("read finalized pending registration")
+            .expect("finalized pending registration");
+
+        assert_eq!(finalized.idempotency_key, "idem-1");
+        assert_eq!(finalized.backend_id, "local");
+        assert_eq!(finalized.provider_kind, "chatgpt");
+        assert_eq!(finalized.target_pool_id.as_deref(), Some("team-main"));
+        assert_eq!(
+            finalized.backend_account_handle.as_deref(),
+            Some("handle-1")
+        );
+        assert_eq!(finalized.account_id.as_deref(), Some("acct-1"));
+        assert!(finalized.completed_at.is_some());
     }
 
     #[tokio::test]
@@ -3193,8 +3240,10 @@ WHERE account_id = ?
                 source: None,
                 enabled: true,
                 healthy: true,
-                pool_id: "team-main".to_string(),
-                position: 0,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
             })
             .await
             .expect("upsert registered account");
@@ -3232,8 +3281,10 @@ WHERE account_id = ?
                 source: None,
                 enabled: true,
                 healthy: true,
-                pool_id: "team-main".to_string(),
-                position: 0,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
             })
             .await
             .expect("update registered account");
@@ -3257,6 +3308,76 @@ WHERE account_id = ?
                 healthy: true,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_registered_account_allows_unassigned_catalog_entries() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-unassigned".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-unassigned".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-unassigned".to_string(),
+                display_name: Some("Holding".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: None,
+            })
+            .await
+            .expect("upsert unassigned registered account");
+
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-unassigned")
+                .await
+                .expect("read unassigned registered account"),
+            Some(RegisteredAccountRecord {
+                account_id: "acct-unassigned".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-unassigned".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-unassigned".to_string(),
+                display_name: Some("Holding".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-unassigned")
+                .await
+                .expect("read membership"),
+            None
+        );
+        assert_eq!(
+            runtime
+                .list_account_pool_memberships(None)
+                .await
+                .expect("list memberships"),
+            Vec::<AccountPoolMembership>::new()
+        );
+        let compat_columns: (String, i64) = sqlx::query_as(
+            r#"
+SELECT pool_id, position
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-unassigned")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("read compat columns");
+
+        assert_eq!(compat_columns, ("".to_string(), 0));
     }
 
     #[tokio::test]

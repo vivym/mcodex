@@ -57,6 +57,7 @@ pub use model::LeaseRenewal;
 pub use model::LegacyAccountImport;
 pub use model::NewPendingAccountRegistration;
 pub use model::PendingAccountRegistration;
+pub use model::RegisteredAccountMembership;
 pub use model::RegisteredAccountRecord;
 pub use model::RegisteredAccountUpsert;
 pub use model::SortKey;

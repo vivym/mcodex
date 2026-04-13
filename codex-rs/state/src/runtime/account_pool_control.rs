@@ -7,6 +7,7 @@ use crate::model::PendingAccountRegistration;
 use crate::model::RegisteredAccountRecord;
 use crate::model::RegisteredAccountUpsert;
 use crate::model::account_datetime_to_epoch_seconds;
+use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::Sqlite;
@@ -167,7 +168,7 @@ SELECT COALESCE(
         WHERE membership.account_id = ?
     ),
     (
-        SELECT account_registry.pool_id
+        SELECT NULLIF(account_registry.pool_id, '')
         FROM account_registry
         WHERE account_registry.account_id = ?
     )
@@ -273,6 +274,16 @@ impl StateRuntime {
         let now = account_datetime_to_epoch_seconds(Utc::now());
         let mut tx = self.pool.begin().await?;
         let previous_pool_id = read_effective_account_pool_id(&mut *tx, &entry.account_id).await?;
+        let compat_pool_id = entry
+            .membership
+            .as_ref()
+            .map(|membership| membership.pool_id.as_str())
+            .unwrap_or("");
+        let compat_position = entry
+            .membership
+            .as_ref()
+            .map(|membership| membership.position)
+            .unwrap_or(0);
 
         sqlx::query(
             r#"
@@ -310,8 +321,8 @@ ON CONFLICT(account_id) DO UPDATE SET
             "#,
         )
         .bind(&entry.account_id)
-        .bind(&entry.pool_id)
-        .bind(entry.position)
+        .bind(compat_pool_id)
+        .bind(compat_position)
         .bind(&entry.account_kind)
         .bind(&entry.backend_family)
         .bind(&entry.workspace_id)
@@ -327,15 +338,30 @@ ON CONFLICT(account_id) DO UPDATE SET
         .execute(&mut *tx)
         .await?;
 
-        upsert_account_pool_membership(
-            &mut *tx,
-            &entry.account_id,
-            &entry.pool_id,
-            entry.position,
-            now,
-            now,
-        )
-        .await?;
+        match entry.membership.as_ref() {
+            Some(membership) => {
+                upsert_account_pool_membership(
+                    &mut *tx,
+                    &entry.account_id,
+                    &membership.pool_id,
+                    membership.position,
+                    now,
+                    now,
+                )
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    r#"
+DELETE FROM account_pool_membership
+WHERE account_id = ?
+                    "#,
+                )
+                .bind(&entry.account_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
         sqlx::query(
             r#"
@@ -353,22 +379,40 @@ WHERE account_id = ?
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            r#"
+        match entry.membership.as_ref() {
+            Some(membership) => {
+                sqlx::query(
+                    r#"
 UPDATE account_runtime_state
 SET pool_id = ?, updated_at = ?
 WHERE account_id = ?
-            "#,
-        )
-        .bind(&entry.pool_id)
-        .bind(now)
-        .bind(&entry.account_id)
-        .execute(&mut *tx)
-        .await?;
+                    "#,
+                )
+                .bind(&membership.pool_id)
+                .bind(now)
+                .bind(&entry.account_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    r#"
+DELETE FROM account_runtime_state
+WHERE account_id = ?
+                    "#,
+                )
+                .bind(&entry.account_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
-        if previous_pool_id
-            .as_deref()
-            .is_some_and(|pool_id| pool_id != entry.pool_id)
+        if previous_pool_id.as_deref()
+            != entry
+                .membership
+                .as_ref()
+                .map(|membership| membership.pool_id.as_str())
+            || entry.membership.is_none()
             || !entry.enabled
             || !entry.healthy
         {
@@ -423,15 +467,17 @@ INSERT INTO pending_account_registration (
     target_pool_id,
     backend_account_handle,
     account_id,
+    completed_at,
     started_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
 ON CONFLICT(idempotency_key) DO UPDATE SET
     backend_id = excluded.backend_id,
     provider_kind = excluded.provider_kind,
     target_pool_id = excluded.target_pool_id,
     backend_account_handle = excluded.backend_account_handle,
     account_id = excluded.account_id,
+    completed_at = NULL,
     updated_at = excluded.updated_at
             "#,
         )
@@ -460,8 +506,10 @@ SELECT
     provider_kind,
     target_pool_id,
     backend_account_handle,
-    account_id
+    account_id,
+    completed_at
 FROM pending_account_registration
+WHERE completed_at IS NULL
 ORDER BY started_at ASC, idempotency_key ASC
             "#,
         )
@@ -477,6 +525,10 @@ ORDER BY started_at ASC, idempotency_key ASC
                     target_pool_id: row.try_get("target_pool_id")?,
                     backend_account_handle: row.try_get("backend_account_handle")?,
                     account_id: row.try_get("account_id")?,
+                    completed_at: row
+                        .try_get::<Option<i64>, _>("completed_at")?
+                        .map(account_epoch_seconds_to_datetime)
+                        .transpose()?,
                 })
             })
             .collect()
@@ -494,7 +546,8 @@ SELECT
     provider_kind,
     target_pool_id,
     backend_account_handle,
-    account_id
+    account_id,
+    completed_at
 FROM pending_account_registration
 WHERE idempotency_key = ?
             "#,
@@ -511,6 +564,10 @@ WHERE idempotency_key = ?
                 target_pool_id: row.try_get("target_pool_id")?,
                 backend_account_handle: row.try_get("backend_account_handle")?,
                 account_id: row.try_get("account_id")?,
+                completed_at: row
+                    .try_get::<Option<i64>, _>("completed_at")?
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?,
             })
         })
         .transpose()
@@ -525,12 +582,13 @@ WHERE idempotency_key = ?
         let result = sqlx::query(
             r#"
 UPDATE pending_account_registration
-SET backend_account_handle = ?, account_id = ?, updated_at = ?
+SET backend_account_handle = ?, account_id = ?, completed_at = ?, updated_at = ?
 WHERE idempotency_key = ?
             "#,
         )
         .bind(backend_account_handle)
         .bind(account_id)
+        .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(idempotency_key)
         .execute(self.pool.as_ref())
