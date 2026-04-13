@@ -348,6 +348,47 @@ pub(crate) async fn register_account_preserves_existing_backend_private_auth_on_
         AuthCredentialsStoreMode::File,
     )?;
 
+    harness
+        .runtime
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-a".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            backend_account_handle: "backend-handle-1".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-a".to_string(),
+            display_name: Some("Conflicting ChatGPT A".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
+        .await?;
+    harness
+        .runtime
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-b".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            backend_account_handle: "backend-handle-2".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-1".to_string(),
+            display_name: Some("Conflicting ChatGPT B".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
+        .await?;
+
     let err = backend
         .register_account(RegisteredAccountRegistration {
             request: RegisteredAccountUpsert {
@@ -371,16 +412,12 @@ pub(crate) async fn register_account_preserves_existing_backend_private_auth_on_
                 id_token: fake_access_token("acct-conflict"),
                 access_token: "managed-access".to_string().into(),
                 refresh_token: "managed-refresh".to_string().into(),
-                account_id: "acct-other".to_string(),
+                account_id: "acct-conflict".to_string(),
             }),
         })
         .await
         .expect_err("conflicting registration should fail");
-    assert!(
-        err.to_string()
-            .contains("account id mismatch between token claims and extracted account id"),
-        "unexpected error: {err}"
-    );
+    assert!(err.to_string().contains("conflicting registered accounts"));
 
     let auth = CodexAuth::from_auth_storage(&auth_home, AuthCredentialsStoreMode::File)?
         .expect("existing backend-private auth should remain");
@@ -417,26 +454,11 @@ pub(crate) async fn register_account_returns_actual_persisted_row_for_existing_a
         .await?;
 
     let returned = backend
-        .register_account(RegisteredAccountRegistration {
-            request: RegisteredAccountUpsert {
-                account_id: "acct-new".to_string(),
-                backend_id: "local".to_string(),
-                backend_family: "local".to_string(),
-                workspace_id: None,
-                backend_account_handle: "backend-handle-1".to_string(),
-                account_kind: "chatgpt".to_string(),
-                provider_fingerprint: "fingerprint-1".to_string(),
-                display_name: Some("Reused ChatGPT".to_string()),
-                source: None,
-                enabled: true,
-                healthy: true,
-                membership: Some(RegisteredAccountMembership {
-                    pool_id: "legacy-default".to_string(),
-                    position: 1,
-                }),
-            },
-            pooled_registration_tokens: None,
-        })
+        .register_account(pooled_registration(
+            "acct-existing",
+            "backend-handle-1",
+            "fingerprint-1",
+        ))
         .await?;
     let persisted = harness
         .runtime
@@ -455,22 +477,81 @@ pub(crate) async fn register_account_cleans_new_backend_private_auth_on_persiste
         harness.runtime.clone(),
         default_config().lease_ttl_duration(),
     );
-    let request = pooled_registration("acct-new", "backend-handle-new", "fingerprint-new");
+    harness
+        .runtime
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-a".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            backend_account_handle: "backend-handle-1".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-a".to_string(),
+            display_name: Some("Conflicting ChatGPT A".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
+        .await?;
+    harness
+        .runtime
+        .upsert_registered_account(RegisteredAccountUpsert {
+            account_id: "acct-b".to_string(),
+            backend_id: "local".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            backend_account_handle: "backend-handle-2".to_string(),
+            account_kind: "chatgpt".to_string(),
+            provider_fingerprint: "fingerprint-1".to_string(),
+            display_name: Some("Conflicting ChatGPT B".to_string()),
+            source: None,
+            enabled: true,
+            healthy: true,
+            membership: Some(RegisteredAccountMembership {
+                pool_id: "legacy-default".to_string(),
+                position: 1,
+            }),
+        })
+        .await?;
     let auth_home = harness
         .runtime
         .codex_home()
         .join(".pooled-auth/backends/local/accounts")
-        .join(request.request.backend_account_handle.as_str());
-
-    fs::remove_dir_all(&auth_home).ok();
-    fs::create_dir_all(auth_home.parent().expect("auth namespace parent"))?;
-    fs::write(&auth_home, "blocking-file")?;
+        .join("backend-handle-1");
 
     let err = backend
-        .register_account(request)
+        .register_account(RegisteredAccountRegistration {
+            request: RegisteredAccountUpsert {
+                account_id: "acct-new".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: None,
+                backend_account_handle: "backend-handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("New ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "legacy-default".to_string(),
+                    position: 1,
+                }),
+            },
+            pooled_registration_tokens: Some(ChatgptManagedRegistrationTokens {
+                id_token: fake_access_token("acct-new"),
+                access_token: "managed-access".to_string().into(),
+                refresh_token: "managed-refresh".to_string().into(),
+                account_id: "acct-new".to_string(),
+            }),
+        })
         .await
         .expect_err("registration should fail");
-    assert!(err.to_string().contains("File exists") || err.to_string().contains("Not a directory"));
+    assert!(err.to_string().contains("conflicting registered accounts"));
 
     assert_eq!(
         harness.runtime.read_registered_account("acct-new").await?,
