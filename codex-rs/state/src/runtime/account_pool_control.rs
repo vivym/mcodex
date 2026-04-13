@@ -297,6 +297,8 @@ ON CONFLICT(account_id) DO UPDATE SET
     pool_id = excluded.pool_id,
     position = excluded.position,
     account_kind = excluded.account_kind,
+    backend_family = excluded.backend_family,
+    workspace_id = COALESCE(excluded.workspace_id, account_registry.workspace_id),
     backend_id = excluded.backend_id,
     backend_account_handle = excluded.backend_account_handle,
     provider_fingerprint = excluded.provider_fingerprint,
@@ -311,8 +313,8 @@ ON CONFLICT(account_id) DO UPDATE SET
         .bind(&entry.pool_id)
         .bind(entry.position)
         .bind(&entry.account_kind)
-        .bind(&entry.backend_id)
-        .bind(Option::<String>::None)
+        .bind(&entry.backend_family)
+        .bind(&entry.workspace_id)
         .bind(&entry.backend_id)
         .bind(&entry.backend_account_handle)
         .bind(&entry.provider_fingerprint)
@@ -605,6 +607,8 @@ ON CONFLICT(singleton) DO UPDATE SET
 SELECT
     account_id,
     backend_id,
+    backend_family,
+    workspace_id,
     backend_account_handle,
     account_kind,
     provider_fingerprint,
@@ -624,6 +628,8 @@ WHERE account_id = ?
             Ok(RegisteredAccountRecord {
                 account_id: row.try_get("account_id")?,
                 backend_id: row.try_get("backend_id")?,
+                backend_family: row.try_get("backend_family")?,
+                workspace_id: row.try_get("workspace_id")?,
                 backend_account_handle: row.try_get("backend_account_handle")?,
                 account_kind: row.try_get("account_kind")?,
                 provider_fingerprint: row.try_get("provider_fingerprint")?,

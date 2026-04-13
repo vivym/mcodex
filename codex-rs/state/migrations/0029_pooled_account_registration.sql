@@ -2,13 +2,17 @@ ALTER TABLE account_registry
 ADD COLUMN backend_id TEXT NOT NULL DEFAULT 'local';
 
 ALTER TABLE account_registry
-ADD COLUMN backend_account_handle TEXT;
+ADD COLUMN backend_account_handle TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE account_registry
-ADD COLUMN provider_fingerprint TEXT;
+ADD COLUMN provider_fingerprint TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE account_registry
 ADD COLUMN display_name TEXT;
+
+UPDATE account_registry
+SET backend_account_handle = account_id,
+    provider_fingerprint = 'legacy:' || account_kind || ':' || COALESCE(workspace_id, '') || ':' || account_id;
 
 CREATE TABLE account_pool_membership (
     account_id TEXT PRIMARY KEY,

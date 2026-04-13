@@ -611,12 +611,15 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    backend_id,
+    backend_account_handle,
+    provider_fingerprint,
     enabled,
     healthy,
     source,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
     source = CASE
         WHEN account_registry.source IS NOT NULL THEN account_registry.source
@@ -631,6 +634,13 @@ ON CONFLICT(account_id) DO UPDATE SET
         .bind("chatgpt")
         .bind("chatgpt")
         .bind(Option::<String>::None)
+        .bind("local")
+        .bind(legacy_backend_account_handle(&legacy_account.account_id))
+        .bind(legacy_provider_fingerprint(
+            "chatgpt",
+            None,
+            &legacy_account.account_id,
+        ))
         .bind(1_i64)
         .bind(1_i64)
         .bind(AccountSource::Migrated.as_str())
@@ -809,7 +819,9 @@ WHERE singleton = 1
             account_id,
         )
         .await
-        .map(|membership| membership.map(super::account_pool_control::AccountPoolMembershipRow::membership))
+        .map(|membership| {
+            membership.map(super::account_pool_control::AccountPoolMembershipRow::membership)
+        })
     }
 
     pub async fn upsert_account_registry_entry(
@@ -833,17 +845,23 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    backend_id,
+    backend_account_handle,
+    provider_fingerprint,
     enabled,
     healthy,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
     pool_id = excluded.pool_id,
     position = excluded.position,
     account_kind = excluded.account_kind,
     backend_family = excluded.backend_family,
     workspace_id = excluded.workspace_id,
+    backend_id = excluded.backend_id,
+    backend_account_handle = excluded.backend_account_handle,
+    provider_fingerprint = excluded.provider_fingerprint,
     enabled = excluded.enabled,
     healthy = excluded.healthy,
     updated_at = excluded.updated_at
@@ -855,6 +873,13 @@ ON CONFLICT(account_id) DO UPDATE SET
         .bind(&entry.account_kind)
         .bind(&entry.backend_family)
         .bind(&entry.workspace_id)
+        .bind("local")
+        .bind(legacy_backend_account_handle(&entry.account_id))
+        .bind(legacy_provider_fingerprint(
+            &entry.account_kind,
+            entry.workspace_id.as_deref(),
+            &entry.account_id,
+        ))
         .bind(i64::from(entry.enabled))
         .bind(i64::from(entry.healthy))
         .bind(now)
@@ -1308,6 +1333,21 @@ LIMIT 1
     .map_err(Into::into)
 }
 
+fn legacy_backend_account_handle(account_id: &str) -> String {
+    account_id.to_string()
+}
+
+fn legacy_provider_fingerprint(
+    account_kind: &str,
+    workspace_id: Option<&str>,
+    account_id: &str,
+) -> String {
+    format!(
+        "legacy:{account_kind}:{}:{account_id}",
+        workspace_id.unwrap_or("")
+    )
+}
+
 async fn load_lease<'e, E>(
     executor: E,
     lease_id: &str,
@@ -1422,6 +1462,8 @@ mod tests {
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::NewPendingAccountRegistration;
+    use crate::RegisteredAccountRecord;
+    use crate::RegisteredAccountUpsert;
     use crate::migrations::STATE_MIGRATOR;
     use chrono::DateTime;
     use chrono::Utc;
@@ -3047,6 +3089,219 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn upgraded_registration_rows_backfill_required_identifiers() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let old_state_migrator = Migrator {
+            migrations: Cow::Owned(
+                STATE_MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| migration.version < 29)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open pre-0029 state db");
+        old_state_migrator
+            .run(&pool)
+            .await
+            .expect("apply pre-0029 state schema");
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    enabled,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind("team-main")
+        .bind(0_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind("workspace-main")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert pre-0029 registry row");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home, "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let committed_identifiers: (String, String, String, String, Option<String>) =
+            sqlx::query_as(
+                r#"
+SELECT backend_id, backend_account_handle, provider_fingerprint, backend_family, workspace_id
+FROM account_registry
+WHERE account_id = ?
+            "#,
+            )
+            .bind("acct-1")
+            .fetch_one(runtime.pool.as_ref())
+            .await
+            .expect("read committed identifiers");
+
+        assert_eq!(committed_identifiers.0, "local".to_string());
+        assert_eq!(committed_identifiers.1, "acct-1".to_string());
+        assert_eq!(
+            committed_identifiers.2,
+            "legacy:chatgpt:workspace-main:acct-1".to_string()
+        );
+        assert_eq!(committed_identifiers.3, "chatgpt".to_string());
+        assert_eq!(committed_identifiers.4, Some("workspace-main".to_string()));
+    }
+
+    #[tokio::test]
+    async fn upsert_registered_account_persists_backend_family_and_required_identifiers() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                pool_id: "team-main".to_string(),
+                position: 0,
+            })
+            .await
+            .expect("upsert registered account");
+
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-1")
+                .await
+                .expect("read registered account"),
+            Some(RegisteredAccountRecord {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+
+        runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-1".to_string(),
+                backend_id: "remote".to_string(),
+                backend_family: "responses".to_string(),
+                workspace_id: None,
+                backend_account_handle: "handle-2".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-2".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                pool_id: "team-main".to_string(),
+                position: 0,
+            })
+            .await
+            .expect("update registered account");
+
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-1")
+                .await
+                .expect("read updated registered account"),
+            Some(RegisteredAccountRecord {
+                account_id: "acct-1".to_string(),
+                backend_id: "remote".to_string(),
+                backend_family: "responses".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-2".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-2".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_account_rows_reject_null_required_identifiers() {
+        let runtime = test_runtime().await;
+
+        let result = sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    backend_id,
+    backend_account_handle,
+    provider_fingerprint,
+    enabled,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind("team-main")
+        .bind(0_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind(Option::<String>::None)
+        .bind("local")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(runtime.pool.as_ref())
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn upsert_account_registry_entry_writes_and_updates_membership() {
         let runtime = test_runtime().await;
 
@@ -3283,11 +3538,14 @@ INSERT INTO account_registry (
     account_kind,
     backend_family,
     workspace_id,
+    backend_id,
+    backend_account_handle,
+    provider_fingerprint,
     enabled,
     healthy,
     created_at,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(account_id)
@@ -3296,6 +3554,13 @@ INSERT INTO account_registry (
         .bind("chatgpt")
         .bind("chatgpt")
         .bind("workspace-main")
+        .bind("local")
+        .bind(super::legacy_backend_account_handle(account_id))
+        .bind(super::legacy_provider_fingerprint(
+            "chatgpt",
+            Some("workspace-main"),
+            account_id,
+        ))
         .bind(1_i64)
         .bind(i64::from(healthy))
         .bind(1_i64)
