@@ -197,6 +197,16 @@ async fn add_chatgpt_account_with_dependencies(
     let idempotency_key = format!("chatgpt-add:local:{provider_account_id}:{pool_id}");
 
     reconcile_pending_add_registration(runtime.as_ref(), &idempotency_key, control_plane).await?;
+    if runtime
+        .read_pending_account_registration(&idempotency_key)
+        .await?
+        .is_some_and(|pending| pending.completed_at.is_some())
+    {
+        runtime
+            .clear_pending_account_registration(&idempotency_key)
+            .await
+            .context("clear completed ChatGPT registration before retry")?;
+    }
 
     let provider_fingerprint = provider_fingerprint(&provider_account_id);
     let existing_memberships = runtime.list_account_pool_memberships(None).await?;
@@ -216,11 +226,6 @@ async fn add_chatgpt_account_with_dependencies(
                 membership.pool_id
             );
         }
-        return Ok(RegisteredAddAccount {
-            account_id: registered.account_id,
-            provider_account_id,
-            pool_id,
-        });
     }
 
     runtime
@@ -235,9 +240,11 @@ async fn add_chatgpt_account_with_dependencies(
         .await
         .context("create pending ChatGPT account registration")?;
 
-    // Membership scans only surface assigned accounts. If this provider identity already
-    // exists without a pool assignment, register_account will reuse the canonical row by
-    // provider fingerprint and attach it to the resolved pool.
+    // Membership scans only surface assigned accounts. Re-registering an already-assigned
+    // same-pool identity should still replay the backend registration path so legacy/raw
+    // backend-private auth can be normalized and repaired. If this provider identity exists
+    // without a pool assignment, register_account will reuse the canonical row by provider
+    // fingerprint and attach it to the resolved pool.
     let registration_result = control_plane
         .register_account(RegisteredAccountRegistration {
             request: RegisteredAccountUpsert {
@@ -708,6 +715,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_chatgpt_registration_reruns_backend_registration_for_same_pool_identity()
+    -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let provider_account_id = "provider-acct-new";
+        harness
+            .runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-local-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some(provider_account_id.to_string()),
+                backend_account_handle: provider_account_id.to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint(provider_account_id),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
+            })
+            .await?;
+        let legacy_auth_home = harness
+            .runtime
+            .codex_home()
+            .join(".pooled-auth/backends/local/accounts")
+            .join(provider_account_id);
+        std::fs::create_dir_all(&legacy_auth_home)?;
+        std::fs::write(legacy_auth_home.join("auth.json"), "{}")?;
+
+        let runner =
+            FakeChatgptRegistrationRunner::browser_success_with_valid_id_token(provider_account_id);
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            AccountPoolConfig::default().lease_ttl_duration(),
+        );
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &backend,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.account_id, "acct-local-1");
+        assert_eq!(result.provider_account_id, provider_account_id);
+        assert_eq!(result.pool_id, "team-main");
+        assert_eq!(
+            harness
+                .runtime
+                .read_registered_account("acct-local-1")
+                .await?
+                .expect("registered account")
+                .backend_account_handle,
+            normalized_chatgpt_backend_account_handle_for_test(provider_account_id)
+        );
+        assert!(
+            !legacy_auth_home.exists(),
+            "legacy raw backend-private auth should be removed"
+        );
+        assert!(
+            harness
+                .runtime
+                .codex_home()
+                .join(".pooled-auth/backends/local/accounts")
+                .join(normalized_chatgpt_backend_account_handle_for_test(
+                    provider_account_id
+                ))
+                .join("auth.json")
+                .exists(),
+            "normalized backend-private auth should be present"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reconcile_pending_add_registration_finalizes_existing_local_account() -> Result<()> {
         let harness = RegistrationHarness::with_registered_account(
             "acct-local-1",
@@ -953,6 +1042,15 @@ allow_context_reuse = false
             }
         }
 
+        fn browser_success_with_valid_id_token(provider_account_id: &str) -> Self {
+            Self {
+                browser_result: valid_tokens_for_real_backend(provider_account_id),
+                device_auth_result: fake_tokens("unused-device-auth-account"),
+                browser_calls: Arc::new(Mutex::new(0)),
+                device_auth_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
         fn device_success(provider_account_id: &str) -> Self {
             Self {
                 browser_result: fake_tokens("unused-browser-account"),
@@ -1087,6 +1185,30 @@ allow_context_reuse = false
             id_token: format!("fake-id-token-{provider_account_id}"),
             access_token: format!("fake-access-token-{provider_account_id}").into(),
             refresh_token: format!("fake-refresh-token-{provider_account_id}").into(),
+            account_id: provider_account_id.to_string(),
+        }
+    }
+
+    fn normalized_chatgpt_backend_account_handle_for_test(provider_account_id: &str) -> String {
+        let encoded_provider_account_id = provider_account_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("chatgpt-{encoded_provider_account_id}")
+    }
+
+    fn valid_tokens_for_real_backend(
+        provider_account_id: &str,
+    ) -> ChatgptManagedRegistrationTokens {
+        let id_token = match provider_account_id {
+            "provider-acct-new" => "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF91c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfYWNjb3VudF9pZCI6InByb3ZpZGVyLWFjY3QtbmV3In19.c2ln".to_string(),
+            other => panic!("missing valid ChatGPT id token fixture for provider account {other}"),
+        };
+        ChatgptManagedRegistrationTokens {
+            id_token,
+            access_token: format!("real-access-token-{provider_account_id}").into(),
+            refresh_token: format!("real-refresh-token-{provider_account_id}").into(),
             account_id: provider_account_id.to_string(),
         }
     }

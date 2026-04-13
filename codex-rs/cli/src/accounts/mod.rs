@@ -200,22 +200,21 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
     let config = Config::load_with_cli_overrides(cli_overrides).await?;
 
-    if matches!(subcommand, AccountsSubcommand::Add(_))
-        && account_pool.is_none() {
-            let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
-                accounts.default_pool.is_some()
-                    || accounts
-                        .pools
-                        .as_ref()
-                        .is_some_and(|pools| !pools.is_empty())
-            });
-            let state_path = state_db_path(config.sqlite_home.as_path());
-            if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
-                anyhow::bail!(
-                    "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
-                );
-            }
+    if matches!(subcommand, AccountsSubcommand::Add(_)) && account_pool.is_none() {
+        let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
+            accounts.default_pool.is_some()
+                || accounts
+                    .pools
+                    .as_ref()
+                    .is_some_and(|pools| !pools.is_empty())
+        });
+        let state_path = state_db_path(config.sqlite_home.as_path());
+        if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
+            anyhow::bail!(
+                "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
+            );
         }
+    }
 
     if matches!(subcommand, AccountsSubcommand::List) {
         let config_has_accounts = config.accounts.as_ref().is_some_and(|accounts| {
