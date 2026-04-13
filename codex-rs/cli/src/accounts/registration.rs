@@ -1,18 +1,406 @@
+use super::diagnostics::read_current_diagnostic;
 use anyhow::Context;
+use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::AccountPoolControlPlane;
+use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::RegisteredAccountRegistration;
 use codex_core::config::Config;
 use codex_login::AuthManager;
+use codex_login::CLIENT_ID;
+use codex_login::ChatgptManagedRegistrationTokens;
 use codex_login::LegacyAuthView;
+use codex_login::ServerOptions;
+use codex_login::run_pooled_browser_registration;
+use codex_login::run_pooled_device_code_registration;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::NewPendingAccountRegistration;
+use codex_state::RegisteredAccountMembership;
+use codex_state::RegisteredAccountRecord;
+use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
 use std::borrow::ToOwned;
+use std::sync::Arc;
 
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
+
+#[derive(Debug)]
+pub(crate) struct RegisteredAddAccount {
+    pub account_id: String,
+    pub provider_account_id: String,
+    pub pool_id: String,
+}
 
 pub(crate) struct ImportedLegacyAccount {
     pub account_id: String,
     pub pool_id: String,
+}
+
+trait ChatgptRegistrationRunner {
+    async fn run_browser(
+        &self,
+        config: &Config,
+    ) -> std::io::Result<ChatgptManagedRegistrationTokens>;
+
+    async fn run_device_auth(
+        &self,
+        config: &Config,
+    ) -> std::io::Result<ChatgptManagedRegistrationTokens>;
+}
+
+struct LiveChatgptRegistrationRunner;
+
+impl ChatgptRegistrationRunner for LiveChatgptRegistrationRunner {
+    async fn run_browser(
+        &self,
+        config: &Config,
+    ) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+        run_pooled_browser_registration(chatgpt_registration_server_options(config)).await
+    }
+
+    async fn run_device_auth(
+        &self,
+        config: &Config,
+    ) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+        run_pooled_device_code_registration(chatgpt_registration_server_options(config)).await
+    }
+}
+
+trait AddRegistrationControlPlane: Send + Sync {
+    async fn register_account(
+        &self,
+        request: RegisteredAccountRegistration,
+    ) -> anyhow::Result<RegisteredAccountRecord>;
+
+    async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool>;
+}
+
+impl<T> AddRegistrationControlPlane for T
+where
+    T: AccountPoolControlPlane + Send + Sync,
+{
+    async fn register_account(
+        &self,
+        request: RegisteredAccountRegistration,
+    ) -> anyhow::Result<RegisteredAccountRecord> {
+        AccountPoolControlPlane::register_account(self, request).await
+    }
+
+    async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool> {
+        AccountPoolControlPlane::delete_registered_account(self, account_id).await
+    }
+}
+
+trait PendingRegistrationFinalizer: Send + Sync {
+    async fn finalize_pending_account_registration(
+        &self,
+        runtime: &StateRuntime,
+        idempotency_key: &str,
+        backend_account_handle: &str,
+        account_id: &str,
+    ) -> anyhow::Result<()>;
+}
+
+pub(crate) struct RuntimePendingRegistrationFinalizer;
+
+impl PendingRegistrationFinalizer for RuntimePendingRegistrationFinalizer {
+    async fn finalize_pending_account_registration(
+        &self,
+        runtime: &StateRuntime,
+        idempotency_key: &str,
+        backend_account_handle: &str,
+        account_id: &str,
+    ) -> anyhow::Result<()> {
+        let finalized = runtime
+            .finalize_pending_account_registration(
+                idempotency_key,
+                backend_account_handle,
+                account_id,
+            )
+            .await?;
+        if !finalized {
+            anyhow::bail!("pending registration `{idempotency_key}` is not active");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn add_chatgpt_account(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    account_pool_override: Option<&str>,
+    device_auth: bool,
+) -> anyhow::Result<RegisteredAddAccount> {
+    add_chatgpt_account_with_runner(
+        runtime,
+        config,
+        account_pool_override,
+        device_auth,
+        &LiveChatgptRegistrationRunner,
+    )
+    .await
+}
+
+async fn add_chatgpt_account_with_runner(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    account_pool_override: Option<&str>,
+    device_auth: bool,
+    runner: &impl ChatgptRegistrationRunner,
+) -> anyhow::Result<RegisteredAddAccount> {
+    let backend = LocalAccountPoolBackend::new(
+        Arc::clone(runtime),
+        AccountPoolConfig::default().lease_ttl_duration(),
+    );
+    add_chatgpt_account_with_dependencies(
+        runtime,
+        config,
+        account_pool_override,
+        device_auth,
+        runner,
+        &backend,
+        &RuntimePendingRegistrationFinalizer,
+    )
+    .await
+}
+
+async fn add_chatgpt_account_with_dependencies(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    account_pool_override: Option<&str>,
+    device_auth: bool,
+    runner: &impl ChatgptRegistrationRunner,
+    control_plane: &impl AddRegistrationControlPlane,
+    finalizer: &impl PendingRegistrationFinalizer,
+) -> anyhow::Result<RegisteredAddAccount> {
+    let diagnostic = read_current_diagnostic(runtime.as_ref(), config, account_pool_override)
+        .await
+        .context("resolve current account pool")?;
+    let Some(pool_id) = diagnostic.preview.effective_pool_id else {
+        anyhow::bail!(
+            "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
+        );
+    };
+
+    let tokens = if device_auth {
+        runner
+            .run_device_auth(config)
+            .await
+            .context("run ChatGPT device-code registration")?
+    } else {
+        runner
+            .run_browser(config)
+            .await
+            .context("run ChatGPT browser registration")?
+    };
+    let provider_account_id = tokens.account_id.clone();
+    let idempotency_key = format!("chatgpt-add:local:{provider_account_id}:{pool_id}");
+
+    reconcile_pending_add_registration(runtime.as_ref(), &idempotency_key, control_plane).await?;
+
+    let provider_fingerprint = provider_fingerprint(&provider_account_id);
+    let existing_memberships = runtime.list_account_pool_memberships(None).await?;
+    for membership in existing_memberships {
+        let Some(registered) = runtime
+            .read_registered_account(&membership.account_id)
+            .await?
+        else {
+            continue;
+        };
+        if registered.provider_fingerprint != provider_fingerprint {
+            continue;
+        }
+        if membership.pool_id != pool_id {
+            anyhow::bail!(
+                "provider identity `{provider_account_id}` is already registered in pool `{}`; use `codex accounts pool assign` if you need to move it",
+                membership.pool_id
+            );
+        }
+        return Ok(RegisteredAddAccount {
+            account_id: registered.account_id,
+            provider_account_id,
+            pool_id,
+        });
+    }
+
+    runtime
+        .create_pending_account_registration(NewPendingAccountRegistration {
+            idempotency_key: idempotency_key.clone(),
+            backend_id: "local".to_string(),
+            provider_kind: "chatgpt".to_string(),
+            target_pool_id: Some(pool_id.clone()),
+            backend_account_handle: None,
+            account_id: None,
+        })
+        .await
+        .context("create pending ChatGPT account registration")?;
+
+    // Membership scans only surface assigned accounts. If this provider identity already
+    // exists without a pool assignment, register_account will reuse the canonical row by
+    // provider fingerprint and attach it to the resolved pool.
+    let registration_result = control_plane
+        .register_account(RegisteredAccountRegistration {
+            request: RegisteredAccountUpsert {
+                account_id: chatgpt_local_account_id(&provider_account_id),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some(provider_account_id.clone()),
+                backend_account_handle: provider_account_id.clone(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint.clone(),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: pool_id.clone(),
+                    position: 0,
+                }),
+            },
+            pooled_registration_tokens: Some(tokens),
+        })
+        .await;
+
+    let registered = match registration_result {
+        Ok(registered) => registered,
+        Err(err) => {
+            runtime
+                .clear_pending_account_registration(&idempotency_key)
+                .await
+                .context("clear pending ChatGPT registration after backend failure")?;
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = finalizer
+        .finalize_pending_account_registration(
+            runtime.as_ref(),
+            &idempotency_key,
+            registered.backend_account_handle.as_str(),
+            registered.account_id.as_str(),
+        )
+        .await
+    {
+        match control_plane
+            .delete_registered_account(registered.account_id.as_str())
+            .await
+        {
+            Ok(true) => {
+                runtime
+                    .clear_pending_account_registration(&idempotency_key)
+                    .await
+                    .context("clear pending ChatGPT registration after finalize compensation")?;
+            }
+            Ok(false) => {
+                return Err(err.context(
+                    "failed to finalize pending ChatGPT registration and compensation did not remove the registered account; manual recovery is required",
+                ));
+            }
+            Err(compensation_err) => {
+                return Err(err.context(format!(
+                    "failed to finalize pending ChatGPT registration and compensation failed: {compensation_err}"
+                )));
+            }
+        }
+        return Err(err);
+    }
+
+    Ok(RegisteredAddAccount {
+        account_id: registered.account_id,
+        provider_account_id,
+        pool_id,
+    })
+}
+
+async fn reconcile_pending_add_registration(
+    runtime: &StateRuntime,
+    idempotency_key: &str,
+    control_plane: &impl AddRegistrationControlPlane,
+) -> anyhow::Result<()> {
+    let Some(pending) = runtime
+        .read_pending_account_registration(idempotency_key)
+        .await?
+    else {
+        return Ok(());
+    };
+    if pending.completed_at.is_some() {
+        return Ok(());
+    }
+
+    match (
+        pending.backend_account_handle.as_deref(),
+        pending.account_id.as_deref(),
+    ) {
+        (Some(backend_account_handle), Some(account_id)) => {
+            if runtime.read_registered_account(account_id).await?.is_some() {
+                let finalized = runtime
+                    .finalize_pending_account_registration(
+                        idempotency_key,
+                        backend_account_handle,
+                        account_id,
+                    )
+                    .await?;
+                if !finalized {
+                    anyhow::bail!("pending registration `{idempotency_key}` is not active");
+                }
+                return Ok(());
+            }
+
+            match control_plane.delete_registered_account(account_id).await {
+                Ok(true) => {
+                    runtime
+                        .clear_pending_account_registration(idempotency_key)
+                        .await
+                        .context("clear compensated pending ChatGPT registration")?;
+                    Ok(())
+                }
+                Ok(false) => anyhow::bail!(
+                    "phase 1 manual recovery required for pending ChatGPT registration `{idempotency_key}`: local account `{account_id}` is missing and compensation could not confirm deletion"
+                ),
+                Err(err) => Err(err).context(format!(
+                    "phase 1 manual recovery required for pending ChatGPT registration `{idempotency_key}`"
+                )),
+            }
+        }
+        (None, Some(account_id)) => {
+            let Some(registered) = runtime.read_registered_account(account_id).await? else {
+                runtime
+                    .clear_pending_account_registration(idempotency_key)
+                    .await
+                    .context("clear stale pending ChatGPT registration")?;
+                return Ok(());
+            };
+            let finalized = runtime
+                .finalize_pending_account_registration(
+                    idempotency_key,
+                    registered.backend_account_handle.as_str(),
+                    registered.account_id.as_str(),
+                )
+                .await?;
+            if !finalized {
+                anyhow::bail!("pending registration `{idempotency_key}` is not active");
+            }
+            Ok(())
+        }
+        (Some(backend_account_handle), None) => {
+            anyhow::bail!(
+                "phase 1 manual recovery required for pending ChatGPT registration `{idempotency_key}`: backend handle `{backend_account_handle}` is recorded without a local account id"
+            )
+        }
+        (None, None) => {
+            runtime
+                .clear_pending_account_registration(idempotency_key)
+                .await
+                .context("clear empty pending ChatGPT registration")?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn api_key_add_is_unsupported() -> anyhow::Result<RegisteredAddAccount> {
+    anyhow::bail!(
+        "phase 1 only supports `codex accounts add chatgpt`; `codex accounts add api-key` is not supported yet"
+    )
 }
 
 pub(crate) async fn import_legacy_account(
@@ -100,4 +488,606 @@ pub(crate) async fn import_legacy_account(
         account_id,
         pool_id: target_pool_id,
     })
+}
+
+fn chatgpt_registration_server_options(config: &Config) -> ServerOptions {
+    ServerOptions::new(
+        config.codex_home.clone(),
+        CLIENT_ID.to_string(),
+        config.forced_chatgpt_workspace_id.clone(),
+        config.cli_auth_credentials_store_mode,
+    )
+}
+
+fn provider_fingerprint(provider_account_id: &str) -> String {
+    format!("chatgpt::{provider_account_id}")
+}
+
+fn chatgpt_local_account_id(provider_account_id: &str) -> String {
+    let local_account_id_suffix = provider_account_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("acct-local-{local_account_id_suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anyhow::Result;
+    use codex_account_pool::RegisteredAccountRegistration;
+    use codex_core::config::ConfigBuilder;
+    use codex_login::ChatgptManagedRegistrationTokens;
+    use codex_state::AccountPoolMembership;
+    use codex_state::AccountStartupSelectionState;
+    use codex_state::AccountStartupSelectionUpdate;
+    use codex_state::RegisteredAccountMembership;
+    use codex_state::RegisteredAccountRecord;
+    use codex_state::RegisteredAccountUpsert;
+    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_uses_override_pool_and_keeps_startup_defaults() -> Result<()>
+    {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            Some("team-other"),
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.pool_id, "team-other");
+        assert_eq!(result.provider_account_id, "provider-acct-new");
+        assert_eq!(
+            harness.runtime.read_account_startup_selection().await?,
+            AccountStartupSelectionState {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_fails_without_resolved_pool_before_persisting_state()
+    -> Result<()> {
+        let harness = RegistrationHarness::without_configured_pool().await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let err = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await
+        .expect_err("missing pool should fail before registration");
+
+        assert!(err.to_string().contains("configure a pool"));
+        assert!(
+            harness
+                .runtime
+                .list_pending_account_registrations()
+                .await?
+                .is_empty()
+        );
+        assert_eq!(runner.browser_calls(), 0);
+        assert_eq!(runner.device_auth_calls(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_is_idempotent_for_same_identity_in_same_pool() -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let runner = FakeChatgptRegistrationRunner::device_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let first = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ true,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+        let second = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ true,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(first.account_id, second.account_id);
+        assert_eq!(first.provider_account_id, "provider-acct-new");
+        assert_eq!(second.provider_account_id, "provider-acct-new");
+        assert_eq!(
+            harness.membership(first.account_id.as_str()).await?,
+            Some(AccountPoolMembership {
+                account_id: first.account_id.clone(),
+                pool_id: "team-main".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_rejects_existing_identity_in_other_pool() -> Result<()> {
+        let harness = RegistrationHarness::with_registered_account(
+            "acct-local-1",
+            "provider-acct-new",
+            Some("team-main"),
+        )
+        .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let err = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            Some("team-other"),
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await
+        .expect_err("cross-pool reuse should be rejected");
+
+        assert!(err.to_string().contains("accounts pool assign"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_assigns_existing_unassigned_identity_to_resolved_pool()
+    -> Result<()> {
+        let harness =
+            RegistrationHarness::with_registered_account("acct-local-1", "provider-acct-new", None)
+                .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            Some("team-main"),
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.account_id, "acct-local-1");
+        assert_eq!(result.provider_account_id, "provider-acct-new");
+        assert_eq!(result.pool_id, "team-main");
+        assert_eq!(
+            harness
+                .runtime
+                .read_registered_account(&chatgpt_local_account_id("provider-acct-new"))
+                .await?,
+            None
+        );
+        assert_eq!(
+            harness.membership("acct-local-1").await?,
+            Some(AccountPoolMembership {
+                account_id: "acct-local-1".to_string(),
+                pool_id: "team-main".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_pending_add_registration_finalizes_existing_local_account() -> Result<()> {
+        let harness = RegistrationHarness::with_registered_account(
+            "acct-local-1",
+            "provider-acct-new",
+            Some("team-main"),
+        )
+        .await?;
+        harness
+            .runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "chatgpt-add:local:provider-acct-new:team-main".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: Some("backend-handle-1".to_string()),
+                account_id: Some("acct-local-1".to_string()),
+            })
+            .await?;
+
+        reconcile_pending_add_registration(
+            &harness.runtime,
+            "chatgpt-add:local:provider-acct-new:team-main",
+            &RuntimeBackedControlPlane::new(harness.runtime.clone()),
+        )
+        .await?;
+
+        let pending = harness
+            .runtime
+            .read_pending_account_registration("chatgpt-add:local:provider-acct-new:team-main")
+            .await?
+            .expect("pending row should still exist after finalization");
+        assert_eq!(
+            pending.backend_account_handle.as_deref(),
+            Some("backend-handle-1")
+        );
+        assert_eq!(pending.account_id.as_deref(), Some("acct-local-1"));
+        assert!(pending.completed_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_pending_add_registration_clears_abandoned_local_only_row() -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        harness
+            .runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "chatgpt-add:local:provider-acct-new:team-main".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: None,
+                account_id: Some("acct-local-missing".to_string()),
+            })
+            .await?;
+
+        reconcile_pending_add_registration(
+            &harness.runtime,
+            "chatgpt-add:local:provider-acct-new:team-main",
+            &RuntimeBackedControlPlane::new(harness.runtime.clone()),
+        )
+        .await?;
+
+        assert!(
+            harness
+                .runtime
+                .read_pending_account_registration("chatgpt-add:local:provider-acct-new:team-main")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_pending_add_registration_fails_closed_for_backend_only_row() -> Result<()> {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        harness
+            .runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "chatgpt-add:local:provider-acct-new:team-main".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: Some("backend-handle-1".to_string()),
+                account_id: None,
+            })
+            .await?;
+
+        let err = reconcile_pending_add_registration(
+            &harness.runtime,
+            "chatgpt-add:local:provider-acct-new:team-main",
+            &RuntimeBackedControlPlane::new(harness.runtime.clone()),
+        )
+        .await
+        .expect_err("backend-only rows should fail closed in phase 1");
+
+        assert!(err.to_string().contains("manual recovery"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_compensates_backend_record_when_finalize_fails() -> Result<()>
+    {
+        let harness = RegistrationHarness::with_configured_pool("team-main").await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+        let finalizer = FailingPendingFinalizer::once("finalize failed");
+
+        let err = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &finalizer,
+        )
+        .await
+        .expect_err("finalize failure should trigger compensation");
+
+        assert!(err.to_string().contains("finalize failed"));
+        assert_eq!(
+            control_plane.deleted_account_ids(),
+            vec!["acct-local-70726f76696465722d616363742d6e6577".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_api_key_reports_phase_one_unsupported() {
+        let err = api_key_add_is_unsupported().expect_err("api-key should stay unsupported");
+        assert!(err.to_string().contains("phase 1"));
+        assert!(err.to_string().contains("chatgpt"));
+    }
+
+    struct RegistrationHarness {
+        _tempdir: TempDir,
+        config: Config,
+        runtime: Arc<StateRuntime>,
+    }
+
+    impl RegistrationHarness {
+        async fn with_configured_pool(default_pool_id: &str) -> Result<Self> {
+            Self::new(Some(default_pool_id)).await
+        }
+
+        async fn without_configured_pool() -> Result<Self> {
+            Self::new(None).await
+        }
+
+        async fn with_registered_account(
+            account_id: &str,
+            provider_account_id: &str,
+            pool_id: Option<&str>,
+        ) -> Result<Self> {
+            let harness = Self::new(Some("team-main")).await?;
+            harness
+                .runtime
+                .upsert_registered_account(RegisteredAccountUpsert {
+                    account_id: account_id.to_string(),
+                    backend_id: "local".to_string(),
+                    backend_family: "chatgpt".to_string(),
+                    workspace_id: Some(provider_account_id.to_string()),
+                    backend_account_handle: "backend-handle-1".to_string(),
+                    account_kind: "chatgpt".to_string(),
+                    provider_fingerprint: provider_fingerprint(provider_account_id),
+                    display_name: Some("Managed ChatGPT".to_string()),
+                    source: None,
+                    enabled: true,
+                    healthy: true,
+                    membership: pool_id.map(|pool_id| RegisteredAccountMembership {
+                        pool_id: pool_id.to_string(),
+                        position: 0,
+                    }),
+                })
+                .await?;
+            Ok(harness)
+        }
+
+        async fn new(default_pool_id: Option<&str>) -> Result<Self> {
+            let tempdir = TempDir::new()?;
+            let config_toml = default_pool_id.map_or_else(String::new, |default_pool_id| {
+                format!(
+                    r#"
+[accounts]
+default_pool = "{default_pool_id}"
+
+[accounts.pools.{default_pool_id}]
+allow_context_reuse = false
+"#
+                )
+            });
+            if !config_toml.is_empty() {
+                std::fs::write(tempdir.path().join("config.toml"), config_toml)?;
+            }
+
+            let config = ConfigBuilder::default()
+                .codex_home(tempdir.path().to_path_buf())
+                .build()
+                .await?;
+            let runtime = StateRuntime::init(
+                tempdir.path().to_path_buf(),
+                config.model_provider_id.clone(),
+            )
+            .await?;
+
+            if let Some(default_pool_id) = default_pool_id {
+                runtime
+                    .write_account_startup_selection(AccountStartupSelectionUpdate {
+                        default_pool_id: Some(default_pool_id.to_string()),
+                        preferred_account_id: None,
+                        suppressed: false,
+                    })
+                    .await?;
+            }
+
+            Ok(Self {
+                _tempdir: tempdir,
+                config,
+                runtime,
+            })
+        }
+
+        async fn membership(&self, account_id: &str) -> Result<Option<AccountPoolMembership>> {
+            self.runtime.read_account_pool_membership(account_id).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeChatgptRegistrationRunner {
+        browser_result: ChatgptManagedRegistrationTokens,
+        device_auth_result: ChatgptManagedRegistrationTokens,
+        browser_calls: Arc<Mutex<u32>>,
+        device_auth_calls: Arc<Mutex<u32>>,
+    }
+
+    impl FakeChatgptRegistrationRunner {
+        fn browser_success(provider_account_id: &str) -> Self {
+            Self {
+                browser_result: fake_tokens(provider_account_id),
+                device_auth_result: fake_tokens("unused-device-auth-account"),
+                browser_calls: Arc::new(Mutex::new(0)),
+                device_auth_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn device_success(provider_account_id: &str) -> Self {
+            Self {
+                browser_result: fake_tokens("unused-browser-account"),
+                device_auth_result: fake_tokens(provider_account_id),
+                browser_calls: Arc::new(Mutex::new(0)),
+                device_auth_calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn browser_calls(&self) -> u32 {
+            *self
+                .browser_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn device_auth_calls(&self) -> u32 {
+            *self
+                .device_auth_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    }
+
+    impl ChatgptRegistrationRunner for FakeChatgptRegistrationRunner {
+        async fn run_browser(
+            &self,
+            _config: &Config,
+        ) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+            let mut calls = self
+                .browser_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *calls += 1;
+            Ok(self.browser_result.clone())
+        }
+
+        async fn run_device_auth(
+            &self,
+            _config: &Config,
+        ) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+            let mut calls = self
+                .device_auth_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *calls += 1;
+            Ok(self.device_auth_result.clone())
+        }
+    }
+
+    struct RuntimeBackedControlPlane {
+        runtime: Arc<StateRuntime>,
+        next_account_id: Mutex<u32>,
+        deleted_account_ids: Mutex<Vec<String>>,
+    }
+
+    impl RuntimeBackedControlPlane {
+        fn new(runtime: Arc<StateRuntime>) -> Self {
+            Self {
+                runtime,
+                next_account_id: Mutex::new(1),
+                deleted_account_ids: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn deleted_account_ids(&self) -> Vec<String> {
+            self.deleted_account_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl AddRegistrationControlPlane for RuntimeBackedControlPlane {
+        async fn register_account(
+            &self,
+            mut request: RegisteredAccountRegistration,
+        ) -> anyhow::Result<RegisteredAccountRecord> {
+            if request.request.account_id.is_empty() {
+                let mut next_account_id = self
+                    .next_account_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                request.request.account_id = format!("acct-local-{next_account_id}");
+                *next_account_id += 1;
+            }
+            let resolved_account_id = self
+                .runtime
+                .upsert_registered_account(request.request.clone())
+                .await?;
+            self.runtime
+                .read_registered_account(&resolved_account_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("registered account missing after fake upsert"))
+        }
+
+        async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool> {
+            self.deleted_account_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(account_id.to_string());
+            self.runtime.remove_account_registry_entry(account_id).await
+        }
+    }
+
+    struct FailingPendingFinalizer {
+        error_message: String,
+    }
+
+    impl FailingPendingFinalizer {
+        fn once(error_message: &str) -> Self {
+            Self {
+                error_message: error_message.to_string(),
+            }
+        }
+    }
+
+    impl PendingRegistrationFinalizer for FailingPendingFinalizer {
+        async fn finalize_pending_account_registration(
+            &self,
+            _runtime: &StateRuntime,
+            _idempotency_key: &str,
+            _backend_account_handle: &str,
+            _account_id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("{}", self.error_message);
+        }
+    }
+
+    fn fake_tokens(provider_account_id: &str) -> ChatgptManagedRegistrationTokens {
+        ChatgptManagedRegistrationTokens {
+            id_token: format!("fake-id-token-{provider_account_id}"),
+            access_token: format!("fake-access-token-{provider_account_id}").into(),
+            refresh_token: format!("fake-refresh-token-{provider_account_id}").into(),
+            account_id: provider_account_id.to_string(),
+        }
+    }
 }
