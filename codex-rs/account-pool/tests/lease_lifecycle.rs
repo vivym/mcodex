@@ -221,8 +221,7 @@ impl TestHarness {
 }
 
 async fn fixture_with_legacy_auth(account_id: &str) -> TestHarness {
-    let tempdir =
-        tempfile::tempdir().unwrap_or_else(|err| panic!("create tempdir failed: {err}"));
+    let tempdir = tempfile::tempdir().unwrap_or_else(|err| panic!("create tempdir failed: {err}"));
     let runtime = StateRuntime::init(tempdir.path().to_path_buf(), "test-provider".to_string())
         .await
         .unwrap_or_else(|err| panic!("initialize runtime failed: {err}"));

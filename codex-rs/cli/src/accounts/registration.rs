@@ -35,12 +35,6 @@ pub(crate) async fn import_legacy_account(
     let target_pool_id = pool
         .or(account_pool_override)
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            config
-                .accounts
-                .as_ref()
-                .and_then(|accounts| accounts.default_pool.clone())
-        })
         .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string());
     let idempotency_key = format!("legacy-import:{account_id}:{target_pool_id}");
 

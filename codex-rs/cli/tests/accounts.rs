@@ -39,6 +39,13 @@ async fn prepared_legacy_auth_only_home() -> Result<TempDir> {
     Ok(codex_home)
 }
 
+async fn prepared_legacy_auth_with_accounts_config_home() -> Result<TempDir> {
+    let codex_home = TempDir::new()?;
+    seed_chatgpt_auth(codex_home.path())?;
+    seed_accounts_config(codex_home.path())?;
+    Ok(codex_home)
+}
+
 async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
     let output = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
         .env("CODEX_HOME", codex_home.path())
@@ -372,6 +379,38 @@ async fn accounts_import_legacy_registers_and_assigns_legacy_account_explicitly(
         read_compat_migration_state(&codex_home).await?,
         codex_state::AccountCompatMigrationState {
             legacy_import_completed: true,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_explicit_pool_uses_legacy_default() -> Result<()> {
+    let codex_home = prepared_legacy_auth_with_accounts_config_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("acct-1"));
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: false,
+        }
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership"),
+        codex_state::AccountPoolMembership {
+            account_id: "acct-1".to_string(),
+            pool_id: "legacy-default".to_string(),
+            source: Some(codex_state::AccountSource::Migrated),
+            enabled: true,
+            healthy: true,
         }
     );
 
