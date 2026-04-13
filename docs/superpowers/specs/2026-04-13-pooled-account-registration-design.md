@@ -212,6 +212,34 @@ Once this design lands:
 This resolves the conflict between explicit account registration and today's startup-time
 `import_legacy_default_account` fallback.
 
+### 7. Phase 1 CLI delivery semantics
+
+The first shippable `accounts add` slice should be intentionally narrow.
+
+Phase 1 command behavior:
+
+- `accounts add chatgpt` is fully supported.
+- `accounts add chatgpt --device-auth` is fully supported.
+- `accounts add api-key` remains explicitly unsupported in this slice and must fail with a clear
+  message instead of pretending registration succeeded.
+
+Pool targeting rules for the ChatGPT add paths:
+
+1. use `codex accounts --account-pool <pool> add ...` when provided,
+2. otherwise use the current effective pool from pooled account diagnostics,
+3. if neither exists, fail and instruct the operator to configure a pool or pass
+   `--account-pool`.
+
+Phase 1 must not silently create an implicit default pool for fresh registrations.
+
+Implementation rules:
+
+- fresh registration writes only backend-private pooled auth owned by the selected backend
+- fresh registration must not mutate shared legacy compatibility auth storage
+- the CLI should orchestrate registration, while backend-specific credential persistence remains in
+  the backend control plane
+- idempotency and rollback should continue to be handled through the pending-registration journal
+
 ## Data Model
 
 ### Registered account catalog
