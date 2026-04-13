@@ -3133,6 +3133,10 @@ WHERE account_id = ?
             .await
             .expect("read finalized pending registration")
             .expect("finalized pending registration");
+        let finalized_again = runtime
+            .finalize_pending_account_registration("idem-1", "handle-2", "acct-2")
+            .await
+            .expect("do not rewrite finalized pending registration");
 
         assert_eq!(finalized.idempotency_key, "idem-1");
         assert_eq!(finalized.backend_id, "local");
@@ -3144,6 +3148,7 @@ WHERE account_id = ?
         );
         assert_eq!(finalized.account_id.as_deref(), Some("acct-1"));
         assert!(finalized.completed_at.is_some());
+        assert!(!finalized_again);
     }
 
     #[tokio::test]
@@ -3431,6 +3436,104 @@ INSERT INTO account_registry (
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upsert_registered_account_reuses_existing_backend_identity() {
+        let runtime = test_runtime().await;
+
+        let initial_account_id = runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
+            })
+            .await
+            .expect("create canonical registered account");
+        let replay_account_id = runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-2".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary Replay".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 1,
+                }),
+            })
+            .await
+            .expect("reuse canonical registered account");
+
+        assert_eq!(initial_account_id, "acct-1".to_string());
+        assert_eq!(replay_account_id, "acct-1".to_string());
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-2")
+                .await
+                .expect("read replay alias account"),
+            None
+        );
+        assert_eq!(
+            runtime
+                .read_registered_account("acct-1")
+                .await
+                .expect("read canonical registered account"),
+            Some(RegisteredAccountRecord {
+                account_id: "acct-1".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                backend_account_handle: "handle-1".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: "fingerprint-1".to_string(),
+                display_name: Some("Primary Replay".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        assert_eq!(
+            runtime
+                .read_account_pool_membership("acct-1")
+                .await
+                .expect("read canonical membership"),
+            Some(AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "team-main".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        let account_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT COUNT(*)
+FROM account_registry
+            "#,
+        )
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("count registered accounts");
+        assert_eq!(account_count, 1);
     }
 
     #[tokio::test]

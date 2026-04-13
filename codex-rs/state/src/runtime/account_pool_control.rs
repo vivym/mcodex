@@ -270,10 +270,44 @@ impl StateRuntime {
     pub async fn upsert_registered_account(
         &self,
         entry: RegisteredAccountUpsert,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<String> {
         let now = account_datetime_to_epoch_seconds(Utc::now());
         let mut tx = self.pool.begin().await?;
-        let previous_pool_id = read_effective_account_pool_id(&mut *tx, &entry.account_id).await?;
+        let matching_account_ids = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT account_id
+FROM account_registry
+WHERE backend_id = ?
+  AND (
+      backend_account_handle = ?
+      OR provider_fingerprint = ?
+  )
+ORDER BY CASE
+    WHEN account_id = ? THEN 0
+    ELSE 1
+END, account_id ASC
+            "#,
+        )
+        .bind(&entry.backend_id)
+        .bind(&entry.backend_account_handle)
+        .bind(&entry.provider_fingerprint)
+        .bind(&entry.account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let resolved_account_id = match matching_account_ids.as_slice() {
+            [] => entry.account_id.clone(),
+            [account_id] => account_id.clone(),
+            _ => {
+                anyhow::bail!(
+                    "conflicting registered accounts for backend_id={} handle={} fingerprint={}",
+                    entry.backend_id,
+                    entry.backend_account_handle,
+                    entry.provider_fingerprint
+                );
+            }
+        };
+        let previous_pool_id =
+            read_effective_account_pool_id(&mut *tx, &resolved_account_id).await?;
         let compat_pool_id = entry
             .membership
             .as_ref()
@@ -320,7 +354,7 @@ ON CONFLICT(account_id) DO UPDATE SET
     updated_at = excluded.updated_at
             "#,
         )
-        .bind(&entry.account_id)
+        .bind(&resolved_account_id)
         .bind(compat_pool_id)
         .bind(compat_position)
         .bind(&entry.account_kind)
@@ -342,7 +376,7 @@ ON CONFLICT(account_id) DO UPDATE SET
             Some(membership) => {
                 upsert_account_pool_membership(
                     &mut *tx,
-                    &entry.account_id,
+                    &resolved_account_id,
                     &membership.pool_id,
                     membership.position,
                     now,
@@ -357,7 +391,7 @@ DELETE FROM account_pool_membership
 WHERE account_id = ?
                     "#,
                 )
-                .bind(&entry.account_id)
+                .bind(&resolved_account_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -373,7 +407,7 @@ WHERE account_id = ?
   )
             "#,
         )
-        .bind(&entry.account_id)
+        .bind(&resolved_account_id)
         .bind(i64::from(entry.healthy))
         .bind(i64::from(entry.healthy))
         .execute(&mut *tx)
@@ -390,7 +424,7 @@ WHERE account_id = ?
                 )
                 .bind(&membership.pool_id)
                 .bind(now)
-                .bind(&entry.account_id)
+                .bind(&resolved_account_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -401,7 +435,7 @@ DELETE FROM account_runtime_state
 WHERE account_id = ?
                     "#,
                 )
-                .bind(&entry.account_id)
+                .bind(&resolved_account_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -418,14 +452,14 @@ WHERE account_id = ?
         {
             super::account_pool::release_unreleased_account_leases(
                 &mut *tx,
-                &entry.account_id,
+                &resolved_account_id,
                 now,
             )
             .await?;
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(resolved_account_id)
     }
 
     pub async fn assign_account_pool_membership(
@@ -584,6 +618,7 @@ WHERE idempotency_key = ?
 UPDATE pending_account_registration
 SET backend_account_handle = ?, account_id = ?, completed_at = ?, updated_at = ?
 WHERE idempotency_key = ?
+  AND completed_at IS NULL
             "#,
         )
         .bind(backend_account_handle)
