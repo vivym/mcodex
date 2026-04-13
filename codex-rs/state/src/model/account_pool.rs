@@ -190,6 +190,64 @@ pub struct AccountPoolMembership {
     pub healthy: bool,
 }
 
+/// Persisted registry row for one pooled account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAccountRecord {
+    pub account_id: String,
+    pub backend_id: String,
+    pub backend_account_handle: Option<String>,
+    pub account_kind: String,
+    pub provider_fingerprint: Option<String>,
+    pub display_name: Option<String>,
+    pub source: Option<AccountSource>,
+    pub enabled: bool,
+    pub healthy: bool,
+}
+
+/// Full replacement update for one registered pooled account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAccountUpsert {
+    pub account_id: String,
+    pub backend_id: String,
+    pub backend_account_handle: Option<String>,
+    pub account_kind: String,
+    pub provider_fingerprint: Option<String>,
+    pub display_name: Option<String>,
+    pub source: Option<AccountSource>,
+    pub enabled: bool,
+    pub healthy: bool,
+    pub pool_id: String,
+    pub position: i64,
+}
+
+/// Crash-recovery journal entry for an in-flight registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAccountRegistration {
+    pub idempotency_key: String,
+    pub backend_id: String,
+    pub provider_kind: String,
+    pub target_pool_id: Option<String>,
+    pub backend_account_handle: Option<String>,
+    pub account_id: Option<String>,
+}
+
+/// Creation params for a crash-recovery journal entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPendingAccountRegistration {
+    pub idempotency_key: String,
+    pub backend_id: String,
+    pub provider_kind: String,
+    pub target_pool_id: Option<String>,
+    pub backend_account_handle: Option<String>,
+    pub account_id: Option<String>,
+}
+
+/// State tracking one-time legacy compatibility import completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountCompatMigrationState {
+    pub legacy_import_completed: bool,
+}
+
 /// Full replacement update for one stored account registry entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRegistryEntryUpdate {

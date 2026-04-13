@@ -51,6 +51,7 @@ use std::time::Duration;
 use tracing::warn;
 
 mod account_pool;
+mod account_pool_control;
 mod agent_jobs;
 mod backfill;
 mod logs;

@@ -6,6 +6,7 @@ mod log;
 mod memories;
 mod thread_metadata;
 
+pub use account_pool::AccountCompatMigrationState;
 pub use account_pool::AccountHealthEvent;
 pub use account_pool::AccountHealthState;
 pub use account_pool::AccountLeaseError;
@@ -23,6 +24,10 @@ pub use account_pool::AccountStartupSelectionUpdate;
 pub use account_pool::LeaseKey;
 pub use account_pool::LeaseRenewal;
 pub use account_pool::LegacyAccountImport;
+pub use account_pool::NewPendingAccountRegistration;
+pub use account_pool::PendingAccountRegistration;
+pub use account_pool::RegisteredAccountRecord;
+pub use account_pool::RegisteredAccountUpsert;
 pub use agent_job::AgentJob;
 pub use agent_job::AgentJobCreateParams;
 pub use agent_job::AgentJobItem;

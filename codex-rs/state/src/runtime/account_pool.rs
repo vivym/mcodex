@@ -313,8 +313,8 @@ WHERE lease_id = ?
         let rows = sqlx::query(
             r#"
 SELECT
-    account_registry.account_id,
-    account_registry.pool_id,
+    membership.account_id,
+    membership.pool_id,
     account_registry.source,
     account_registry.enabled,
     account_registry.healthy,
@@ -326,22 +326,24 @@ SELECT
     active_lease.renewed_at,
     active_lease.expires_at,
     active_lease.released_at
-FROM account_registry
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
 LEFT JOIN account_runtime_state
-  ON account_runtime_state.account_id = account_registry.account_id
+  ON account_runtime_state.account_id = membership.account_id
 LEFT JOIN account_leases AS active_lease
-  ON active_lease.account_id = account_registry.account_id
- AND active_lease.pool_id = account_registry.pool_id
+  ON active_lease.account_id = membership.account_id
+ AND active_lease.pool_id = membership.pool_id
  AND active_lease.released_at IS NULL
  AND active_lease.expires_at > ?
-WHERE account_registry.pool_id = ?
+WHERE membership.pool_id = ?
 ORDER BY
     CASE
-        WHEN ? IS NOT NULL AND account_registry.account_id = ? THEN 0
+        WHEN ? IS NOT NULL AND membership.account_id = ? THEN 0
         ELSE 1
     END,
-    account_registry.position ASC,
-    account_registry.account_id ASC
+    membership.position ASC,
+    membership.account_id ASC
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(now))
@@ -550,6 +552,33 @@ WHERE account_id = ?
         .execute(&mut *tx)
         .await?;
 
+        let runtime_pool_id: Option<String> = sqlx::query_scalar(
+            r#"
+SELECT pool_id
+FROM account_runtime_state
+WHERE account_id = ?
+            "#,
+        )
+        .bind(&event.account_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(pool_id) = runtime_pool_id {
+            let position = super::account_pool_control::read_account_pool_position(
+                &mut *tx,
+                &event.account_id,
+            )
+            .await?
+            .unwrap_or(0);
+            super::account_pool_control::sync_account_membership_compat(
+                &mut tx,
+                &event.account_id,
+                &pool_id,
+                position,
+                updated_at,
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -560,6 +589,18 @@ WHERE account_id = ?
     ) -> anyhow::Result<()> {
         let now = account_datetime_to_epoch_seconds(Utc::now());
         let mut tx = self.pool.begin().await?;
+        let existing_membership = super::account_pool_control::read_account_pool_membership_row(
+            &mut *tx,
+            &legacy_account.account_id,
+        )
+        .await?;
+        let default_pool_id = existing_membership
+            .as_ref()
+            .map(|membership| membership.pool_id.clone())
+            .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string());
+        let default_position = existing_membership
+            .map(|membership| membership.position)
+            .unwrap_or(0);
 
         sqlx::query(
             r#"
@@ -598,15 +639,14 @@ ON CONFLICT(account_id) DO UPDATE SET
         .execute(&mut *tx)
         .await?;
 
-        let default_pool_id: String = sqlx::query_scalar(
-            r#"
-SELECT pool_id
-FROM account_registry
-WHERE account_id = ?
-            "#,
+        super::account_pool_control::upsert_account_pool_membership(
+            &mut *tx,
+            &legacy_account.account_id,
+            &default_pool_id,
+            default_position,
+            now,
+            now,
         )
-        .bind(&legacy_account.account_id)
-        .fetch_one(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -764,36 +804,12 @@ WHERE singleton = 1
         &self,
         account_id: &str,
     ) -> anyhow::Result<Option<AccountPoolMembership>> {
-        let row = sqlx::query(
-            r#"
-SELECT
-    account_id,
-    pool_id,
-    source,
-    enabled,
-    healthy
-FROM account_registry
-WHERE account_id = ?
-            "#,
+        super::account_pool_control::read_account_pool_membership_row(
+            self.pool.as_ref(),
+            account_id,
         )
-        .bind(account_id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-
-        match row {
-            Some(row) => Ok(Some(AccountPoolMembership {
-                account_id: row.try_get("account_id")?,
-                pool_id: row.try_get("pool_id")?,
-                source: row
-                    .try_get::<Option<String>, _>("source")?
-                    .as_deref()
-                    .map(AccountSource::try_from)
-                    .transpose()?,
-                enabled: row.try_get::<i64, _>("enabled")? != 0,
-                healthy: row.try_get::<i64, _>("healthy")? != 0,
-            })),
-            None => Ok(None),
-        }
+        .await
+        .map(|membership| membership.map(super::account_pool_control::AccountPoolMembershipRow::membership))
     }
 
     pub async fn upsert_account_registry_entry(
@@ -802,15 +818,10 @@ WHERE account_id = ?
     ) -> anyhow::Result<()> {
         let now = account_datetime_to_epoch_seconds(Utc::now());
         let mut tx = self.pool.begin().await?;
-        let previous_pool_id: Option<String> = sqlx::query_scalar(
-            r#"
-SELECT pool_id
-FROM account_registry
-WHERE account_id = ?
-            "#,
+        let previous_pool_id = super::account_pool_control::read_effective_account_pool_id(
+            &mut *tx,
+            &entry.account_id,
         )
-        .bind(&entry.account_id)
-        .fetch_optional(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -849,6 +860,16 @@ ON CONFLICT(account_id) DO UPDATE SET
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
+        .await?;
+
+        super::account_pool_control::upsert_account_pool_membership(
+            &mut *tx,
+            &entry.account_id,
+            &entry.pool_id,
+            entry.position,
+            now,
+            now,
+        )
         .await?;
 
         sqlx::query(
@@ -957,83 +978,22 @@ WHERE preferred_account_id = ?
         account_id: &str,
         pool_id: &str,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
-
-        let result = sqlx::query(
-            r#"
-UPDATE account_registry
-SET pool_id = ?, updated_at = ?
-WHERE account_id = ?
-            "#,
-        )
-        .bind(pool_id)
-        .bind(updated_at)
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query(
-            r#"
-UPDATE account_runtime_state
-SET pool_id = ?, updated_at = ?
-WHERE account_id = ?
-            "#,
-        )
-        .bind(pool_id)
-        .bind(updated_at)
-        .bind(account_id)
-        .execute(&mut *tx)
-        .await?;
-
-        release_unreleased_account_leases(&mut *tx, account_id, updated_at).await?;
-
-        tx.commit().await?;
-        Ok(true)
+        self.assign_account_pool_membership(account_id, pool_id)
+            .await
     }
 
     pub async fn list_account_pool_memberships(
         &self,
         pool_id: Option<&str>,
     ) -> anyhow::Result<Vec<AccountPoolMembership>> {
-        let rows = sqlx::query(
-            r#"
-SELECT
-    account_id,
-    pool_id,
-    source,
-    enabled,
-    healthy
-FROM account_registry
-WHERE (? IS NULL OR pool_id = ?)
-ORDER BY pool_id ASC, position ASC, account_id ASC
-            "#,
-        )
-        .bind(pool_id)
-        .bind(pool_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(AccountPoolMembership {
-                    account_id: row.try_get("account_id")?,
-                    pool_id: row.try_get("pool_id")?,
-                    source: row
-                        .try_get::<Option<String>, _>("source")?
-                        .as_deref()
-                        .map(AccountSource::try_from)
-                        .transpose()?,
-                    enabled: row.try_get::<i64, _>("enabled")? != 0,
-                    healthy: row.try_get::<i64, _>("healthy")? != 0,
-                })
+        super::account_pool_control::list_account_pool_membership_rows(self.pool.as_ref(), pool_id)
+            .await
+            .map(|memberships| {
+                memberships
+                    .into_iter()
+                    .map(super::account_pool_control::AccountPoolMembershipRow::membership)
+                    .collect()
             })
-            .collect()
     }
 
     pub async fn write_account_startup_selection(
@@ -1143,7 +1103,7 @@ WHERE released_at IS NULL
     Ok(())
 }
 
-async fn release_unreleased_account_leases<'e, E>(
+pub(super) async fn release_unreleased_account_leases<'e, E>(
     executor: E,
     account_id: &str,
     released_at: i64,
@@ -1188,29 +1148,31 @@ INSERT INTO account_leases (
     released_at
 ) SELECT
     ?,
-    account_registry.account_id,
+    membership.account_id,
     ?,
     ?,
     COALESCE((
         SELECT MAX(existing.lease_epoch) + 1
         FROM account_leases AS existing
-        WHERE existing.account_id = account_registry.account_id
+        WHERE existing.account_id = membership.account_id
     ), 1),
     ?,
     ?,
     ?,
     NULL
-FROM account_registry
-WHERE pool_id = ?
-  AND enabled = 1
-  AND healthy = 1
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+WHERE membership.pool_id = ?
+  AND account_registry.enabled = 1
+  AND account_registry.healthy = 1
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
-      WHERE account_leases.account_id = account_registry.account_id
+      WHERE account_leases.account_id = membership.account_id
         AND account_leases.released_at IS NULL
   )
-ORDER BY position ASC, account_id ASC
+ORDER BY membership.position ASC, membership.account_id ASC
 LIMIT 1
         "#,
     )
@@ -1247,27 +1209,29 @@ INSERT INTO account_leases (
     released_at
 ) SELECT
     ?,
-    account_registry.account_id,
+    membership.account_id,
     ?,
     ?,
     COALESCE((
         SELECT MAX(existing.lease_epoch) + 1
         FROM account_leases AS existing
-        WHERE existing.account_id = account_registry.account_id
+        WHERE existing.account_id = membership.account_id
     ), 1),
     ?,
     ?,
     ?,
     NULL
-FROM account_registry
-WHERE pool_id = ?
-  AND account_id = ?
-  AND enabled = 1
-  AND healthy = 1
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+WHERE membership.pool_id = ?
+  AND membership.account_id = ?
+  AND account_registry.enabled = 1
+  AND account_registry.healthy = 1
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
-      WHERE account_leases.account_id = account_registry.account_id
+      WHERE account_leases.account_id = membership.account_id
         AND account_leases.released_at IS NULL
   )
 LIMIT 1
@@ -1319,19 +1283,21 @@ where
 {
     sqlx::query_scalar(
         r#"
-SELECT account_registry.account_id
-FROM account_registry
-WHERE pool_id = ?
-  AND enabled = 1
-  AND healthy = 1
+SELECT membership.account_id
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+WHERE membership.pool_id = ?
+  AND account_registry.enabled = 1
+  AND account_registry.healthy = 1
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
-      WHERE account_leases.account_id = account_registry.account_id
+      WHERE account_leases.account_id = membership.account_id
         AND account_leases.released_at IS NULL
         AND account_leases.expires_at > ?
   )
-ORDER BY position ASC, account_id ASC
+ORDER BY membership.position ASC, membership.account_id ASC
 LIMIT 1
         "#,
     )
@@ -1455,6 +1421,7 @@ mod tests {
     use crate::AccountStartupSelectionPreview;
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
+    use crate::NewPendingAccountRegistration;
     use crate::migrations::STATE_MIGRATOR;
     use chrono::DateTime;
     use chrono::Utc;
@@ -2920,6 +2887,166 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn membership_backfill_reads_new_membership_table_and_keeps_compat_columns_synced() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let state_path = super::state_db_path(codex_home.as_path());
+        let old_state_migrator = Migrator {
+            migrations: Cow::Owned(
+                STATE_MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|migration| migration.version < 29)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&state_path)
+                .create_if_missing(true),
+        )
+        .await
+        .expect("open pre-0029 state db");
+        old_state_migrator
+            .run(&pool)
+            .await
+            .expect("apply pre-0029 state schema");
+        sqlx::query(
+            r#"
+INSERT INTO account_registry (
+    account_id,
+    pool_id,
+    position,
+    account_kind,
+    backend_family,
+    workspace_id,
+    enabled,
+    healthy,
+    created_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind("team-main")
+        .bind(0_i64)
+        .bind("chatgpt")
+        .bind("chatgpt")
+        .bind("workspace-main")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert pre-0029 registry row");
+        pool.close().await;
+
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("initialize runtime");
+        let membership = runtime
+            .read_account_pool_membership("acct-1")
+            .await
+            .expect("read account pool membership")
+            .expect("membership");
+        let compat_columns: (String, i64) = sqlx::query_as(
+            r#"
+SELECT pool_id, position
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("read compat columns");
+
+        assert_eq!(
+            membership,
+            AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "team-main".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            }
+        );
+        assert_eq!(compat_columns, ("team-main".to_string(), 0));
+
+        runtime
+            .assign_account_pool_membership("acct-1", "team-other")
+            .await
+            .expect("reassign membership");
+
+        let updated_membership = runtime
+            .read_account_pool_membership("acct-1")
+            .await
+            .expect("read updated membership");
+        let updated_compat_columns: (String, i64) = sqlx::query_as(
+            r#"
+SELECT pool_id, position
+FROM account_registry
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .fetch_one(runtime.pool.as_ref())
+        .await
+        .expect("read updated compat columns");
+
+        assert_eq!(
+            updated_membership,
+            Some(AccountPoolMembership {
+                account_id: "acct-1".to_string(),
+                pool_id: "team-other".to_string(),
+                source: None,
+                enabled: true,
+                healthy: true,
+            })
+        );
+        assert_eq!(updated_compat_columns, ("team-other".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn pending_registration_round_trip_is_keyed_by_idempotency_key() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "idem-1".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: None,
+                account_id: None,
+            })
+            .await
+            .expect("create pending registration");
+
+        assert_eq!(
+            runtime
+                .read_pending_account_registration("idem-1")
+                .await
+                .expect("read pending registration"),
+            Some(crate::PendingAccountRegistration {
+                idempotency_key: "idem-1".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-main".to_string()),
+                backend_account_handle: None,
+                account_id: None,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_account_registry_entry_writes_and_updates_membership() {
         let runtime = test_runtime().await;
 
@@ -3176,6 +3303,25 @@ INSERT INTO account_registry (
         .execute(runtime.pool.as_ref())
         .await
         .expect("seed account");
+        sqlx::query(
+            r#"
+INSERT INTO account_pool_membership (
+    account_id,
+    pool_id,
+    position,
+    assigned_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(account_id)
+        .bind(pool_id)
+        .bind(position)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(runtime.pool.as_ref())
+        .await
+        .expect("seed account membership");
     }
 
     fn test_timestamp(seconds: i64) -> DateTime<Utc> {

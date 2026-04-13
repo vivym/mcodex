@@ -24,6 +24,7 @@ pub use runtime::StateRuntime;
 /// Most consumers should prefer [`StateRuntime`].
 pub use extract::apply_rollout_item;
 pub use extract::rollout_item_affects_thread_metadata;
+pub use model::AccountCompatMigrationState;
 pub use model::AccountHealthEvent;
 pub use model::AccountHealthState;
 pub use model::AccountLeaseError;
@@ -54,6 +55,10 @@ pub use model::ExtractionOutcome;
 pub use model::LeaseKey;
 pub use model::LeaseRenewal;
 pub use model::LegacyAccountImport;
+pub use model::NewPendingAccountRegistration;
+pub use model::PendingAccountRegistration;
+pub use model::RegisteredAccountRecord;
+pub use model::RegisteredAccountUpsert;
 pub use model::SortKey;
 pub use model::Stage1JobClaim;
 pub use model::Stage1JobClaimOutcome;
