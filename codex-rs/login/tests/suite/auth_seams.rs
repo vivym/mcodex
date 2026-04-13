@@ -4,6 +4,10 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::LeasedTurnAuth;
 use codex_login::LegacyAuthView;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
+use codex_login::auth::LocalLeaseScopedAuthSession;
+use codex_login::auth::login_with_chatgpt_auth_tokens;
 use codex_login::login_with_api_key;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
@@ -45,6 +49,55 @@ pub(crate) async fn leased_turn_auth_does_not_read_shared_auth_manager() {
     assert_eq!(legacy_after_reload.api_key(), Some("sk-shared-new"));
     assert_eq!(legacy_after_reload.get_account_id(), None);
     assert_eq!(leased.account_id(), Some("acct-1".to_string()));
+}
+
+pub(crate) async fn pooled_registration_browser_returns_tokens_without_writing_shared_auth() {
+    super::pooled_registration::pooled_browser_registration_returns_tokens_without_writing_shared_auth()
+        .await;
+}
+
+pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_rebind()
+-> anyhow::Result<()> {
+    let codex_home = tempdir().expect("create tempdir");
+    let backend_account_handle = "backend-handle-1";
+    let auth_home = codex_home
+        .path()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    let binding = LeaseAuthBinding {
+        account_id: "acct-1".to_string(),
+        backend_account_handle: backend_account_handle.to_string(),
+        lease_epoch: 1,
+    };
+
+    login_with_chatgpt_auth_tokens(
+        auth_home.as_path(),
+        &fake_access_token("acct-1"),
+        "acct-1",
+        None,
+    )?;
+    let session = LocalLeaseScopedAuthSession::new(binding, auth_home.clone());
+    assert_eq!(
+        session.refresh_leased_turn_auth()?.account_id(),
+        Some("acct-1".to_string())
+    );
+
+    login_with_chatgpt_auth_tokens(
+        auth_home.as_path(),
+        &fake_access_token("acct-2"),
+        "acct-2",
+        None,
+    )?;
+
+    let err = session
+        .refresh_leased_turn_auth()
+        .expect_err("rebinding should fail closed");
+    assert!(
+        err.to_string().contains("rebinding"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
 }
 
 fn fake_access_token(chatgpt_account_id: &str) -> String {

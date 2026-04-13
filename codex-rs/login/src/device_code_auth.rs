@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::pkce::PkceCodes;
+use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 use crate::server::ServerOptions;
 use codex_client::build_reqwest_client_with_custom_ca;
 use std::io;
@@ -174,6 +175,37 @@ pub async fn complete_device_code_login(
     opts: ServerOptions,
     device_code: DeviceCode,
 ) -> std::io::Result<()> {
+    let tokens = complete_device_code_registration(opts.clone(), device_code).await?;
+    crate::server::persist_tokens_async(
+        &opts.codex_home,
+        /*api_key*/ None,
+        tokens.id_token,
+        tokens.access_token,
+        tokens.refresh_token,
+        opts.cli_auth_credentials_store_mode,
+    )
+    .await
+}
+
+pub async fn run_pooled_device_code_registration(
+    opts: ServerOptions,
+) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+    let device_code = request_device_code(&opts).await?;
+    print_device_code_prompt(&device_code.verification_url, &device_code.user_code);
+    complete_pooled_device_code_registration(opts, device_code).await
+}
+
+pub async fn complete_pooled_device_code_registration(
+    opts: ServerOptions,
+    device_code: DeviceCode,
+) -> std::io::Result<ChatgptManagedRegistrationTokens> {
+    complete_device_code_registration(opts, device_code).await
+}
+
+async fn complete_device_code_registration(
+    opts: ServerOptions,
+    device_code: DeviceCode,
+) -> std::io::Result<ChatgptManagedRegistrationTokens> {
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let base_url = opts.issuer.trim_end_matches('/');
     let api_base_url = format!("{base_url}/api/accounts");
@@ -210,15 +242,11 @@ pub async fn complete_device_code_login(
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
 
-    crate::server::persist_tokens_async(
-        &opts.codex_home,
-        /*api_key*/ None,
+    crate::server::build_chatgpt_managed_registration_tokens(
         tokens.id_token,
         tokens.access_token,
         tokens.refresh_token,
-        opts.cli_auth_credentials_store_mode,
     )
-    .await
 }
 
 pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {

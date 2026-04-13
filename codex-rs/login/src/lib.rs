@@ -6,6 +6,7 @@ pub mod token_data;
 
 mod device_code_auth;
 mod pkce;
+pub mod pooled_registration;
 mod server;
 
 pub use codex_client::BuildCustomCaTransportError as BuildLoginHttpClientError;
@@ -14,6 +15,9 @@ pub use device_code_auth::DeviceCode;
 pub use device_code_auth::complete_device_code_login;
 pub use device_code_auth::request_device_code;
 pub use device_code_auth::run_device_code_login;
+pub use pooled_registration::ChatgptManagedRegistrationTokens;
+pub use pooled_registration::run_pooled_browser_registration;
+pub use pooled_registration::run_pooled_device_code_registration;
 pub use server::LoginServer;
 pub use server::ServerOptions;
 pub use server::ShutdownHandle;

@@ -2,8 +2,11 @@ use anyhow::Result;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
+use codex_login::auth::LeaseScopedAuthSession;
 use codex_state::AccountLeaseRecord;
 use codex_state::LeaseKey;
+use std::fmt;
+use std::sync::Arc;
 
 /// Request for choosing the startup account.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,12 +122,107 @@ impl LeasedAccount {
         self.record.expires_at - now
     }
 
-    pub(crate) fn record(&self) -> &AccountLeaseRecord {
-        &self.record
+}
+
+/// Lease grant that carries the lease snapshot and a lease-scoped auth session.
+#[derive(Clone)]
+pub struct LeaseGrant {
+    pub lease_key: LeaseKey,
+    pub account_id: String,
+    pub pool_id: String,
+    pub auth_session: Arc<dyn LeaseScopedAuthSession>,
+    pub expires_at: DateTime<Utc>,
+    pub next_eligible_at: Option<DateTime<Utc>>,
+    acquired_at: DateTime<Utc>,
+    holder_instance_id: String,
+}
+
+impl fmt::Debug for LeaseGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LeaseGrant")
+            .field("lease_key", &self.lease_key)
+            .field("account_id", &self.account_id)
+            .field("pool_id", &self.pool_id)
+            .field("expires_at", &self.expires_at)
+            .field("next_eligible_at", &self.next_eligible_at)
+            .field("acquired_at", &self.acquired_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeaseGrant {
+    pub(crate) fn from_record(
+        record: AccountLeaseRecord,
+        auth_session: Arc<dyn LeaseScopedAuthSession>,
+        next_eligible_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            lease_key: record.lease_key(),
+            account_id: record.account_id,
+            pool_id: record.pool_id,
+            auth_session,
+            expires_at: record.expires_at,
+            next_eligible_at,
+            acquired_at: record.acquired_at,
+            holder_instance_id: record.holder_instance_id,
+        }
     }
 
-    pub(crate) fn with_record(record: AccountLeaseRecord) -> Self {
-        Self { record }
+    pub fn key(&self) -> LeaseKey {
+        self.lease_key.clone()
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn pool_id(&self) -> &str {
+        &self.pool_id
+    }
+
+    pub fn lease_epoch(&self) -> i64 {
+        self.lease_key.lease_epoch
+    }
+
+    pub fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+
+    pub fn acquired_at(&self) -> DateTime<Utc> {
+        self.acquired_at
+    }
+
+    pub fn remaining_ttl(&self, now: DateTime<Utc>) -> Duration {
+        self.expires_at - now
+    }
+
+    pub(crate) fn with_record(mut self, record: AccountLeaseRecord) -> Self {
+        self.lease_key = record.lease_key();
+        self.account_id = record.account_id;
+        self.pool_id = record.pool_id;
+        self.expires_at = record.expires_at;
+        self.acquired_at = record.acquired_at;
+        self.holder_instance_id = record.holder_instance_id;
+        self
+    }
+
+    pub(crate) fn with_lease_epoch(mut self, lease_epoch: i64) -> Self {
+        self.lease_key.lease_epoch = lease_epoch;
+        self
+    }
+
+    pub(crate) fn leased_account(&self) -> LeasedAccount {
+        LeasedAccount::new(AccountLeaseRecord {
+            lease_id: self.lease_key.lease_id.clone(),
+            pool_id: self.pool_id.clone(),
+            account_id: self.account_id.clone(),
+            holder_instance_id: self.holder_instance_id.clone(),
+            lease_epoch: self.lease_key.lease_epoch,
+            acquired_at: self.acquired_at,
+            renewed_at: self.acquired_at,
+            expires_at: self.expires_at,
+            released_at: None,
+        })
     }
 }
 

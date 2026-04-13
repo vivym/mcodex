@@ -4,12 +4,16 @@ mod storage;
 mod util;
 
 mod external_bearer;
+mod lease_scoped_session;
 mod leased_auth;
 mod legacy_auth_view;
 mod manager;
 
 pub use error::RefreshTokenFailedError;
 pub use error::RefreshTokenFailedReason;
+pub use lease_scoped_session::LeaseAuthBinding;
+pub use lease_scoped_session::LeaseScopedAuthSession;
+pub use lease_scoped_session::LocalLeaseScopedAuthSession;
 pub use leased_auth::LeasedTurnAuth;
 pub use legacy_auth_view::LegacyAuthView;
 pub use manager::*;

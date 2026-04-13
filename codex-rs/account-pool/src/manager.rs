@@ -3,6 +3,7 @@ use crate::bootstrap::LegacyAuthBootstrap;
 use crate::lease_lifecycle::LeaseHealthEvent;
 use crate::types::AccountPoolConfig;
 use crate::types::HealthEventDisposition;
+use crate::types::LeaseGrant;
 use crate::types::LeasedAccount;
 use crate::types::RateLimitSnapshot;
 use crate::types::SelectionRequest;
@@ -16,8 +17,8 @@ use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
 
 enum LeaseRenewalDisposition {
-    NotNeeded(LeasedAccount),
-    Renewed(LeasedAccount),
+    NotNeeded(LeaseGrant),
+    Renewed(LeaseGrant),
     Missing { pool_id: String },
 }
 
@@ -26,7 +27,7 @@ pub struct AccountPoolManager<B: AccountPoolExecutionBackend, L: LegacyAuthBoots
     legacy_bootstrap: L,
     config: AccountPoolConfig,
     holder_instance_id: String,
-    active_lease: Option<LeasedAccount>,
+    active_lease: Option<LeaseGrant>,
     next_health_event_sequence: i64,
     bootstrapped_legacy_auth: bool,
 }
@@ -79,7 +80,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         if self.active_lease.is_some() {
             match self.try_renew_active_lease_if_needed(now).await? {
                 LeaseRenewalDisposition::NotNeeded(lease)
-                | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease),
+                | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
                     return self.acquire_fresh_lease(pool_id).await;
                 }
@@ -97,7 +98,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         if self.active_lease.is_some() {
             match self.try_renew_active_lease_if_needed(now).await? {
                 LeaseRenewalDisposition::NotNeeded(lease)
-                | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease),
+                | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
                     return self.acquire_fresh_lease(pool_id).await;
                 }
@@ -118,7 +119,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
 
         match self.backend.renew_lease(&active_lease.key(), now).await? {
             LeaseRenewal::Renewed(record) => {
-                self.active_lease = Some(LeasedAccount::with_record(record));
+                self.active_lease = Some(active_lease.with_record(record));
             }
             LeaseRenewal::Missing => {
                 self.active_lease = None;
@@ -160,7 +161,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         let event = LeaseHealthEvent::RateLimited {
             observed_at: snapshot.observed_at,
         }
-        .into_account_health_event(&active_lease, sequence_number);
+        .into_account_health_event(&active_lease.leased_account(), sequence_number);
         self.backend.record_health_event(event).await?;
 
         Ok(HealthEventDisposition::Applied)
@@ -181,7 +182,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         let health_event = LeaseHealthEvent::RateLimited {
             observed_at: event.observed_at,
         }
-        .into_account_health_event(&active_lease, sequence_number);
+        .into_account_health_event(&active_lease.leased_account(), sequence_number);
         self.backend.record_health_event(health_event).await?;
 
         Ok(HealthEventDisposition::Applied)
@@ -201,7 +202,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         let health_event = LeaseHealthEvent::Unauthorized {
             observed_at: Utc::now(),
         }
-        .into_account_health_event(&active_lease, sequence_number);
+        .into_account_health_event(&active_lease.leased_account(), sequence_number);
         self.backend.record_health_event(health_event).await?;
 
         Ok(HealthEventDisposition::Applied)
@@ -211,9 +212,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         if let Some(active_lease) = self.active_lease.as_mut()
             && active_lease.account_id() == account_id
         {
-            let mut updated = active_lease.record().clone();
-            updated.lease_epoch += 1;
-            *active_lease = LeasedAccount::with_record(updated);
+            *active_lease = active_lease
+                .clone()
+                .with_lease_epoch(active_lease.lease_epoch() + 1);
             self.next_health_event_sequence = 0;
         }
 
@@ -249,7 +250,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
 
         match self.backend.renew_lease(&active_lease.key(), now).await? {
             LeaseRenewal::Renewed(record) => {
-                let renewed = LeasedAccount::with_record(record);
+                let renewed = active_lease.with_record(record);
                 self.active_lease = Some(renewed.clone());
                 Ok(LeaseRenewalDisposition::Renewed(renewed))
             }
@@ -279,7 +280,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
     }
 
     async fn acquire_fresh_lease(&mut self, pool_id: String) -> anyhow::Result<LeasedAccount> {
-        let record = self
+        let grant = self
             .backend
             .acquire_lease(&pool_id, &self.holder_instance_id)
             .await
@@ -287,13 +288,13 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 AccountLeaseError::NoEligibleAccount => anyhow::anyhow!(err),
                 AccountLeaseError::Storage(_) => anyhow::anyhow!(err),
             })?;
-        let leased_account = LeasedAccount::new(record);
+        let leased_account = grant.leased_account();
         self.next_health_event_sequence = self
             .backend
             .read_account_health_event_sequence(leased_account.account_id())
             .await?
             .unwrap_or(0);
-        self.active_lease = Some(leased_account.clone());
+        self.active_lease = Some(grant);
         Ok(leased_account)
     }
 }

@@ -21,6 +21,7 @@ pub use types::AccountRecord;
 pub use types::ContextReuseDecision;
 pub use types::ContextReuseRequest;
 pub use types::HealthEventDisposition;
+pub use types::LeaseGrant;
 pub use types::LeasedAccount;
 pub use types::RateLimitSnapshot;
 pub use types::SelectionRequest;

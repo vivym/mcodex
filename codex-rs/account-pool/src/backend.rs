@@ -1,10 +1,10 @@
 use crate::types::AccountRecord;
+use crate::types::LeaseGrant;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
-use codex_state::AccountLeaseRecord;
 use codex_state::AccountStartupSelectionState;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
@@ -30,7 +30,7 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         &self,
         pool_id: &str,
         holder_instance_id: &str,
-    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError>;
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError>;
 
     /// Renew the lease if it is still active.
     async fn renew_lease(

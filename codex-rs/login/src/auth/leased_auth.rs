@@ -17,6 +17,10 @@ pub struct LeasedTurnAuth {
 }
 
 impl LeasedTurnAuth {
+    pub(crate) fn from_codex_auth(auth: CodexAuth) -> Self {
+        Self::new(auth)
+    }
+
     pub fn new(auth: CodexAuth) -> Self {
         Self {
             auth,
@@ -35,7 +39,7 @@ impl LeasedTurnAuth {
         let auth = CodexAuth::from_auth_storage(&codex_home, AuthCredentialsStoreMode::Ephemeral)
             .unwrap_or_else(|err| panic!("failed to load leased ChatGPT auth: {err}"))
             .unwrap_or_else(|| panic!("leased ChatGPT auth was not saved"));
-        Self::new(auth)
+        Self::from_codex_auth(auth)
     }
 
     pub fn account_id(&self) -> Option<String> {

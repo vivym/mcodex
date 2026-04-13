@@ -44,9 +44,13 @@ use tiny_http::Request;
 use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+
+use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
@@ -131,6 +135,28 @@ impl ShutdownHandle {
 
 /// Starts a local callback server and returns the browser auth URL.
 pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
+    run_login_server_impl(opts, None)
+}
+
+pub(crate) async fn run_browser_login_for_registration(
+    opts: ServerOptions,
+) -> io::Result<ChatgptManagedRegistrationTokens> {
+    let (tx, rx) = oneshot::channel();
+    let completion = Arc::new(AsyncMutex::new(Some(tx)));
+    let server = run_login_server_impl(opts, Some(completion))?;
+    let tokens = rx
+        .await
+        .map_err(|err| io::Error::other(format!("registration completion dropped: {err}")))?;
+    server.block_until_done().await?;
+    Ok(tokens)
+}
+
+fn run_login_server_impl(
+    opts: ServerOptions,
+    registration_completion: Option<
+        Arc<AsyncMutex<Option<oneshot::Sender<ChatgptManagedRegistrationTokens>>>>,
+    >,
+) -> io::Result<LoginServer> {
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
 
@@ -194,8 +220,16 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                         };
 
                         let url_raw = req.url().to_string();
-                        let response =
-                            process_request(&url_raw, &opts, &redirect_uri, &pkce, actual_port, &state).await;
+                        let response = process_request(
+                            &url_raw,
+                            &opts,
+                            &redirect_uri,
+                            &pkce,
+                            actual_port,
+                            &state,
+                            registration_completion.clone(),
+                        )
+                        .await;
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
@@ -260,6 +294,9 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
+    registration_completion: Option<
+        Arc<AsyncMutex<Option<oneshot::Sender<ChatgptManagedRegistrationTokens>>>>,
+    >,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -344,43 +381,84 @@ async fn process_request(
                             /*error_description*/ None,
                         );
                     }
-                    // Obtain API key via token-exchange and persist
-                    let api_key = obtain_api_key(&opts.issuer, &opts.client_id, &tokens.id_token)
-                        .await
-                        .ok();
-                    if let Err(err) = persist_tokens_async(
-                        &opts.codex_home,
-                        api_key.clone(),
-                        tokens.id_token.clone(),
-                        tokens.access_token.clone(),
-                        tokens.refresh_token.clone(),
-                        opts.cli_auth_credentials_store_mode,
-                    )
-                    .await
-                    {
-                        eprintln!("Persist error: {err}");
-                        return login_error_response(
-                            "Sign-in completed but credentials could not be saved locally.",
-                            io::ErrorKind::Other,
-                            Some("persist_failed"),
-                            Some(&err.to_string()),
-                        );
-                    }
+                    if let Some(completion) = registration_completion {
+                        let registration_tokens = match build_chatgpt_managed_registration_tokens(
+                            tokens.id_token.clone(),
+                            tokens.access_token.clone(),
+                            tokens.refresh_token.clone(),
+                        ) {
+                            Ok(tokens) => tokens,
+                            Err(err) => {
+                                return login_error_response(
+                                    &format!(
+                                        "Sign-in completed but pooled registration failed: {err}"
+                                    ),
+                                    io::ErrorKind::Other,
+                                    Some("pooled_registration_failed"),
+                                    /*error_description*/ None,
+                                );
+                            }
+                        };
+                        let mut completion = completion.lock().await;
+                        if let Some(sender) = completion.take() {
+                            let _ = sender.send(registration_tokens);
+                        }
 
-                    let success_url = compose_success_url(
-                        actual_port,
-                        &opts.issuer,
-                        &tokens.id_token,
-                        &tokens.access_token,
-                    );
-                    match tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes()) {
-                        Ok(header) => HandledRequest::RedirectWithHeader(header),
-                        Err(_) => login_error_response(
-                            "Sign-in completed but redirecting back to Codex failed.",
-                            io::ErrorKind::Other,
-                            Some("redirect_failed"),
-                            /*error_description*/ None,
-                        ),
+                        let body = include_str!("assets/success.html");
+                        HandledRequest::ResponseAndExit {
+                            headers: match Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"text/html; charset=utf-8"[..],
+                            ) {
+                                Ok(header) => vec![header],
+                                Err(_) => Vec::new(),
+                            },
+                            body: body.as_bytes().to_vec(),
+                            result: Ok(()),
+                        }
+                    } else {
+                        // Obtain API key via token-exchange and persist
+                        let api_key =
+                            obtain_api_key(&opts.issuer, &opts.client_id, &tokens.id_token)
+                                .await
+                                .ok();
+                        if let Err(err) = persist_tokens_async(
+                            &opts.codex_home,
+                            api_key.clone(),
+                            tokens.id_token.clone(),
+                            tokens.access_token.clone(),
+                            tokens.refresh_token.clone(),
+                            opts.cli_auth_credentials_store_mode,
+                        )
+                        .await
+                        {
+                            eprintln!("Persist error: {err}");
+                            return login_error_response(
+                                "Sign-in completed but credentials could not be saved locally.",
+                                io::ErrorKind::Other,
+                                Some("persist_failed"),
+                                Some(&err.to_string()),
+                            );
+                        }
+
+                        let success_url = compose_success_url(
+                            actual_port,
+                            &opts.issuer,
+                            &tokens.id_token,
+                            &tokens.access_token,
+                        );
+                        match tiny_http::Header::from_bytes(
+                            &b"Location"[..],
+                            success_url.as_bytes(),
+                        ) {
+                            Ok(header) => HandledRequest::RedirectWithHeader(header),
+                            Err(_) => login_error_response(
+                                "Sign-in completed but redirecting back to Codex failed.",
+                                io::ErrorKind::Other,
+                                Some("redirect_failed"),
+                                /*error_description*/ None,
+                            ),
+                        }
                     }
                 }
                 Err(err) => {
@@ -786,6 +864,25 @@ pub(crate) async fn persist_tokens_async(
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+}
+
+pub(crate) fn build_chatgpt_managed_registration_tokens(
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+) -> io::Result<ChatgptManagedRegistrationTokens> {
+    let account_id = jwt_auth_claims(&id_token)
+        .get("chatgpt_account_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| io::Error::other("registration tokens are missing chatgpt_account_id"))?
+        .to_string();
+
+    Ok(ChatgptManagedRegistrationTokens {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id,
+    })
 }
 
 fn compose_success_url(port: u16, issuer: &str, id_token: &str, access_token: &str) -> String {

@@ -1382,9 +1382,14 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "codex-app-server-protocol",
+ "codex-login",
  "codex-state",
  "pretty_assertions",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

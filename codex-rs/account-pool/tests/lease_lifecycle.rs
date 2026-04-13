@@ -1,13 +1,16 @@
 use chrono::Duration;
 use chrono::Utc;
 use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::AccountPoolExecutionBackend;
 use codex_account_pool::AccountPoolManager;
 use codex_account_pool::HealthEventDisposition;
+use codex_account_pool::LeaseGrant;
 use codex_account_pool::LegacyAuthBootstrap;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::RateLimitSnapshot;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
+use codex_login::auth::login_with_chatgpt_auth_tokens;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
@@ -192,6 +195,51 @@ async fn configured_lease_ttl_is_used_for_acquire_and_renew() {
     assert_eq!(renewed.expires_at() - renew_at, Duration::seconds(30));
 }
 
+#[tokio::test]
+async fn local_lease_scoped_session_refresh_preserves_stable_account_identity() {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let grant = seed_local_lease_session(&harness, "holder-a")
+        .await
+        .expect("seed local lease session");
+
+    let before = grant.auth_session.binding().account_id.clone();
+    let refreshed = grant
+        .auth_session
+        .refresh_leased_turn_auth()
+        .expect("refresh leased auth");
+    let after = grant.auth_session.binding().account_id.clone();
+
+    assert_eq!(before, after);
+    assert_eq!(refreshed.account_id(), Some(before));
+}
+
+async fn seed_local_lease_session(
+    harness: &TestHarness,
+    holder_instance_id: &str,
+) -> anyhow::Result<LeaseGrant> {
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    let grant = backend
+        .acquire_lease("legacy-default", holder_instance_id)
+        .await?;
+    let binding = grant.auth_session.binding().clone();
+    let auth_home = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(binding.backend_account_handle);
+    login_with_chatgpt_auth_tokens(
+        auth_home.as_path(),
+        &fake_access_token(binding.account_id.as_str()),
+        binding.account_id.as_str(),
+        None,
+    )?;
+
+    Ok(grant)
+}
+
 struct TestHarness {
     runtime: Arc<StateRuntime>,
     bootstrap_calls: Arc<AtomicUsize>,
@@ -277,4 +325,9 @@ fn default_config() -> AccountPoolConfig {
         default_pool_id: Some("legacy-default".to_string()),
         ..AccountPoolConfig::default()
     }
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    let _ = chatgpt_account_id;
+    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF91c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtbGVnYWN5In19.c2ln".to_string()
 }

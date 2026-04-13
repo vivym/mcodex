@@ -1,14 +1,17 @@
 use super::LocalAccountPoolBackend;
 use crate::backend::AccountPoolExecutionBackend;
+use crate::types::LeaseGrant;
 use async_trait::async_trait;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
-use codex_state::AccountLeaseRecord;
 use codex_state::AccountStartupSelectionState;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
+use std::sync::Arc;
 
 #[async_trait]
 impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
@@ -16,10 +19,30 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         &self,
         pool_id: &str,
         holder_instance_id: &str,
-    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
-        self.runtime
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let lease = self
+            .runtime
             .acquire_account_lease(pool_id, holder_instance_id, self.lease_ttl)
+            .await?;
+        let registered_account = self
+            .runtime
+            .read_registered_account(lease.account_id.as_str())
             .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+            .ok_or_else(|| {
+                AccountLeaseError::Storage(
+                    "registered account missing for acquired lease".to_string(),
+                )
+            })?;
+
+        let binding = LeaseAuthBinding {
+            account_id: lease.account_id.clone(),
+            backend_account_handle: registered_account.backend_account_handle,
+            lease_epoch: lease.lease_epoch as u64,
+        };
+        let auth_home = self.backend_private_auth_home(&binding.backend_account_handle);
+        let auth_session = Arc::new(LocalLeaseScopedAuthSession::new(binding, auth_home));
+        Ok(LeaseGrant::from_record(lease, auth_session, None))
     }
 
     async fn renew_lease(
