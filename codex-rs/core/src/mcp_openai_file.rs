@@ -33,7 +33,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let Some(arguments) = arguments_value.as_object() else {
         return Ok(Some(arguments_value));
     };
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let mut rewritten_arguments = arguments.clone();
 
     for field_name in openai_file_input_params {
@@ -142,10 +142,83 @@ async fn build_uploaded_local_argument_value(
 mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
+    use base64::Engine;
+    use codex_login::LeasedTurnAuth;
+    use codex_login::auth::LeaseAuthBinding;
+    use codex_login::auth::LeaseScopedAuthSession;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use serde::Serialize;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    struct TestLeaseScopedAuthSession {
+        binding: LeaseAuthBinding,
+    }
+
+    impl TestLeaseScopedAuthSession {
+        fn new(account_id: &str) -> Self {
+            Self {
+                binding: LeaseAuthBinding {
+                    account_id: account_id.to_string(),
+                    backend_account_handle: format!("handle-{account_id}"),
+                    lease_epoch: 1,
+                },
+            }
+        }
+    }
+
+    impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+        fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            self.refresh_leased_turn_auth()
+        }
+
+        fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+            Ok(LeasedTurnAuth::chatgpt(
+                self.binding.account_id.clone(),
+                fake_access_token(&self.binding.account_id),
+            ))
+        }
+
+        fn binding(&self) -> &LeaseAuthBinding {
+            &self.binding
+        }
+
+        fn ensure_current(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake_access_token(chatgpt_account_id: &str) -> String {
+        #[derive(Serialize)]
+        struct Header {
+            alg: &'static str,
+            typ: &'static str,
+        }
+
+        let header = Header {
+            alg: "none",
+            typ: "JWT",
+        };
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "email_verified": true,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-12345",
+                "chatgpt_account_id": chatgpt_account_id,
+            },
+        });
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
+            panic!("serialize header: {err}");
+        }));
+        let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
+            panic!("serialize payload: {err}");
+        }));
+        let signature_b64 = b64(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
 
     #[tokio::test]
     async fn openai_file_argument_rewrite_requires_declared_file_params() {
@@ -469,5 +542,89 @@ mod tests {
 
         assert!(error.contains("failed to upload"));
         assert!(error.contains("file"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_mcp_tool_arguments_for_openai_files_uses_leased_auth_when_available() {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::header;
+        use wiremock::matchers::method;
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files"))
+            .and(header("chatgpt-account-id", "pooled-account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "file_id": "file_lease",
+                "upload_url": format!("{}/upload/file_lease", server.uri()),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/upload/file_lease"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backend-api/files/file_lease/uploaded"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "success",
+                "download_url": format!("{}/download/file_lease", server.uri()),
+                "file_name": "file_report.csv",
+                "mime_type": "text/csv",
+                "file_size_bytes": 5,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (mut session, mut turn_context) = make_session_and_context().await;
+        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        );
+        session.services.lease_auth.replace_current(Some(Arc::new(
+            TestLeaseScopedAuthSession::new("pooled-account"),
+        )));
+        let dir = tempdir().expect("temp dir");
+        let local_path = dir.path().join("file_report.csv");
+        tokio::fs::write(&local_path, b"hello")
+            .await
+            .expect("write local file");
+        turn_context.cwd = AbsolutePathBuf::try_from(dir.path()).expect("absolute path");
+
+        let mut config = (*turn_context.config).clone();
+        config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+        turn_context.config = Arc::new(config);
+
+        let rewritten = rewrite_mcp_tool_arguments_for_openai_files(
+            &session,
+            &turn_context,
+            Some(serde_json::json!({
+                "file": "file_report.csv",
+            })),
+            Some(&["file".to_string()]),
+        )
+        .await
+        .expect("rewrite should upload with leased auth")
+        .expect("rewritten arguments");
+
+        assert_eq!(
+            rewritten,
+            serde_json::json!({
+                "file": {
+                    "download_url": format!("{}/download/file_lease", server.uri()),
+                    "file_id": "file_lease",
+                    "mime_type": "text/csv",
+                    "file_name": "file_report.csv",
+                    "uri": "sediment://file_lease",
+                    "file_size_bytes": 5,
+                }
+            })
+        );
     }
 }

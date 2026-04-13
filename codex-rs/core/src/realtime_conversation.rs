@@ -514,12 +514,7 @@ async fn prepare_realtime_start(
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
     let provider = sess.provider().await;
-    let auth_manager = sess
-        .services
-        .model_client
-        .auth_manager()
-        .unwrap_or_else(|| Arc::clone(&sess.services.auth_manager));
-    let auth = auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let config = sess.get_config().await;
     let transport = params
         .transport

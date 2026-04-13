@@ -72,7 +72,7 @@ impl ToolHandler for ToolSuggestHandler {
             ));
         }
 
-        let auth = session.services.auth_manager.auth().await;
+        let auth = session.current_auth().await;
         let manager = session.services.mcp_connection_manager.read().await;
         let mcp_tools = manager.list_all_tools().await;
         drop(manager);

@@ -193,7 +193,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
 
     // Refresh from the effective merged MCP map (global + repo + managed) and
     // overlay the updated global servers so we don't drop repo-scoped servers.
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let mut refresh_servers = sess
         .services
         .mcp_manager
