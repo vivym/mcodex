@@ -24,28 +24,40 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
             .runtime
             .acquire_account_lease(pool_id, holder_instance_id, self.lease_ttl)
             .await?;
-        let registered_account = self
+        let registered_account = match self
             .runtime
             .read_registered_account(lease.account_id.as_str())
             .await
-            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
-            .ok_or_else(|| {
-                AccountLeaseError::Storage(
+        {
+            Ok(Some(registered_account)) => registered_account,
+            Ok(None) => {
+                self.release_failed_acquisition(&lease, None).await;
+                return Err(AccountLeaseError::Storage(
                     "registered account missing for acquired lease".to_string(),
-                )
-            })?;
+                ));
+            }
+            Err(err) => {
+                self.release_failed_acquisition(&lease, None).await;
+                return Err(AccountLeaseError::Storage(err.to_string()));
+            }
+        };
 
         let binding = LeaseAuthBinding {
             account_id: lease.account_id.clone(),
             backend_account_handle: registered_account.backend_account_handle,
             lease_epoch: lease.lease_epoch as u64,
         };
-        self.write_backend_private_lease_epoch(
-            binding.backend_account_handle.as_str(),
-            binding.lease_epoch,
-        )
-        .await
-        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+        if let Err(err) = self
+            .write_backend_private_lease_epoch(
+                binding.backend_account_handle.as_str(),
+                binding.lease_epoch,
+            )
+            .await
+        {
+            self.release_failed_acquisition(&lease, Some(&binding.backend_account_handle))
+                .await;
+            return Err(AccountLeaseError::Storage(err.to_string()));
+        }
         let auth_home = self.backend_private_auth_home(&binding.backend_account_handle);
         let auth_session = Arc::new(LocalLeaseScopedAuthSession::new(binding, auth_home));
         Ok(LeaseGrant::from_record(lease, auth_session, None))
@@ -93,5 +105,34 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
 
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState> {
         self.runtime.read_account_startup_selection().await
+    }
+}
+
+impl LocalAccountPoolBackend {
+    async fn release_failed_acquisition(
+        &self,
+        lease: &codex_state::AccountLeaseRecord,
+        backend_account_handle: Option<&str>,
+    ) {
+        if let Some(backend_account_handle) = backend_account_handle
+            && let Err(err) = self
+                .clear_backend_private_lease_epoch(backend_account_handle)
+                .await
+        {
+            eprintln!(
+                "failed to clear backend-private lease epoch marker after lease acquisition failure for {backend_account_handle}: {err}"
+            );
+        }
+
+        if let Err(err) = self
+            .runtime
+            .release_account_lease(&lease.lease_key(), Utc::now())
+            .await
+        {
+            eprintln!(
+                "failed to release acquired lease after lease acquisition failure for lease {} account {}: {err}",
+                lease.lease_id, lease.account_id
+            );
+        }
     }
 }

@@ -10,7 +10,6 @@ use codex_login::TokenData;
 use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth::LocalLeaseScopedAuthSession;
-use codex_login::auth::write_lease_epoch_marker;
 use codex_login::login_with_api_key;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
@@ -90,20 +89,34 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_r
         },
         AuthCredentialsStoreMode::File,
     )?;
-    write_lease_epoch_marker(auth_home.as_path(), 1)?;
+    LocalLeaseScopedAuthSession::write_lease_epoch_marker(auth_home.as_path(), 1)?;
     let session = LocalLeaseScopedAuthSession::new(binding, auth_home.clone());
     assert_eq!(
         session.refresh_leased_turn_auth()?.account_id(),
         Some("acct-1".to_string())
     );
 
-    write_lease_epoch_marker(auth_home.as_path(), 2)?;
+    save_auth(
+        auth_home.as_path(),
+        &AuthDotJson {
+            auth_mode: None,
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&fake_access_token("acct-2"))?,
+                access_token: "managed-access-2".to_string(),
+                refresh_token: "managed-refresh-2".to_string(),
+                account_id: Some("acct-2".to_string()),
+            }),
+            last_refresh: Some(Utc::now()),
+        },
+        AuthCredentialsStoreMode::File,
+    )?;
 
     let err = session
         .refresh_leased_turn_auth()
-        .expect_err("stale lease should fail closed");
+        .expect_err("rebound auth should fail closed");
     assert!(
-        err.to_string().contains("lease epoch mismatch"),
+        err.to_string().contains("rebinding"),
         "unexpected error: {err}"
     );
 

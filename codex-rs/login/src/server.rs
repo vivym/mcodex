@@ -390,6 +390,9 @@ async fn process_request(
                         ) {
                             Ok(tokens) => tokens,
                             Err(err) => {
+                                if let Some(sender) = completion.lock().await.take() {
+                                    drop(sender);
+                                }
                                 return login_error_response(
                                     &format!(
                                         "Sign-in completed but pooled registration failed: {err}"

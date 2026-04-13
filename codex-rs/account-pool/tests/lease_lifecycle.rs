@@ -1,3 +1,4 @@
+use base64::Engine;
 use chrono::Duration;
 use chrono::Utc;
 use codex_account_pool::AccountPoolConfig;
@@ -9,6 +10,7 @@ use codex_account_pool::LeaseGrant;
 use codex_account_pool::LegacyAuthBootstrap;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::RateLimitSnapshot;
+use codex_account_pool::RegisteredAccountRegistration;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
 use codex_login::AuthCredentialsStoreMode;
@@ -19,6 +21,9 @@ use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
+use serde::Serialize;
+use serde_json::json;
+use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -117,6 +122,20 @@ mod lease_lifecycle {
         stale_lease_scoped_session_fails_after_epoch_supersession()
             .await
             .expect("stale session should fail after epoch supersession");
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_releases_lease_when_marker_write_fails() {
+        super::acquire_lease_releases_lease_when_marker_write_fails()
+            .await
+            .expect("failed acquisition should be compensated");
+    }
+
+    #[tokio::test]
+    async fn lease_lifecycle_register_account_cleans_backend_private_auth_on_db_failure() {
+        register_account_cleans_backend_private_auth_on_db_failure()
+            .await
+            .expect("failed registration should clean up backend-private auth");
     }
 }
 
@@ -239,31 +258,13 @@ pub(crate) async fn register_account_persists_backend_private_auth_for_pooled_ac
         harness.runtime.clone(),
         default_config().lease_ttl_duration(),
     );
-    let request = RegisteredAccountUpsert {
-        account_id: "acct-1".to_string(),
-        backend_id: "local".to_string(),
-        backend_family: "local".to_string(),
-        workspace_id: None,
-        backend_account_handle: "backend-handle-1".to_string(),
-        account_kind: "chatgpt".to_string(),
-        provider_fingerprint: "fingerprint-1".to_string(),
-        display_name: Some("Managed ChatGPT".to_string()),
-        source: None,
-        enabled: true,
-        healthy: true,
-        membership: Some(RegisteredAccountMembership {
-            pool_id: "legacy-default".to_string(),
-            position: 1,
-        }),
-    };
-    let tokens = ChatgptManagedRegistrationTokens {
-        id_token: fake_access_token("acct-1"),
-        access_token: "managed-access".to_string().into(),
-        refresh_token: "managed-refresh".to_string().into(),
-        account_id: "acct-1".to_string(),
-    };
-
-    let record = backend.register_account(request, Some(tokens)).await?;
+    let record = backend
+        .register_account(pooled_registration(
+            "acct-1",
+            "backend-handle-1",
+            "fingerprint-1",
+        ))
+        .await?;
 
     let auth_home = harness
         .runtime
@@ -275,6 +276,48 @@ pub(crate) async fn register_account_persists_backend_private_auth_for_pooled_ac
 
     assert_eq!(record.backend_account_handle, "backend-handle-1");
     assert_eq!(auth.get_account_id(), Some("acct-1".to_string()));
+    Ok(())
+}
+
+pub(crate) async fn register_account_cleans_backend_private_auth_on_db_failure()
+-> anyhow::Result<()> {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    harness
+        .runtime
+        .upsert_registered_account(pooled_registration_request(
+            "acct-a",
+            "backend-handle-1",
+            "fingerprint-a",
+        ))
+        .await?;
+    harness
+        .runtime
+        .upsert_registered_account(pooled_registration_request(
+            "acct-b",
+            "backend-handle-2",
+            "fingerprint-b",
+        ))
+        .await?;
+    let request = pooled_registration("acct-new", "backend-handle-1", "fingerprint-b");
+    let auth_home = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts")
+        .join(request.request.backend_account_handle.as_str());
+
+    let err = backend
+        .register_account(request)
+        .await
+        .expect_err("registration should fail");
+    assert!(err.to_string().contains("conflicting registered accounts"));
+    assert!(
+        !auth_home.exists(),
+        "backend-private auth should be cleaned up"
+    );
     Ok(())
 }
 
@@ -313,6 +356,47 @@ pub(crate) async fn stale_lease_scoped_session_fails_after_epoch_supersession() 
     Ok(())
 }
 
+pub(crate) async fn acquire_lease_releases_lease_when_marker_write_fails() -> anyhow::Result<()> {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    backend
+        .register_account(pooled_registration(
+            "acct-legacy",
+            "backend-handle-legacy",
+            "fingerprint-legacy",
+        ))
+        .await?;
+
+    let auth_home = harness
+        .runtime
+        .codex_home()
+        .join(".pooled-auth/backends/local/accounts")
+        .join("backend-handle-legacy");
+    fs::remove_dir_all(&auth_home)?;
+    fs::write(&auth_home, "blocking-file")?;
+
+    let err = backend
+        .acquire_lease("legacy-default", "holder-a")
+        .await
+        .expect_err("marker write should fail");
+    assert!(
+        err.to_string().contains("blocking-file")
+            || err.to_string().contains("Not a directory")
+            || err.to_string().contains("File exists"),
+        "unexpected error: {err}"
+    );
+
+    assert_eq!(
+        harness.runtime.read_active_holder_lease("holder-a").await?,
+        None
+    );
+
+    Ok(())
+}
+
 async fn seed_local_lease_session(
     harness: &TestHarness,
     holder_instance_id: &str,
@@ -322,10 +406,11 @@ async fn seed_local_lease_session(
         default_config().lease_ttl_duration(),
     );
     backend
-        .register_account(
-            pooled_account_registration_request("acct-legacy", "backend-handle-legacy"),
-            Some(pooled_account_registration_tokens("acct-legacy")),
-        )
+        .register_account(pooled_registration(
+            "acct-legacy",
+            "backend-handle-legacy",
+            "fingerprint-legacy",
+        ))
         .await?;
     let grant = backend
         .acquire_lease("legacy-default", holder_instance_id)
@@ -421,9 +506,30 @@ fn default_config() -> AccountPoolConfig {
     }
 }
 
-fn pooled_account_registration_request(
+fn pooled_registration(
     account_id: &str,
     backend_account_handle: &str,
+    provider_fingerprint: &str,
+) -> RegisteredAccountRegistration {
+    RegisteredAccountRegistration {
+        request: pooled_registration_request(
+            account_id,
+            backend_account_handle,
+            provider_fingerprint,
+        ),
+        pooled_registration_tokens: Some(ChatgptManagedRegistrationTokens {
+            id_token: fake_access_token(account_id),
+            access_token: "managed-access".to_string().into(),
+            refresh_token: "managed-refresh".to_string().into(),
+            account_id: account_id.to_string(),
+        }),
+    }
+}
+
+fn pooled_registration_request(
+    account_id: &str,
+    backend_account_handle: &str,
+    provider_fingerprint: &str,
 ) -> RegisteredAccountUpsert {
     RegisteredAccountUpsert {
         account_id: account_id.to_string(),
@@ -432,7 +538,7 @@ fn pooled_account_registration_request(
         workspace_id: None,
         backend_account_handle: backend_account_handle.to_string(),
         account_kind: "chatgpt".to_string(),
-        provider_fingerprint: format!("fingerprint-{account_id}"),
+        provider_fingerprint: provider_fingerprint.to_string(),
         display_name: Some("Managed ChatGPT".to_string()),
         source: None,
         enabled: true,
@@ -444,16 +550,29 @@ fn pooled_account_registration_request(
     }
 }
 
-fn pooled_account_registration_tokens(account_id: &str) -> ChatgptManagedRegistrationTokens {
-    ChatgptManagedRegistrationTokens {
-        id_token: fake_access_token(account_id),
-        access_token: "managed-access".to_string().into(),
-        refresh_token: "managed-refresh".to_string().into(),
-        account_id: account_id.to_string(),
-    }
-}
-
 fn fake_access_token(chatgpt_account_id: &str) -> String {
-    let _ = chatgpt_account_id;
-    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF91c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFjY3QtbGVnYWN5In19.c2ln".to_string()
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }

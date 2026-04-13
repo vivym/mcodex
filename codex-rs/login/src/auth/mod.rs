@@ -14,8 +14,6 @@ pub use error::RefreshTokenFailedReason;
 pub use lease_scoped_session::LeaseAuthBinding;
 pub use lease_scoped_session::LeaseScopedAuthSession;
 pub use lease_scoped_session::LocalLeaseScopedAuthSession;
-pub use lease_scoped_session::clear_lease_epoch_marker;
-pub use lease_scoped_session::write_lease_epoch_marker;
 pub use leased_auth::LeasedTurnAuth;
 pub use legacy_auth_view::LegacyAuthView;
 pub use manager::*;

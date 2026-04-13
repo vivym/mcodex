@@ -5,7 +5,6 @@ use anyhow::anyhow;
 use anyhow::bail;
 use codex_config::types::AuthCredentialsStoreMode;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 
 /// Binding that ties a session to the account and lease that created it.
@@ -34,6 +33,20 @@ pub struct LocalLeaseScopedAuthSession {
 impl LocalLeaseScopedAuthSession {
     pub fn new(binding: LeaseAuthBinding, auth_home: PathBuf) -> Self {
         Self { binding, auth_home }
+    }
+
+    pub fn write_lease_epoch_marker(auth_home: &std::path::Path, lease_epoch: u64) -> Result<()> {
+        fs::create_dir_all(auth_home)?;
+        fs::write(lease_epoch_marker_path(auth_home), lease_epoch.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_lease_epoch_marker(auth_home: &std::path::Path) -> Result<()> {
+        match fs::remove_file(lease_epoch_marker_path(auth_home)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn load_bound_auth(&self) -> Result<CodexAuth> {
@@ -76,27 +89,13 @@ impl LocalLeaseScopedAuthSession {
     }
 }
 
-pub fn write_lease_epoch_marker(auth_home: &Path, lease_epoch: u64) -> Result<()> {
-    fs::create_dir_all(auth_home)?;
-    fs::write(lease_epoch_marker_path(auth_home), lease_epoch.to_string())?;
-    Ok(())
-}
-
-pub fn clear_lease_epoch_marker(auth_home: &Path) -> Result<()> {
-    match fs::remove_file(lease_epoch_marker_path(auth_home)) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn read_lease_epoch_marker(auth_home: &Path) -> Result<u64> {
+fn read_lease_epoch_marker(auth_home: &std::path::Path) -> Result<u64> {
     let marker = fs::read_to_string(lease_epoch_marker_path(auth_home))?;
     let lease_epoch = marker.trim().parse::<u64>()?;
     Ok(lease_epoch)
 }
 
-fn lease_epoch_marker_path(auth_home: &Path) -> PathBuf {
+fn lease_epoch_marker_path(auth_home: &std::path::Path) -> PathBuf {
     auth_home.join("lease_epoch")
 }
 

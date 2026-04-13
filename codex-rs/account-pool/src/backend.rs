@@ -62,10 +62,16 @@ pub trait AccountPoolControlPlane: Send + Sync {
     /// Register or update a pooled account record.
     async fn register_account(
         &self,
-        request: RegisteredAccountUpsert,
-        pooled_registration_tokens: Option<ChatgptManagedRegistrationTokens>,
+        request: RegisteredAccountRegistration,
     ) -> anyhow::Result<RegisteredAccountRecord>;
 
     /// Delete a pooled account record by account identifier.
     async fn delete_registered_account(&self, account_id: &str) -> anyhow::Result<bool>;
+}
+
+/// Self-describing request for pooled account registration.
+#[derive(Debug, Clone)]
+pub struct RegisteredAccountRegistration {
+    pub request: RegisteredAccountUpsert,
+    pub pooled_registration_tokens: Option<ChatgptManagedRegistrationTokens>,
 }
