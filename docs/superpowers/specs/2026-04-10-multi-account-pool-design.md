@@ -841,9 +841,14 @@ Other shipped products or commands that still intentionally read shared compatib
 pooled leased auth.
 
 Legacy `codex login` clears durable default-startup suppression.
-Legacy `codex logout` also enables durable default-startup suppression for pooled auto-selection.
-Generic future runtime instances should remain signed out until the user explicitly resumes pooled selection
-through a pool-aware command.
+Legacy `codex logout` revokes any active process-local pooled lease and enables durable
+default-startup suppression only for managed or persisted legacy auth modes.
+When the current auth mode is runtime-local `chatgptAuthTokens`, `codex logout` remains
+runtime-local and non-durable.
+Note: the addendum in `2026-04-13-pooled-account-registration-design.md` is the normative source
+for logout behavior refinements introduced after this base design.
+Generic future runtime instances should remain signed out until the user explicitly resumes pooled
+selection through a pool-aware command.
 
 Pool selection in v1 should be explicit:
 
