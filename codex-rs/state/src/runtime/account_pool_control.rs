@@ -477,8 +477,8 @@ ON CONFLICT(idempotency_key) DO UPDATE SET
     target_pool_id = excluded.target_pool_id,
     backend_account_handle = excluded.backend_account_handle,
     account_id = excluded.account_id,
-    completed_at = NULL,
     updated_at = excluded.updated_at
+WHERE pending_account_registration.completed_at IS NULL
             "#,
         )
         .bind(&entry.idempotency_key)

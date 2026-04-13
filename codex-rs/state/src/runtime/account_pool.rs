@@ -3109,6 +3109,17 @@ WHERE account_id = ?
             .finalize_pending_account_registration("idem-1", "handle-1", "acct-1")
             .await
             .expect("finalize pending registration");
+        runtime
+            .create_pending_account_registration(NewPendingAccountRegistration {
+                idempotency_key: "idem-1".to_string(),
+                backend_id: "local".to_string(),
+                provider_kind: "chatgpt".to_string(),
+                target_pool_id: Some("team-other".to_string()),
+                backend_account_handle: None,
+                account_id: None,
+            })
+            .await
+            .expect("do not reopen finalized pending registration");
 
         assert_eq!(
             runtime
