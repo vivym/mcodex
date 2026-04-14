@@ -8,12 +8,14 @@ use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::ChatGptAuthFixture;
 use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::encode_id_token;
 use app_test_support::to_response;
+use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -25,6 +27,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
@@ -444,6 +447,7 @@ async fn seed_default_pool_state(codex_home: &std::path::Path) -> Result<Arc<Sta
             account_id: PRIMARY_ACCOUNT_ID.to_string(),
         })
         .await?;
+    write_pooled_auth(codex_home, PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID)?;
     Ok(runtime)
 }
 
@@ -454,7 +458,25 @@ async fn seed_two_accounts(codex_home: &std::path::Path) -> Result<Arc<StateRunt
             account_id: SECONDARY_ACCOUNT_ID.to_string(),
         })
         .await?;
+    write_pooled_auth(codex_home, SECONDARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID)?;
     Ok(runtime)
+}
+
+fn write_pooled_auth(
+    codex_home: &std::path::Path,
+    backend_account_handle: &str,
+    account_id: &str,
+) -> Result<()> {
+    let auth_home = codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(backend_account_handle);
+    write_chatgpt_auth(
+        auth_home.as_path(),
+        ChatGptAuthFixture::new(format!("pooled-access-{account_id}"))
+            .account_id(account_id)
+            .chatgpt_account_id(account_id),
+        AuthCredentialsStoreMode::File,
+    )
 }
 
 async fn start_thread(mcp: &mut McpProcess) -> Result<codex_app_server_protocol::Thread> {
