@@ -226,6 +226,9 @@ pub(crate) mod test_support;
 
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
+use crate::startup_access::StartupPromptDecision;
+use crate::startup_access::probe_startup_access;
+use crate::startup_access::resolve_startup_prompt_decision_with_probe;
 use crate::tui::Tui;
 pub use cli::Cli;
 use codex_arg0::Arg0DispatchPaths;
@@ -1085,26 +1088,47 @@ async fn run_ratatui_app(
     } else {
         LoginStatus::NotAuthenticated
     };
-    let should_show_onboarding =
-        should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
+    let startup_prompt_decision = if initial_config.model_provider.requires_openai_auth
+        && login_status == LoginStatus::NotAuthenticated
+    {
+        let Some(app_server) = app_server.as_ref() else {
+            unreachable!("app server should exist when auth is required");
+        };
+        resolve_startup_prompt_decision_with_probe(
+            login_status,
+            initial_config.model_provider.requires_openai_auth,
+            initial_config
+                .notices
+                .hide_pooled_only_startup_notice
+                .unwrap_or(false),
+            probe_startup_access(app_server, &initial_config).await,
+        )
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?
+    } else {
+        StartupPromptDecision::NoPrompt
+    };
+    let should_show_onboarding = should_show_onboarding(
+        login_status,
+        should_show_trust_screen_flag,
+        startup_prompt_decision,
+    );
 
     let config = if should_show_onboarding {
-        let show_login_screen = should_show_login_screen(login_status, &initial_config);
+        let show_login_screen =
+            should_show_login_screen(login_status, &initial_config, startup_prompt_decision);
         let onboarding_result = run_onboarding_app(
             OnboardingScreenArgs {
                 show_login_screen,
                 show_trust_screen: should_show_trust_screen_flag,
+                startup_prompt_decision,
                 login_status,
                 app_server_request_handle: app_server
                     .as_ref()
                     .map(AppServerSession::request_handle),
                 config: initial_config.clone(),
             },
-            if show_login_screen {
-                app_server.as_mut()
-            } else {
-                None
-            },
+            app_server.as_mut(),
             &mut tui,
         )
         .await?;
@@ -1122,10 +1146,11 @@ async fn run_ratatui_app(
             });
         }
         trust_decision_was_made = onboarding_result.directory_trust_decision.is_some();
+        let login_flow_shown = show_login_screen || onboarding_result.login_flow_shown;
         // If this onboarding run included the login step, always refresh cloud requirements and
         // rebuild config. This avoids missing newly available cloud requirements due to login
         // status detection edge cases.
-        if show_login_screen && !remote_mode {
+        if login_flow_shown && !remote_mode {
             cloud_requirements = cloud_requirements_loader_for_storage(
                 initial_config.codex_home.clone(),
                 /*enable_codex_api_key_env*/ false,
@@ -1137,7 +1162,11 @@ async fn run_ratatui_app(
         // If the user made an explicit trust decision, or we showed the login flow, reload config
         // so current process state reflects persisted trust/auth changes.
         if onboarding_result.directory_trust_decision.is_some()
-            || (show_login_screen && !remote_mode)
+            || should_reload_config_after_onboarding(
+                login_flow_shown,
+                remote_mode,
+                &onboarding_result,
+            )
         {
             load_config_or_exit(
                 cli_kv_overrides.clone(),
@@ -1709,29 +1738,50 @@ fn should_show_trust_screen(config: &Config) -> bool {
 
 fn should_show_onboarding(
     login_status: LoginStatus,
-    config: &Config,
     show_trust_screen: bool,
+    startup_prompt_decision: StartupPromptDecision,
 ) -> bool {
     if show_trust_screen {
         return true;
     }
 
-    should_show_login_screen(login_status, config)
+    match startup_prompt_decision {
+        StartupPromptDecision::NeedsLogin => login_status == LoginStatus::NotAuthenticated,
+        StartupPromptDecision::PooledOnlyNotice
+        | StartupPromptDecision::PooledAccessPausedNotice => true,
+        StartupPromptDecision::NoPrompt => false,
+    }
 }
 
-fn should_show_login_screen(login_status: LoginStatus, config: &Config) -> bool {
+fn should_show_login_screen(
+    login_status: LoginStatus,
+    config: &Config,
+    startup_prompt_decision: StartupPromptDecision,
+) -> bool {
     // Only show the login screen for providers that actually require OpenAI auth
     // (OpenAI or equivalents). For OSS/other providers, skip login entirely.
     if !config.model_provider.requires_openai_auth {
         return false;
     }
 
-    login_status == LoginStatus::NotAuthenticated
+    matches!(startup_prompt_decision, StartupPromptDecision::NeedsLogin)
+        && login_status == LoginStatus::NotAuthenticated
+}
+
+fn should_reload_config_after_onboarding(
+    login_flow_shown: bool,
+    remote_mode: bool,
+    onboarding_result: &crate::onboarding::onboarding_screen::OnboardingResult,
+) -> bool {
+    (onboarding_result.reload_config && !remote_mode)
+        || onboarding_result.directory_trust_decision.is_some()
+        || (login_flow_shown && !remote_mode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::startup_access::StartupPromptDecision;
     use codex_app_server_protocol::ClientRequest;
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ThreadStartParams;
@@ -1914,6 +1964,127 @@ mod tests {
         assert_eq!(params.model_providers, None);
         assert_eq!(params.cwd.as_deref(), Some("repo/on/server"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_only_notice_triggers_onboarding() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(should_show_onboarding(
+            LoginStatus::NotAuthenticated,
+            /*show_trust_screen*/ false,
+            StartupPromptDecision::PooledOnlyNotice,
+        ));
+        assert!(config.model_provider.requires_openai_auth);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_paused_notice_triggers_onboarding() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(should_show_onboarding(
+            LoginStatus::NotAuthenticated,
+            /*show_trust_screen*/ false,
+            StartupPromptDecision::PooledAccessPausedNotice,
+        ));
+        assert!(config.model_provider.requires_openai_auth);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_pooled_only_notice_skips_onboarding() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(!should_show_onboarding(
+            LoginStatus::NotAuthenticated,
+            /*show_trust_screen*/ false,
+            StartupPromptDecision::NoPrompt,
+        ));
+        assert!(config.model_provider.requires_openai_auth);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn needs_login_triggers_onboarding() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(should_show_onboarding(
+            LoginStatus::NotAuthenticated,
+            /*show_trust_screen*/ false,
+            StartupPromptDecision::NeedsLogin,
+        ));
+        assert!(config.model_provider.requires_openai_auth);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_notice_does_not_show_login_screen_until_requested() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(!should_show_login_screen(
+            LoginStatus::NotAuthenticated,
+            &config,
+            StartupPromptDecision::PooledOnlyNotice,
+        ));
+        assert!(!should_show_login_screen(
+            LoginStatus::NotAuthenticated,
+            &config,
+            StartupPromptDecision::PooledAccessPausedNotice,
+        ));
+        assert!(should_show_login_screen(
+            LoginStatus::NotAuthenticated,
+            &config,
+            StartupPromptDecision::NeedsLogin,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn local_notice_persistence_requests_config_reload() {
+        let result = crate::onboarding::onboarding_screen::OnboardingResult {
+            directory_trust_decision: None,
+            should_exit: false,
+            reload_config: true,
+            login_flow_shown: false,
+        };
+
+        assert!(should_reload_config_after_onboarding(
+            /*login_flow_shown*/ false, /*remote_mode*/ false, &result,
+        ));
+    }
+
+    #[test]
+    fn remote_notice_persistence_does_not_force_config_reload() {
+        let result = crate::onboarding::onboarding_screen::OnboardingResult {
+            directory_trust_decision: None,
+            should_exit: false,
+            reload_config: true,
+            login_flow_shown: false,
+        };
+
+        assert!(!should_reload_config_after_onboarding(
+            /*login_flow_shown*/ false, /*remote_mode*/ true, &result,
+        ));
+    }
+
+    #[test]
+    fn revealed_pooled_notice_login_flow_requests_local_config_reload() {
+        let result = crate::onboarding::onboarding_screen::OnboardingResult {
+            directory_trust_decision: None,
+            should_exit: false,
+            reload_config: false,
+            login_flow_shown: true,
+        };
+
+        assert!(should_reload_config_after_onboarding(
+            /*login_flow_shown*/ true, /*remote_mode*/ false, &result,
+        ));
     }
 
     #[test]

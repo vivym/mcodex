@@ -1,0 +1,11 @@
+---
+source: tui/src/onboarding/onboarding_screen.rs
+expression: render_to_string(&screen)
+---
+  Welcome to Codex, OpenAI's command-line coding agent
+
+  Pooled access is available
+
+  You can continue with pooled access or hand off to login.
+
+  Press enter to continue, press l to log in, or press n to hide and con
