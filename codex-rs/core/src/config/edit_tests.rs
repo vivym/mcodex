@@ -464,6 +464,40 @@ hide_rate_limit_model_nudge = true
 }
 
 #[test]
+fn set_hide_pooled_only_startup_notice_writes_notice_flag() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_hide_pooled_only_startup_notice(true)
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[notice]
+hide_pooled_only_startup_notice = true
+"#;
+    assert_eq!(contents, expected);
+}
+
+#[test]
+fn set_hide_pooled_only_startup_notice_false_writes_visible_state() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_hide_pooled_only_startup_notice(false)
+        .apply_blocking()
+        .expect("persist");
+
+    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let expected = r#"[notice]
+hide_pooled_only_startup_notice = false
+"#;
+    assert_eq!(contents, expected);
+}
+
+#[test]
 fn blocking_set_hide_gpt5_1_migration_prompt_preserves_table() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();

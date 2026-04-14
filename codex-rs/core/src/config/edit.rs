@@ -39,6 +39,8 @@ pub enum ConfigEdit {
     SetNoticeHideWorldWritableWarning(bool),
     /// Toggle the rate limit model nudge acknowledgement flag.
     SetNoticeHideRateLimitModelNudge(bool),
+    /// Toggle the pooled-only startup notice acknowledgement flag.
+    SetNoticeHidePooledOnlyStartupNotice(bool),
     /// Toggle the Windows onboarding acknowledgement flag.
     SetWindowsWslSetupAcknowledged(bool),
     /// Toggle the model migration prompt acknowledgement flag.
@@ -399,6 +401,11 @@ impl ConfigDocument {
             ConfigEdit::SetNoticeHideRateLimitModelNudge(acknowledged) => Ok(self.write_value(
                 Scope::Global,
                 &[NOTICE_TABLE_KEY, "hide_rate_limit_model_nudge"],
+                value(*acknowledged),
+            )),
+            ConfigEdit::SetNoticeHidePooledOnlyStartupNotice(acknowledged) => Ok(self.write_value(
+                Scope::Global,
+                &[NOTICE_TABLE_KEY, "hide_pooled_only_startup_notice"],
                 value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideModelMigrationPrompt(migration_config, acknowledged) => {
@@ -894,6 +901,14 @@ impl ConfigEditsBuilder {
     pub fn set_hide_rate_limit_model_nudge(mut self, acknowledged: bool) -> Self {
         self.edits
             .push(ConfigEdit::SetNoticeHideRateLimitModelNudge(acknowledged));
+        self
+    }
+
+    pub fn set_hide_pooled_only_startup_notice(mut self, acknowledged: bool) -> Self {
+        self.edits
+            .push(ConfigEdit::SetNoticeHidePooledOnlyStartupNotice(
+                acknowledged,
+            ));
         self
     }
 
