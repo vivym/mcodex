@@ -147,14 +147,23 @@ mod tests {
     use codex_app_server_protocol::AuthMode as AppServerAuthMode;
     use codex_config::types::AccountsConfigToml;
     use codex_core::config::ConfigBuilder;
+    use codex_core::config_loader::LoaderOverrides;
     use codex_state::AccountRegistryEntryUpdate;
     use codex_state::AccountStartupSelectionUpdate;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    async fn test_config(codex_home: &std::path::Path) -> Config {
+    async fn test_config(fixture_root: &std::path::Path) -> Config {
+        let cwd = fixture_root.join("cwd");
+        let sqlite_home = fixture_root.join("sqlite");
+        std::fs::create_dir_all(&cwd).expect("create cwd fixture");
+        std::fs::create_dir_all(&sqlite_home).expect("create sqlite fixture");
+
         let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.to_path_buf())
+            .codex_home(fixture_root.to_path_buf())
+            .fallback_cwd(Some(cwd.clone()))
+            .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
             .build()
             .await
             .expect("load config");
@@ -162,6 +171,8 @@ mod tests {
             default_pool: Some("pool-main".to_string()),
             ..Default::default()
         });
+        config.cwd = AbsolutePathBuf::try_from(cwd).expect("cwd should be absolute");
+        config.sqlite_home = sqlite_home;
         config
     }
 
