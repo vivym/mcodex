@@ -11,14 +11,17 @@ use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLeaseReadResponse;
+use codex_app_server_protocol::AccountLeaseResumeResponse;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
+use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
@@ -331,6 +334,75 @@ impl AppServerSession {
             response,
             Local::now(),
         ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn read_account_lease_startup_probe(
+        &self,
+    ) -> Result<Option<AccountLeaseReadResponse>> {
+        const METHOD: &str = "accountLease/read";
+        const METHOD_NOT_FOUND: i64 = -32601;
+
+        let request_id = self.next_request_id();
+        let response = self
+            .client
+            .request(ClientRequest::AccountLeaseRead {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("accountLease/read failed during TUI startup probe")?;
+
+        match response {
+            Ok(payload) => serde_json::from_value(payload)
+                .map(Some)
+                .map_err(|source| TypedRequestError::Deserialize {
+                    method: METHOD.to_string(),
+                    source,
+                })
+                .wrap_err("accountLease/read failed during TUI startup probe"),
+            Err(source) if source.code == METHOD_NOT_FOUND => Ok(None),
+            Err(source) => Err(TypedRequestError::Server {
+                method: METHOD.to_string(),
+                source,
+            })
+            .wrap_err("accountLease/read failed during TUI startup probe"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn resume_pooled_startup(&self) -> Result<AccountLeaseResumeResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::AccountLeaseResume {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("accountLease/resume failed in TUI")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn write_hide_pooled_only_startup_notice(&self, hide: bool) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: ConfigWriteResponse = self
+            .client
+            .request_typed(ClientRequest::ConfigBatchWrite {
+                request_id,
+                params: ConfigBatchWriteParams {
+                    edits: vec![ConfigEdit {
+                        key_path: "notice.hide_pooled_only_startup_notice".to_string(),
+                        value: serde_json::json!(hide),
+                        merge_strategy: MergeStrategy::Replace,
+                    }],
+                    file_path: None,
+                    expected_version: None,
+                    reload_user_config: false,
+                },
+            })
+            .await
+            .wrap_err("config/batchWrite failed while writing pooled startup notice preference")?;
+        Ok(())
     }
 
     pub(crate) async fn next_event(&mut self) -> Option<AppServerEvent> {

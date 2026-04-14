@@ -143,6 +143,7 @@ mod session_log;
 mod shimmer;
 mod skills_helpers;
 mod slash_command;
+mod startup_access;
 mod status;
 mod status_indicator_widget;
 mod streaming;
