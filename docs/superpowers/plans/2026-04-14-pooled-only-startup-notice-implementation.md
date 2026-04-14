@@ -565,7 +565,7 @@ just fix -p codex-tui
 
 Expected: PASS with no additional source edits required.
 
-- [ ] **Step 3: Ask before full workspace test** (Deferred: full workspace `cargo test` still requires explicit approval.)
+- [x] **Step 3: Ask before full workspace test** (Completed: the user approved and full workspace `cargo test` passed.)
 
 If the user approves, run:
 
