@@ -3,6 +3,7 @@
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::Widget;
@@ -61,8 +62,8 @@ impl PooledAccessNoticeWidget {
         self.outcome
     }
 
-    pub(crate) fn set_error(&mut self, error: String) {
-        self.error = Some(error);
+    pub(crate) fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
     }
 
     fn title(&self) -> &'static str {
@@ -88,9 +89,11 @@ impl PooledAccessNoticeWidget {
             PooledAccessNoticeKind::PooledOnly => Line::from(vec![
                 "Press ".dim(),
                 key_hint::plain(KeyCode::Enter).into(),
-                " to continue, or press ".dim(),
+                " to continue, press ".dim(),
                 key_hint::plain(KeyCode::Char('l')).into(),
-                " to log in".dim(),
+                " to log in, or press ".dim(),
+                key_hint::plain(KeyCode::Char('n')).into(),
+                " to hide and continue".dim(),
             ]),
             PooledAccessNoticeKind::PooledPaused => Line::from(vec![
                 "Press ".dim(),
@@ -118,8 +121,20 @@ impl KeyboardHandler for PooledAccessNoticeWidget {
                     }
                 });
             }
-            KeyCode::Char('l') | KeyCode::Char('L') => {
+            KeyCode::Char('l') | KeyCode::Char('L')
+                if !key_event.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
                 self.outcome = Some(PooledAccessNoticeOutcome::OpenLogin);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N')
+                if matches!(self.kind, PooledAccessNoticeKind::PooledOnly)
+                    && !key_event.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                self.outcome = Some(PooledAccessNoticeOutcome::HideAndContinue);
             }
             _ => {}
         }
@@ -186,6 +201,23 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_l_does_not_request_login_handoff() {
+        let mut widget = PooledAccessNoticeWidget::pooled_only(false);
+        widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(widget.outcome(), None);
+    }
+
+    #[test]
+    fn pooled_only_notice_n_requests_hide_and_continue() {
+        let mut widget = PooledAccessNoticeWidget::pooled_only(false);
+        widget.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            widget.outcome(),
+            Some(PooledAccessNoticeOutcome::HideAndContinue)
+        );
+    }
+
+    #[test]
     fn pooled_only_notice_l_requests_login_handoff() {
         let mut widget = PooledAccessNoticeWidget::pooled_only(false);
         widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
@@ -210,10 +242,13 @@ mod tests {
     }
 
     #[test]
-    fn pooled_paused_notice_shows_inline_error() {
-        let mut widget = PooledAccessNoticeWidget::pooled_paused(false);
-        widget.set_error("resume failed".to_string());
+    fn pooled_notice_error_can_be_cleared() {
+        let mut widget = PooledAccessNoticeWidget::pooled_only(false);
+        widget.set_error(Some("resume failed".to_string()));
         assert!(render_to_string(&widget).contains("resume failed"));
+
+        widget.set_error(None);
+        assert!(!render_to_string(&widget).contains("resume failed"));
     }
 
     #[test]
@@ -226,5 +261,12 @@ mod tests {
     fn pooled_paused_notice_renders_snapshot() {
         let widget = PooledAccessNoticeWidget::pooled_paused(false);
         assert_snapshot!("pooled_paused_notice", render_to_string(&widget));
+    }
+
+    #[test]
+    fn pooled_paused_notice_renders_error_snapshot() {
+        let mut widget = PooledAccessNoticeWidget::pooled_paused(false);
+        widget.set_error(Some("resume failed".to_string()));
+        assert_snapshot!("pooled_paused_notice_error", render_to_string(&widget));
     }
 }

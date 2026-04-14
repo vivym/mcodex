@@ -6,4 +6,4 @@ expression: render_to_string(&widget)
 
   You can continue with pooled access or hand off to login.
 
-  Press enter to continue, or press l to log in
+  Press enter to continue, press l to log in, or press n to hide and con
