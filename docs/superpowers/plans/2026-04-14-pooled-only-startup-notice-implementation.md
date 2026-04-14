@@ -62,7 +62,7 @@ Out of scope:
 - Test: `codex-rs/core/src/config/edit_tests.rs`
 - Generate: `codex-rs/core/config.schema.json`
 
-- [ ] **Step 1: Write the failing config edit tests**
+- [x] **Step 1: Write the failing config edit tests**
 
 Add focused tests to `codex-rs/core/src/config/edit_tests.rs` that exercise the typed edit and builder API instead of raw TOML mutation:
 
@@ -104,13 +104,13 @@ fn set_hide_pooled_only_startup_notice_false_writes_visible_state() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted tests to verify they fail**
+- [x] **Step 2: Run the targeted tests to verify they fail**
 
 Run: `cargo test -p codex-core config_edit_tests::set_hide_pooled_only_startup_notice -- --nocapture`
 
 Expected: FAIL because `ConfigEditsBuilder` and `ConfigEdit` do not yet expose the new notice key.
 
-- [ ] **Step 3: Implement the typed notice flag**
+- [x] **Step 3: Implement the typed notice flag**
 
 Update `codex-rs/config/src/types.rs` and `codex-rs/core/src/config/edit.rs`:
 
@@ -137,7 +137,7 @@ pub fn set_hide_pooled_only_startup_notice(mut self, acknowledged: bool) -> Self
 
 Apply the edit in `ConfigEditor::apply`, keeping the path hard-coded in one place: `notice.hide_pooled_only_startup_notice`.
 
-- [ ] **Step 4: Regenerate schema and rerun the focused tests**
+- [x] **Step 4: Regenerate schema and rerun the focused tests**
 
 Run:
 
@@ -149,7 +149,7 @@ cargo test -p codex-core config_edit_tests::set_hide_pooled_only_startup_notice_
 
 Expected: PASS, and `codex-rs/core/config.schema.json` contains the new `notice.hide_pooled_only_startup_notice` property.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -169,7 +169,7 @@ git commit -m "feat(config): persist pooled startup notice preference"
 - Modify: `codex-rs/tui/src/lib.rs`
 - Test: `codex-rs/tui/src/startup_access.rs`
 
-- [ ] **Step 1: Write the failing startup-decision tests**
+- [x] **Step 1: Write the failing startup-decision tests**
 
 Add unit tests in the new `codex-rs/tui/src/startup_access.rs` covering local and remote mapping without touching onboarding yet:
 
@@ -237,13 +237,13 @@ async fn startup_probe_failure_falls_back_to_needs_login() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted tests to verify they fail**
+- [x] **Step 2: Run the targeted tests to verify they fail**
 
 Run: `cargo test -p codex-tui startup_access::tests::startup_decision_ -- --nocapture`
 
 Expected: FAIL because the new module and decision types do not exist.
 
-- [ ] **Step 3: Implement the startup-access module and app-server helpers**
+- [x] **Step 3: Implement the startup-access module and app-server helpers**
 
 Create `codex-rs/tui/src/startup_access.rs` with:
 
@@ -290,7 +290,7 @@ pub(crate) async fn write_hide_pooled_only_startup_notice(&mut self, hide: bool)
 
 Keep these wrappers narrow and reuse existing `ClientRequest::{AccountLeaseRead, AccountLeaseResume, ConfigBatchWrite}` instead of adding new protocol.
 
-- [ ] **Step 4: Rerun the targeted tests**
+- [x] **Step 4: Rerun the targeted tests**
 
 Run:
 
@@ -306,7 +306,7 @@ Expected: PASS. The remote probe tests should prove:
 - visible remote pooled surface maps to `PooledOnlyNotice`
 - empty remote lease data falls back to `NeedsLogin`
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -325,7 +325,7 @@ git commit -m "feat(tui): add pooled startup access decision layer"
 - Test: `codex-rs/tui/src/onboarding/pooled_access_notice.rs`
 - Snapshot: `codex-rs/tui/src/onboarding/snapshots/*pooled_access_notice*.snap`
 
-- [ ] **Step 1: Write the failing widget and interaction tests**
+- [x] **Step 1: Write the failing widget and interaction tests**
 
 Add focused tests directly next to the new widget module:
 
@@ -372,13 +372,13 @@ fn pooled_only_notice_renders_snapshot() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted tests to verify they fail**
+- [x] **Step 2: Run the targeted tests to verify they fail**
 
 Run: `cargo test -p codex-tui pooled_access_notice -- --nocapture`
 
 Expected: FAIL because the widget module does not exist and no snapshots have been recorded.
 
-- [ ] **Step 3: Implement the dedicated onboarding widget**
+- [x] **Step 3: Implement the dedicated onboarding widget**
 
 Create `codex-rs/tui/src/onboarding/pooled_access_notice.rs` with:
 
@@ -390,7 +390,7 @@ Create `codex-rs/tui/src/onboarding/pooled_access_notice.rs` with:
 
 Register the module in `codex-rs/tui/src/onboarding/mod.rs`.
 
-- [ ] **Step 4: Rerun tests and accept snapshots intentionally**
+- [x] **Step 4: Rerun tests and accept snapshots intentionally**
 
 Run:
 
@@ -402,7 +402,7 @@ cargo insta accept -p codex-tui
 
 Expected: PASS, with accepted snapshots for both the pooled-only and pooled-paused notice renderings.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -423,7 +423,7 @@ git commit -m "feat(tui): add pooled startup notice widgets"
 - Test: `codex-rs/tui/src/onboarding/onboarding_screen.rs`
 - Test: `codex-rs/tui/src/lib.rs`
 
-- [ ] **Step 1: Write the failing onboarding/integration tests**
+- [x] **Step 1: Write the failing onboarding/integration tests**
 
 Add focused tests for the new startup path. Put the interaction harness in `codex-rs/tui/src/onboarding/onboarding_screen.rs` as a local `#[cfg(test)]` helper so the plan does not depend on an undefined shared harness:
 
@@ -476,7 +476,7 @@ async fn pooled_only_notice_n_persists_flag_and_skips_future_notice() {
 
 In the same task, add narrow `codex-rs/tui/src/lib.rs` tests for the outer gate so `should_show_onboarding(...)` and `should_show_login_screen(...)` do not regress once pooled notice states are introduced.
 
-- [ ] **Step 2: Run the targeted tests to verify they fail**
+- [x] **Step 2: Run the targeted tests to verify they fail**
 
 Run:
 
@@ -487,7 +487,7 @@ cargo test -p codex-tui pooled_only_notice_l_reveals_prebuilt_auth_step -- --noc
 
 Expected: FAIL because onboarding still only knows `Welcome`, `Auth`, and `TrustDirectory`, and `should_show_onboarding` does not include pooled notice states.
 
-- [ ] **Step 3: Implement the minimal onboarding wiring**
+- [x] **Step 3: Implement the minimal onboarding wiring**
 
 Update `codex-rs/tui/src/onboarding/onboarding_screen.rs`:
 
@@ -507,7 +507,7 @@ Update `codex-rs/tui/src/lib.rs`:
 - reload local config if the startup-local persistence path changed the file
 - continue passing `None` for onboarding app-server access only when no startup interaction needs it
 
-- [ ] **Step 4: Rerun targeted tests plus crate-level coverage**
+- [x] **Step 4: Rerun targeted tests plus crate-level coverage**
 
 Run:
 
@@ -528,7 +528,7 @@ Expected: PASS. Verify that:
 - `L` reveals the prebuilt auth step instead of rebuilding onboarding
 - `N` persists the new config key and suppresses future pooled-only prompts
 
-- [ ] **Step 5: Format, lint, verify crate boundaries, and commit**
+- [x] **Step 5: Format, lint, verify crate boundaries, and commit**
 
 Run:
 
@@ -541,7 +541,7 @@ git commit -m "feat(tui): wire pooled startup notices into onboarding"
 
 ## Final Verification
 
-- [ ] **Step 1: Run the touched-crate verification suite**
+- [x] **Step 1: Run the touched-crate verification suite**
 
 Run:
 
@@ -552,7 +552,7 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 2: Run formatting and scoped linting**
+- [x] **Step 2: Run formatting and scoped linting**
 
 Run:
 
@@ -565,7 +565,7 @@ just fix -p codex-tui
 
 Expected: PASS with no additional source edits required.
 
-- [ ] **Step 3: Ask before full workspace test**
+- [ ] **Step 3: Ask before full workspace test** (Deferred: full workspace `cargo test` still requires explicit approval.)
 
 If the user approves, run:
 
@@ -575,7 +575,7 @@ cargo test
 
 Expected: PASS. Do not run this step without explicit approval because the work touches `codex-core`.
 
-- [ ] **Step 4: Final commit if verification uncovered follow-up changes**
+- [x] **Step 4: Final commit if verification uncovered follow-up changes**
 
 Run:
 
