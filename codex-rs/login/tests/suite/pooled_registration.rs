@@ -47,6 +47,22 @@ fn reserve_port() -> u16 {
         .port()
 }
 
+async fn send_callback_when_ready(port: u16) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    let callback = format!("http://127.0.0.1:{port}/auth/callback?code=abc&state=test-state");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+
+    loop {
+        match client.get(&callback).send().await {
+            Ok(response) => return response,
+            Err(err) if err.is_connect() && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("send callback request: {err:?}"),
+        }
+    }
+}
+
 pub(crate) async fn pooled_browser_registration_returns_tokens_without_writing_shared_auth() {
     let codex_home = tempdir().expect("create tempdir");
     let mock_server = MockServer::start().await;
@@ -70,14 +86,7 @@ pub(crate) async fn pooled_browser_registration_returns_tokens_without_writing_s
     let opts = test_server_options(codex_home.path(), mock_server.uri(), port);
     let join = tokio::spawn(async move { run_pooled_browser_registration(opts).await });
 
-    let client = reqwest::Client::new();
-    let callback = format!("http://127.0.0.1:{port}/auth/callback?code=abc&state=test-state");
-
-    let response = client
-        .get(&callback)
-        .send()
-        .await
-        .expect("send callback request");
+    let response = send_callback_when_ready(port).await;
     assert!(response.status().is_success());
 
     let tokens = join
@@ -110,14 +119,7 @@ pub(crate) async fn pooled_browser_registration_failure_completes_without_hangin
     let opts = test_server_options(codex_home.path(), mock_server.uri(), port);
     let join = tokio::spawn(async move { run_pooled_browser_registration(opts).await });
 
-    let client = reqwest::Client::new();
-    let callback = format!("http://127.0.0.1:{port}/auth/callback?code=abc&state=test-state");
-
-    let response = client
-        .get(&callback)
-        .send()
-        .await
-        .expect("send callback request");
+    let response = send_callback_when_ready(port).await;
     assert!(response.status().is_success());
 
     let err = tokio::time::timeout(Duration::from_secs(2), join)
