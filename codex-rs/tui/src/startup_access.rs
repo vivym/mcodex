@@ -130,6 +130,8 @@ fn remote_startup_probe_from_response(
         return StartupProbe::PooledSuppressed { remote: true };
     }
 
+    // Remote startup intentionally uses the visible pooled surface as a
+    // best-effort availability signal instead of requiring an active lease.
     if response.pool_id.is_some() {
         StartupProbe::PooledAvailable { remote: true }
     } else {
@@ -143,7 +145,45 @@ mod tests {
     use anyhow::anyhow;
     use codex_app_server_protocol::AccountLeaseReadResponse;
     use codex_app_server_protocol::AuthMode as AppServerAuthMode;
+    use codex_config::types::AccountsConfigToml;
+    use codex_core::config::ConfigBuilder;
+    use codex_state::AccountRegistryEntryUpdate;
+    use codex_state::AccountStartupSelectionUpdate;
     use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    async fn test_config(codex_home: &std::path::Path) -> Config {
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.to_path_buf())
+            .build()
+            .await
+            .expect("load config");
+        config.accounts = Some(AccountsConfigToml {
+            default_pool: Some("pool-main".to_string()),
+            ..Default::default()
+        });
+        config
+    }
+
+    async fn seed_account(
+        runtime: &StateRuntime,
+        account_id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: None,
+                enabled,
+                healthy: true,
+            })
+            .await?;
+        Ok(())
+    }
 
     #[test]
     fn startup_decision_is_no_prompt_when_shared_login_exists() {
@@ -191,6 +231,100 @@ mod tests {
         );
 
         assert_eq!(decision, StartupPromptDecision::NoPrompt);
+    }
+
+    #[tokio::test]
+    async fn local_probe_reports_suppressed_pool_as_paused() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config(codex_home.path()).await;
+        let runtime =
+            StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                .await
+                .expect("initialize runtime");
+
+        seed_account(runtime.as_ref(), "acct-1", true)
+            .await
+            .expect("seed enabled account");
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: true,
+            })
+            .await
+            .expect("write suppressed selection");
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::PooledSuppressed { remote: false });
+    }
+
+    #[tokio::test]
+    async fn local_probe_reports_visible_pool_even_without_predicted_account() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config(codex_home.path()).await;
+        let runtime =
+            StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                .await
+                .expect("initialize runtime");
+
+        seed_account(runtime.as_ref(), "acct-disabled", false)
+            .await
+            .expect("seed disabled preferred account");
+        seed_account(runtime.as_ref(), "acct-enabled", true)
+            .await
+            .expect("seed enabled backup account");
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-disabled".to_string()),
+                suppressed: false,
+            })
+            .await
+            .expect("write visible selection");
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .expect("preview startup selection");
+        assert_eq!(preview.predicted_account_id, None);
+        assert!(!preview.suppressed);
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::PooledAvailable { remote: false });
+    }
+
+    #[tokio::test]
+    async fn local_probe_returns_unavailable_when_pool_has_no_enabled_accounts() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config(codex_home.path()).await;
+        let runtime =
+            StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                .await
+                .expect("initialize runtime");
+
+        seed_account(runtime.as_ref(), "acct-disabled", false)
+            .await
+            .expect("seed disabled account");
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-disabled".to_string()),
+                suppressed: false,
+            })
+            .await
+            .expect("write selection");
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::Unavailable);
     }
 
     #[test]
