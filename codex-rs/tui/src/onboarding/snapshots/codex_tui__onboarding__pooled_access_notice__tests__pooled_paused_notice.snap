@@ -1,0 +1,10 @@
+---
+source: tui/src/onboarding/pooled_access_notice.rs
+expression: render_to_string(&widget)
+---
+  Pooled access is paused
+
+  Pooled access is paused for this startup. Resume it or hand off to
+  login.
+
+  Press enter to resume, or press l to log in
