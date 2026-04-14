@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust workspace crates (`codex-account-pool`, `codex-state`, `codex-login`, `codex-core`, `codex-cli`, `codex-app-server`, `codex-app-server-protocol`, `codex-tui`, `codex-config`), SQLite via `sqlx`, clap, ratatui snapshot tests, existing app-server v2 JSON-RPC.
 
+**Completion Notes:** Completed on `multi-account-pool-v1`. This plan delivered the local pool crate, pooled state/config/auth seams, lease-aware future-turn routing, and the first app-server/CLI/TUI pooled account surface. Later gap-closure and `accounts add` follow-up work is tracked in the subsequent dated plans.
+
 ---
 
 ## Planned File Layout
@@ -32,7 +34,7 @@
 - Create: `codex-rs/account-pool/tests/policy.rs`
 - Modify: `codex-rs/Cargo.toml`
 
-- [ ] **Step 1: Write the failing crate test**
+- [x] **Step 1: Write the failing crate test**
 
 ```rust
 #[test]
@@ -46,12 +48,12 @@ fn default_selection_prefers_healthy_account_and_rejects_mixed_kind_auto_rotatio
 }
 ```
 
-- [ ] **Step 2: Run the new crate test to verify the workspace is missing the crate**
+- [x] **Step 2: Run the new crate test to verify the workspace is missing the crate**
 
 Run: `cargo test -p codex-account-pool policy`  
 Expected: FAIL with “package ID specification `codex-account-pool` did not match any packages”.
 
-- [ ] **Step 3: Add the workspace entry and crate skeleton**
+- [x] **Step 3: Add the workspace entry and crate skeleton**
 
 ```toml
 # codex-rs/account-pool/Cargo.toml
@@ -74,16 +76,16 @@ pub use policy::select_startup_account;
 pub use types::{SelectionRequest, SelectionResult};
 ```
 
-- [ ] **Step 4: Run `just fmt` in `codex-rs`**
+- [x] **Step 4: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 5: Run the new crate test to verify the scaffold passes**
+- [x] **Step 5: Run the new crate test to verify the scaffold passes**
 
 Run: `cargo test -p codex-account-pool policy`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/Cargo.toml codex-rs/account-pool
@@ -101,7 +103,7 @@ git commit -m "feat: scaffold account pool crate"
 - Modify: `codex-rs/state/src/lib.rs`
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 
-- [ ] **Step 1: Write failing storage tests next to the new runtime module**
+- [x] **Step 1: Write failing storage tests next to the new runtime module**
 
 ```rust
 #[tokio::test]
@@ -127,12 +129,12 @@ async fn migrated_install_creates_legacy_default_selection_state() {
 }
 ```
 
-- [ ] **Step 2: Run the state test to verify the APIs do not exist yet**
+- [x] **Step 2: Run the state test to verify the APIs do not exist yet**
 
 Run: `cargo test -p codex-state account_pool`  
 Expected: FAIL with missing migration table and/or missing `acquire_account_lease`.
 
-- [ ] **Step 3: Add the migration and typed runtime APIs**
+- [x] **Step 3: Add the migration and typed runtime APIs**
 
 ```sql
 -- 0025_account_pool.sql
@@ -155,7 +157,7 @@ impl StateRuntime {
 }
 ```
 
-- [ ] **Step 4: Export the new model/runtime types without leaking raw SQL to consumers**
+- [x] **Step 4: Export the new model/runtime types without leaking raw SQL to consumers**
 
 ```rust
 // codex-rs/state/src/lib.rs
@@ -163,16 +165,16 @@ pub use model::AccountLeaseRecord;
 pub use model::AccountPoolHealthState;
 ```
 
-- [ ] **Step 5: Run `just fmt` in `codex-rs`**
+- [x] **Step 5: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 6: Run the state test suite for the new module**
+- [x] **Step 6: Run the state test suite for the new module**
 
 Run: `cargo test -p codex-state account_pool`  
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/state
@@ -188,7 +190,7 @@ git commit -m "feat: add account pool state runtime"
 - Modify: `codex-rs/core/src/config/config_tests.rs`
 - Modify: `codex-rs/core/config.schema.json`
 
-- [ ] **Step 1: Write failing config parsing tests**
+- [x] **Step 1: Write failing config parsing tests**
 
 ```rust
 #[test]
@@ -209,12 +211,12 @@ account_kinds = ["chatgpt"]
 }
 ```
 
-- [ ] **Step 2: Run the config tests to verify the field is rejected**
+- [x] **Step 2: Run the config tests to verify the field is rejected**
 
 Run: `cargo test -p codex-config parses_accounts_pool_config -- --exact`  
 Expected: FAIL with unknown field / missing type errors.
 
-- [ ] **Step 3: Add the TOML types and resolved config plumbing**
+- [x] **Step 3: Add the TOML types and resolved config plumbing**
 
 ```rust
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -231,7 +233,7 @@ pub struct AccountsConfigToml {
 }
 ```
 
-- [ ] **Step 4: Add config validation for lease timing invariants**
+- [x] **Step 4: Add config validation for lease timing invariants**
 
 ```rust
 if let Some(accounts) = &config.accounts
@@ -264,21 +266,21 @@ if let Some(accounts) = &config.accounts
 }
 ```
 
-- [ ] **Step 5: Regenerate the config schema**
+- [x] **Step 5: Regenerate the config schema**
 
 Run: `just write-config-schema`
 
-- [ ] **Step 6: Run `just fmt` in `codex-rs`**
+- [x] **Step 6: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 7: Run targeted config tests**
+- [x] **Step 7: Run targeted config tests**
 
 Run: `cargo test -p codex-config parses_accounts_pool_config -- --exact`  
 Run: `cargo test -p codex-core config_tests -- --skip windows`  
 Expected: PASS, including the new accounts config coverage.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add codex-rs/config/src/types.rs codex-rs/config/src/config_toml.rs codex-rs/config/src/types_tests.rs codex-rs/core/src/config/config_tests.rs codex-rs/core/config.schema.json
@@ -299,7 +301,7 @@ git commit -m "feat: add account pool config types"
 - Test: `codex-rs/core/tests/suite/window_headers.rs`
 - Test: `codex-rs/core/tests/suite/client_websockets.rs`
 
-- [ ] **Step 1: Write failing auth and transport seam tests**
+- [x] **Step 1: Write failing auth and transport seam tests**
 
 ```rust
 #[tokio::test]
@@ -324,14 +326,14 @@ async fn remote_session_reset_changes_session_id_without_changing_thread_id() {
 }
 ```
 
-- [ ] **Step 2: Run targeted tests to verify the seams are absent**
+- [x] **Step 2: Run targeted tests to verify the seams are absent**
 
 Run: `cargo test -p codex-login legacy_auth_view_reads_auth_manager_snapshot -- --exact`  
 Run: `cargo test -p codex-login leased_turn_auth_does_not_read_shared_auth_manager -- --exact`  
 Run: `cargo test -p codex-core remote_session_reset_changes_session_id_without_changing_thread_id -- --exact`  
 Expected: FAIL.
 
-- [ ] **Step 3: Add the seam types and `ModelClient` transport identity plumbing**
+- [x] **Step 3: Add the seam types and `ModelClient` transport identity plumbing**
 
 ```rust
 pub struct LegacyAuthView<'a> {
@@ -356,11 +358,11 @@ pub(crate) fn reset_remote_session_identity(&mut self) {
 }
 ```
 
-- [ ] **Step 4: Run `just fmt` in `codex-rs`**
+- [x] **Step 4: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 5: Run the targeted login/core tests**
+- [x] **Step 5: Run the targeted login/core tests**
 
 Run: `cargo test -p codex-login legacy_auth_view_reads_auth_manager_snapshot -- --exact`  
 Run: `cargo test -p codex-login leased_turn_auth_does_not_read_shared_auth_manager -- --exact`  
@@ -368,7 +370,7 @@ Run: `cargo test -p codex-core window_headers`
 Run: `cargo test -p codex-core client_websockets`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/login codex-rs/core/src/client.rs codex-rs/core/src/realtime_conversation.rs codex-rs/codex-api/src/requests/headers.rs codex-rs/core/tests/suite/window_headers.rs codex-rs/core/tests/suite/client_websockets.rs
@@ -389,7 +391,7 @@ git commit -m "feat: add leased auth and remote session seams"
 - Modify: `codex-rs/account-pool/tests/policy.rs`
 - Create: `codex-rs/account-pool/tests/lease_lifecycle.rs`
 
-- [ ] **Step 1: Write failing policy/lease tests**
+- [x] **Step 1: Write failing policy/lease tests**
 
 ```rust
 #[tokio::test]
@@ -438,12 +440,12 @@ fn context_reuse_requires_consent_and_portable_transport() {
 }
 ```
 
-- [ ] **Step 2: Run the new crate tests to confirm the manager is missing**
+- [x] **Step 2: Run the new crate tests to confirm the manager is missing**
 
 Run: `cargo test -p codex-account-pool ensure_active_lease_reuses_sticky_account_until_threshold -- --exact`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement the minimal local backend, bootstrap, and manager**
+- [x] **Step 3: Implement the minimal local backend, bootstrap, and manager**
 
 ```rust
 pub struct AccountPoolManager<B: AccountPoolBackend, L: LegacyAuthBootstrap> {
@@ -478,7 +480,7 @@ pub async fn bootstrap_from_legacy_auth(&mut self) -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 4: Add monotonic event ordering and pre-turn safety-margin checks**
+- [x] **Step 4: Add monotonic event ordering and pre-turn safety-margin checks**
 
 ```rust
 if active_lease.remaining_ttl(now) <= self.config.derived_pre_turn_safety_margin() {
@@ -507,16 +509,16 @@ match evaluate_context_reuse(ContextReuseRequest {
 }
 ```
 
-- [ ] **Step 5: Run `just fmt` in `codex-rs`**
+- [x] **Step 5: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 6: Run the full new-crate test suite**
+- [x] **Step 6: Run the full new-crate test suite**
 
 Run: `cargo test -p codex-account-pool`  
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/account-pool
@@ -532,7 +534,7 @@ git commit -m "feat: implement local account pool manager"
 - Modify: `codex-rs/core/src/client.rs`
 - Modify: `codex-rs/core/src/lib.rs`
 
-- [ ] **Step 1: Write failing core integration tests for future-turn rotation**
+- [x] **Step 1: Write failing core integration tests for future-turn rotation**
 
 ```rust
 #[tokio::test]
@@ -574,12 +576,12 @@ async fn fence_loss_blocks_followup_remote_work() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted core test**
+- [x] **Step 2: Run the targeted core test**
 
 Run: `cargo test -p codex-core usage_limit_reached_rotates_only_future_turns_on_responses_transport -- --exact`  
 Expected: FAIL.
 
-- [ ] **Step 3: Add the lease-aware turn startup and future-turn failover wiring**
+- [x] **Step 3: Add the lease-aware turn startup and future-turn failover wiring**
 
 ```rust
 let lease = self.account_pool.ensure_active_lease(session_context).await?;
@@ -624,11 +626,11 @@ self.account_pool
 let refreshed_auth = self.account_pool.refresh_turn_auth(&lease).await?;
 ```
 
-- [ ] **Step 4: Run `just fmt` in `codex-rs`**
+- [x] **Step 4: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 5: Run targeted core tests**
+- [x] **Step 5: Run targeted core tests**
 
 Run: `cargo test -p codex-core account_pool`  
 Run: `cargo test -p codex-core quota_exceeded`  
@@ -640,7 +642,7 @@ Run: `cargo test -p codex-core stream_error_allows_next_turn -- --exact`
 Run: `cargo test -p codex-core window_headers`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/core/src/codex.rs codex-rs/core/src/client.rs codex-rs/core/src/lib.rs codex-rs/core/tests/suite/account_pool.rs codex-rs/core/tests/suite/mod.rs
@@ -656,7 +658,7 @@ git commit -m "feat: wire core to leased account pool"
 - Modify: `codex-rs/cli/src/login.rs`
 - Create: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Write failing CLI parsing and behavior tests**
+- [x] **Step 1: Write failing CLI parsing and behavior tests**
 
 ```rust
 #[test]
@@ -696,12 +698,12 @@ fn logout_enables_durable_startup_suppression_for_future_runtimes() {
 }
 ```
 
-- [ ] **Step 2: Run the new CLI test file**
+- [x] **Step 2: Run the new CLI test file**
 
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: FAIL with unknown subcommand and/or assertion failures.
 
-- [ ] **Step 3: Add the new command module and wire the split**
+- [x] **Step 3: Add the new command module and wire the split**
 
 ```rust
 #[derive(Debug, clap::Subcommand)]
@@ -715,16 +717,16 @@ pub enum AccountsSubcommand {
 }
 ```
 
-- [ ] **Step 4: Run `just fmt` in `codex-rs`**
+- [x] **Step 4: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 5: Run targeted CLI tests**
+- [x] **Step 5: Run targeted CLI tests**
 
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts.rs codex-rs/cli/src/lib.rs codex-rs/cli/src/main.rs codex-rs/cli/src/login.rs codex-rs/cli/tests/accounts.rs
@@ -744,7 +746,7 @@ git commit -m "feat: add accounts cli namespace"
 - Create: `codex-rs/app-server/tests/suite/v2/account_lease.rs`
 - Modify: `codex-rs/app-server/tests/suite/v2/mod.rs`
 
-- [ ] **Step 1: Write failing protocol and app-server tests**
+- [x] **Step 1: Write failing protocol and app-server tests**
 
 ```rust
 #[tokio::test]
@@ -790,13 +792,13 @@ async fn account_logout_with_runtime_local_chatgpt_tokens_is_not_durable() -> Re
 }
 ```
 
-- [ ] **Step 2: Run protocol and app-server tests**
+- [x] **Step 2: Run protocol and app-server tests**
 
 Run: `cargo test -p codex-app-server-protocol account_lease`  
 Run: `cargo test -p codex-app-server account_lease`  
 Expected: FAIL.
 
-- [ ] **Step 3: Add the v2 payloads and extract pooled handling into a new module**
+- [x] **Step 3: Add the v2 payloads and extract pooled handling into a new module**
 
 ```rust
 pub struct AccountLeaseReadResponse {
@@ -842,7 +844,7 @@ pub(crate) async fn handle_account_logout(...) -> Result<()> {
 }
 ```
 
-- [ ] **Step 4: Register the new v2 methods and enforce v1 pooled-mode limits**
+- [x] **Step 4: Register the new v2 methods and enforce v1 pooled-mode limits**
 
 ```rust
 // protocol/common.rs
@@ -857,15 +859,15 @@ if transport.is_websocket() || runtime.loaded_thread_count() > 1 {
 }
 ```
 
-- [ ] **Step 5: Regenerate the app-server schema**
+- [x] **Step 5: Regenerate the app-server schema**
 
 Run: `just write-app-server-schema`
 
-- [ ] **Step 6: Run `just fmt` in `codex-rs`**
+- [x] **Step 6: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 7: Run targeted protocol and app-server tests**
+- [x] **Step 7: Run targeted protocol and app-server tests**
 
 Run: `cargo test -p codex-app-server-protocol account_lease`  
 Run: `cargo test -p codex-app-server account_lease`  
@@ -873,7 +875,7 @@ Run: `cargo test -p codex-app-server account_logout_with_runtime_local_chatgpt_t
 Run: `cargo test -p codex-app-server rate_limits`  
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add codex-rs/app-server-protocol/src/protocol/common.rs codex-rs/app-server-protocol/src/protocol/v2.rs codex-rs/app-server/src/account_lease_api.rs codex-rs/app-server/src/message_processor.rs codex-rs/app-server/src/codex_message_processor.rs codex-rs/app-server/README.md codex-rs/app-server/tests/suite/v2/account.rs codex-rs/app-server/tests/suite/v2/account_lease.rs codex-rs/app-server/tests/suite/v2/mod.rs
@@ -891,7 +893,7 @@ git commit -m "feat: add pooled account lease app-server api"
 - Modify: `codex-rs/tui/src/chatwidget/tests/mod.rs`
 - Update snapshots under: `codex-rs/tui/src/status/snapshots/`
 
-- [ ] **Step 1: Write failing status-surface tests**
+- [x] **Step 1: Write failing status-surface tests**
 
 ```rust
 #[test]
@@ -907,12 +909,12 @@ fn status_snapshot_shows_auto_switch_and_remote_reset_messages() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted TUI tests to generate failing snapshots**
+- [x] **Step 2: Run the targeted TUI tests to generate failing snapshots**
 
 Run: `cargo test -p codex-tui status_snapshot_shows_active_pool_and_next_eligible_time -- --exact`  
 Expected: FAIL with a new or mismatched snapshot.
 
-- [ ] **Step 3: Add the minimal status rendering**
+- [x] **Step 3: Add the minimal status rendering**
 
 ```rust
 pub(crate) enum StatusAccountDisplay {
@@ -921,27 +923,27 @@ pub(crate) enum StatusAccountDisplay {
 }
 ```
 
-- [ ] **Step 4: Review and accept the intended snapshots**
+- [x] **Step 4: Review and accept the intended snapshots**
 
 Run: `cargo insta pending-snapshots -p codex-tui`  
 Run: `cargo insta accept -p codex-tui`
 
-- [ ] **Step 5: Run `just fmt` in `codex-rs`**
+- [x] **Step 5: Run `just fmt` in `codex-rs`**
 
 Run: `just fmt`
 
-- [ ] **Step 6: Run targeted crate tests**
+- [x] **Step 6: Run targeted crate tests**
 
 Run: `cargo test -p codex-tui`  
 Expected: PASS.
 
-- [ ] **Step 7: Ask before the full workspace test suite, then run it if approved**
+- [x] **Step 7: Ask before the full workspace test suite, then run it if approved**
 
 Run: `cargo test`  
 Expected: PASS.  
 Note: this touches `codex-core`, `codex-state`, and `codex-app-server-protocol`, so ask the user before running the complete suite.
 
-- [ ] **Step 8: Run scoped fixers without re-running tests afterward**
+- [x] **Step 8: Run scoped fixers without re-running tests afterward**
 
 Run: `just fix -p codex-account-pool`  
 Run: `just fix -p codex-state`  
@@ -955,7 +957,7 @@ Run: `just fix -p codex-tui`
 
 Expected: PASS / no remaining clippy fixes.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add codex-rs/tui/src/status/account.rs codex-rs/tui/src/status/card.rs codex-rs/tui/src/status/tests.rs codex-rs/tui/src/chatwidget/status_surfaces.rs codex-rs/tui/src/chatwidget/tests/status_command_tests.rs codex-rs/tui/src/chatwidget/tests/mod.rs codex-rs/tui/src/status/snapshots

@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust workspace crates (`codex-cli`, `codex-account-pool`, `codex-login`, `codex-state`), SQLite via `sqlx`, clap, existing pooled browser/device auth flows, `pretty_assertions`, and targeted crate tests.
 
+**Completion Notes:** Completed on `multi-account-pool-v1`. `codex accounts add chatgpt` and `codex accounts add chatgpt --device-auth` now register pooled accounts through backend-private auth without touching shared legacy auth. `accounts add api-key` and remote backends remain explicitly out of scope for this phase.
+
 ---
 
 ## Scope
@@ -59,7 +61,7 @@ Out of scope:
 - Modify: `codex-rs/cli/src/accounts/mod.rs`
 - Test: `codex-rs/cli/src/accounts/registration.rs`
 
-- [ ] **Step 1: Write the failing registration unit tests**
+- [x] **Step 1: Write the failing registration unit tests**
 
 Add focused tests inside `codex-rs/cli/src/accounts/registration.rs` so the command orchestration can
 be tested without spawning the binary or opening a browser:
@@ -258,12 +260,12 @@ async fn add_api_key_reports_phase_one_unsupported() {
 }
 ```
 
-- [ ] **Step 2: Run the CLI crate tests to verify failure**
+- [x] **Step 2: Run the CLI crate tests to verify failure**
 
 Run: `cargo test -p codex-cli add_chatgpt_registration_ -- --nocapture`  
 Expected: FAIL because the orchestration helper, fake runner seam, and API-key rejection helper do not exist.
 
-- [ ] **Step 3: Implement the minimal orchestration helpers**
+- [x] **Step 3: Implement the minimal orchestration helpers**
 
 In `codex-rs/cli/src/accounts/registration.rs`, add:
 
@@ -344,14 +346,14 @@ Keep the implementation conservative:
 
 Do **not** add hidden CLI flags or env-based OAuth test hooks here. The fake runner seam is enough.
 
-- [ ] **Step 4: Run the targeted CLI tests**
+- [x] **Step 4: Run the targeted CLI tests**
 
 Run: `cargo test -p codex-cli add_chatgpt_registration_ -- --nocapture`  
 Run: `cargo test -p codex-cli reconcile_pending_add_registration -- --nocapture`  
 Run: `cargo test -p codex-cli add_api_key_reports_phase_one_unsupported -- --nocapture`  
 Expected: PASS.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run: `just fmt`  
 Run: `just fix -p codex-cli`
@@ -368,7 +370,7 @@ git commit -m "feat(cli): add pooled registration orchestration helpers"
 - Modify: `codex-rs/account-pool/src/backend/local/control.rs`
 - Test: `codex-rs/account-pool/tests/lease_lifecycle.rs`
 
-- [ ] **Step 1: Write the failing backend tests**
+- [x] **Step 1: Write the failing backend tests**
 
 Add tests in `codex-rs/account-pool/tests/lease_lifecycle.rs` that lock the new path-safety rule:
 
@@ -424,12 +426,12 @@ async fn lease_lifecycle_register_account_reuses_encoded_handle_for_same_provide
 }
 ```
 
-- [ ] **Step 2: Run the backend tests to verify failure**
+- [x] **Step 2: Run the backend tests to verify failure**
 
 Run: `cargo test -p codex-account-pool lease_lifecycle_register_account_ -- --nocapture`  
 Expected: FAIL because the local backend still treats `request.backend_account_handle` as a raw path component.
 
-- [ ] **Step 3: Implement local-handle normalization inside the backend**
+- [x] **Step 3: Implement local-handle normalization inside the backend**
 
 In `codex-rs/account-pool/src/backend/local/mod.rs`, add a tiny helper:
 
@@ -456,12 +458,12 @@ In `codex-rs/account-pool/src/backend/local/control.rs`:
 This is a deliberate compatibility move: the backend becomes the owner of local handle generation
 without forcing broader request-shape churn across crates that are already working.
 
-- [ ] **Step 4: Run the targeted backend tests**
+- [x] **Step 4: Run the targeted backend tests**
 
 Run: `cargo test -p codex-account-pool lease_lifecycle_register_account_ -- --nocapture`  
 Expected: PASS.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run: `just fmt`  
 Run: `just fix -p codex-account-pool`
@@ -477,7 +479,7 @@ git commit -m "fix(account-pool): normalize backend-private handles for pooled r
 - Modify: `codex-rs/cli/src/accounts/mod.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Replace the old gap tests with process-level add-command tests**
+- [x] **Step 1: Replace the old gap tests with process-level add-command tests**
 
 In `codex-rs/cli/tests/accounts.rs`, replace the current credential-gap assertions with command
 behavior that can run without real OAuth:
@@ -520,12 +522,12 @@ async fn accounts_add_api_key_reports_phase_one_unsupported() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run the integration test to verify failure**
+- [x] **Step 2: Run the integration test to verify failure**
 
 Run: `cargo test -p codex-cli --test accounts accounts_add_ -- --nocapture`  
 Expected: FAIL because `run_accounts_impl(...)` still bails out with the old credential-gap message before config loading and dispatch.
 
-- [ ] **Step 3: Remove the hard-coded add bailout and route through registration helpers**
+- [x] **Step 3: Remove the hard-coded add bailout and route through registration helpers**
 
 In `codex-rs/cli/src/accounts/mod.rs`:
 
@@ -549,13 +551,13 @@ AccountsSubcommand::Add(command) => {
 
 Keep the current clap shape intact. This is not the slice to redesign the command grammar.
 
-- [ ] **Step 4: Run the targeted CLI tests**
+- [x] **Step 4: Run the targeted CLI tests**
 
 Run: `cargo test -p codex-cli --test accounts accounts_add_ -- --nocapture`  
 Run: `cargo test -p codex-cli add_chatgpt_registration_ -- --nocapture`  
 Expected: PASS.
 
-- [ ] **Step 5: Run crate verification, then format/lint, and commit**
+- [x] **Step 5: Run crate verification, then format/lint, and commit**
 
 Run: `cargo test -p codex-cli`  
 Run: `cargo test -p codex-account-pool`  

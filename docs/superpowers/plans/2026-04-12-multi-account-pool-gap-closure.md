@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust workspace crates (`codex-state`, `codex-core`, `codex-cli`, `codex-app-server`, `codex-app-server-protocol`, `codex-tui`), SQLite via `sqlx`, app-server v2 JSON-RPC, clap, ratatui/insta snapshot tests.
 
+**Completion Notes:** Completed on `multi-account-pool-v1`. Live lease snapshots now flow from core to app-server, CLI diagnostics/mutators and TUI lease status are in place, and the verification tail was closed with Bazel lock checks plus an approved full workspace `cargo test`. Remaining follow-up work is intentionally limited to later `accounts add api-key` and remote-pool slices.
+
 ---
 
 ## Scope
@@ -52,7 +54,7 @@ Non-goals:
 - Modify: `codex-rs/core/src/codex_thread.rs`
 - Modify: `codex-rs/core/tests/suite/account_pool.rs`
 
-- [ ] **Step 1: Write failing state diagnostics tests**
+- [x] **Step 1: Write failing state diagnostics tests**
 
 Add focused tests in `codex-rs/state/src/runtime/account_pool.rs`:
 
@@ -76,12 +78,12 @@ async fn read_pool_diagnostics_reports_per_account_eligibility_and_next_eligible
 }
 ```
 
-- [ ] **Step 2: Run state tests to verify failure**
+- [x] **Step 2: Run state tests to verify failure**
 
 Run: `cargo test -p codex-state account_pool -- --nocapture`  
 Expected: FAIL because the new public read APIs do not exist.
 
-- [ ] **Step 3: Add state read models and public APIs**
+- [x] **Step 3: Add state read models and public APIs**
 
 Add small model structs in `codex-rs/state/src/model/account_pool.rs`:
 
@@ -122,7 +124,7 @@ pub async fn read_account_pool_diagnostic(
 
 Keep these as reads only. Do not change the SQLite schema unless tests prove current schema cannot answer the queries.
 
-- [ ] **Step 4: Write failing core runtime snapshot tests**
+- [x] **Step 4: Write failing core runtime snapshot tests**
 
 Extend `codex-rs/core/tests/suite/account_pool.rs`:
 
@@ -143,12 +145,12 @@ async fn account_lease_snapshot_records_remote_reset_generation_when_account_cha
 }
 ```
 
-- [ ] **Step 5: Run core tests to verify failure**
+- [x] **Step 5: Run core tests to verify failure**
 
 Run: `cargo test -p codex-core account_pool -- --nocapture`  
 Expected: FAIL because core has no public lease snapshot.
 
-- [ ] **Step 6: Add core snapshot type and manager method**
+- [x] **Step 6: Add core snapshot type and manager method**
 
 In `codex-rs/core/src/state/service.rs`, add a session-local snapshot type near `AccountPoolManager`:
 
@@ -172,7 +174,7 @@ pub(crate) struct AccountLeaseRuntimeSnapshot {
 
 Use a Rust enum for `AccountLeaseRuntimeReason`, then map it to the existing API reason strings in app-server.
 
-- [ ] **Step 7: Track remote reset and retry-suppressed state in core**
+- [x] **Step 7: Track remote reset and retry-suppressed state in core**
 
 Update `prepare_turn` and the callsite in `codex-rs/core/src/codex.rs` so the manager records:
 
@@ -184,7 +186,7 @@ Update `prepare_turn` and the callsite in `codex-rs/core/src/codex.rs` so the ma
 
 Reuse existing state where possible. Do not add app-server protocol fields unless the existing `switch_reason` / `suppression_reason` fields cannot express the state.
 
-- [ ] **Step 8: Expose the snapshot through `CodexThread`**
+- [x] **Step 8: Expose the snapshot through `CodexThread`**
 
 Add a narrow method in `codex-rs/core/src/codex_thread.rs`:
 
@@ -196,13 +198,13 @@ pub async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot
 
 Export the snapshot type from `codex-core` only as narrowly as app-server requires. Prefer `pub(crate)` inside core and a small public app-server-facing view if crate boundaries require it.
 
-- [ ] **Step 9: Run targeted tests**
+- [x] **Step 9: Run targeted tests**
 
 Run: `cargo test -p codex-state account_pool -- --nocapture`  
 Run: `cargo test -p codex-core account_pool -- --nocapture`  
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add codex-rs/state/src/model/account_pool.rs codex-rs/state/src/runtime/account_pool.rs codex-rs/state/src/lib.rs codex-rs/core/src/state/service.rs codex-rs/core/src/codex.rs codex-rs/core/src/codex_thread.rs codex-rs/core/tests/suite/account_pool.rs
@@ -221,7 +223,7 @@ git commit -m "feat: expose live pooled account lease snapshots"
 - Modify if protocol shape changes: `codex-rs/app-server-protocol/src/protocol/common.rs`
 - Modify if behavior docs change: `codex-rs/app-server/README.md`
 
-- [ ] **Step 1: Write failing app-server live-state tests**
+- [x] **Step 1: Write failing app-server live-state tests**
 
 Add tests in `codex-rs/app-server/tests/suite/v2/account_lease.rs`:
 
@@ -249,12 +251,12 @@ async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -
 }
 ```
 
-- [ ] **Step 2: Run app-server test to verify failure**
+- [x] **Step 2: Run app-server test to verify failure**
 
 Run: `cargo test -p codex-app-server account_lease -- --nocapture`  
 Expected: FAIL because `accountLease/read` still uses startup preview and hardcodes live fields to `None`.
 
-- [ ] **Step 3: Change app-server read path to prefer the live loaded thread**
+- [x] **Step 3: Change app-server read path to prefer the live loaded thread**
 
 In `codex_message_processor.rs`, after validating the v1 limits, find the single loaded thread if present. Pass it to `account_lease_api`:
 
@@ -265,7 +267,7 @@ let response = account_lease_api::read_account_lease(self.config.as_ref(), loade
 
 Keep the startup-preview fallback in `account_lease_api` for process startup/no-thread cases.
 
-- [ ] **Step 4: Map core snapshot to existing protocol fields**
+- [x] **Step 4: Map core snapshot to existing protocol fields**
 
 In `account_lease_api.rs`, replace hardcoded `None` fields with live snapshot values:
 
@@ -286,7 +288,7 @@ Use reason strings already understood by TUI when possible:
 - `durablySuppressed`
 - new string only if needed: `futureTurnOnlyAfterLimitFailure`
 
-- [ ] **Step 5: Emit `accountLease/updated` from the thread listener**
+- [x] **Step 5: Emit `accountLease/updated` from the thread listener**
 
 Store the last emitted lease notification in `ThreadState`.
 
@@ -302,7 +304,7 @@ maybe_emit_account_lease_updated(
 
 The helper reads the live snapshot, converts it to `AccountLeaseUpdatedNotification`, compares it to the previous notification, and emits only when different.
 
-- [ ] **Step 6: Preserve stdio/websocket restrictions**
+- [x] **Step 6: Preserve stdio/websocket restrictions**
 
 Keep existing rejection tests for:
 
@@ -310,7 +312,7 @@ Keep existing rejection tests for:
 - stdio runtime with more than one loaded thread
 - `chatgptAuthTokens` runtime-local logout behavior
 
-- [ ] **Step 7: Regenerate schema only if protocol fields changed**
+- [x] **Step 7: Regenerate schema only if protocol fields changed**
 
 If Task 2 adds or changes protocol fields:
 
@@ -318,13 +320,13 @@ Run: `just write-app-server-schema`
 
 If it only fills existing fields and adds reason strings, no schema regeneration is needed.
 
-- [ ] **Step 8: Run targeted tests**
+- [x] **Step 8: Run targeted tests**
 
 Run: `cargo test -p codex-app-server account_lease -- --nocapture`  
 Run if protocol changed: `cargo test -p codex-app-server-protocol account_lease -- --nocapture`  
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add codex-rs/app-server/src/account_lease_api.rs codex-rs/app-server/src/codex_message_processor.rs codex-rs/app-server/src/message_processor.rs codex-rs/app-server/src/thread_state.rs codex-rs/app-server/tests/suite/v2/account_lease.rs codex-rs/app-server/README.md codex-rs/app-server-protocol
@@ -342,7 +344,7 @@ git commit -m "feat: report live pooled lease updates from app server"
 - Modify as needed: `codex-rs/state/src/model/account_pool.rs`
 - Modify as needed: `codex-rs/state/src/runtime/account_pool.rs`
 
-- [ ] **Step 1: Write failing CLI diagnostics tests**
+- [x] **Step 1: Write failing CLI diagnostics tests**
 
 Add tests in `codex-rs/cli/tests/accounts.rs`:
 
@@ -365,12 +367,12 @@ async fn accounts_status_accepts_account_pool_override_without_persisting_it() -
 }
 ```
 
-- [ ] **Step 2: Run CLI tests to verify failure**
+- [x] **Step 2: Run CLI tests to verify failure**
 
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: FAIL because `--json`, `--account-pool`, and per-account diagnostics do not exist.
 
-- [ ] **Step 3: Split the CLI module**
+- [x] **Step 3: Split the CLI module**
 
 Move `accounts.rs` into an `accounts/` directory:
 
@@ -380,13 +382,13 @@ Move `accounts.rs` into an `accounts/` directory:
 
 Keep existing public imports stable for `main.rs`.
 
-- [ ] **Step 4: Add `--account-pool` and `--json`**
+- [x] **Step 4: Add `--account-pool` and `--json`**
 
 Add `account_pool: Option<String>` to `AccountsCommand`, not to global config. It is a transient selector and must not mutate durable `default_pool_id`.
 
 Add `--json` to `Current` and `Status` only unless tests prove other subcommands need it.
 
-- [ ] **Step 5: Use state diagnostics for status output**
+- [x] **Step 5: Use state diagnostics for status output**
 
 `accounts current` stays compact:
 
@@ -405,12 +407,12 @@ Add `--json` to `Current` and `Status` only unless tests prove other subcommands
 - next eligible time
 - per-account eligibility reasons
 
-- [ ] **Step 6: Run targeted tests**
+- [x] **Step 6: Run targeted tests**
 
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts.rs codex-rs/cli/src/accounts codex-rs/cli/src/main.rs codex-rs/cli/tests/accounts.rs codex-rs/state/src/model/account_pool.rs codex-rs/state/src/runtime/account_pool.rs
@@ -429,7 +431,7 @@ git commit -m "feat: add structured pooled account status"
 - Modify: `codex-rs/state/src/lib.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Write failing registry mutator tests**
+- [x] **Step 1: Write failing registry mutator tests**
 
 Add tests:
 
@@ -453,12 +455,12 @@ async fn accounts_pool_assign_moves_account_only_with_explicit_pool() -> Result<
 }
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: FAIL because mutator subcommands do not exist.
 
-- [ ] **Step 3: Add state registry mutation APIs**
+- [x] **Step 3: Add state registry mutation APIs**
 
 Add public methods to `StateRuntime`:
 
@@ -472,7 +474,7 @@ pub async fn list_account_pool_memberships(&self, pool_id: Option<&str>) -> anyh
 
 Use existing `healthy` if there is no separate enabled column. If a separate enabled concept is necessary, add a migration and run the appropriate state tests.
 
-- [ ] **Step 4: Add CLI mutator subcommands**
+- [x] **Step 4: Add CLI mutator subcommands**
 
 Add clap variants:
 
@@ -493,7 +495,7 @@ enum PoolSubcommand {
 }
 ```
 
-- [ ] **Step 5: Implement `add` conservatively**
+- [x] **Step 5: Implement `add` conservatively**
 
 Do not invent a fork-only credential container. For v1:
 
@@ -503,13 +505,13 @@ Do not invent a fork-only credential container. For v1:
 
 If a clean credential import hook does not exist, stop after registry mutators and surface the credential-storage gap before changing `auth.json`.
 
-- [ ] **Step 6: Run targeted tests**
+- [x] **Step 6: Run targeted tests**
 
 Run: `cargo test -p codex-state account_pool -- --nocapture`  
 Run: `cargo test -p codex-cli --test accounts`  
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts codex-rs/cli/src/login.rs codex-rs/cli/tests/accounts.rs codex-rs/state/src/model/account_pool.rs codex-rs/state/src/runtime/account_pool.rs codex-rs/state/src/lib.rs codex-rs/state/migrations
@@ -528,7 +530,7 @@ git commit -m "feat: add pooled account management commands"
 - Modify: `codex-rs/tui/src/chatwidget/tests/status_command_tests.rs`
 - Modify or add snapshots under: `codex-rs/tui/src/status/snapshots/`
 
-- [ ] **Step 1: Write failing TUI snapshot tests**
+- [x] **Step 1: Write failing TUI snapshot tests**
 
 Add tests:
 
@@ -553,7 +555,7 @@ async fn status_snapshot_shows_retry_suppressed_after_non_replayable_limit_failu
 }
 ```
 
-- [ ] **Step 2: Write failing chat notification tests**
+- [x] **Step 2: Write failing chat notification tests**
 
 Add `chatwidget` tests where `AccountLeaseUpdated` changes account id / reason:
 
@@ -565,13 +567,13 @@ fn account_lease_updated_adds_automatic_switch_notice_when_account_changes() {
 }
 ```
 
-- [ ] **Step 3: Run targeted tests to verify failure**
+- [x] **Step 3: Run targeted tests to verify failure**
 
 Run: `cargo test -p codex-tui status_snapshot_shows_no_available_account_error_state -- --exact`  
 Run: `cargo test -p codex-tui account_lease_updated_adds_automatic_switch_notice_when_account_changes -- --exact`  
 Expected: FAIL.
 
-- [ ] **Step 4: Implement TUI display mapping**
+- [x] **Step 4: Implement TUI display mapping**
 
 Update `status_account_lease_display_from_response` so existing/new reason strings map to user-facing text:
 
@@ -583,7 +585,7 @@ Update `status_account_lease_display_from_response` so existing/new reason strin
 
 Keep `/status` as the source of truth. Do not add a full account UI.
 
-- [ ] **Step 5: Add lightweight history notice on meaningful lease transitions**
+- [x] **Step 5: Add lightweight history notice on meaningful lease transitions**
 
 Change `ChatWidget::update_account_lease_state` to diff old/new display:
 
@@ -594,19 +596,19 @@ Change `ChatWidget::update_account_lease_state` to diff old/new display:
 
 Use existing `PlainHistoryCell` / wrapped warning cells. Do not add cards inside cards.
 
-- [ ] **Step 6: Review and accept snapshots**
+- [x] **Step 6: Review and accept snapshots**
 
 Run: `cargo test -p codex-tui`  
 Run: `cargo insta pending-snapshots -p codex-tui`  
 Review the generated `*.snap.new` files.  
 Run if intended: `cargo insta accept -p codex-tui`
 
-- [ ] **Step 7: Run targeted TUI tests**
+- [x] **Step 7: Run targeted TUI tests**
 
 Run: `cargo test -p codex-tui`  
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add codex-rs/tui/src/app/app_server_adapter.rs codex-rs/tui/src/app_server_session.rs codex-rs/tui/src/chatwidget.rs codex-rs/tui/src/status codex-rs/tui/src/chatwidget/tests/status_command_tests.rs
@@ -622,17 +624,17 @@ git commit -m "feat: surface pooled lease transitions in tui"
 - Modify if state migration added: `codex-rs/state/migrations/**`
 - Modify if dependency changed: `codex-rs/Cargo.lock`, `codex-rs/MODULE.bazel.lock`
 
-- [ ] **Step 1: Regenerate app-server schema if protocol changed**
+- [x] **Step 1: Regenerate app-server schema if protocol changed**
 
 Run: `just write-app-server-schema`  
 Expected: generated schema files update only if Task 2 changed the API shape.
 
-- [ ] **Step 2: Regenerate config schema if config types changed**
+- [x] **Step 2: Regenerate config schema if config types changed**
 
 Run only if config types changed: `just write-config-schema`  
 Expected: `codex-rs/core/config.schema.json` updates.
 
-- [ ] **Step 3: Run targeted crate tests**
+- [x] **Step 3: Run targeted crate tests**
 
 Run:
 
@@ -647,14 +649,14 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 4: Ask before full workspace tests**
+- [x] **Step 4: Ask before full workspace tests**
 
 Because this closes shared `state/core/protocol/app-server/cli/tui` work, ask the user before running full workspace tests:
 
 Run after approval: `cargo test`  
 Alternative if available and approved: `just test`
 
-- [ ] **Step 5: Run scoped fixers**
+- [x] **Step 5: Run scoped fixers**
 
 Run after tests pass:
 
@@ -670,10 +672,9 @@ just fmt
 
 Per repo convention, do not rerun tests after final `just fix` / `just fmt`.
 
-- [ ] **Step 6: Commit final cleanup**
+- [x] **Step 6: Commit final cleanup**
 
 ```bash
 git add codex-rs docs/superpowers/plans/2026-04-12-multi-account-pool-gap-closure.md
 git commit -m "chore: verify multi-account pool spec gap closure"
 ```
-
