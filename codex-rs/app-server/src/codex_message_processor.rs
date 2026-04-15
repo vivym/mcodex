@@ -8718,7 +8718,10 @@ async fn maybe_emit_account_lease_updated_notification(
 }
 
 fn event_can_change_account_lease_notification(event: &EventMsg) -> bool {
-    matches!(event, EventMsg::TurnStarted(_) | EventMsg::Error(_))
+    matches!(
+        event,
+        EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_) | EventMsg::Error(_)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
