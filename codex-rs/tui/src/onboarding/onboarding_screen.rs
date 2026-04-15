@@ -1,9 +1,9 @@
+use crate::legacy_core::config::Config;
+#[cfg(target_os = "windows")]
+use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::ServerNotification;
-use codex_core::config::Config;
-#[cfg(target_os = "windows")]
-use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use crossterm::event::KeyCode;
@@ -103,7 +103,7 @@ impl OnboardingScreen {
             config,
         } = args;
         let cwd = config.cwd.to_path_buf();
-        let codex_home = config.codex_home.clone();
+        let codex_home = config.codex_home.to_path_buf();
         let forced_login_method = config.forced_login_method;
         let auth_widget = if show_login_screen
             || matches!(
@@ -765,7 +765,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::LoginStatus;
-    use codex_core::config::ConfigBuilder;
+    use crate::legacy_core::config::ConfigBuilder;
 
     async fn build_config(temp_dir: &TempDir) -> Result<Config> {
         ConfigBuilder::default()

@@ -58,7 +58,7 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         .build()
         .await
         .expect("config");
-    let resolved_model = codex_core::test_support::get_model_offline(cfg.model.as_deref());
+    let resolved_model = crate::legacy_core::test_support::get_model_offline(cfg.model.as_deref());
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let init = ChatWidgetInit {
         config: cfg.clone(),
@@ -72,8 +72,6 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
         is_first_run: true,
         status_account_display: None,
         status_account_lease_display: None,
-        initial_workspace_role: None,
-        initial_is_workspace_owner: None,
         initial_plan_type: None,
         model: Some(resolved_model.clone()),
         startup_tooltip_override: None,

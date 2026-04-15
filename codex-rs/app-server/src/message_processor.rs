@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
-use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
@@ -223,6 +222,11 @@ impl MessageProcessor {
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
         }));
+        let analytics_events_client = AnalyticsEventsClient::new(
+            Arc::clone(&auth_manager),
+            config.chatgpt_base_url.trim_end_matches('/').to_string(),
+            config.analytics_enabled,
+        );
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager.clone(),
@@ -233,12 +237,8 @@ impl MessageProcessor {
                     .enabled(Feature::DefaultModeRequestUserInput),
             },
             environment_manager,
+            Some(analytics_events_client.clone()),
         ));
-        let analytics_events_client = AnalyticsEventsClient::new(
-            Arc::clone(&auth_manager),
-            config.chatgpt_base_url.trim_end_matches('/').to_string(),
-            config.analytics_enabled,
-        );
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
@@ -265,7 +265,7 @@ impl MessageProcessor {
             .plugins_manager()
             .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
         let config_api = ConfigApi::new(
-            config.codex_home.clone(),
+            config.codex_home.to_path_buf(),
             cli_overrides,
             runtime_feature_enablement,
             loader_overrides,
@@ -273,7 +273,8 @@ impl MessageProcessor {
             thread_manager,
             analytics_events_client.clone(),
         );
-        let external_agent_config_api = ExternalAgentConfigApi::new(config.codex_home.clone());
+        let external_agent_config_api =
+            ExternalAgentConfigApi::new(config.codex_home.to_path_buf());
         let fs_api = FsApi::default();
         let fs_watch_manager = FsWatchManager::new(outgoing.clone());
 
@@ -622,21 +623,9 @@ impl MessageProcessor {
                 }
 
                 let user_agent = get_codex_user_agent();
-                let codex_home = match self.config.codex_home.clone().try_into() {
-                    Ok(codex_home) => codex_home,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INTERNAL_ERROR_CODE,
-                            message: format!("Invalid CODEX_HOME: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(connection_request_id, error).await;
-                        return;
-                    }
-                };
                 let response = InitializeResponse {
                     user_agent,
-                    codex_home,
+                    codex_home: self.config.codex_home.clone(),
                     platform_family: std::env::consts::FAMILY.to_string(),
                     platform_os: std::env::consts::OS.to_string(),
                 };
@@ -678,6 +667,16 @@ impl MessageProcessor {
             };
             self.outgoing.send_error(connection_request_id, error).await;
             return;
+        }
+        if self.config.features.enabled(Feature::GeneralAnalytics)
+            && let ClientRequest::TurnStart { request_id, .. }
+            | ClientRequest::TurnSteer { request_id, .. } = &codex_request
+        {
+            self.analytics_events_client.track_request(
+                connection_id.0,
+                request_id.clone(),
+                codex_request.clone(),
+            );
         }
 
         match codex_request {

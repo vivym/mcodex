@@ -2,9 +2,9 @@
 
 use crate::LoginStatus;
 use crate::app_server_session::AppServerSession;
+use crate::legacy_core::config::Config;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_core::config::Config;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 
@@ -142,12 +142,12 @@ fn remote_startup_probe_from_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_core::config::ConfigBuilder;
+    use crate::legacy_core::config_loader::LoaderOverrides;
     use anyhow::anyhow;
     use codex_app_server_protocol::AccountLeaseReadResponse;
     use codex_app_server_protocol::AuthMode as AppServerAuthMode;
     use codex_config::types::AccountsConfigToml;
-    use codex_core::config::ConfigBuilder;
-    use codex_core::config_loader::LoaderOverrides;
     use codex_state::AccountRegistryEntryUpdate;
     use codex_state::AccountStartupSelectionUpdate;
     use codex_utils_absolute_path::AbsolutePathBuf;

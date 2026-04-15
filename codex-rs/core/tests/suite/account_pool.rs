@@ -328,6 +328,12 @@ async fn nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion() -> Res
 
     let first_turn_error = submit_turn_and_wait(&test, "near-limit turn").await?;
     assert!(first_turn_error.is_none());
+    wait_for_account_health_transition(
+        &test,
+        AccountHealthState::RateLimited,
+        AccountLeaseRuntimeReason::NonReplayableTurn,
+    )
+    .await?;
 
     let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
     assert!(second_turn_error.is_none());
@@ -1123,6 +1129,12 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
 
     let first_turn_error = submit_turn_and_wait(&test, "near-limit turn").await?;
     assert!(first_turn_error.is_none());
+    wait_for_account_health_transition(
+        &test,
+        AccountHealthState::RateLimited,
+        AccountLeaseRuntimeReason::NonReplayableTurn,
+    )
+    .await?;
     assert_eq!(
         test.codex
             .current_lease_bridge_account_id()
@@ -1642,6 +1654,12 @@ async fn submit_turn_and_wait(
         })
         .await?;
 
+    let turn_id = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+
     let mut saw_error = None;
     loop {
         let event = wait_for_event(&test.codex, |_| true).await;
@@ -1649,11 +1667,37 @@ async fn submit_turn_and_wait(
             EventMsg::Error(error_event) => {
                 saw_error = Some(error_event);
             }
-            EventMsg::TurnComplete(_) => {
+            EventMsg::TurnComplete(event) if event.turn_id == turn_id => {
                 return Ok(saw_error);
             }
             _ => {}
         }
+    }
+}
+
+async fn wait_for_account_health_transition(
+    test: &TestCodex,
+    expected_health_state: AccountHealthState,
+    expected_switch_reason: AccountLeaseRuntimeReason,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = test
+            .codex
+            .account_lease_snapshot()
+            .await
+            .expect("pooled session should expose lease snapshot");
+        if snapshot.health_state == Some(expected_health_state)
+            && snapshot.switch_reason == Some(expected_switch_reason)
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for account health transition: {snapshot:?}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

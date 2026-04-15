@@ -106,8 +106,7 @@ fn function_invocation(
         turn,
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
-        tool_name: TOOL_SUGGEST_TOOL_NAME.to_string(),
-        tool_namespace: None,
+        tool_name: TOOL_SUGGEST_TOOL_NAME.into(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
         },

@@ -528,7 +528,7 @@ pub(crate) async fn import_legacy_account(
 
 fn chatgpt_registration_server_options(config: &Config) -> ServerOptions {
     ServerOptions::new(
-        config.codex_home.clone(),
+        config.codex_home.clone().to_path_buf(),
         CLIENT_ID.to_string(),
         config.forced_chatgpt_workspace_id.clone(),
         config.cli_auth_credentials_store_mode,

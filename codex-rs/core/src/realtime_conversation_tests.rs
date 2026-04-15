@@ -83,9 +83,15 @@ async fn build_realtime_session_config_uses_remote_session_id_after_reset() {
     let remote_session_id = model_client_session.remote_session_id().to_string();
     assert_ne!(remote_session_id, thread_id);
 
-    let config = build_realtime_session_config(&session, None, None, None)
-        .await
-        .expect("build realtime config");
+    let config = build_realtime_session_config(
+        &session,
+        None,
+        None,
+        codex_protocol::protocol::RealtimeOutputModality::Text,
+        None,
+    )
+    .await
+    .expect("build realtime config");
 
     assert_eq!(
         config.session_id.as_deref(),

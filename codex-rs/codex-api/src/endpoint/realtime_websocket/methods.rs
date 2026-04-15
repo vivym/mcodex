@@ -7,9 +7,9 @@ use crate::endpoint::realtime_websocket::protocol::RealtimeAudioFrame;
 use crate::endpoint::realtime_websocket::protocol::RealtimeEvent;
 use crate::endpoint::realtime_websocket::protocol::RealtimeEventParser;
 use crate::endpoint::realtime_websocket::protocol::RealtimeOutboundMessage;
+use crate::endpoint::realtime_websocket::protocol::RealtimeOutputModality;
 use crate::endpoint::realtime_websocket::protocol::RealtimeSessionConfig;
 use crate::endpoint::realtime_websocket::protocol::RealtimeSessionMode;
-use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptDelta;
 use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
 use crate::endpoint::realtime_websocket::protocol::RealtimeVoice;
 use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
@@ -17,6 +17,7 @@ use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -307,10 +308,17 @@ impl RealtimeWebsocketWriter {
         &self,
         instructions: String,
         session_mode: RealtimeSessionMode,
+        output_modality: RealtimeOutputModality,
         voice: RealtimeVoice,
     ) -> Result<(), ApiError> {
         let session_mode = normalized_session_mode(self.event_parser, session_mode);
-        let session = session_update_session(self.event_parser, instructions, session_mode, voice);
+        let session = session_update_session(
+            self.event_parser,
+            instructions,
+            session_mode,
+            output_modality,
+            voice,
+        );
         self.send_json(&RealtimeOutboundMessage::SessionUpdate { session })
             .await
     }
@@ -406,10 +414,10 @@ impl RealtimeWebsocketEvents {
         let mut active_transcript = self.active_transcript.lock().await;
         match event {
             RealtimeEvent::InputAudioSpeechStarted(_) => {}
-            RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta { delta }) => {
+            RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
                 append_transcript_delta(&mut active_transcript.entries, "user", delta);
             }
-            RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta { delta }) => {
+            RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
                 append_transcript_delta(&mut active_transcript.entries, "assistant", delta);
             }
             RealtimeEvent::HandoffRequested(handoff) => {
@@ -418,8 +426,12 @@ impl RealtimeWebsocketEvents {
                 }
             }
             RealtimeEvent::SessionUpdated { .. }
+            | RealtimeEvent::InputTranscriptDone(_)
+            | RealtimeEvent::OutputTranscriptDone(_)
             | RealtimeEvent::AudioOut(_)
+            | RealtimeEvent::ResponseCreated(_)
             | RealtimeEvent::ResponseCancelled(_)
+            | RealtimeEvent::ResponseDone(_)
             | RealtimeEvent::ConversationItemAdded(_)
             | RealtimeEvent::ConversationItemDone { .. }
             | RealtimeEvent::Error(_) => {}
@@ -579,7 +591,12 @@ impl RealtimeWebsocketClient {
         );
         connection
             .writer
-            .send_session_update(config.instructions, config.session_mode, config.voice)
+            .send_session_update(
+                config.instructions,
+                config.session_mode,
+                config.output_modality,
+                config.voice,
+            )
             .await?;
         Ok(connection)
     }
@@ -719,11 +736,14 @@ fn normalize_realtime_path(url: &mut Url) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptDelta;
     use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
     use codex_protocol::protocol::RealtimeHandoffRequested;
     use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
     use codex_protocol::protocol::RealtimeResponseCancelled;
+    use codex_protocol::protocol::RealtimeResponseCreated;
+    use codex_protocol::protocol::RealtimeResponseDone;
+    use codex_protocol::protocol::RealtimeTranscriptDelta;
+    use codex_protocol::protocol::RealtimeTranscriptDone;
     use codex_protocol::protocol::RealtimeVoice;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
@@ -890,6 +910,8 @@ mod tests {
     fn parse_realtime_v2_input_audio_transcription_delta_event() {
         let payload = json!({
             "type": "conversation.item.input_audio_transcription.delta",
+            "item_id": "item_input_1",
+            "content_index": 0,
             "delta": "hello"
         })
         .to_string();
@@ -899,6 +921,32 @@ mod tests {
             Some(RealtimeEvent::InputTranscriptDelta(
                 RealtimeTranscriptDelta {
                     delta: "hello".to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_realtime_v2_item_done_output_text_event() {
+        let payload = json!({
+            "type": "conversation.item.done",
+            "item": {
+                "id": "item_output_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "hello"},
+                    {"type": "output_text", "text": " world"}
+                ]
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
+            Some(RealtimeEvent::OutputTranscriptDone(
+                RealtimeTranscriptDone {
+                    text: "hello world".to_string(),
                 }
             ))
         );
@@ -999,7 +1047,9 @@ mod tests {
 
         assert_eq!(
             parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
-            None
+            Some(RealtimeEvent::ResponseDone(RealtimeResponseDone {
+                response_id: None
+            }))
         );
     }
 
@@ -1013,10 +1063,9 @@ mod tests {
 
         assert_eq!(
             parse_realtime_event(payload.as_str(), RealtimeEventParser::RealtimeV2),
-            Some(RealtimeEvent::ConversationItemAdded(json!({
-                "type": "response.created",
-                "response": {"id": "resp_created_1"}
-            })))
+            Some(RealtimeEvent::ResponseCreated(RealtimeResponseCreated {
+                response_id: Some("resp_created_1".to_string())
+            }))
         );
     }
 
@@ -1369,6 +1418,7 @@ mod tests {
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,
                     session_mode: RealtimeSessionMode::Conversational,
+                    output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Breeze,
                 },
                 HeaderMap::new(),
@@ -1643,6 +1693,7 @@ mod tests {
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::RealtimeV2,
                     session_mode: RealtimeSessionMode::Conversational,
+                    output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cedar,
                 },
                 HeaderMap::new(),
@@ -1748,6 +1799,7 @@ mod tests {
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::RealtimeV2,
                     session_mode: RealtimeSessionMode::Transcription,
+                    output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Marin,
                 },
                 HeaderMap::new(),
@@ -1851,6 +1903,7 @@ mod tests {
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,
                     session_mode: RealtimeSessionMode::Transcription,
+                    output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cove,
                 },
                 HeaderMap::new(),
@@ -1940,6 +1993,7 @@ mod tests {
                     session_id: Some("conv_1".to_string()),
                     event_parser: RealtimeEventParser::V1,
                     session_mode: RealtimeSessionMode::Conversational,
+                    output_modality: RealtimeOutputModality::Audio,
                     voice: RealtimeVoice::Cove,
                 },
                 HeaderMap::new(),

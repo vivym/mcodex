@@ -1,8 +1,10 @@
 use crate::events::AppServerRpcTransport;
+use crate::events::GuardianReviewEventParams;
 use crate::events::TrackEventRequest;
 use crate::events::TrackEventsRequest;
 use crate::events::current_runtime_metadata;
 use crate::facts::AnalyticsFact;
+use crate::facts::AnalyticsJsonRpcError;
 use crate::facts::AppInvocation;
 use crate::facts::AppMentionedInput;
 use crate::facts::AppUsedInput;
@@ -13,9 +15,15 @@ use crate::facts::SkillInvocation;
 use crate::facts::SkillInvokedInput;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::TrackEventsContext;
+use crate::facts::TurnResolvedConfigFact;
+use crate::facts::TurnTokenUsageFact;
 use crate::reducer::AnalyticsReducer;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponse;
 use codex_app_server_protocol::InitializeParams;
+use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ServerNotification;
 use codex_login::AuthManager;
 use codex_login::AuthProvider;
 use codex_login::SharedAuthProvider;
@@ -168,6 +176,12 @@ impl AnalyticsEventsClient {
         ));
     }
 
+    pub fn track_guardian_review(&self, input: GuardianReviewEventParams) {
+        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(
+            Box::new(input),
+        )));
+    }
+
     pub fn track_app_mentioned(&self, tracking: TrackEventsContext, mentions: Vec<AppInvocation>) {
         if mentions.is_empty() {
             return;
@@ -175,6 +189,14 @@ impl AnalyticsEventsClient {
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::AppMentioned(
             AppMentionedInput { tracking, mentions },
         )));
+    }
+
+    pub fn track_request(&self, connection_id: u64, request_id: RequestId, request: ClientRequest) {
+        self.record_fact(AnalyticsFact::Request {
+            connection_id,
+            request_id,
+            request: Box::new(request),
+        });
     }
 
     pub fn track_app_used(&self, tracking: TrackEventsContext, app: AppInvocation) {
@@ -192,6 +214,24 @@ impl AnalyticsEventsClient {
         }
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(
             crate::facts::PluginUsedInput { tracking, plugin },
+        )));
+    }
+
+    pub fn track_compaction(&self, event: crate::facts::CodexCompactionEvent) {
+        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::Compaction(
+            Box::new(event),
+        )));
+    }
+
+    pub fn track_turn_resolved_config(&self, fact: TurnResolvedConfigFact) {
+        self.record_fact(AnalyticsFact::Custom(
+            CustomAnalyticsFact::TurnResolvedConfig(Box::new(fact)),
+        ));
+    }
+
+    pub fn track_turn_token_usage(&self, fact: TurnTokenUsageFact) {
+        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::TurnTokenUsage(
+            Box::new(fact),
         )));
     }
 
@@ -243,6 +283,25 @@ impl AnalyticsEventsClient {
             connection_id,
             response: Box::new(response),
         });
+    }
+
+    pub fn track_error_response(
+        &self,
+        connection_id: u64,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+        error_type: Option<AnalyticsJsonRpcError>,
+    ) {
+        self.record_fact(AnalyticsFact::ErrorResponse {
+            connection_id,
+            request_id,
+            error,
+            error_type,
+        });
+    }
+
+    pub fn track_notification(&self, notification: ServerNotification) {
+        self.record_fact(AnalyticsFact::Notification(Box::new(notification)));
     }
 }
 
