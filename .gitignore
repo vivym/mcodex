@@ -68,7 +68,7 @@ coverage/
 
 # personal files
 personal/
-.omc/
+/.omc/
 
 # os
 .DS_Store
