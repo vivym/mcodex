@@ -15,12 +15,13 @@ The recommended direction is:
 - treat registered accounts, pool membership, startup selection, preferred
   account, and suppression as state-owned data
 - keep backend choice and pool policy in `config.toml`
-- narrow `accounts.default_pool` from an always-live startup override to a
-  bootstrap compatibility fallback used only when persisted startup selection
-  has not been established yet
+- keep the existing upstream-friendly default-pool precedence where explicit
+  config remains higher priority than persisted startup-selection fallback
 - make CLI, core, and app-server use one shared effective-pool resolution rule
 - make fresh registration into an explicit pool establish persisted startup
-  selection when no persisted default exists yet
+  selection only when no durable default exists in either config or state
+- make pooled-mode enablement depend on pooled intent discovered from config or
+  state rather than raw `config.accounts` presence
 - stop reporting config-only pool counts as though they were actual registered
   runtime pools
 
@@ -38,9 +39,10 @@ The design stays close to upstream shape by preserving:
 - process-level pool override support
 - persisted startup-selection state in the existing state DB
 
-The main semantic change is ownership: persisted startup selection becomes the
-authoritative default for future runtimes, while config remains policy and
-bootstrap input rather than the primary long-lived source of startup truth.
+The main semantic change is not default-pool precedence; it is pooled-mode
+ownership and activation. Persisted startup selection remains the durable
+fallback for installs that do not declare an explicit config default, while
+config remains the higher-priority operator intent when present.
 
 ## Goals
 
@@ -156,8 +158,9 @@ Under this approach:
 
 - state owns startup selection and registered runtime facts
 - config owns backend and policy
-- config `default_pool` becomes bootstrap compatibility input, not the primary
-  persisted startup owner
+- config `default_pool` remains the higher-priority operator default
+- persisted startup selection remains the durable fallback when config does not
+  declare a default
 
 Pros:
 
@@ -209,25 +212,24 @@ These are operator intent and policy, not runtime facts.
 ### 2. Narrow the meaning of `accounts.default_pool`
 
 `accounts.default_pool` should remain in the config type for compatibility, but
-its semantics should narrow:
+its role should be clarified:
 
-- It is no longer the always-authoritative default for future runtimes.
-- It acts as bootstrap input when persisted startup selection has not yet been
-  established.
-- Once startup selection has a persisted default pool in state, that persisted
-  value becomes the authoritative default unless a process-level override is
-  supplied.
+- It remains an explicit operator-configured default and therefore keeps higher
+  priority than persisted startup-selection fallback.
+- It does not stop startup selection from being persisted in state.
+- Persisted startup selection is still used when config does not define a
+  default.
 
-This preserves config compatibility while moving durable selection ownership to
-state.
+This preserves config compatibility while still allowing state to carry durable
+selection for config-less installs and fresh local product homes.
 
 ### 3. Use one effective-pool resolution rule everywhere
 
 The effective-pool resolution order should become:
 
 1. process-level override such as `--account-pool <pool>`
-2. persisted startup-selection default pool in state
-3. `accounts.default_pool` from config as bootstrap compatibility fallback
+2. `accounts.default_pool` from config when present
+3. persisted startup-selection default pool in state
 4. otherwise no effective pool
 
 This rule should be shared by:
@@ -238,12 +240,13 @@ This rule should be shared by:
 - app-server account lease diagnostics
 
 There should not be separate CLI-only or app-server-only interpretations of
-default pool precedence.
+default pool precedence. This preserves the current upstream-friendly precedence
+while making the rule shared and explicit.
 
 ### 4. Make fresh registration establish durable startup selection when needed
 
 When `accounts add chatgpt` is invoked with an explicit pool target and there is
-no persisted default pool in startup-selection state yet:
+no durable default in either config or persisted startup-selection state:
 
 - register the account into the requested pool
 - persist that pool as the startup default pool
@@ -254,8 +257,9 @@ no persisted default pool in startup-selection state yet:
 This keeps registration idempotent while ensuring that a fresh home can become
 startup-eligible without a manual config edit.
 
-This behavior should be limited to the "no persisted default exists yet" case so
-that explicit later operator choices are not silently overwritten.
+This behavior should be limited to the "no durable default exists yet" case so
+that explicit later operator choices in either config or state are not silently
+overwritten.
 
 ### 5. Stop using config presence as the pooled-mode gate
 
@@ -264,8 +268,7 @@ available.
 
 Instead:
 
-- pooled mode should initialize when state DB exists and effective-pool
-  resolution succeeds under the shared resolution rule
+- pooled mode should initialize only when a pooled-intent probe succeeds
 - config policy, when present, should overlay onto runtime behavior
 - when policy config is absent, runtime should use explicit built-in defaults
 
@@ -273,34 +276,42 @@ This removes the current false dependency where valid pooled state exists but
 the runtime still falls back to legacy onboarding because `[accounts]` is
 missing.
 
-### 6. Clarify policy defaults when config is absent
+The pooled-intent probe should be satisfied by at least one of:
 
-This slice must explicitly choose behavior for missing per-pool policy config.
+- `config.accounts` being present
+- persisted startup-selection state containing a default pool, preferred
+  account, or suppression marker
+- pooled account membership already existing in state
 
-Recommended default:
+Implementation should preserve `account_pool_manager: Option<_>` as the
+top-level pooled-mode gate so existing turn and compact call sites do not begin
+failing closed in non-pooled sessions.
 
-- `allow_context_reuse = false` when there is no explicit per-pool policy entry
+### 6. Defer policy-default changes in this slice
+
+This slice should not change runtime policy defaults beyond what is required to
+remove the false dependency on config presence.
+
+Recommended behavior:
+
+- preserve current runtime defaults when policy config is absent
+- do not tighten `allow_context_reuse` semantics in the same slice as startup
+  selection ownership
 
 Reasoning:
 
-- it matches the documented "explicit opt-in" boundary for cross-account context
-  reuse
-- it is safer than implicitly enabling reuse on state-only installs
-- it avoids surprising behavior after fresh registration in an otherwise
-  unconfigured home
-
-Lease timing and switch thresholds may continue to use existing built-in
-defaults when config is absent.
-
-This is the one part of the slice with the highest behavior-change risk relative
-to current code, but it is still the correct ownership boundary.
+- the source-of-truth problem can be solved without bundling a separate runtime
+  behavior change
+- preserving current defaults minimizes regression risk and merge friction
+- context-reuse policy tightening can be evaluated later as its own focused
+  design slice with dedicated compatibility review
 
 ### 7. Make diagnostics describe both policy and runtime state accurately
 
 `accounts status` should distinguish:
 
 - persisted default pool
-- configured bootstrap default pool
+- configured default pool
 - effective pool
 - effective pool source
 - registered pool count
@@ -311,13 +322,21 @@ It should not collapse these into one misleading `configured pools` line.
 Recommended text fields:
 
 - `persisted default pool: <id|none>`
-- `configured bootstrap pool: <id|none>`
+- `configured default pool: <id|none>`
 - `effective pool: <id|none>`
-- `effective pool source: override|persistedSelection|configBootstrap|none`
+- `effective pool source: override|persistedSelection|configDefault|none`
 - `registered pools: <n>`
 - `configured policy pools: <n>`
 
 The JSON form should expose the same distinctions.
+
+For compatibility:
+
+- preserve existing `configuredPoolCount` with its current config-policy meaning
+- add new fields such as `registeredPoolCount`,
+  `configuredPolicyPoolCount`, `persistedDefaultPoolId`, and
+  `configuredDefaultPoolId` rather than silently changing the old field's
+  meaning
 
 ### 8. Keep merge friction low by preserving existing public shapes where possible
 
@@ -332,6 +351,8 @@ To stay merge-friendly:
   fork-specific conditionals
 - prefer additive diagnostics fields over breaking JSON removals in the first
   slice
+- preserve `account_pool_manager: Option<_>` semantics at the session-service
+  boundary where practical
 
 ## Architecture Changes
 
@@ -347,7 +368,7 @@ and returns:
 
 - effective pool id
 - source of that decision
-- configured bootstrap default pool
+- configured default pool
 - persisted default pool
 
 This is the key refactor that removes duplicated precedence logic.
@@ -363,21 +384,24 @@ also be constructible from defaults alone.
 ### Runtime initialization
 
 `build_account_pool_manager` should stop returning `None` merely because
-`config.accounts` is absent. It should instead:
+`config.accounts` is absent. Instead, session bootstrap should:
 
-- require state DB
-- derive a resolved policy view from config or defaults
-- let startup lease preparation decide whether pooled mode is actually
-  startable based on effective-pool resolution
+- run the pooled-intent probe
+- require state DB plus pooled intent before constructing the manager
+- derive a resolved policy view from config or defaults only after pooled mode
+  has been deemed applicable
+
+This preserves the existing optional-manager gate while removing the false
+requirement that config must be present for pooled mode to exist.
 
 ## CLI Behavior
 
 ### `accounts add`
 
 - `--account-pool` continues to target the registration pool explicitly
-- if persisted startup default is absent, the requested pool becomes the
-  persisted startup default
-- if persisted startup default already exists, it remains unchanged
+- if neither config nor state already declares a durable default, the requested
+  pool becomes the persisted startup default
+- if a durable config or state default already exists, it remains unchanged
 
 ### `accounts current`
 
@@ -409,14 +433,16 @@ with the terminal CLI about whether a pool is available.
 
 ### Existing homes with config and state
 
-- persisted startup selection should begin taking precedence over config
-  `default_pool`
-- config `default_pool` remains visible as bootstrap compatibility metadata
+- config `default_pool` continues to take precedence over persisted
+  startup-selection fallback
+- persisted startup selection remains visible in diagnostics and continues to
+  serve config-less startups
 
 ### Existing homes with config but no persisted selection
 
-- config `default_pool` continues to work as bootstrap fallback
+- config `default_pool` continues to work as the effective configured default
 - first explicit stateful pool choice may establish persisted default selection
+  only when config does not already declare a durable default
 
 ### Existing homes with state but no config
 
@@ -439,29 +465,33 @@ selection and runtime state remain installation-local.
 At minimum, add or update tests for:
 
 - CLI status on a home with registered pools but no `config.toml`
-- CLI status distinguishing persisted default vs configured bootstrap default
-- `accounts add --account-pool X` persisting startup default when none exists
+- CLI status distinguishing persisted default vs configured default
+- `accounts add --account-pool X` persisting startup default only when no
+  durable config or state default exists
 - `accounts add --account-pool X` not overwriting an existing persisted default
 - core startup using pooled mode with state-only selection and default policy
-- app-server diagnostics using persisted selection before config bootstrap
+- app-server diagnostics using configured default before persisted fallback
 - context-reuse behavior when policy config is absent
 
 ## Risks
 
-### Risk: behavior change for existing installs that rely on config overriding state
+### Risk: pooled-intent probing could enable pooled mode in sessions that only
+contain stale or partial state
 
 Mitigation:
 
-- document the precedence change clearly
-- preserve config field shape
-- expose both persisted and configured defaults in diagnostics
+- require explicit pooled signals rather than "state DB exists" alone
+- add regression tests for non-pooled sessions that still should not build an
+  account-pool manager
 
-### Risk: context-reuse default tightening changes transport behavior
+### Risk: registration may unexpectedly persist a startup default
 
 Mitigation:
 
-- scope the change to missing-policy cases only
-- add explicit regression tests around account rotation
+- limit persistence to the case where neither config nor state already declares
+  a durable default
+- add regression tests covering config-default homes and existing-persisted
+  default homes
 
 ### Risk: partial adoption leaves CLI, core, and app-server inconsistent
 
@@ -473,9 +503,10 @@ Mitigation:
 
 1. extract shared effective-pool resolution helper
 2. update CLI diagnostics/output to use richer resolved data
-3. make `accounts add` establish persisted default selection when absent
-4. refactor core pooled-mode initialization to use resolved policy defaults
-   instead of `config.accounts` presence as the gate
+3. make `accounts add` establish persisted default selection only when no
+   durable config or state default exists
+4. add pooled-intent probing and refactor core pooled-mode initialization to
+   use it instead of `config.accounts` presence as the gate
 5. update app-server diagnostics to use the shared resolver
 6. add regression tests across CLI, core, and app-server
 
