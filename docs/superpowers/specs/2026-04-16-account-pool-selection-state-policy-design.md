@@ -207,6 +207,7 @@ The following remain in `config.toml`:
 - `accounts.lease_ttl_secs`
 - `accounts.heartbeat_interval_secs`
 - `accounts.min_switch_interval_secs`
+- `accounts.allocation_mode`
 - `accounts.pools.<id>.allow_context_reuse`
 - `accounts.pools.<id>.account_kinds`
 
@@ -273,7 +274,8 @@ available.
 Instead:
 
 - pooled mode should initialize only when a pooled-intent probe succeeds
-- config policy, when present, should overlay onto runtime behavior
+- config policy, when present, should overlay onto runtime behavior only after
+  pooled applicability has been established
 - when policy config is absent, runtime should use explicit built-in defaults
 
 This removes the current false dependency where valid pooled state exists but
@@ -282,8 +284,15 @@ missing.
 
 The pooled-intent probe should be satisfied by at least one of:
 
-- `config.accounts` being present
+- a process-level override explicitly naming a pool
+- config declaring `accounts.default_pool`
 - pooled account membership already existing in state
+
+The following must not count as pooled intent by themselves:
+
+- `config.accounts` containing only policy fields
+- migrated policy-only pooled config copied into a fresh `mcodex` home
+- preferred-account or suppression markers without matching pool membership
 
 Implementation should preserve `account_pool_manager: Option<_>` as the
 top-level pooled-mode gate so existing turn and compact call sites do not begin
@@ -366,11 +375,13 @@ To stay merge-friendly:
 
 ## Architecture Changes
 
-### State-layer startup status API
+### State/account-pool startup status API
 
-Extend the existing state-layer startup preview so the state crate becomes the
-single place that resolves startup selection and startup availability. The new
-API should be consumed by CLI, core, app-server, and TUI.
+Extend the existing state-layer startup preview so `codex-state` remains the
+source of persisted startup-selection facts and membership-backed availability.
+Add the corresponding startup-status and resolved-policy adapter in
+`codex-account-pool`, then have CLI, core, app-server, and TUI consume that
+shared result instead of each reimplementing the probe.
 
 It should take:
 
@@ -386,26 +397,39 @@ and returns:
 - startup availability classification
 - optional pool diagnostic when an effective pool resolves
 
-This extends the existing `StateRuntime::preview_account_startup_selection`
-entry point instead of creating a second resolver with overlapping semantics.
+This should build on `StateRuntime::preview_account_startup_selection` rather
+than creating a second resolver with overlapping semantics. The state layer
+continues to own persisted facts; the account-pool layer owns resolved policy
+defaults and pooled-applicability decisions that depend on those facts. The
+`codex-account-pool` layer should remain a thin adapter over `codex-state`
+rather than growing a second independent startup-selection or membership
+resolver.
 
 ### Policy resolution
 
-Introduce a resolved policy view with built-in defaults so core runtime can
-operate even when `config.accounts` is absent.
+Introduce a resolved policy view in `codex-account-pool` with built-in defaults
+so runtime can operate even when `config.accounts` is absent.
 
 This view should be derived from `AccountsConfigToml` when present, but it must
-also be constructible from defaults alone.
+also be constructible from defaults alone. It should package config/defaulted
+policy only; it should not duplicate persisted-fact reads or precedence logic
+that already belongs to `codex-state`.
 
 ### Runtime initialization
 
-`build_account_pool_manager` should stop returning `None` merely because
-`config.accounts` is absent. Instead, session bootstrap should:
+Session bootstrap should stop deciding pooled applicability directly inside the
+core-local manager wiring. Instead, core should ask the shared account-pool
+startup-status path whether pooled mode applies, then treat the existing
+`build_account_pool_manager` logic as a thin adapter over that result.
 
-- run the pooled-intent probe
+Runtime initialization should:
+
+- run the pooled-intent probe through the shared account-pool startup-status
+  path
 - require state DB plus pooled intent before constructing the manager
-- derive a resolved policy view from config or defaults only after pooled mode
-  has been deemed applicable
+- reject policy-only migrated config as insufficient pooled applicability
+- derive a resolved policy view from config or defaults inside
+  `codex-account-pool` only after pooled mode has been deemed applicable
 
 This preserves the existing optional-manager gate while removing the false
 requirement that config must be present for pooled mode to exist.
@@ -482,9 +506,12 @@ resolved pooled startup access.
   upstream `codex`
 - config migration should remain a transform, not a blind copy
 - when upstream pooled SQLite state is not imported, config migration should
-  preserve accounts policy fields but intentionally drop `accounts.default_pool`
-  so the new product home can establish its own persisted startup selection from
-  local registration
+  preserve accounts policy fields, including `accounts.allocation_mode`, but
+  intentionally drop `accounts.default_pool` so the new product home can
+  establish its own persisted startup selection from local registration
+- imported policy-only pooled config must not by itself cause the fresh product
+  home to enter pooled mode before local pooled membership exists or an explicit
+  local default pool is chosen
 
 This design works with the `mcodex` migration principle because policy remains
 copyable in config while selection and runtime state remain installation-local.
@@ -501,10 +528,14 @@ At minimum, add or update tests for:
   durable config or state default exists
 - `accounts add --account-pool X` not overwriting an existing persisted default
 - core startup using pooled mode with state-only selection and default policy
+- core and TUI startup staying out of pooled mode for migrated policy-only
+  config with no local pooled membership
 - app-server diagnostics using configured default before persisted fallback
 - TUI startup access on a home with pooled membership but no login/auth baseline
-- migration transform dropping `accounts.default_pool` while preserving accounts
-  policy
+- migration transform dropping `accounts.default_pool` while preserving
+  `accounts.allocation_mode` and the rest of accounts policy
+- migration prompt detection when the legacy upstream home is surfaced via
+  `CODEX_HOME`
 - context-reuse behavior when policy config is absent
 
 ## Risks
@@ -535,6 +566,8 @@ Mitigation:
 
 - make config migration explicitly drop `accounts.default_pool` when pooled state
   is not imported
+- treat policy-only migrated accounts config as insufficient pooled intent until
+  local pooled membership or an explicit local default exists
 - add migration tests covering fresh `mcodex` homes seeded from upstream config
 
 ### Risk: field-level JSON compatibility regressions
@@ -554,18 +587,22 @@ Mitigation:
 ## Recommended Implementation Shape
 
 1. extend the state-layer startup preview into a richer startup-status API with
-   resolution-source and availability outputs
+   resolution-source and availability outputs, then expose it through a shared
+   `codex-account-pool` startup-status adapter
 2. update CLI diagnostics/output to use the richer state-layer status while
    preserving existing JSON field meanings
 3. make `accounts add` establish persisted default selection only when no
    durable config or state default exists
 4. define state-only pooled homes as `local` backend and add pooled-intent
-   probing based on config presence or registered membership
-5. update core, app-server, and TUI startup access to use the state-layer
-   startup status API
-6. update `mcodex` config migration transform to strip `accounts.default_pool`
-   while preserving accounts policy
-7. add regression tests across CLI, core, app-server, TUI, and migration
+   probing based on explicit override, configured default pool, or registered
+   membership
+5. update `codex-account-pool` to own the thin resolved-policy/applicability
+   adapter over `codex-state`, without introducing a second startup resolver
+6. update core, app-server, and TUI startup access to use the shared
+   account-pool startup status API
+7. update `mcodex` config migration transform to strip `accounts.default_pool`
+   while preserving accounts policy, including `allocation_mode`
+8. add regression tests across CLI, core, app-server, TUI, and migration
 
 ## Acceptance Criteria
 

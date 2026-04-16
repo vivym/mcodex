@@ -157,6 +157,9 @@ probing:
 Legacy identity should be treated as an import source, not as a secondary live
 runtime location.
 
+Migration probing should resolve the legacy upstream home by checking
+`CODEX_HOME` when it is set and otherwise falling back to `~/.codex`.
+
 ### First-run migration trigger
 
 On startup, `mcodex` should enter a blocking migration prompt when all of the
@@ -164,7 +167,8 @@ following are true:
 
 - `mcodex` home is not yet initialized
 - no prior migration completion marker exists
-- upstream `~/.codex` exists
+- a readable legacy upstream home exists after resolving `CODEX_HOME` first and
+  `~/.codex` second and passing lightweight import preflight checks
 
 If those conditions are not met, startup proceeds normally.
 
@@ -314,10 +318,14 @@ without contaminating the normal runtime path.
 For pooled-account settings specifically:
 
 - preserve policy fields that remain valid in the fork, such as lease timing,
-  thresholds, backend choice, and pool-policy tables
+  thresholds, backend choice, `accounts.allocation_mode`, and pool-policy
+  tables
 - do not blindly preserve `accounts.default_pool` when pooled SQLite state is
   not being imported, because that selection would point at state that does not
   exist in the new product home
+- imported pooled policy does not by itself mean local pooled state exists, so
+  startup must not treat policy-only imported config as sufficient reason to
+  enter pooled mode before local registration
 
 Blind file copy is not recommended. A transform keeps future divergence
 manageable and avoids importing upstream-specific product assumptions
@@ -409,8 +417,9 @@ dependency:
 
 ### Migration detection
 
-- If upstream `~/.codex` is unreadable, treat migration as unavailable and log a
-  startup warning rather than blocking all startup.
+- If the resolved legacy upstream home from `CODEX_HOME` or `~/.codex` is
+  unreadable, treat migration as unavailable and log a startup warning rather
+  than blocking all startup.
 
 ### Config import
 
@@ -447,6 +456,8 @@ Add targeted tests for:
 Add integration coverage for:
 
 - first launch with only `~/.codex` present triggers migration prompt
+- first launch with legacy `CODEX_HOME` pointing at an upstream home also
+  triggers migration prompt
 - choosing import copies config/auth but not runtime state
 - choosing skip suppresses future prompts
 - post-migration startup enters the TUI normally
@@ -456,7 +467,7 @@ Add integration coverage for:
 
 Manual smoke test on a machine that already has upstream `codex` installed:
 
-1. confirm upstream `~/.codex` exists
+1. confirm an upstream home exists at either legacy `CODEX_HOME` or `~/.codex`
 2. install and launch `mcodex`
 3. confirm migration prompt appears
 4. import config/login
@@ -470,7 +481,8 @@ Manual smoke test on a machine that already has upstream `codex` installed:
 - `mcodex` launches and uses `MCODEX_HOME`/`~/.mcodex` by default.
 - Normal runtime does not implicitly read `CODEX_HOME`.
 - On first launch, `mcodex` offers a blocking migration prompt when upstream
-  `~/.codex` exists and `~/.mcodex` is uninitialized.
+  legacy home state exists via `CODEX_HOME` or `~/.codex` and `~/.mcodex` is
+  uninitialized.
 - Import copies compatible config and auth only.
 - Import never copies runtime SQLite state, logs, history, or account-pool
   state.
