@@ -4,9 +4,9 @@
 
 **Goal:** Land the pooled-startup source-of-truth fix and the `mcodex` product-identity migration flow together so fresh and migrated `mcodex` homes start correctly without manual `config.toml` edits, while preserving upstream-friendly config/state boundaries and additive public contracts.
 
-**Architecture:** Keep pooled startup facts in `codex-state`, move the shared startup-status/applicability adapter into `codex-account-pool`, and make every surface consume that shared result instead of open-coding config/state probes. In parallel, switch runtime home identity to `MCODEX_HOME`/`~/.mcodex`, add a first-run product migration service that runs before personality migration, and explicitly treat pooled startup selection as installation-local state that is not imported across the product boundary.
+**Architecture:** Keep pooled startup facts in `codex-state`, move the shared startup-status/applicability adapter into `codex-account-pool`, and make every surface consume that shared result instead of open-coding config/state probes. In parallel, centralize product identity metadata for home/env names plus system/admin config roots, switch runtime home identity to `MCODEX_HOME`/`~/.mcodex`, add a first-run product migration service that runs before personality migration, and explicitly treat pooled startup selection as installation-local state that is not imported across the product boundary.
 
-**Tech Stack:** Rust workspace crates (`codex-utils-home-dir`, `codex-core`, `codex-state`, `codex-account-pool`, `codex-cli`, `codex-app-server`, `codex-app-server-protocol`, `codex-tui`), SQLite via `codex-state`, existing startup/migration hooks, install scripts, `pretty_assertions`, `insta` where needed, and targeted crate tests.
+**Tech Stack:** Rust workspace crates (`codex-product-identity`, `codex-utils-home-dir`, `codex-core`, `codex-core-skills`, `codex-state`, `codex-account-pool`, `codex-cli`, `codex-app-server`, `codex-app-server-protocol`, `codex-tui`), SQLite via `codex-state`, existing startup/migration hooks, install scripts, `pretty_assertions`, `insta` where needed, and targeted crate tests.
 
 ---
 
@@ -15,6 +15,7 @@
 In scope:
 
 - switch active runtime home resolution from `CODEX_HOME`/`~/.codex` to `MCODEX_HOME`/`~/.mcodex`
+- centralize product identity metadata and route runtime system/admin config roots, macOS managed-preferences domain, legacy managed-config shims, and admin skills roots through it so normal `mcodex` startup does not read upstream `/etc/codex/...`, `%ProgramData%\OpenAI\Codex\...`, or `com.openai.codex` roots/domains by default
 - add first-run product-identity migration detection, marker persistence, config/auth import, and explicit disclosure that pooled startup selection is not imported
 - run product-identity migration before personality migration, with separate markers and non-overlapping skip semantics
 - extend pooled startup resolution into an additive startup-status surface shared by state/account-pool/CLI/core/app-server/TUI
@@ -48,7 +49,12 @@ Out of scope:
 
 ## Planned File Layout
 
-- Modify `codex-rs/utils/home-dir/src/lib.rs` to resolve the active `mcodex` home, expose legacy-home probing for migration, and keep the caller-facing API centralized in one crate.
+- Create `codex-rs/product-identity/Cargo.toml`, `codex-rs/product-identity/BUILD.bazel`, and `codex-rs/product-identity/src/lib.rs` to define the narrow fork identity contract: active/legacy home names, env vars, Unix system config roots, Windows admin config roots, macOS managed-preferences domain, release metadata, installer names, and managed-config compatibility roots.
+- Modify `codex-rs/Cargo.toml`, consumer `BUILD.bazel` files, and generated lock metadata required by the new `codex-product-identity` crate.
+- Modify `codex-rs/utils/home-dir/Cargo.toml` and `codex-rs/utils/home-dir/src/lib.rs` to resolve the active `mcodex` home from the product identity unit, expose legacy-home probing for migration, and keep the caller-facing API centralized in one crate.
+- Modify `codex-rs/core/Cargo.toml`, `codex-rs/core/src/config_loader/mod.rs`, `codex-rs/core/src/config_loader/layer_io.rs`, `codex-rs/core/src/config_loader/macos.rs`, and `codex-rs/core/src/config_loader/tests.rs` so system `config.toml`, `requirements.toml`, macOS managed preferences, and legacy `managed_config.toml` defaults use active `mcodex` identity/roots while legacy upstream values remain available only through explicit backward-compatibility helpers.
+- Modify `codex-rs/core-skills/Cargo.toml`, `codex-rs/core-skills/src/loader.rs`, and `codex-rs/core-skills/src/loader_tests.rs` so admin-scoped skills use the active product system root instead of hard-coded `/etc/codex/skills`.
+- Modify `codex-rs/tui/src/debug_config.rs` so debug/config rendering and tests report the active `mcodex` system/admin roots and preserve legacy managed-config labels only where the runtime actually loaded a legacy shim.
 - Create `codex-rs/core/src/product_identity_migration.rs` to own first-run migration detection, markers, config transform rules, auth copy orchestration, and ordering with personality migration.
 - Create `codex-rs/core/src/product_identity_migration_tests.rs` for migration detection, marker, config-transform, and ordering coverage.
 - Modify `codex-rs/core/src/lib.rs` to export the new product-identity migration module.
@@ -73,17 +79,58 @@ Out of scope:
 - Modify `codex-rs/tui/src/updates.rs`, `codex-rs/tui/src/update_prompt.rs`, `scripts/install/install.sh`, `scripts/install/install.ps1`, and `scripts/dev/install-local.sh` to point at `mcodex` product identity and home naming.
 - Update `docs/config.md` and `docs/install.md` for the new home/env names and first-run migration behavior.
 
-### Task 1: Establish Product Home Resolution And Migration Foundation
+### Task 1: Establish Product Identity, Home Resolution, And Migration Foundation
 
 **Files:**
+- Create: `codex-rs/product-identity/Cargo.toml`
+- Create: `codex-rs/product-identity/BUILD.bazel`
+- Create: `codex-rs/product-identity/src/lib.rs`
+- Modify: `codex-rs/Cargo.toml`
+- Modify: `codex-rs/utils/home-dir/Cargo.toml`
+- Modify: `codex-rs/utils/home-dir/BUILD.bazel`
 - Modify: `codex-rs/utils/home-dir/src/lib.rs`
+- Modify: `codex-rs/core/Cargo.toml`
+- Modify: `codex-rs/core/BUILD.bazel`
+- Modify: `codex-rs/core/src/config_loader/mod.rs`
+- Modify: `codex-rs/core/src/config_loader/layer_io.rs`
+- Modify: `codex-rs/core/src/config_loader/macos.rs`
+- Modify: `codex-rs/core/src/config_loader/tests.rs`
+- Modify: `codex-rs/core-skills/Cargo.toml`
+- Modify: `codex-rs/core-skills/BUILD.bazel`
+- Modify: `codex-rs/core-skills/src/loader.rs`
+- Modify: `codex-rs/core-skills/src/loader_tests.rs`
+- Modify: `codex-rs/tui/Cargo.toml`
+- Modify: `codex-rs/tui/BUILD.bazel`
+- Modify: `codex-rs/tui/src/debug_config.rs`
 - Create: `codex-rs/core/src/product_identity_migration.rs`
 - Create: `codex-rs/core/src/product_identity_migration_tests.rs`
 - Modify: `codex-rs/core/src/lib.rs`
+- Test: `codex-rs/product-identity/src/lib.rs`
 - Test: `codex-rs/utils/home-dir/src/lib.rs`
+- Test: `codex-rs/core/src/config_loader/tests.rs`
+- Test: `codex-rs/core-skills/src/loader_tests.rs`
+- Test: `codex-rs/tui/src/debug_config.rs`
 - Test: `codex-rs/core/src/product_identity_migration_tests.rs`
 
-- [ ] **Step 1: Write failing home-resolution tests**
+- [ ] **Step 1: Write failing product-identity and home-resolution tests**
+
+Add focused tests in `codex-rs/product-identity/src/lib.rs`:
+
+```rust
+#[test]
+fn mcodex_identity_defines_active_and_legacy_roots() {
+    assert_eq!(MCODEX.product_name, "mcodex");
+    assert_eq!(MCODEX.binary_name, "mcodex");
+    assert_eq!(MCODEX.default_home_dir_name, ".mcodex");
+    assert_eq!(MCODEX.home_env_var, "MCODEX_HOME");
+    assert_eq!(MCODEX.legacy_home_env_var, "CODEX_HOME");
+    assert_eq!(MCODEX.unix_system_config_root, "/etc/mcodex");
+    assert_eq!(MCODEX.legacy_unix_system_config_root, "/etc/codex");
+    assert!(MCODEX.windows_admin_config_components.contains(&"Mcodex"));
+    assert!(MCODEX.legacy_windows_admin_config_components.contains(&"Codex"));
+    assert_eq!(MCODEX.macos_managed_config_domain, "com.vivym.mcodex");
+}
+```
 
 Add focused tests in `codex-rs/utils/home-dir/src/lib.rs`:
 
@@ -125,7 +172,49 @@ fn find_codex_home_ignores_codex_home_when_mcodex_home_is_unset() {
 }
 ```
 
-- [ ] **Step 2: Write failing product-migration tests**
+- [ ] **Step 2: Write failing system/admin root and product-migration tests**
+
+Add targeted tests in `codex-rs/core/src/config_loader/tests.rs` or the closest existing config-loader unit module:
+
+```rust
+#[test]
+fn system_config_toml_file_uses_active_mcodex_unix_root() {
+    assert_eq!(
+        unix_system_config_toml_file_for_tests().as_path(),
+        Path::new("/etc/mcodex/config.toml")
+    );
+}
+
+#[test]
+fn managed_config_default_path_uses_active_mcodex_unix_root() {
+    assert_eq!(
+        managed_config_default_path_for_tests().as_path(),
+        Path::new("/etc/mcodex/managed_config.toml")
+    );
+}
+
+#[test]
+fn managed_preferences_source_uses_active_mcodex_domain() {
+    assert_eq!(
+        managed_preferences_requirements_source_for_tests().domain(),
+        "com.vivym.mcodex"
+    );
+}
+```
+
+Add targeted tests in `codex-rs/core-skills/src/loader_tests.rs`:
+
+```rust
+#[test]
+fn admin_skills_root_uses_active_mcodex_system_root() {
+    assert_eq!(
+        admin_skills_root_for_tests().as_path(),
+        Path::new("/etc/mcodex/skills")
+    );
+}
+```
+
+Update `codex-rs/tui/src/debug_config.rs` tests so expected rendered paths use `/etc/mcodex/...` and the active Windows admin root, not `/etc/codex/...` or `C:\ProgramData\OpenAI\Codex\...`, except in tests that explicitly exercise a legacy managed-config shim.
 
 Add targeted tests in `codex-rs/core/src/product_identity_migration_tests.rs`:
 
@@ -172,7 +261,51 @@ async fn auth_import_failure_is_reported_as_warning_without_blocking_startup() -
 }
 ```
 
-- [ ] **Step 3: Implement active and legacy home helpers**
+- [ ] **Step 3: Implement the product identity unit and active/legacy home helpers**
+
+Create `codex-rs/product-identity/src/lib.rs` with a small data-only API. Keep it free of runtime config parsing and business logic:
+
+```rust
+pub struct ProductIdentity {
+    pub product_name: &'static str,
+    pub binary_name: &'static str,
+    pub default_home_dir_name: &'static str,
+    pub home_env_var: &'static str,
+    pub legacy_binary_name: &'static str,
+    pub legacy_home_dir_name: &'static str,
+    pub legacy_home_env_var: &'static str,
+    pub unix_system_config_root: &'static str,
+    pub legacy_unix_system_config_root: &'static str,
+    pub windows_admin_config_components: &'static [&'static str],
+    pub legacy_windows_admin_config_components: &'static [&'static str],
+    pub github_repo_owner: &'static str,
+    pub github_repo_name: &'static str,
+    pub release_api_url: &'static str,
+    pub release_notes_url: &'static str,
+    pub installer_dir_name: &'static str,
+    pub macos_managed_config_domain: &'static str,
+}
+
+pub const MCODEX: ProductIdentity = ProductIdentity {
+    product_name: "mcodex",
+    binary_name: "mcodex",
+    default_home_dir_name: ".mcodex",
+    home_env_var: "MCODEX_HOME",
+    legacy_binary_name: "codex",
+    legacy_home_dir_name: ".codex",
+    legacy_home_env_var: "CODEX_HOME",
+    unix_system_config_root: "/etc/mcodex",
+    legacy_unix_system_config_root: "/etc/codex",
+    windows_admin_config_components: &["Mcodex"],
+    legacy_windows_admin_config_components: &["OpenAI", "Codex"],
+    github_repo_owner: "vivym",
+    github_repo_name: "mcodex",
+    release_api_url: "https://api.github.com/repos/vivym/mcodex/releases/latest",
+    release_notes_url: "https://github.com/vivym/mcodex/releases/latest",
+    installer_dir_name: "mcodex",
+    macos_managed_config_domain: "com.vivym.mcodex",
+};
+```
 
 Update `codex-rs/utils/home-dir/src/lib.rs` so the active API resolves `MCODEX_HOME` / `~/.mcodex`, while a separate helper handles legacy import probing:
 
@@ -187,6 +320,8 @@ pub fn find_legacy_codex_home_for_migration(
     // prefer CODEX_HOME, else ~/.codex, but require readability/preflight success
 }
 ```
+
+Update the config-loader, macOS managed-preferences loader, managed-config loader, admin-skills loader, and debug-config tests to consume `codex-product-identity` rather than hard-coded upstream roots.
 
 - [ ] **Step 4: Implement the shared migration service**
 
@@ -232,11 +367,16 @@ The config transform must preserve policy fields, drop `accounts.default_pool`, 
 Run:
 
 ```bash
+cd codex-rs
+cargo test -p codex-product-identity
 cargo test -p codex-utils-home-dir
+cargo test -p codex-core config_loader -- --nocapture
 cargo test -p codex-core product_identity_migration -- --nocapture
+cargo test -p codex-core-skills
+cargo test -p codex-tui debug_config -- --nocapture
 ```
 
-Expected: PASS. The new tests prove `MCODEX_HOME` is authoritative, legacy probing still sees `CODEX_HOME`, and the migration transform preserves policy while dropping startup-selection-bearing config.
+Expected: PASS. The new tests prove `MCODEX_HOME` is authoritative, legacy probing still sees `CODEX_HOME`, active system/admin roots resolve to `mcodex`, legacy upstream roots are not loaded by default, and the migration transform preserves policy while dropping startup-selection-bearing config.
 
 - [ ] **Step 6: Format, lint, and commit**
 
@@ -245,9 +385,15 @@ Run:
 ```bash
 cd codex-rs
 just fmt
+just fix -p codex-product-identity
 just fix -p codex-utils-home-dir
 just fix -p codex-core
-git add utils/home-dir/src/lib.rs core/src/lib.rs core/src/product_identity_migration.rs core/src/product_identity_migration_tests.rs
+just fix -p codex-core-skills
+just fix -p codex-tui
+cd ..
+just bazel-lock-update
+just bazel-lock-check
+git add MODULE.bazel.lock codex-rs/Cargo.toml codex-rs/product-identity/Cargo.toml codex-rs/product-identity/BUILD.bazel codex-rs/product-identity/src/lib.rs codex-rs/utils/home-dir/Cargo.toml codex-rs/utils/home-dir/BUILD.bazel codex-rs/utils/home-dir/src/lib.rs codex-rs/core/Cargo.toml codex-rs/core/BUILD.bazel codex-rs/core/src/lib.rs codex-rs/core/src/config_loader/mod.rs codex-rs/core/src/config_loader/layer_io.rs codex-rs/core/src/config_loader/macos.rs codex-rs/core/src/config_loader/tests.rs codex-rs/core/src/product_identity_migration.rs codex-rs/core/src/product_identity_migration_tests.rs codex-rs/core-skills/Cargo.toml codex-rs/core-skills/BUILD.bazel codex-rs/core-skills/src/loader.rs codex-rs/core-skills/src/loader_tests.rs codex-rs/tui/Cargo.toml codex-rs/tui/BUILD.bazel codex-rs/tui/src/debug_config.rs
 git commit -m "feat(core): add mcodex identity migration foundation"
 ```
 
@@ -766,6 +912,8 @@ git commit -m "feat(tui): use shared pooled startup status"
 ### Task 7: Update Install/Update Identity Edges And Documentation
 
 **Files:**
+- Modify: `codex-rs/cli/Cargo.toml`
+- Modify: `codex-rs/cli/BUILD.bazel`
 - Modify: `codex-rs/cli/src/main.rs`
 - Modify: `scripts/install/install.sh`
 - Modify: `scripts/install/install.ps1`
@@ -792,6 +940,8 @@ CODEX_HOME
 
 with fork-appropriate product identity and `MCODEX_HOME`/`~/.mcodex`.
 
+Where a Rust surface needs product names, release URLs, or installer directory names, consume `codex_product_identity::MCODEX` instead of introducing new hard-coded fork strings. Keep shell/PowerShell scripts aligned with the same values from Task 1.
+
 Update `codex-rs/cli/src/main.rs` in the same task so the clap binary/help identity also moves to `mcodex`, for example:
 
 ```rust
@@ -815,17 +965,29 @@ Update `docs/config.md` and `docs/install.md` so they describe:
 Run:
 
 ```bash
+cd codex-rs
+cargo test -p codex-cli -- --nocapture
+cargo test -p codex-tui updates -- --nocapture
+cd ..
 rg -n "CODEX_HOME|~/.codex|openai/codex|bin_name = \\\"codex\\\"" scripts/install codex-rs/tui/src codex-rs/cli/src/main.rs docs/config.md docs/install.md
+rg -n "/etc/codex|ProgramData\\\\OpenAI\\\\Codex|com\\.openai\\.codex|managed_config" codex-rs/core/src/config_loader codex-rs/core-skills/src codex-rs/tui/src/debug_config.rs docs/config.md docs/install.md
 ```
 
-Expected: only legacy-migration documentation and intentionally preserved upstream references remain.
+Expected: only legacy-migration documentation, intentionally preserved upstream references, and explicitly named legacy managed-config compatibility shims remain.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Format, lint, and commit**
 
 Run:
 
 ```bash
-git add codex-rs/cli/src/main.rs scripts/install/install.sh scripts/install/install.ps1 scripts/dev/install-local.sh codex-rs/tui/src/updates.rs codex-rs/tui/src/update_prompt.rs docs/config.md docs/install.md
+cd codex-rs
+just fmt
+just fix -p codex-cli
+just fix -p codex-tui
+cd ..
+just bazel-lock-update
+just bazel-lock-check
+git add MODULE.bazel.lock codex-rs/cli/Cargo.toml codex-rs/cli/BUILD.bazel codex-rs/cli/src/main.rs scripts/install/install.sh scripts/install/install.ps1 scripts/dev/install-local.sh codex-rs/tui/src/updates.rs codex-rs/tui/src/update_prompt.rs docs/config.md docs/install.md
 git commit -m "docs: switch install and update surfaces to mcodex"
 ```
 
@@ -839,14 +1001,19 @@ git commit -m "docs: switch install and update surfaces to mcodex"
 Run:
 
 ```bash
+cd codex-rs
+cargo test -p codex-product-identity
 cargo test -p codex-utils-home-dir
+cargo test -p codex-core config_loader -- --nocapture
 cargo test -p codex-core product_identity_migration -- --nocapture
 cargo test -p codex-core personality_migration -- --nocapture
+cargo test -p codex-core-skills
 cargo test -p codex-state account_pool -- --nocapture
 cargo test -p codex-account-pool
 cargo test -p codex-cli accounts -- --nocapture
 cargo test -p codex-app-server-protocol
 cargo test -p codex-app-server account_lease -- --nocapture
+cargo test -p codex-tui debug_config -- --nocapture
 cargo test -p codex-tui startup_access -- --nocapture
 ```
 
@@ -875,6 +1042,7 @@ Verify manually:
 2. migrated home from legacy `CODEX_HOME` or `~/.codex` prompts once, discloses that pooled selection is not imported, and writes separate migration markers
 3. `accounts status --json` preserves legacy fields while adding resolution fields
 4. TUI no longer shows the login wall for valid pooled-only startup access
+5. normal runtime and debug config point at `mcodex` system/admin roots and managed-preferences domain, while `/etc/codex/...`, `%ProgramData%\OpenAI\Codex\...`, and `com.openai.codex` appear only in explicit legacy migration or managed-config compatibility paths
 
 - [ ] **Step 5: Final commit or fixup commit**
 
