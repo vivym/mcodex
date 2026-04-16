@@ -55,11 +55,10 @@ mod tests {
         assert_eq!(MCODEX.legacy_home_env_var, "CODEX_HOME");
         assert_eq!(MCODEX.unix_system_config_root, "/etc/mcodex");
         assert_eq!(MCODEX.legacy_unix_system_config_root, "/etc/codex");
-        assert!(MCODEX.windows_admin_config_components.contains(&"Mcodex"));
-        assert!(
-            MCODEX
-                .legacy_windows_admin_config_components
-                .contains(&"Codex")
+        assert_eq!(MCODEX.windows_admin_config_components, &["Mcodex"]);
+        assert_eq!(
+            MCODEX.legacy_windows_admin_config_components,
+            &["OpenAI", "Codex"]
         );
         assert_eq!(MCODEX.macos_managed_config_domain, "com.vivym.mcodex");
     }
