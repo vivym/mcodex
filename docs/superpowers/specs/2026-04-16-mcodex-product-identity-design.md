@@ -311,6 +311,14 @@ without contaminating the normal runtime path.
 - rewrite or drop product-specific values as needed
 - write a new `mcodex` config
 
+For pooled-account settings specifically:
+
+- preserve policy fields that remain valid in the fork, such as lease timing,
+  thresholds, backend choice, and pool-policy tables
+- do not blindly preserve `accounts.default_pool` when pooled SQLite state is
+  not being imported, because that selection would point at state that does not
+  exist in the new product home
+
 Blind file copy is not recommended. A transform keeps future divergence
 manageable and avoids importing upstream-specific product assumptions
 unchanged.

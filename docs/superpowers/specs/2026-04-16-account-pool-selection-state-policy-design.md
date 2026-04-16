@@ -17,11 +17,14 @@ The recommended direction is:
 - keep backend choice and pool policy in `config.toml`
 - keep the existing upstream-friendly default-pool precedence where explicit
   config remains higher priority than persisted startup-selection fallback
-- make CLI, core, and app-server use one shared effective-pool resolution rule
+- extend the existing state-layer startup preview into a richer startup-status
+  API consumed by CLI, core, app-server, and TUI
 - make fresh registration into an explicit pool establish persisted startup
   selection only when no durable default exists in either config or state
 - make pooled-mode enablement depend on pooled intent discovered from config or
   state rather than raw `config.accounts` presence
+- preserve existing JSON field meanings and add new resolution-source fields
+  instead of repurposing shipped output contracts
 - stop reporting config-only pool counts as though they were actual registered
   runtime pools
 
@@ -54,7 +57,8 @@ config remains the higher-priority operator intent when present.
 - Preserve mergeability with upstream by minimizing churn to config types and
   reusing existing state models where possible.
 - Keep policy-level settings declarative and reviewable in `config.toml`.
-- Unify effective-pool resolution across CLI, core runtime, and app-server.
+- Unify startup selection and availability reporting across CLI, core runtime,
+  app-server, and TUI.
 
 ## Non-Goals
 
@@ -171,9 +175,8 @@ Pros:
 
 Cons:
 
-- Requires one semantic change to effective-pool precedence
-- Needs coordinated updates across CLI, core, and app-server
-- Requires careful handling for missing per-pool policy config
+- Needs coordinated updates across CLI, core, app-server, and TUI
+- Requires careful handling for state-only homes and missing policy config
 
 This is the recommended approach.
 
@@ -223,7 +226,7 @@ its role should be clarified:
 This preserves config compatibility while still allowing state to carry durable
 selection for config-less installs and fresh local product homes.
 
-### 3. Use one effective-pool resolution rule everywhere
+### 3. Use one effective-pool resolution rule everywhere via the state layer
 
 The effective-pool resolution order should become:
 
@@ -238,6 +241,7 @@ This rule should be shared by:
 - `codex accounts status`
 - `AccountPoolManager` startup lease preparation
 - app-server account lease diagnostics
+- TUI startup access probing
 
 There should not be separate CLI-only or app-server-only interpretations of
 default pool precedence. This preserves the current upstream-friendly precedence
@@ -279,8 +283,6 @@ missing.
 The pooled-intent probe should be satisfied by at least one of:
 
 - `config.accounts` being present
-- persisted startup-selection state containing a default pool, preferred
-  account, or suppression marker
 - pooled account membership already existing in state
 
 Implementation should preserve `account_pool_manager: Option<_>` as the
@@ -295,6 +297,7 @@ remove the false dependency on config presence.
 Recommended behavior:
 
 - preserve current runtime defaults when policy config is absent
+- treat state-only pooled homes as implying the `local` account-pool backend
 - do not tighten `allow_context_reuse` semantics in the same slice as startup
   selection ownership
 
@@ -302,6 +305,8 @@ Reasoning:
 
 - the source-of-truth problem can be solved without bundling a separate runtime
   behavior change
+- state-only pooled homes are backed by local SQLite and local pooled-auth
+  storage, so treating them as `local` avoids undefined backend semantics
 - preserving current defaults minimizes regression risk and merge friction
 - context-reuse policy tightening can be evaluated later as its own focused
   design slice with dedicated compatibility review
@@ -313,7 +318,8 @@ Reasoning:
 - persisted default pool
 - configured default pool
 - effective pool
-- effective pool source
+- effective pool resolution source
+- effective account source
 - registered pool count
 - configured policy pool count
 
@@ -324,7 +330,8 @@ Recommended text fields:
 - `persisted default pool: <id|none>`
 - `configured default pool: <id|none>`
 - `effective pool: <id|none>`
-- `effective pool source: override|persistedSelection|configDefault|none`
+- `effective pool resolution: override|persistedSelection|configDefault|none`
+- `effective account source: <accountSource|none>`
 - `registered pools: <n>`
 - `configured policy pools: <n>`
 
@@ -333,10 +340,13 @@ The JSON form should expose the same distinctions.
 For compatibility:
 
 - preserve existing `configuredPoolCount` with its current config-policy meaning
+- preserve existing `effectivePoolSource` with its current account-source
+  meaning
 - add new fields such as `registeredPoolCount`,
   `configuredPolicyPoolCount`, `persistedDefaultPoolId`, and
-  `configuredDefaultPoolId` rather than silently changing the old field's
-  meaning
+  `configuredDefaultPoolId`
+- add a new field such as `effectivePoolResolutionSource` rather than silently
+  changing the old `effectivePoolSource` contract
 
 ### 8. Keep merge friction low by preserving existing public shapes where possible
 
@@ -347,8 +357,8 @@ To stay merge-friendly:
   needed
 - reuse existing startup-selection state fields instead of introducing a second
   persistent default-pool store
-- centralize effective-pool resolution in a shared helper rather than scattering
-  fork-specific conditionals
+- extend the existing state-layer startup preview/status APIs rather than
+  creating a second parallel resolver contract
 - prefer additive diagnostics fields over breaking JSON removals in the first
   slice
 - preserve `account_pool_manager: Option<_>` semantics at the session-service
@@ -356,22 +366,28 @@ To stay merge-friendly:
 
 ## Architecture Changes
 
-### Shared effective-pool resolver
+### State-layer startup status API
 
-Introduce a small shared resolver used by CLI, core, and app-server that takes:
+Extend the existing state-layer startup preview so the state crate becomes the
+single place that resolves startup selection and startup availability. The new
+API should be consumed by CLI, core, app-server, and TUI.
+
+It should take:
 
 - optional process override
-- persisted startup-selection state
-- optional accounts config
+- optional configured default pool id
 
 and returns:
 
-- effective pool id
-- source of that decision
-- configured default pool
-- persisted default pool
+- startup preview
+- effective pool resolution source
+- configured default pool id
+- persisted default pool id
+- startup availability classification
+- optional pool diagnostic when an effective pool resolves
 
-This is the key refactor that removes duplicated precedence logic.
+This extends the existing `StateRuntime::preview_account_startup_selection`
+entry point instead of creating a second resolver with overlapping semantics.
 
 ### Policy resolution
 
@@ -406,12 +422,14 @@ requirement that config must be present for pooled mode to exist.
 ### `accounts current`
 
 - show effective pool under the shared resolution rule
-- show effective pool source in JSON
+- preserve `effectivePoolSource` as account-source output
+- add `effectivePoolResolutionSource` in JSON for selection provenance
 
 ### `accounts status`
 
 - stop presenting config-only pool count as total configured runtime pools
 - show persisted/configured/effective pool distinctions
+- preserve existing JSON field meanings while adding new resolution fields
 
 ### `accounts pool list`
 
@@ -425,9 +443,16 @@ requirement that config must be present for pooled mode to exist.
 
 ## App-Server Behavior
 
-App-server lease diagnostics should consume the same effective-pool resolver as
-CLI and core. This prevents the desktop/app-server surface from disagreeing
-with the terminal CLI about whether a pool is available.
+App-server lease diagnostics should consume the same state-layer startup status
+API as CLI and core. This prevents different surfaces from disagreeing about
+whether a pool is selected or startup access is available.
+
+## TUI Behavior
+
+TUI startup-access probing must also consume the same state-layer startup status
+API. This slice is not complete unless the local startup prompt logic stops
+falling back to login/API-key prompts for homes that have pooled membership and
+resolved pooled startup access.
 
 ## Migration And Compatibility
 
@@ -448,17 +473,21 @@ with the terminal CLI about whether a pool is available.
 
 - pooled startup should become available
 - runtime uses built-in policy defaults
+- runtime treats the account-pool backend as `local`
 
 ### Product-identity migration
-
-No change is needed to the existing `mcodex` migration principle:
 
 - config and auth can still be copied
 - SQLite pooled state still remains product-local and is not imported from
   upstream `codex`
+- config migration should remain a transform, not a blind copy
+- when upstream pooled SQLite state is not imported, config migration should
+  preserve accounts policy fields but intentionally drop `accounts.default_pool`
+  so the new product home can establish its own persisted startup selection from
+  local registration
 
-This design works with that rule because policy remains copyable in config while
-selection and runtime state remain installation-local.
+This design works with the `mcodex` migration principle because policy remains
+copyable in config while selection and runtime state remain installation-local.
 
 ## Testing Strategy
 
@@ -466,11 +495,16 @@ At minimum, add or update tests for:
 
 - CLI status on a home with registered pools but no `config.toml`
 - CLI status distinguishing persisted default vs configured default
+- CLI JSON preserving `effectivePoolSource` semantics while adding
+  `effectivePoolResolutionSource`
 - `accounts add --account-pool X` persisting startup default only when no
   durable config or state default exists
 - `accounts add --account-pool X` not overwriting an existing persisted default
 - core startup using pooled mode with state-only selection and default policy
 - app-server diagnostics using configured default before persisted fallback
+- TUI startup access on a home with pooled membership but no login/auth baseline
+- migration transform dropping `accounts.default_pool` while preserving accounts
+  policy
 - context-reuse behavior when policy config is absent
 
 ## Risks
@@ -481,6 +515,8 @@ contain stale or partial state
 Mitigation:
 
 - require explicit pooled signals rather than "state DB exists" alone
+- use real registered pool membership as the state-side pooled-intent signal
+  instead of treating preferred-account or suppression markers as sufficient
 - add regression tests for non-pooled sessions that still should not build an
   account-pool manager
 
@@ -493,30 +529,56 @@ Mitigation:
 - add regression tests covering config-default homes and existing-persisted
   default homes
 
+### Risk: copied upstream config could still block fresh local startup selection
+
+Mitigation:
+
+- make config migration explicitly drop `accounts.default_pool` when pooled state
+  is not imported
+- add migration tests covering fresh `mcodex` homes seeded from upstream config
+
+### Risk: field-level JSON compatibility regressions
+
+Mitigation:
+
+- preserve existing `effectivePoolSource` and `configuredPoolCount` semantics
+- add only additive JSON fields for new diagnostics
+
 ### Risk: partial adoption leaves CLI, core, and app-server inconsistent
 
 Mitigation:
 
-- do not land this slice without a shared resolver used by all three surfaces
+- do not land this slice without the state-layer startup status API being used
+  by CLI, core, app-server, and TUI
 
 ## Recommended Implementation Shape
 
-1. extract shared effective-pool resolution helper
-2. update CLI diagnostics/output to use richer resolved data
+1. extend the state-layer startup preview into a richer startup-status API with
+   resolution-source and availability outputs
+2. update CLI diagnostics/output to use the richer state-layer status while
+   preserving existing JSON field meanings
 3. make `accounts add` establish persisted default selection only when no
    durable config or state default exists
-4. add pooled-intent probing and refactor core pooled-mode initialization to
-   use it instead of `config.accounts` presence as the gate
-5. update app-server diagnostics to use the shared resolver
-6. add regression tests across CLI, core, and app-server
+4. define state-only pooled homes as `local` backend and add pooled-intent
+   probing based on config presence or registered membership
+5. update core, app-server, and TUI startup access to use the state-layer
+   startup status API
+6. update `mcodex` config migration transform to strip `accounts.default_pool`
+   while preserving accounts policy
+7. add regression tests across CLI, core, app-server, TUI, and migration
 
 ## Acceptance Criteria
 
 - A fresh `mcodex` home with pooled accounts registered into `main-pool` starts
   in pooled mode without requiring manual `config.toml` edits.
+- A fresh `mcodex` home created by config/auth migration from upstream can
+  register a local pooled account and establish startup selection without manual
+  config edits.
 - `accounts status` on that home reports a real effective pool and distinguishes
   runtime pools from configured policy pools.
-- CLI, core, and app-server agree on effective-pool resolution.
+- CLI JSON preserves existing field meanings while adding explicit resolution
+  provenance.
+- CLI, core, app-server, and TUI agree on startup selection and availability.
 - `config.toml` still carries policy fields and remains merge-compatible with
   upstream shape.
 - No DB-only rewrite is required.
