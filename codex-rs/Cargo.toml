@@ -90,6 +90,7 @@ members = [
     "test-binary-support",
     "codex-experimental-api-macros",
     "plugin",
+    "product-identity",
 ]
 resolver = "2"
 
@@ -151,6 +152,7 @@ codex-network-proxy = { path = "network-proxy" }
 codex-ollama = { path = "ollama" }
 codex-otel = { path = "otel" }
 codex-plugin = { path = "plugin" }
+codex-product-identity = { path = "product-identity" }
 codex-process-hardening = { path = "process-hardening" }
 codex-protocol = { path = "protocol" }
 codex-realtime-webrtc = { path = "realtime-webrtc" }

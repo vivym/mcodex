@@ -2571,6 +2571,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-product-identity"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+]
+
+[[package]]
 name = "codex-protocol"
 version = "0.0.0"
 dependencies = [
@@ -3021,6 +3028,7 @@ version = "0.0.0"
 name = "codex-utils-home-dir"
 version = "0.0.0"
 dependencies = [
+ "codex-product-identity",
  "codex-utils-absolute-path",
  "dirs",
  "pretty_assertions",
