@@ -33,6 +33,17 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError>;
 
+    /// Acquire a pool lease while temporarily excluding specific account ids.
+    async fn acquire_lease_excluding(
+        &self,
+        pool_id: &str,
+        holder_instance_id: &str,
+        excluded_account_ids: &[String],
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = excluded_account_ids;
+        self.acquire_lease(pool_id, holder_instance_id).await
+    }
+
     /// Renew the lease if it is still active.
     async fn renew_lease(
         &self,

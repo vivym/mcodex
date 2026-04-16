@@ -1,6 +1,9 @@
 use crate::backend::AccountPoolExecutionBackend;
 use crate::bootstrap::LegacyAuthBootstrap;
 use crate::lease_lifecycle::LeaseHealthEvent;
+use crate::proactive_switch::ProactiveSwitchObservation;
+use crate::proactive_switch::ProactiveSwitchOutcome;
+use crate::proactive_switch::ProactiveSwitchState;
 use crate::types::AccountPoolConfig;
 use crate::types::HealthEventDisposition;
 use crate::types::LeaseGrant;
@@ -22,6 +25,12 @@ enum LeaseRenewalDisposition {
     Missing { pool_id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRotation {
+    HardFailure,
+    SoftProactive,
+}
+
 pub struct AccountPoolManager<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> {
     backend: B,
     legacy_bootstrap: L,
@@ -30,6 +39,9 @@ pub struct AccountPoolManager<B: AccountPoolExecutionBackend, L: LegacyAuthBoots
     active_lease: Option<LeaseGrant>,
     next_health_event_sequence: i64,
     bootstrapped_legacy_auth: bool,
+    proactive_switch_state: ProactiveSwitchState,
+    pending_rotation: Option<PendingRotation>,
+    last_proactively_replaced_account_id: Option<String>,
 }
 
 impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<B, L> {
@@ -49,6 +61,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
             active_lease: None,
             next_health_event_sequence: 0,
             bootstrapped_legacy_auth: false,
+            proactive_switch_state: ProactiveSwitchState::default(),
+            pending_rotation: None,
+            last_proactively_replaced_account_id: None,
         })
     }
 
@@ -77,30 +92,39 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         request: SelectionRequest,
     ) -> anyhow::Result<LeasedAccount> {
         let now = request.now.unwrap_or_else(Utc::now);
+        if let Some(lease) = self.try_rotate_active_lease_if_needed(now).await? {
+            return Ok(lease);
+        }
         if self.active_lease.is_some() {
+            let _ = self.proactive_switch_state.revalidate_before_turn(now);
             match self.try_renew_active_lease_if_needed(now).await? {
                 LeaseRenewalDisposition::NotNeeded(lease)
                 | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
-                    return self.acquire_fresh_lease(pool_id).await;
+                    return self.acquire_fresh_lease(pool_id).await.map_err(Into::into);
                 }
             }
         }
 
         self.acquire_fresh_lease(self.resolve_pool_id(request.pool_id).await?)
             .await
+            .map_err(Into::into)
     }
 
     pub async fn renew_active_lease_if_needed(
         &mut self,
         now: DateTime<Utc>,
     ) -> anyhow::Result<LeasedAccount> {
+        if let Some(lease) = self.try_rotate_active_lease_if_needed(now).await? {
+            return Ok(lease);
+        }
         if self.active_lease.is_some() {
+            let _ = self.proactive_switch_state.revalidate_before_turn(now);
             match self.try_renew_active_lease_if_needed(now).await? {
                 LeaseRenewalDisposition::NotNeeded(lease)
                 | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
-                    return self.acquire_fresh_lease(pool_id).await;
+                    return self.acquire_fresh_lease(pool_id).await.map_err(Into::into);
                 }
             }
         }
@@ -110,6 +134,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 .await?,
         )
         .await
+        .map_err(Into::into)
     }
 
     pub async fn heartbeat_active_lease(&mut self, now: DateTime<Utc>) -> anyhow::Result<()> {
@@ -124,6 +149,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
             LeaseRenewal::Missing => {
                 self.active_lease = None;
                 self.next_health_event_sequence = 0;
+                self.proactive_switch_state.reset();
+                self.pending_rotation = None;
+                self.last_proactively_replaced_account_id = None;
             }
         }
 
@@ -131,14 +159,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
     }
 
     pub async fn release_active_lease(&mut self) -> anyhow::Result<()> {
-        if let Some(active_lease) = self.active_lease.as_ref() {
-            let _ = self
-                .backend
-                .release_lease(&active_lease.key(), Utc::now())
-                .await?;
-        }
-        self.active_lease = None;
-        self.next_health_event_sequence = 0;
+        self.release_active_lease_at(Utc::now()).await?;
+        self.pending_rotation = None;
+        self.last_proactively_replaced_account_id = None;
         Ok(())
     }
 
@@ -152,17 +175,27 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         }
 
         if snapshot.used_percent < f64::from(self.config.proactive_switch_threshold_percent) {
+            self.proactive_switch_state.reset();
+            if matches!(self.pending_rotation, Some(PendingRotation::SoftProactive)) {
+                self.pending_rotation = None;
+            }
             return Ok(HealthEventDisposition::Applied);
         }
-
-        let sequence_number = self.next_health_event_sequence + 1;
-        self.next_health_event_sequence = sequence_number;
         let active_lease = self.active_lease.clone().context("active lease missing")?;
-        let event = LeaseHealthEvent::RateLimited {
-            observed_at: snapshot.observed_at,
+        match self
+            .proactive_switch_state
+            .observe_soft_pressure(ProactiveSwitchObservation {
+                lease_acquired_at: active_lease.acquired_at(),
+                observed_at: snapshot.observed_at,
+                min_switch_interval: self.config.min_switch_interval_duration(),
+            }) {
+            ProactiveSwitchOutcome::NoAction | ProactiveSwitchOutcome::Suppressed { .. } => {}
+            ProactiveSwitchOutcome::RotateOnNextTurn => {
+                if self.pending_rotation != Some(PendingRotation::HardFailure) {
+                    self.pending_rotation = Some(PendingRotation::SoftProactive);
+                }
+            }
         }
-        .into_account_health_event(&active_lease.leased_account(), sequence_number);
-        self.backend.record_health_event(event).await?;
 
         Ok(HealthEventDisposition::Applied)
     }
@@ -184,6 +217,8 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         }
         .into_account_health_event(&active_lease.leased_account(), sequence_number);
         self.backend.record_health_event(health_event).await?;
+        self.proactive_switch_state.reset();
+        self.pending_rotation = Some(PendingRotation::HardFailure);
 
         Ok(HealthEventDisposition::Applied)
     }
@@ -204,6 +239,8 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         }
         .into_account_health_event(&active_lease.leased_account(), sequence_number);
         self.backend.record_health_event(health_event).await?;
+        self.proactive_switch_state.reset();
+        self.pending_rotation = Some(PendingRotation::HardFailure);
 
         Ok(HealthEventDisposition::Applied)
     }
@@ -216,6 +253,8 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 .clone()
                 .with_lease_epoch(active_lease.lease_epoch() + 1);
             self.next_health_event_sequence = 0;
+            self.proactive_switch_state.reset();
+            self.pending_rotation = None;
         }
 
         Ok(())
@@ -257,6 +296,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
             LeaseRenewal::Missing => {
                 self.active_lease = None;
                 self.next_health_event_sequence = 0;
+                self.proactive_switch_state.reset();
+                self.pending_rotation = None;
+                self.last_proactively_replaced_account_id = None;
                 Ok(LeaseRenewalDisposition::Missing {
                     pool_id: active_lease.pool_id().to_string(),
                 })
@@ -279,22 +321,114 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
             .context("account pool has no default pool configured")
     }
 
-    async fn acquire_fresh_lease(&mut self, pool_id: String) -> anyhow::Result<LeasedAccount> {
-        let grant = self
-            .backend
-            .acquire_lease(&pool_id, &self.holder_instance_id)
+    async fn try_rotate_active_lease_if_needed(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Option<LeasedAccount>> {
+        let Some(pending_rotation) = self.pending_rotation.take() else {
+            return Ok(None);
+        };
+        let Some(active_lease) = self.active_lease.clone() else {
+            return Ok(None);
+        };
+        let current_account_id = active_lease.account_id().to_string();
+        let pool_id = active_lease.pool_id().to_string();
+        self.release_active_lease_at(now).await?;
+        if pending_rotation == PendingRotation::HardFailure {
+            self.last_proactively_replaced_account_id = None;
+        }
+
+        let leased_account = match pending_rotation {
+            PendingRotation::HardFailure => self.acquire_fresh_lease(pool_id).await?,
+            PendingRotation::SoftProactive => {
+                self.acquire_proactively_rotated_lease(pool_id, current_account_id.as_str())
+                    .await?
+            }
+        };
+        if pending_rotation == PendingRotation::SoftProactive
+            && leased_account.account_id() != current_account_id
+        {
+            self.last_proactively_replaced_account_id = Some(current_account_id);
+        }
+
+        Ok(Some(leased_account))
+    }
+
+    async fn release_active_lease_at(&mut self, now: DateTime<Utc>) -> anyhow::Result<()> {
+        if let Some(active_lease) = self.active_lease.as_ref() {
+            let _ = self.backend.release_lease(&active_lease.key(), now).await?;
+        }
+        self.active_lease = None;
+        self.next_health_event_sequence = 0;
+        self.proactive_switch_state.reset();
+        Ok(())
+    }
+
+    async fn acquire_proactively_rotated_lease(
+        &mut self,
+        pool_id: String,
+        current_account_id: &str,
+    ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
+        let current_only = vec![current_account_id.to_string()];
+        let mut excluded = current_only.clone();
+        if let Some(last_replaced_account_id) = self.last_proactively_replaced_account_id.as_ref()
+            && last_replaced_account_id != current_account_id
+        {
+            excluded.push(last_replaced_account_id.clone());
+        }
+
+        match self
+            .acquire_fresh_lease_excluding(pool_id.clone(), &excluded)
             .await
-            .map_err(|err| match err {
-                AccountLeaseError::NoEligibleAccount => anyhow::anyhow!(err),
-                AccountLeaseError::Storage(_) => anyhow::anyhow!(err),
-            })?;
+        {
+            Ok(lease) => Ok(lease),
+            Err(AccountLeaseError::NoEligibleAccount) if excluded.len() > 1 => {
+                match self
+                    .acquire_fresh_lease_excluding(pool_id.clone(), &current_only)
+                    .await
+                {
+                    Ok(lease) => Ok(lease),
+                    Err(AccountLeaseError::NoEligibleAccount) => {
+                        self.acquire_fresh_lease(pool_id).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(AccountLeaseError::NoEligibleAccount) => self.acquire_fresh_lease(pool_id).await,
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn acquire_fresh_lease(
+        &mut self,
+        pool_id: String,
+    ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
+        self.acquire_fresh_lease_excluding(pool_id, &[]).await
+    }
+
+    async fn acquire_fresh_lease_excluding(
+        &mut self,
+        pool_id: String,
+        excluded_account_ids: &[String],
+    ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
+        let grant = if excluded_account_ids.is_empty() {
+            self.backend
+                .acquire_lease(&pool_id, &self.holder_instance_id)
+                .await?
+        } else {
+            self.backend
+                .acquire_lease_excluding(&pool_id, &self.holder_instance_id, excluded_account_ids)
+                .await?
+        };
         let leased_account = grant.leased_account();
         self.next_health_event_sequence = self
             .backend
             .read_account_health_event_sequence(leased_account.account_id())
-            .await?
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
             .unwrap_or(0);
         self.active_lease = Some(grant);
+        self.proactive_switch_state.reset();
         Ok(leased_account)
     }
 }
