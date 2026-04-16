@@ -8,6 +8,7 @@ use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
@@ -24,6 +25,8 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
@@ -35,6 +38,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::time::Duration;
 use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::Respond;
@@ -44,6 +48,7 @@ use wiremock::matchers::path_regex;
 
 const PRIMARY_ACCOUNT_ID: &str = "acct-1";
 const SECONDARY_ACCOUNT_ID: &str = "acct-2";
+const ACCOUNT_LEASE_ROTATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn account_lease_read_reports_process_local_pool_state() -> Result<()> {
@@ -158,21 +163,43 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
     seed_two_accounts(codex_home.path()).await?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(ACCOUNT_LEASE_ROTATION_TIMEOUT, mcp.initialize())
+        .await
+        .context("timed out initializing pooled account lease test mcp process")??;
 
-    let thread = start_thread(&mut mcp).await?;
+    let thread = start_thread_with_timeout(&mut mcp, ACCOUNT_LEASE_ROTATION_TIMEOUT).await?;
 
-    let _first_turn = start_turn(&mut mcp, &thread.id, "hit the limit").await?;
+    let _first_turn = start_turn_with_timeout(
+        &mut mcp,
+        &thread.id,
+        "hit the limit",
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
     timeout(
-        DEFAULT_READ_TIMEOUT,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_notification_message("error"),
     )
-    .await??;
-    mcp.clear_message_buffer();
+    .await
+    .context("timed out waiting for first turn rate-limit error")??;
+    wait_for_terminal_thread_status_after_failed_turn(
+        &mut mcp,
+        &thread.id,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
+    // The rotated lease update may be emitted on the first turn error or on the next turn start,
+    // so keep buffered notifications until we observe the secondary-account snapshot.
 
-    let second_turn = start_turn(&mut mcp, &thread.id, "rotate to the next account").await?;
-    let notification = timeout(
-        DEFAULT_READ_TIMEOUT,
+    let second_turn = start_turn_with_timeout(
+        &mut mcp,
+        &thread.id,
+        "rotate to the next account",
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
+    let notification = match timeout(
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_matching_notification(
             "accountLease/updated for rotated account",
             |notification| {
@@ -186,7 +213,21 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
             },
         ),
     )
-    .await??;
+    .await
+    {
+        Ok(notification) => notification?,
+        Err(_) => {
+            let pending_notifications = mcp.pending_notification_methods();
+            let lease_snapshot: AccountLeaseReadResponse = to_response(
+                mcp.read_account_lease()
+                    .await
+                    .context("failed to read account lease after rotated notification timeout")?,
+            )?;
+            bail!(
+                "timed out waiting for rotated accountLease/updated notification; pending_notifications={pending_notifications:?}; lease_snapshot={lease_snapshot:?}"
+            );
+        }
+    };
     let updated: AccountLeaseUpdatedNotification =
         serde_json::from_value(notification.params.expect("params must be present"))?;
     assert_eq!(updated.account_id.as_deref(), Some(SECONDARY_ACCOUNT_ID));
@@ -194,7 +235,7 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
     assert_eq!(updated.suppressed, false);
 
     timeout(
-        DEFAULT_READ_TIMEOUT,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_matching_notification(
             "turn/completed for rotated account turn",
             |notification| {
@@ -209,7 +250,8 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
             },
         ),
     )
-    .await??;
+    .await
+    .context("timed out waiting for rotated turn/completed notification")??;
 
     Ok(())
 }
@@ -256,15 +298,30 @@ async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -
     seed_two_accounts(codex_home.path()).await?;
 
     let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    timeout(ACCOUNT_LEASE_ROTATION_TIMEOUT, mcp.initialize())
+        .await
+        .context("timed out initializing pooled account reset test mcp process")??;
 
-    let thread = start_thread(&mut mcp).await?;
-    let _first_turn = start_turn(&mut mcp, &thread.id, "rate limit me").await?;
+    let thread = start_thread_with_timeout(&mut mcp, ACCOUNT_LEASE_ROTATION_TIMEOUT).await?;
+    let _first_turn = start_turn_with_timeout(
+        &mut mcp,
+        &thread.id,
+        "rate limit me",
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
     timeout(
-        DEFAULT_READ_TIMEOUT,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_notification_message("error"),
     )
-    .await??;
+    .await
+    .context("timed out waiting for account limit error before reset preview")??;
+    wait_for_terminal_thread_status_after_failed_turn(
+        &mut mcp,
+        &thread.id,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
 
     let after_failure: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
     assert_eq!(
@@ -276,10 +333,15 @@ async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -
         Some("nonReplayableTurn")
     );
 
-    mcp.clear_message_buffer();
-    let second_turn = start_turn(&mut mcp, &thread.id, "recover on another account").await?;
+    let second_turn = start_turn_with_timeout(
+        &mut mcp,
+        &thread.id,
+        "recover on another account",
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+    )
+    .await?;
     timeout(
-        DEFAULT_READ_TIMEOUT,
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_matching_notification(
             "turn/completed for recovered turn",
             |notification| {
@@ -294,7 +356,8 @@ async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -
             },
         ),
     )
-    .await??;
+    .await
+    .context("timed out waiting for recovered turn/completed notification")??;
 
     let after_rotation: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
     assert_eq!(
@@ -480,14 +543,22 @@ fn write_pooled_auth(
 }
 
 async fn start_thread(mcp: &mut McpProcess) -> Result<codex_app_server_protocol::Thread> {
+    start_thread_with_timeout(mcp, DEFAULT_READ_TIMEOUT).await
+}
+
+async fn start_thread_with_timeout(
+    mcp: &mut McpProcess,
+    read_timeout: Duration,
+) -> Result<codex_app_server_protocol::Thread> {
     let thread_id = mcp
         .send_thread_start_request(ThreadStartParams::default())
         .await?;
     let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
+        read_timeout,
         mcp.read_stream_until_response_message(RequestId::Integer(thread_id)),
     )
-    .await??;
+    .await
+    .context("timed out waiting for thread/start response")??;
     let ThreadStartResponse { thread, .. } = to_response(response)?;
     Ok(thread)
 }
@@ -496,6 +567,15 @@ async fn start_turn(
     mcp: &mut McpProcess,
     thread_id: &str,
     text: &str,
+) -> Result<codex_app_server_protocol::Turn> {
+    start_turn_with_timeout(mcp, thread_id, text, DEFAULT_READ_TIMEOUT).await
+}
+
+async fn start_turn_with_timeout(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    text: &str,
+    read_timeout: Duration,
 ) -> Result<codex_app_server_protocol::Turn> {
     let request_id = mcp
         .send_turn_start_request(TurnStartParams {
@@ -508,12 +588,47 @@ async fn start_turn(
         })
         .await?;
     let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
+        read_timeout,
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
-    .await??;
+    .await
+    .context("timed out waiting for turn/start response")??;
     let TurnStartResponse { turn } = to_response(response)?;
     Ok(turn)
+}
+
+async fn wait_for_terminal_thread_status_after_failed_turn(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    read_timeout: Duration,
+) -> Result<()> {
+    timeout(
+        read_timeout,
+        mcp.read_stream_until_matching_notification(
+            "terminal thread/status/changed after failed turn",
+            |notification| {
+                if notification.method != "thread/status/changed" {
+                    return false;
+                }
+                let Some(params) = notification.params.as_ref() else {
+                    return false;
+                };
+                let Ok(status_changed) =
+                    serde_json::from_value::<ThreadStatusChangedNotification>(params.clone())
+                else {
+                    return false;
+                };
+                status_changed.thread_id == thread_id
+                    && matches!(
+                        status_changed.status,
+                        ThreadStatus::Idle | ThreadStatus::SystemError | ThreadStatus::NotLoaded
+                    )
+            },
+        ),
+    )
+    .await
+    .context("timed out waiting for terminal thread/status/changed after failed turn")??;
+    Ok(())
 }
 
 async fn create_rate_limit_then_success_server() -> wiremock::MockServer {

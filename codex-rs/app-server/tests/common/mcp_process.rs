@@ -143,7 +143,10 @@ impl McpProcess {
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
         cmd.env("CODEX_HOME", codex_home);
-        cmd.env("RUST_LOG", "info");
+        // The app-server integration suite spawns many child processes in parallel. Keeping the
+        // default child log level at `warn` avoids stderr backpressure and harness capture
+        // contention that can otherwise starve the JSON-RPC control flow and make tests flaky.
+        cmd.env("RUST_LOG", "warn");
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
         cmd.args(args);
 
