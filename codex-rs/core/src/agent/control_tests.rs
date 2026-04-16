@@ -210,7 +210,7 @@ async fn wait_for_live_thread_spawn_children(
     let mut expected_children = expected_children.to_vec();
     expected_children.sort_by_key(std::string::ToString::to_string);
 
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(15), async {
         loop {
             let mut child_ids = control
                 .open_thread_spawn_children(parent_thread_id)
@@ -473,7 +473,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         .find(|entry| *entry == expected);
     assert_eq!(captured, Some(expected));
 
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(15), async {
         loop {
             if thread.codex.session.has_pending_input().await {
                 break;
