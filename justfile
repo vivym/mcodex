@@ -42,6 +42,10 @@ install:
     rustup show active-toolchain
     cargo fetch
 
+[no-cd]
+local-install:
+    ./scripts/dev/install-local.sh
+
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
 #
