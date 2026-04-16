@@ -238,6 +238,10 @@ It should define at least:
 - `legacy_binary_name = "codex"`
 - `legacy_home_dir_name = ".codex"`
 - `legacy_home_env_var = "CODEX_HOME"`
+- active Unix system config root
+- active Windows admin config root
+- legacy Unix system config root
+- legacy Windows admin config root
 - `github_repo_owner`
 - `github_repo_name`
 - `release API URLs`
@@ -310,14 +314,36 @@ Recommended phases:
 ### 4a. Compose startup migration with personality migration explicitly
 
 This new product-identity migration must run before the existing personality
-migration on startup.
+migration on startup, and it must have a single shared owner.
+
+There are multiple startup entrypoints in this repo, so the migration flow must
+not be reimplemented independently in each one. Instead, introduce one shared
+startup-preflight service that owns:
+
+- home resolution for the active product identity
+- migration-offer decision logic
+- import execution and marker writes
+- the final handoff state that tells the caller whether startup can continue
+
+UI layers may render different affordances, but they must not invent different
+migration decisions.
 
 Required ordering:
 
 1. resolve the active `mcodex` home
-2. run product-identity migration detection/prompt/import for that home
+2. run the shared product-identity preflight for that home
 3. once the product migration flow completes, run personality migration against
    the resulting `mcodex` home and imported config, if applicable
+
+Entry-point ownership rules:
+
+- interactive startup surfaces may present the blocking migration prompt, but
+  only after the shared preflight says promptable migration is required
+- non-interactive startup surfaces must not present a second prompt; if
+  migration is required and cannot be completed headlessly, they should fail
+  fast with an explicit migration-required result
+- personality migration must never run before the shared preflight has resolved
+  the product home and migration status
 
 Marker rules:
 
@@ -341,20 +367,18 @@ without contaminating the normal runtime path.
 - rewrite or drop product-specific values as needed
 - write a new `mcodex` config
 
-For pooled-account settings specifically:
+For pooled-account settings specifically, this spec should define only the
+product-boundary rule, not pooled-runtime semantics:
 
-- preserve policy fields that remain valid in the fork, such as lease timing,
-  thresholds, backend choice, `accounts.allocation_mode`, and pool-policy
-  tables
-- do not blindly preserve `accounts.default_pool` when pooled SQLite state is
-  not being imported, because that selection would point at state that does not
-  exist in the new product home
-- imported pooled policy does not by itself mean local pooled state exists, so
-  startup must not treat policy-only imported config as sufficient reason to
-  enter pooled mode before local registration
-- migration UX must disclose this explicitly, because from the user's point of
-  view their prior startup pool selection is being intentionally left behind at
-  the product boundary
+- migrated config must not manufacture pooled runtime state that was not
+  imported
+- startup-selection fields whose meaning depends on missing runtime state must
+  be dropped during migration
+- migration UX must disclose when a startup-selection field is intentionally not
+  carried over
+- the precise allow/drop table for pooled config belongs in the account-pool
+  startup-selection design and implementation plan, not in this product
+  identity spec
 
 Blind file copy is not recommended. A transform keeps future divergence
 manageable and avoids importing upstream-specific product assumptions
@@ -383,6 +407,9 @@ Therefore, this design requires product identity to drive:
 - release notes URLs
 - package-manager update commands
 - installer default directories
+- Unix system config roots
+- Windows admin config roots
+- legacy managed-config file paths, where backward-compat shims still exist
 - product naming in prompts and notices
 
 This applies to:
@@ -393,7 +420,9 @@ This applies to:
 - install.ps1
 - npm/package staging metadata that is needed for internal install paths
 - macOS managed-config domain
+- Unix `/etc/...` config and skills roots
 - Windows install location defaults
+- Windows `%ProgramData%/...` config roots
 
 ### 8. Keep public distribution channels out of phase 1
 
@@ -426,6 +455,7 @@ The following areas are expected to change in the implementation plan:
 - update-check logic and update command rendering
 - install scripts
 - local/internal release metadata
+- system/admin config roots and managed-config loaders
 - user-visible product strings in key startup/update surfaces
 
 The following areas should be changed only if required by a concrete runtime
@@ -520,6 +550,10 @@ Manual smoke test on a machine that already has upstream `codex` installed:
 - Import never copies runtime SQLite state, logs, history, or account-pool
   state.
 - Update prompts and installer paths no longer point at upstream `codex`.
+- Normal runtime does not ingest upstream system/admin config roots such as
+  `/etc/codex/...` by default.
+- Product-identity migration runs through one shared startup preflight before
+  personality migration in every entrypoint.
 - The implementation keeps fork identity changes localized to edge surfaces,
   with no unnecessary repo-wide internal rename.
 
