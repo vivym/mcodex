@@ -477,6 +477,7 @@ mod tests {
     use crate::legacy_core::config_loader::Sourced;
     use crate::legacy_core::config_loader::WebSearchModeRequirement;
     use codex_app_server_protocol::ConfigLayerSource;
+    use codex_product_identity::MCODEX;
     use codex_protocol::config_types::ApprovalsReviewer;
     use codex_protocol::config_types::WebSearchMode;
     use codex_protocol::protocol::AskForApproval;
@@ -484,6 +485,8 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use ratatui::text::Line;
     use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::path::PathBuf;
     use toml::Value as TomlValue;
 
     fn empty_toml_table() -> TomlValue {
@@ -492,6 +495,19 @@ mod tests {
 
     fn absolute_path(path: &str) -> AbsolutePathBuf {
         AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
+    }
+
+    fn active_admin_root() -> PathBuf {
+        if cfg!(windows) {
+            MCODEX
+                .windows_admin_config_components
+                .iter()
+                .fold(PathBuf::from(r"C:\ProgramData"), |path, component| {
+                    path.join(component)
+                })
+        } else {
+            Path::new(MCODEX.unix_system_config_root).to_path_buf()
+        }
     }
 
     fn render_to_text(lines: &[Line<'static>]) -> String {
@@ -509,11 +525,8 @@ mod tests {
 
     #[test]
     fn debug_config_output_lists_all_layers_including_disabled() {
-        let system_file = if cfg!(windows) {
-            absolute_path("C:\\etc\\codex\\config.toml")
-        } else {
-            absolute_path("/etc/codex/config.toml")
-        };
+        let system_file = AbsolutePathBuf::try_from(active_admin_root().join("config.toml"))
+            .expect("system config path");
         let project_folder = if cfg!(windows) {
             absolute_path("C:\\repo\\.codex")
         } else {
@@ -550,11 +563,9 @@ mod tests {
 
     #[test]
     fn debug_config_output_lists_requirement_sources() {
-        let requirements_file = if cfg!(windows) {
-            absolute_path("C:\\ProgramData\\OpenAI\\Codex\\requirements.toml")
-        } else {
-            absolute_path("/etc/codex/requirements.toml")
-        };
+        let requirements_file =
+            AbsolutePathBuf::try_from(active_admin_root().join("requirements.toml"))
+                .expect("requirements path");
 
         let requirements = ConfigRequirements {
             approval_policy: ConstrainedWithSource::new(

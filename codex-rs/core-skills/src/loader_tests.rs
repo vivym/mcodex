@@ -135,6 +135,51 @@ fn normalized(path: &Path) -> AbsolutePathBuf {
         .abs()
 }
 
+fn load_skill_roots_for_test(mcodex_home: &str) -> Vec<SkillRoot> {
+    let codex_home = Path::new(mcodex_home);
+    let user_file = codex_home.join(CONFIG_TOML_FILE).abs();
+    let home_dir = codex_home
+        .parent()
+        .expect("mcodex home should have a parent")
+        .abs();
+    let layers = vec![ConfigLayerEntry::new(
+        ConfigLayerSource::User { file: user_file },
+        TomlValue::Table(toml::map::Map::new()),
+    )];
+    let stack = ConfigLayerStack::new(
+        layers,
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+
+    skill_roots_from_layer_stack(&stack, &home_dir, Some(&home_dir))
+}
+
+#[cfg(unix)]
+#[test]
+fn admin_skills_root_uses_active_mcodex_system_root() {
+    assert_eq!(
+        admin_skills_root_for_tests().as_path(),
+        Path::new("/etc/mcodex/skills")
+    );
+}
+
+#[test]
+fn user_agents_skills_root_is_preserved_with_mcodex_home() {
+    let roots = load_skill_roots_for_test("/tmp/home/.mcodex");
+    assert!(
+        roots
+            .iter()
+            .any(|root| root.path.ends_with(".agents/skills"))
+    );
+    assert!(
+        !roots
+            .iter()
+            .any(|root| root.path.ends_with(".codex/skills"))
+    );
+}
+
 #[test]
 fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_system_to_admin()
 -> anyhow::Result<()> {

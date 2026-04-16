@@ -1691,11 +1691,11 @@ async fn wait_for_account_health_transition(
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let snapshot = test
-            .codex
-            .account_lease_snapshot()
-            .await
-            .expect("pooled session should expose lease snapshot");
+        let Some(snapshot) = test.codex.account_lease_snapshot().await else {
+            return Err(anyhow::anyhow!(
+                "pooled session should expose lease snapshot"
+            ));
+        };
         if snapshot.health_state == Some(expected_health_state)
             && snapshot.switch_reason == Some(expected_switch_reason)
         {

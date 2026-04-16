@@ -12,6 +12,7 @@ use codex_config::ConfigRequirementsWithSources;
 use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ProjectConfig;
 use codex_git_utils::resolve_root_git_project_for_trust;
+use codex_product_identity::MCODEX;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
@@ -67,11 +68,6 @@ pub use codex_config::project_root_markers_from_config;
 #[cfg(test)]
 pub(crate) use codex_config::version_for_toml;
 
-/// On Unix systems, load default settings from this file path, if present.
-/// Note that /etc/codex/ is treated as a "config folder," so subfolders such
-/// as skills/ and rules/ will also be honored.
-pub const SYSTEM_CONFIG_TOML_FILE_UNIX: &str = "/etc/codex/config.toml";
-
 #[cfg(windows)]
 const DEFAULT_PROGRAM_DATA_DIR_WINDOWS: &str = r"C:\ProgramData";
 
@@ -92,8 +88,8 @@ pub(crate) async fn first_layer_config_error_from_entries(
 ///
 /// - cloud:    managed cloud requirements
 /// - admin:    managed preferences (*)
-/// - system    `/etc/codex/requirements.toml` (Unix) or
-///   `%ProgramData%\OpenAI\Codex\requirements.toml` (Windows)
+/// - system    `/etc/mcodex/requirements.toml` (Unix) or
+///   `%ProgramData%\Mcodex\requirements.toml` (Windows)
 ///
 /// For backwards compatibility, we also load from
 /// `managed_config.toml` and map it to `requirements.toml`.
@@ -101,8 +97,8 @@ pub(crate) async fn first_layer_config_error_from_entries(
 /// Configuration is built up from multiple layers in the following order:
 ///
 /// - admin:    managed preferences (*)
-/// - system    `/etc/codex/config.toml` (Unix) or
-///   `%ProgramData%\OpenAI\Codex\config.toml` (Windows)
+/// - system    `/etc/mcodex/config.toml` (Unix) or
+///   `%ProgramData%\Mcodex\config.toml` (Windows)
 /// - user      `${CODEX_HOME}/config.toml`
 /// - cwd       `${PWD}/config.toml` (loaded but disabled when the directory is untrusted)
 /// - tree      parent directories up to root looking for `./.codex/config.toml` (loaded but disabled when untrusted)
@@ -140,8 +136,9 @@ pub async fn load_config_layers_state(
     )
     .await?;
 
-    // Honor the system requirements.toml location.
-    let requirements_toml_file = system_requirements_toml_file()?;
+    // Honor the system requirements.toml location, with explicit legacy-root
+    // fallback for migrated installations.
+    let requirements_toml_file = compatible_system_requirements_toml_file()?;
     load_requirements_toml(&mut config_requirements_toml, requirements_toml_file).await?;
 
     // Make a best-effort to support the legacy `managed_config.toml` as a
@@ -169,9 +166,9 @@ pub async fn load_config_layers_state(
         )?)
     };
 
-    // Include an entry for the "system" config folder, loading its config.toml,
-    // if it exists.
-    let system_config_toml_file = system_config_toml_file()?;
+    // Include an entry for the "system" config folder, loading its config.toml
+    // with explicit legacy-root fallback if the active root is absent.
+    let system_config_toml_file = compatible_system_config_toml_file()?;
     let system_layer =
         load_config_toml_for_required_layer(&system_config_toml_file, |config_toml| {
             ConfigLayerEntry::new(
@@ -400,9 +397,96 @@ async fn load_requirements_toml(
     Ok(())
 }
 
+fn compatible_system_file_path(
+    active_root: &Path,
+    legacy_root: &Path,
+    file_name: &str,
+) -> io::Result<AbsolutePathBuf> {
+    let active_file = active_root.join(file_name);
+    let legacy_file = legacy_root.join(file_name);
+    let selected = if active_file.exists() || !legacy_file.exists() {
+        active_file
+    } else {
+        legacy_file
+    };
+    AbsolutePathBuf::try_from(selected)
+}
+
+#[cfg(unix)]
+fn compatible_system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    let active_file = system_requirements_toml_file()?;
+    let active_root = active_file.as_path().parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "System requirements file {} has no parent directory",
+                active_file.as_path().display()
+            ),
+        )
+    })?;
+    compatible_system_file_path(
+        active_root,
+        legacy_unix_system_config_root(),
+        "requirements.toml",
+    )
+}
+
+#[cfg(windows)]
+fn compatible_system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
+    let active_file = system_requirements_toml_file()?;
+    let active_root = active_file.as_path().parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "System requirements file {} has no parent directory",
+                active_file.as_path().display()
+            ),
+        )
+    })?;
+    compatible_system_file_path(
+        active_root,
+        legacy_windows_system_dir().as_path(),
+        "requirements.toml",
+    )
+}
+
+#[cfg(unix)]
+fn compatible_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+    let active_file = system_config_toml_file()?;
+    let active_root = active_file.as_path().parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "System config file {} has no parent directory",
+                active_file.as_path().display()
+            ),
+        )
+    })?;
+    compatible_system_file_path(active_root, legacy_unix_system_config_root(), "config.toml")
+}
+
+#[cfg(windows)]
+fn compatible_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
+    let active_file = system_config_toml_file()?;
+    let active_root = active_file.as_path().parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "System config file {} has no parent directory",
+                active_file.as_path().display()
+            ),
+        )
+    })?;
+    compatible_system_file_path(
+        active_root,
+        legacy_windows_system_dir().as_path(),
+        "config.toml",
+    )
+}
+
 #[cfg(unix)]
 fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
-    AbsolutePathBuf::from_absolute_path(Path::new("/etc/codex/requirements.toml"))
+    AbsolutePathBuf::try_from(unix_system_config_root().join("requirements.toml"))
 }
 
 #[cfg(windows)]
@@ -412,7 +496,7 @@ fn system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
 
 #[cfg(unix)]
 fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
-    AbsolutePathBuf::from_absolute_path(Path::new(SYSTEM_CONFIG_TOML_FILE_UNIX))
+    AbsolutePathBuf::try_from(unix_system_config_root().join("config.toml"))
 }
 
 #[cfg(windows)]
@@ -421,7 +505,7 @@ fn system_config_toml_file() -> io::Result<AbsolutePathBuf> {
 }
 
 #[cfg(windows)]
-fn windows_codex_system_dir() -> PathBuf {
+fn windows_system_dir_from_components(components: &[&str]) -> PathBuf {
     let program_data = windows_program_data_dir_from_known_folder().unwrap_or_else(|err| {
         tracing::warn!(
             error = %err,
@@ -429,18 +513,40 @@ fn windows_codex_system_dir() -> PathBuf {
         );
         PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS)
     });
-    program_data.join("OpenAI").join("Codex")
+    components
+        .iter()
+        .fold(program_data, |path, component| path.join(component))
+}
+
+#[cfg(unix)]
+fn unix_system_config_root() -> &'static Path {
+    Path::new(MCODEX.unix_system_config_root)
+}
+
+#[cfg(unix)]
+fn legacy_unix_system_config_root() -> &'static Path {
+    Path::new(MCODEX.legacy_unix_system_config_root)
+}
+
+#[cfg(windows)]
+fn active_windows_system_dir() -> PathBuf {
+    windows_system_dir_from_components(MCODEX.windows_admin_config_components)
+}
+
+#[cfg(windows)]
+fn legacy_windows_system_dir() -> PathBuf {
+    windows_system_dir_from_components(MCODEX.legacy_windows_admin_config_components)
 }
 
 #[cfg(windows)]
 fn windows_system_requirements_toml_file() -> io::Result<AbsolutePathBuf> {
-    let requirements_toml_file = windows_codex_system_dir().join("requirements.toml");
+    let requirements_toml_file = active_windows_system_dir().join("requirements.toml");
     AbsolutePathBuf::try_from(requirements_toml_file)
 }
 
 #[cfg(windows)]
 fn windows_system_config_toml_file() -> io::Result<AbsolutePathBuf> {
-    let config_toml_file = windows_codex_system_dir().join("config.toml");
+    let config_toml_file = active_windows_system_dir().join("config.toml");
     AbsolutePathBuf::try_from(config_toml_file)
 }
 
@@ -872,7 +978,7 @@ async fn load_project_layers(
 }
 
 /// The legacy mechanism for specifying admin-enforced configuration is to read
-/// from a file like `/etc/codex/managed_config.toml` that has the same
+/// from a file like `/etc/mcodex/managed_config.toml` that has the same
 /// structure as `config.toml` where fields like `approval_policy` can specify
 /// exactly one value rather than a list of allowed values.
 ///
@@ -1019,13 +1125,51 @@ foo = "xyzzy"
         );
     }
 
+    #[test]
+    fn compatible_system_file_path_prefers_active_root_when_present() {
+        let temp_dir = tempdir().expect("tempdir");
+        let active_root = temp_dir.path().join("mcodex");
+        let legacy_root = temp_dir.path().join("codex");
+        std::fs::create_dir_all(&active_root).expect("create active root");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy root");
+        std::fs::write(active_root.join("config.toml"), "model = \"active\"")
+            .expect("write active config");
+        std::fs::write(legacy_root.join("config.toml"), "model = \"legacy\"")
+            .expect("write legacy config");
+
+        let selected = compatible_system_file_path(&active_root, &legacy_root, "config.toml")
+            .expect("select config path");
+
+        assert_eq!(
+            selected.as_path(),
+            active_root.join("config.toml").as_path()
+        );
+    }
+
+    #[test]
+    fn compatible_system_file_path_falls_back_to_legacy_root_when_active_missing() {
+        let temp_dir = tempdir().expect("tempdir");
+        let active_root = temp_dir.path().join("mcodex");
+        let legacy_root = temp_dir.path().join("codex");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy root");
+        std::fs::write(legacy_root.join("config.toml"), "model = \"legacy\"")
+            .expect("write legacy config");
+
+        let selected = compatible_system_file_path(&active_root, &legacy_root, "config.toml")
+            .expect("select config path");
+
+        assert_eq!(
+            selected.as_path(),
+            legacy_root.join("config.toml").as_path()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_system_requirements_toml_file_uses_expected_suffix() {
         let expected = windows_program_data_dir_from_known_folder()
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
-            .join("OpenAI")
-            .join("Codex")
+            .join("Mcodex")
             .join("requirements.toml");
         assert_eq!(
             windows_system_requirements_toml_file()
@@ -1037,7 +1181,7 @@ foo = "xyzzy"
             windows_system_requirements_toml_file()
                 .expect("requirements.toml path")
                 .as_path()
-                .ends_with(Path::new("OpenAI").join("Codex").join("requirements.toml"))
+                .ends_with(Path::new("Mcodex").join("requirements.toml"))
         );
     }
 
@@ -1046,8 +1190,7 @@ foo = "xyzzy"
     fn windows_system_config_toml_file_uses_expected_suffix() {
         let expected = windows_program_data_dir_from_known_folder()
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROGRAM_DATA_DIR_WINDOWS))
-            .join("OpenAI")
-            .join("Codex")
+            .join("Mcodex")
             .join("config.toml");
         assert_eq!(
             windows_system_config_toml_file()
@@ -1059,7 +1202,7 @@ foo = "xyzzy"
             windows_system_config_toml_file()
                 .expect("config.toml path")
                 .as_path()
-                .ends_with(Path::new("OpenAI").join("Codex").join("config.toml"))
+                .ends_with(Path::new("Mcodex").join("config.toml"))
         );
     }
 }

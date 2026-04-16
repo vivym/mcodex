@@ -19,6 +19,7 @@ pub struct ProductIdentity {
     pub release_notes_url: &'static str,
     pub installer_dir_name: &'static str,
     pub macos_managed_config_domain: &'static str,
+    pub legacy_macos_managed_config_domain: &'static str,
 }
 
 pub const MCODEX: ProductIdentity = ProductIdentity {
@@ -39,6 +40,7 @@ pub const MCODEX: ProductIdentity = ProductIdentity {
     release_notes_url: "https://github.com/vivym/mcodex/releases/latest",
     installer_dir_name: "mcodex",
     macos_managed_config_domain: "com.vivym.mcodex",
+    legacy_macos_managed_config_domain: "com.openai.codex",
 };
 
 #[cfg(test)]
@@ -61,5 +63,9 @@ mod tests {
             &["OpenAI", "Codex"]
         );
         assert_eq!(MCODEX.macos_managed_config_domain, "com.vivym.mcodex");
+        assert_eq!(
+            MCODEX.legacy_macos_managed_config_domain,
+            "com.openai.codex"
+        );
     }
 }

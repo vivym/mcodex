@@ -36,6 +36,52 @@ fn config_error_from_io(err: &std::io::Error) -> &super::ConfigError {
         .expect("expected ConfigLoadError")
 }
 
+#[cfg(unix)]
+#[test]
+fn system_config_toml_file_uses_active_mcodex_unix_root() {
+    assert_eq!(
+        super::system_config_toml_file()
+            .expect("system config path")
+            .as_path(),
+        Path::new("/etc/mcodex/config.toml")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_config_default_path_uses_active_mcodex_unix_root() {
+    assert_eq!(
+        super::layer_io::managed_config_default_path_for_tests().as_path(),
+        Path::new("/etc/mcodex/managed_config.toml")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_preferences_source_uses_active_mcodex_domain() {
+    let source = super::macos::managed_preferences_requirements_source_for_tests();
+    assert_eq!(
+        source,
+        RequirementSource::MdmManagedPreferences {
+            domain: "com.vivym.mcodex".to_string(),
+            key: "requirements_toml_base64".to_string(),
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_preferences_source_can_report_legacy_codex_domain() {
+    let source = super::macos::legacy_managed_preferences_requirements_source_for_tests();
+    assert_eq!(
+        source,
+        RequirementSource::MdmManagedPreferences {
+            domain: "com.openai.codex".to_string(),
+            key: "requirements_toml_base64".to_string(),
+        }
+    );
+}
+
 async fn make_config_for_test(
     codex_home: &Path,
     project_path: &Path,

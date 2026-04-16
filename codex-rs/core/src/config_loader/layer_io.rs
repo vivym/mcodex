@@ -5,15 +5,13 @@ use super::macos::ManagedAdminConfigLayer;
 use super::macos::load_managed_admin_config_layer;
 use codex_config::config_error_from_toml;
 use codex_config::io_error_from_config_error;
+use codex_product_identity::MCODEX;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use tokio::fs;
 use toml::Value as TomlValue;
-
-#[cfg(unix)]
-const CODEX_MANAGED_CONFIG_SYSTEM_PATH: &str = "/etc/codex/managed_config.toml";
 
 #[derive(Debug, Clone)]
 pub(super) struct MangedConfigFromFile {
@@ -29,7 +27,7 @@ pub(super) struct ManagedConfigFromMdm {
 
 #[derive(Debug, Clone)]
 pub(super) struct LoadedConfigLayers {
-    /// If present, data read from a file such as `/etc/codex/managed_config.toml`.
+    /// If present, data read from a file such as `/etc/mcodex/managed_config.toml`.
     pub managed_config: Option<MangedConfigFromFile>,
     /// If present, data read from managed preferences (macOS only).
     pub managed_config_from_mdm: Option<ManagedConfigFromMdm>,
@@ -53,7 +51,7 @@ pub(super) async fn load_config_layers_internal(
     } = overrides;
 
     let managed_config_path = AbsolutePathBuf::from_absolute_path(
-        managed_config_path.unwrap_or_else(|| managed_config_default_path(codex_home)),
+        managed_config_path.unwrap_or_else(|| managed_config_path_for_load(codex_home)),
     )?;
 
     let managed_config =
@@ -81,7 +79,9 @@ pub(super) async fn load_config_layers_internal(
 
 #[cfg(target_os = "macos")]
 fn map_managed_admin_layer(layer: ManagedAdminConfigLayer) -> ManagedConfigFromMdm {
-    let ManagedAdminConfigLayer { config, raw_toml } = layer;
+    let ManagedAdminConfigLayer {
+        config, raw_toml, ..
+    } = layer;
     ManagedConfigFromMdm {
         managed_config: config,
         raw_toml,
@@ -125,11 +125,95 @@ pub(super) fn managed_config_default_path(codex_home: &Path) -> PathBuf {
     #[cfg(unix)]
     {
         let _ = codex_home;
-        PathBuf::from(CODEX_MANAGED_CONFIG_SYSTEM_PATH)
+        Path::new(MCODEX.unix_system_config_root).join("managed_config.toml")
     }
 
     #[cfg(not(unix))]
     {
         codex_home.join("managed_config.toml")
+    }
+}
+
+fn managed_config_path_for_load(codex_home: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let active_path = managed_config_default_path(codex_home);
+        let Some(active_root) = active_path.parent() else {
+            return active_path;
+        };
+        managed_config_path_with_legacy_fallback(
+            active_root,
+            Path::new(MCODEX.legacy_unix_system_config_root),
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        managed_config_default_path(codex_home)
+    }
+}
+
+#[cfg(unix)]
+fn managed_config_path_with_legacy_fallback(active_root: &Path, legacy_root: &Path) -> PathBuf {
+    let active_path = active_root.join("managed_config.toml");
+    let legacy_path = legacy_root.join("managed_config.toml");
+    if active_path.exists() || !legacy_path.exists() {
+        active_path
+    } else {
+        legacy_path
+    }
+}
+
+#[cfg(test)]
+pub(super) fn managed_config_default_path_for_tests() -> PathBuf {
+    managed_config_default_path(Path::new("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_config_path_for_load_prefers_active_root_when_present() {
+        let temp_dir = tempdir().expect("tempdir");
+        let active_root = temp_dir.path().join("mcodex");
+        let legacy_root = temp_dir.path().join("codex");
+        std::fs::create_dir_all(&active_root).expect("create active root");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy root");
+        std::fs::write(
+            active_root.join("managed_config.toml"),
+            "model = \"active\"",
+        )
+        .expect("write active managed config");
+        std::fs::write(
+            legacy_root.join("managed_config.toml"),
+            "model = \"legacy\"",
+        )
+        .expect("write legacy managed config");
+
+        let selected = managed_config_path_with_legacy_fallback(&active_root, &legacy_root);
+
+        assert_eq!(selected, active_root.join("managed_config.toml"),);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_config_path_for_load_falls_back_to_legacy_root() {
+        let temp_dir = tempdir().expect("tempdir");
+        let active_root = temp_dir.path().join("mcodex");
+        let legacy_root = temp_dir.path().join("codex");
+        std::fs::create_dir_all(&legacy_root).expect("create legacy root");
+        std::fs::write(
+            legacy_root.join("managed_config.toml"),
+            "model = \"legacy\"",
+        )
+        .expect("write legacy managed config");
+
+        let selected = managed_config_path_with_legacy_fallback(&active_root, &legacy_root);
+
+        assert_eq!(selected, legacy_root.join("managed_config.toml"),);
     }
 }

@@ -12,6 +12,8 @@ use codex_config::ConfigLayerStackOrdering;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
+#[cfg(test)]
+use codex_product_identity::MCODEX;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -260,8 +262,8 @@ fn skill_roots_from_layer_stack_inner(
                 });
             }
             ConfigLayerSource::System { .. } => {
-                // The system config layer lives under `/etc/codex/` on Unix, so treat
-                // `/etc/codex/skills` as admin-scoped skills.
+                // The active product's system config layer doubles as the admin skills root on
+                // Unix, so `/etc/mcodex/skills` is admin-scoped under mcodex.
                 roots.push(SkillRoot {
                     path: config_folder.join(SKILLS_DIR_NAME),
                     scope: SkillScope::Admin,
@@ -858,6 +860,26 @@ fn extract_frontmatter(contents: &str) -> Option<String> {
 
     Some(frontmatter_lines.join("\n"))
 }
+
+#[cfg(test)]
+pub(crate) fn admin_skills_root_for_tests() -> PathBuf {
+    #[cfg(unix)]
+    {
+        Path::new(MCODEX.unix_system_config_root).join(SKILLS_DIR_NAME)
+    }
+
+    #[cfg(windows)]
+    {
+        return MCODEX
+            .windows_admin_config_components
+            .iter()
+            .fold(PathBuf::from(r"C:\ProgramData"), |path, component| {
+                path.join(component)
+            })
+            .join(SKILLS_DIR_NAME);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn skill_roots_from_layer_stack(
     config_layer_stack: &ConfigLayerStack,
