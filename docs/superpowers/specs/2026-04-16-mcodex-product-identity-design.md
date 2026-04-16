@@ -177,6 +177,8 @@ If those conditions are not met, startup proceeds normally.
 The prompt should offer:
 
 - import config and login
+- note that pooled account selection is not imported and will be re-established
+  locally
 - skip
 
 It should not silently auto-import. The user should make an explicit choice.
@@ -188,6 +190,8 @@ If the user chooses import:
 - create the `mcodex` home
 - copy compatible config into the new home
 - copy auth-related material into the new home
+- do not preserve startup pool selection fields that depend on pooled runtime
+  state not being imported
 - record a migration completion marker
 
 If the user chooses skip:
@@ -303,6 +307,28 @@ Recommended phases:
 4. If chosen, import config and auth into the new home
 5. Record migration completion
 
+### 4a. Compose startup migration with personality migration explicitly
+
+This new product-identity migration must run before the existing personality
+migration on startup.
+
+Required ordering:
+
+1. resolve the active `mcodex` home
+2. run product-identity migration detection/prompt/import for that home
+3. once the product migration flow completes, run personality migration against
+   the resulting `mcodex` home and imported config, if applicable
+
+Marker rules:
+
+- product-identity migration and personality migration keep separate markers
+- skipping product-identity migration must not suppress personality migration
+- a personality-migration marker must not suppress the product-identity
+  migration prompt
+
+This avoids double-prompt ambiguity while keeping the two migrations
+independently mergeable.
+
 This logic should be isolated from generic config loading so it can evolve
 without contaminating the normal runtime path.
 
@@ -326,6 +352,9 @@ For pooled-account settings specifically:
 - imported pooled policy does not by itself mean local pooled state exists, so
   startup must not treat policy-only imported config as sufficient reason to
   enter pooled mode before local registration
+- migration UX must disclose this explicitly, because from the user's point of
+  view their prior startup pool selection is being intentionally left behind at
+  the product boundary
 
 Blind file copy is not recommended. A transform keeps future divergence
 manageable and avoids importing upstream-specific product assumptions
@@ -447,6 +476,9 @@ Add targeted tests for:
 - runtime does not fall back to `CODEX_HOME`
 - default home resolves to `~/.mcodex`
 - migration-offer decision matrix
+- startup ordering between product-identity migration and personality migration
+- separate marker behavior for product-identity migration vs personality
+  migration
 - config import filtering/mapping
 - migration marker behavior
 - update source selection and update command rendering
@@ -458,6 +490,7 @@ Add integration coverage for:
 - first launch with only `~/.codex` present triggers migration prompt
 - first launch with legacy `CODEX_HOME` pointing at an upstream home also
   triggers migration prompt
+- imported startup text makes it clear that pooled selection is not carried over
 - choosing import copies config/auth but not runtime state
 - choosing skip suppresses future prompts
 - post-migration startup enters the TUI normally
@@ -496,6 +529,7 @@ Once this identity slice lands, the next plan should cover:
 
 - exact implementation tasks for the identity layer
 - runtime migration service wiring
+- startup ordering with personality migration
 - update/install edge adoption
 - test coverage for migration and identity resolution
 

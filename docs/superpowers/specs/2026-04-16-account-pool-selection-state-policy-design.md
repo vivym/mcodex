@@ -223,9 +223,17 @@ its role should be clarified:
 - It does not stop startup selection from being persisted in state.
 - Persisted startup selection is still used when config does not define a
   default.
+- This live runtime meaning applies within one product home. Cross-product
+  migration that does not import pooled runtime state must not preserve
+  `accounts.default_pool` as though it were still a valid startup selection.
 
 This preserves config compatibility while still allowing state to carry durable
 selection for config-less installs and fresh local product homes.
+
+In other words, `accounts.default_pool` remains a normal operator default for a
+given installation, but product-identity migration intentionally treats it as
+selection-bearing state that must be re-established locally when pooled SQLite
+state is not copied.
 
 ### 3. Use one effective-pool resolution rule everywhere via the state layer
 
@@ -287,6 +295,10 @@ The pooled-intent probe should be satisfied by at least one of:
 - a process-level override explicitly naming a pool
 - config declaring `accounts.default_pool`
 - pooled account membership already existing in state
+
+Explicit local override/config intent must become actionable on a fresh home
+once the local state runtime for that home has been initialized. The absence of
+a preexisting SQLite file must not by itself suppress pooled applicability.
 
 The following must not count as pooled intent by themselves:
 
@@ -426,6 +438,9 @@ Runtime initialization should:
 
 - run the pooled-intent probe through the shared account-pool startup-status
   path
+- initialize or open the local state runtime for the current product home as
+  part of normal bootstrap rather than treating "SQLite file does not exist yet"
+  as a non-pooled signal
 - require state DB plus pooled intent before constructing the manager
 - reject policy-only migrated config as insufficient pooled applicability
 - derive a resolved policy view from config or defaults inside
@@ -512,6 +527,9 @@ resolved pooled startup access.
 - imported policy-only pooled config must not by itself cause the fresh product
   home to enter pooled mode before local pooled membership exists or an explicit
   local default pool is chosen
+- migration UX must explicitly disclose that pooled startup selection is not
+  carried across the product boundary and will be re-established locally after
+  import
 
 This design works with the `mcodex` migration principle because policy remains
 copyable in config while selection and runtime state remain installation-local.
@@ -568,13 +586,20 @@ Mitigation:
   is not imported
 - treat policy-only migrated accounts config as insufficient pooled intent until
   local pooled membership or an explicit local default exists
+- disclose in the migration prompt that startup pool selection is not imported
+  and must be recreated locally
 - add migration tests covering fresh `mcodex` homes seeded from upstream config
 
 ### Risk: field-level JSON compatibility regressions
 
 Mitigation:
 
+- treat `AccountStartupSelectionPreview` expansion as additive-only in this
+  slice, whether by adding optional fields or by introducing a companion status
+  type alongside existing semantics
 - preserve existing `effectivePoolSource` and `configuredPoolCount` semantics
+- keep CLI JSON changes additive-only
+- keep app-server v2 account-lease diagnostics changes additive-only
 - add only additive JSON fields for new diagnostics
 
 ### Risk: partial adoption leaves CLI, core, and app-server inconsistent
