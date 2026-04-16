@@ -480,18 +480,30 @@ WHERE account_id = ?
         &self,
         event: AccountHealthEvent,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
-        let observed_at = account_datetime_to_epoch_seconds(event.observed_at);
-        let has_membership = super::account_pool_control::read_account_pool_membership_row(
-            &mut *tx,
-            &event.account_id,
-        )
-        .await?
-        .is_some();
+        // This transaction reads membership state and then writes runtime health state. Starting
+        // with BEGIN IMMEDIATE avoids deferred read->write upgrade races, and the bounded retry
+        // lets us recover if another writer holds the lock longer than SQLite's busy timeout.
+        for attempt in 0..5 {
+            let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+                Ok(tx) => tx,
+                Err(err) if err.to_string().contains("database is locked") && attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let updated_at = account_datetime_to_epoch_seconds(Utc::now());
+            let observed_at = account_datetime_to_epoch_seconds(event.observed_at);
+            let result = async {
+                let has_membership = super::account_pool_control::read_account_pool_membership_row(
+                    &mut *tx,
+                    &event.account_id,
+                )
+                .await?
+                .is_some();
 
-        sqlx::query(
-            r#"
+                sqlx::query(
+                    r#"
 INSERT INTO account_runtime_state (
     account_id,
     pool_id,
@@ -522,18 +534,18 @@ ON CONFLICT(account_id) DO UPDATE SET
     END,
     updated_at = excluded.updated_at
             "#,
-        )
-        .bind(&event.account_id)
-        .bind(&event.pool_id)
-        .bind(event.health_state.as_str())
-        .bind(event.sequence_number)
-        .bind(observed_at)
-        .bind(updated_at)
-        .execute(&mut *tx)
-        .await?;
+                )
+                .bind(&event.account_id)
+                .bind(&event.pool_id)
+                .bind(event.health_state.as_str())
+                .bind(event.sequence_number)
+                .bind(observed_at)
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await?;
 
-        let update_registry_query = if has_membership {
-            r#"
+                let update_registry_query = if has_membership {
+                    r#"
 UPDATE account_registry
 SET pool_id = COALESCE((
         SELECT pool_id
@@ -552,8 +564,8 @@ SET pool_id = COALESCE((
     updated_at = ?
 WHERE account_id = ?
             "#
-        } else {
-            r#"
+                } else {
+                    r#"
 UPDATE account_registry
 SET healthy = CASE
         WHEN (
@@ -567,44 +579,59 @@ SET healthy = CASE
     updated_at = ?
 WHERE account_id = ?
             "#
-        };
-        sqlx::query(update_registry_query)
-            .bind(updated_at)
-            .bind(&event.account_id)
-            .execute(&mut *tx)
-            .await?;
+                };
+                sqlx::query(update_registry_query)
+                    .bind(updated_at)
+                    .bind(&event.account_id)
+                    .execute(&mut *tx)
+                    .await?;
 
-        if has_membership {
-            let runtime_pool_id: Option<String> = sqlx::query_scalar(
-                r#"
+                if has_membership {
+                    let runtime_pool_id: Option<String> = sqlx::query_scalar(
+                        r#"
 SELECT pool_id
 FROM account_runtime_state
 WHERE account_id = ?
             "#,
-            )
-            .bind(&event.account_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(pool_id) = runtime_pool_id {
-                let position = super::account_pool_control::read_account_pool_position(
-                    &mut *tx,
-                    &event.account_id,
-                )
-                .await?
-                .unwrap_or(0);
-                super::account_pool_control::sync_account_membership_compat(
-                    &mut tx,
-                    &event.account_id,
-                    &pool_id,
-                    position,
-                    updated_at,
-                )
-                .await?;
+                    )
+                    .bind(&event.account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if let Some(pool_id) = runtime_pool_id {
+                        let position = super::account_pool_control::read_account_pool_position(
+                            &mut *tx,
+                            &event.account_id,
+                        )
+                        .await?
+                        .unwrap_or(0);
+                        super::account_pool_control::sync_account_membership_compat(
+                            &mut tx,
+                            &event.account_id,
+                            &pool_id,
+                            position,
+                            updated_at,
+                        )
+                        .await?;
+                    }
+                }
+
+                tx.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(err) if err.to_string().contains("database is locked") && attempt < 4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
             }
         }
 
-        tx.commit().await?;
-        Ok(())
+        Err(anyhow::anyhow!(
+            "record_account_health_event exceeded retry budget"
+        ))
     }
 
     pub async fn import_legacy_default_account(
@@ -2206,6 +2233,54 @@ WHERE version = 26
                 .await
                 .unwrap(),
             Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_account_health_event_retries_when_database_is_locked() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let mut lock_conn = runtime
+            .pool
+            .acquire()
+            .await
+            .expect("acquire lock connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock_conn)
+            .await
+            .expect("begin immediate lock");
+
+        let runtime_for_record = Arc::clone(&runtime);
+        let record_task = tokio::spawn(async move {
+            runtime_for_record
+                .record_account_health_event(AccountHealthEvent {
+                    account_id: "acct-1".to_string(),
+                    pool_id: "pool-main".to_string(),
+                    health_state: AccountHealthState::RateLimited,
+                    sequence_number: 1,
+                    observed_at: test_timestamp(1),
+                })
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        sqlx::query("COMMIT")
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release immediate lock");
+
+        record_task
+            .await
+            .expect("record task join")
+            .expect("record health event should retry after lock release");
+
+        assert_eq!(
+            runtime
+                .read_account_health_event_sequence("acct-1")
+                .await
+                .unwrap(),
+            Some(1)
         );
     }
 

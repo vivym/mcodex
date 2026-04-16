@@ -870,6 +870,7 @@ async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Resu
     skip_if_no_network!(Ok(()));
 
     assert_pre_turn_remote_compact_failure_rotates_next_turn(
+        AccountHealthState::RateLimited,
         ResponseTemplate::new(429)
             .insert_header("content-type", "application/json")
             .set_body_json(json!({
@@ -888,6 +889,7 @@ async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<(
     skip_if_no_network!(Ok(()));
 
     assert_pre_turn_remote_compact_failure_rotates_next_turn(
+        AccountHealthState::Unauthorized,
         ResponseTemplate::new(401)
             .insert_header("content-type", "application/json")
             .set_body_string("unauthorized"),
@@ -1472,6 +1474,7 @@ async fn wait_for_compact_request(mock_response: &ResponseMock) {
 }
 
 async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
+    expected_health_state: AccountHealthState,
     compact_failure_response: ResponseTemplate,
 ) -> Result<()> {
     struct CompactSeqResponder {
@@ -1544,6 +1547,12 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         second_turn_error.is_some(),
         "pre-turn compact failure should fail the current turn"
     );
+    wait_for_account_health_transition(
+        &test,
+        expected_health_state,
+        AccountLeaseRuntimeReason::NonReplayableTurn,
+    )
+    .await?;
 
     let third_turn_error = submit_turn_and_wait(&test, "turn after compact failure").await?;
     assert!(third_turn_error.is_none());
