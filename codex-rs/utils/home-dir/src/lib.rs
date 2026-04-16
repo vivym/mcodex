@@ -16,13 +16,10 @@ pub fn find_codex_home() -> io::Result<AbsolutePathBuf> {
     let codex_home_env = std::env::var(MCODEX.home_env_var)
         .ok()
         .filter(|val| !val.is_empty());
-    find_codex_home_from_envs(codex_home_env.as_deref(), None)
+    find_codex_home_from_env(codex_home_env.as_deref())
 }
 
-fn find_codex_home_from_envs(
-    active_home_env: Option<&str>,
-    _legacy_home_env: Option<&str>,
-) -> io::Result<AbsolutePathBuf> {
+fn find_codex_home_from_env(active_home_env: Option<&str>) -> io::Result<AbsolutePathBuf> {
     match active_home_env.filter(|val| !val.is_empty()) {
         Some(val) => find_existing_home_dir(val, MCODEX.home_env_var),
         None => find_default_home_dir(MCODEX.default_home_dir_name),
@@ -33,7 +30,7 @@ pub fn find_legacy_codex_home_for_migration(
     legacy_home_env: Option<&str>,
 ) -> io::Result<Option<AbsolutePathBuf>> {
     if let Some(val) = legacy_home_env.filter(|val| !val.is_empty()) {
-        return Ok(find_existing_home_dir(val, MCODEX.legacy_home_env_var).ok());
+        return find_existing_home_dir(val, MCODEX.legacy_home_env_var).map(Some);
     }
 
     let mut path = match home_dir() {
@@ -42,7 +39,14 @@ pub fn find_legacy_codex_home_for_migration(
     };
     path.push(MCODEX.legacy_home_dir_name);
 
-    Ok(find_existing_home_dir_from_path(path).ok())
+    match find_existing_home_dir_from_path(path.clone()) {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("failed to read legacy Codex home {path:?}: {err}"),
+        )),
+    }
 }
 
 fn find_default_home_dir(home_dir_name: &str) -> io::Result<AbsolutePathBuf> {
@@ -84,7 +88,7 @@ fn find_existing_home_dir_from_path(path: PathBuf) -> io::Result<AbsolutePathBuf
 
 #[cfg(test)]
 mod tests {
-    use super::find_codex_home_from_envs;
+    use super::find_codex_home_from_env;
     use super::find_legacy_codex_home_for_migration;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use dirs::home_dir;
@@ -107,11 +111,7 @@ mod tests {
             .to_str()
             .expect("missing codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_envs(
-            /*active_home_env*/ Some(missing_str),
-            /*legacy_home_env*/ None,
-        )
-        .expect_err("missing MCODEX_HOME");
+        let err = find_codex_home_from_env(Some(missing_str)).expect_err("missing MCODEX_HOME");
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert!(
             err.to_string().contains("MCODEX_HOME"),
@@ -128,11 +128,7 @@ mod tests {
             .to_str()
             .expect("file codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_envs(
-            /*active_home_env*/ Some(file_str),
-            /*legacy_home_env*/ None,
-        )
-        .expect_err("file MCODEX_HOME");
+        let err = find_codex_home_from_env(Some(file_str)).expect_err("file MCODEX_HOME");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("not a directory"),
@@ -143,16 +139,12 @@ mod tests {
     #[test]
     fn find_codex_home_prefers_mcodex_home_env() {
         let temp_home = TempDir::new().expect("temp home");
-        let resolved = find_codex_home_from_envs(
-            /*active_home_env*/
-            Some(
-                temp_home
-                    .path()
-                    .to_str()
-                    .expect("temp codex home path should be valid utf-8"),
-            ),
-            /*legacy_home_env*/ None,
-        )
+        let resolved = find_codex_home_from_env(Some(
+            temp_home
+                .path()
+                .to_str()
+                .expect("temp codex home path should be valid utf-8"),
+        ))
         .expect("resolve active home");
 
         assert_eq!(resolved, expected_absolute(temp_home.path()));
@@ -160,7 +152,7 @@ mod tests {
 
     #[test]
     fn find_codex_home_without_env_uses_dot_mcodex() {
-        let resolved = find_codex_home_from_envs(None, None).expect("default home");
+        let resolved = find_codex_home_from_env(None).expect("default home");
 
         assert!(resolved.as_path().ends_with(".mcodex"));
     }
@@ -180,19 +172,48 @@ mod tests {
     }
 
     #[test]
+    fn find_legacy_codex_home_for_migration_missing_codex_home_is_fatal() {
+        let temp_home = TempDir::new().expect("temp home");
+        let missing = temp_home.path().join("missing-codex-home");
+        let missing_str = missing
+            .to_str()
+            .expect("missing codex home path should be valid utf-8");
+
+        let err = find_legacy_codex_home_for_migration(Some(missing_str))
+            .expect_err("missing CODEX_HOME should fail");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("CODEX_HOME"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn find_legacy_codex_home_for_migration_file_codex_home_is_fatal() {
+        let temp_home = TempDir::new().expect("temp home");
+        let file_path = temp_home.path().join("codex-home.txt");
+        fs::write(&file_path, "not a directory").expect("write temp file");
+        let file_str = file_path
+            .to_str()
+            .expect("file codex home path should be valid utf-8");
+
+        let err = find_legacy_codex_home_for_migration(Some(file_str))
+            .expect_err("file CODEX_HOME should fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("CODEX_HOME"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn find_codex_home_ignores_codex_home_when_mcodex_home_is_unset() {
         let legacy_home = TempDir::new().expect("legacy home");
-        let resolved = find_codex_home_from_envs(
-            /*active_home_env*/ None,
-            /*legacy_home_env*/
-            Some(
-                legacy_home
-                    .path()
-                    .to_str()
-                    .expect("legacy codex home path should be valid utf-8"),
-            ),
-        )
-        .expect("default home");
+        let resolved = find_codex_home_from_env(None).expect("default home");
 
         assert_ne!(resolved, expected_absolute(legacy_home.path()));
         assert!(resolved.as_path().ends_with(".mcodex"));
@@ -200,7 +221,7 @@ mod tests {
 
     #[test]
     fn find_codex_home_without_env_matches_home_dir() {
-        let resolved = find_codex_home_from_envs(None, None).expect("default home");
+        let resolved = find_codex_home_from_env(None).expect("default home");
         let mut expected = home_dir().expect("home dir");
         expected.push(".mcodex");
         let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
