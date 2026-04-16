@@ -185,6 +185,20 @@ control-plane identifier for a remote account, or a local mirrored `account_id`
 bound to that remote identifier, so durable preferred-account state and
 diagnostics have something stable to reference across restarts.
 
+For local pooled state and selectors, this slice recommends one canonical local
+namespace:
+
+- durable preferred-account state should point at the local mirrored
+  `account_id`
+- exclusion lists such as anti-flap `exclude_account_ids` should also use the
+  local mirrored `account_id`
+- backend-owned remote references remain stable correlated metadata associated
+  with that local `account_id`, not a second selector namespace exposed
+  everywhere in runtime code
+
+This keeps remote mode compatible with the existing selection-state model, which
+already stores preferred-account facts in local state.
+
 That stable identifier must not be:
 
 - an active lease id
@@ -259,17 +273,21 @@ At minimum, a future acquire request should be able to carry:
 
 - `pool_id`
 - `holder_instance_id`
-- optional stable preferred-account identifier
-- optional `exclude_account_ids` for anti-flap reselection
+- optional local mirrored preferred `account_id`
+- optional local mirrored `exclude_account_ids` for anti-flap reselection
 
 Exact Rust trait shape belongs to implementation planning, but the contract
 must be more remote-ready than "just pass pool id and assume local state owns
 the rest."
 
-If the backend does not recognize the requested preferred-account identifier, or
-that account no longer exists in the remote catalog, the runtime should degrade
-through the existing preferred-account-missing/ineligible semantics rather than
-inventing a remote-only selection state model.
+The runtime/backend adapter is responsible for translating those local mirrored
+ids to the backend's stable remote control-plane references before issuing the
+remote lease request.
+
+If the backend no longer recognizes the mapped remote reference, or that remote
+account no longer exists in the catalog, the runtime should degrade through the
+existing preferred-account-missing/ineligible semantics rather than inventing a
+remote-only selection state model.
 
 ### 5. Keep local SQLite out of the remote source-of-truth path
 

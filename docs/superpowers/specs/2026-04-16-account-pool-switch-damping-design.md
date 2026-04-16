@@ -199,6 +199,18 @@ Effective rule:
 Before `proactive_switch_allowed_at`, the runtime may note the soft pressure but
 must keep the current lease active.
 
+That noted soft pressure is live-only and not durably latched:
+
+- a threshold crossing observed before `proactive_switch_allowed_at` may be
+  remembered only as a transient live signal for status/diagnostics
+- once the damping window opens, proactive rotation must still be gated by a
+  current or freshly revalidated soft-pressure observation rather than by a
+  stale earlier threshold crossing alone
+- if pressure subsides before the damping window opens, the runtime should
+  continue using the current lease without forcing a delayed proactive switch
+- if pressure is still present when the next turn is prepared after the damping
+  window opens, that fresh observation may trigger proactive rotation
+
 This keeps the rule close to the user mental model:
 
 - once a runtime instance is assigned an account, hold that account for at
@@ -209,6 +221,7 @@ The suppression state is live only:
 - it belongs to the current runtime instance
 - it is cleared when the runtime exits
 - it is not persisted in startup-selection SQLite state
+- it must not create a delayed mandatory switch solely from an old soft signal
 
 ### 3. Preserve immediate hard-failure failover
 
