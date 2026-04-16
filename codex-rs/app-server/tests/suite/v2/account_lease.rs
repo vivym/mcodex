@@ -130,6 +130,89 @@ async fn account_lease_read_reports_live_active_lease_fields_after_turn_start() 
 }
 
 #[tokio::test]
+async fn account_lease_read_and_update_report_live_proactive_switch_suppression_fields()
+-> Result<()> {
+    let server = core_test_support::responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-codex-primary-used-percent", "92.0")
+                .insert_header("x-codex-primary-window-minutes", "60")
+                .set_body_raw(
+                    create_final_assistant_message_sse_response("Done")?,
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_with_min_switch_interval(codex_home.path(), &server.uri(), 5)?;
+    seed_default_pool_state(codex_home.path()).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread(&mut mcp).await?;
+    let turn = start_turn(&mut mcp, &thread.id, "hold this lease").await?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "accountLease/updated for proactive switch suppression",
+            |notification| {
+                notification.method == "accountLease/updated"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("proactiveSwitchPending"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            },
+        ),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed for proactive switch suppression turn",
+            |notification| {
+                notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn_params| turn_params.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(turn.id.as_str())
+            },
+        ),
+    )
+    .await??;
+
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(updated.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(updated.suppressed, false);
+    assert_eq!(updated.min_switch_interval_secs, Some(5));
+    assert_eq!(updated.proactive_switch_pending, Some(true));
+    assert_eq!(updated.proactive_switch_suppressed, Some(true));
+    assert!(updated.lease_acquired_at.is_some());
+    assert!(updated.proactive_switch_allowed_at.is_some());
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(response.min_switch_interval_secs, Some(5));
+    assert_eq!(response.proactive_switch_pending, Some(true));
+    assert_eq!(response.proactive_switch_suppressed, Some(true));
+    assert!(response.lease_acquired_at.is_some());
+    assert!(response.proactive_switch_allowed_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_lease_updated_emits_on_resume() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
@@ -684,13 +767,55 @@ fn create_pooled_config_toml(
     codex_home: &std::path::Path,
     server_uri: &str,
 ) -> std::io::Result<()> {
-    create_pooled_config_toml_with_default_pool(codex_home, server_uri, "legacy-default")
+    write_pooled_config_toml(
+        codex_home,
+        server_uri,
+        PooledConfigTomlOptions {
+            default_pool: "legacy-default",
+            min_switch_interval_secs: 0,
+        },
+    )
 }
 
 fn create_pooled_config_toml_with_default_pool(
     codex_home: &std::path::Path,
     server_uri: &str,
     default_pool: &str,
+) -> std::io::Result<()> {
+    write_pooled_config_toml(
+        codex_home,
+        server_uri,
+        PooledConfigTomlOptions {
+            default_pool,
+            min_switch_interval_secs: 0,
+        },
+    )
+}
+
+fn create_pooled_config_toml_with_min_switch_interval(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    min_switch_interval_secs: u64,
+) -> std::io::Result<()> {
+    write_pooled_config_toml(
+        codex_home,
+        server_uri,
+        PooledConfigTomlOptions {
+            default_pool: "legacy-default",
+            min_switch_interval_secs,
+        },
+    )
+}
+
+struct PooledConfigTomlOptions<'a> {
+    default_pool: &'a str,
+    min_switch_interval_secs: u64,
+}
+
+fn write_pooled_config_toml(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    options: PooledConfigTomlOptions<'_>,
 ) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
@@ -715,6 +840,7 @@ supports_websockets = false
 backend = "local"
 default_pool = "{default_pool}"
 allocation_mode = "exclusive"
+min_switch_interval_secs = {min_switch_interval_secs}
 
 [accounts.pools.legacy-default]
 allow_context_reuse = false
@@ -727,7 +853,9 @@ account_kinds = ["chatgpt"]
 [accounts.pools.persisted-default]
 allow_context_reuse = false
 account_kinds = ["chatgpt"]
-"#
+"#,
+            default_pool = options.default_pool,
+            min_switch_interval_secs = options.min_switch_interval_secs,
         ),
     )
 }

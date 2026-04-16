@@ -1409,7 +1409,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `accountLease/read` — read pooled lease status for the current process. When exactly one pooled thread is loaded, the response prefers that thread's live lease snapshot and otherwise falls back to startup-selection preview state. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
+- `accountLease/read` — read pooled lease status for the current process. When exactly one pooled thread is loaded, the response prefers that thread's live lease snapshot and otherwise falls back to startup-selection preview state. Live snapshots also expose proactive switch damping state via `leaseAcquiredAt`, `minSwitchIntervalSecs`, `proactiveSwitchPending`, `proactiveSwitchSuppressed`, and `proactiveSwitchAllowedAt`. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
 - `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
 - `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes or when a loaded pooled thread's live lease notification state changes.
@@ -1501,7 +1501,7 @@ Field notes:
 { "method": "account/logout", "id": 6 }
 { "id": 6, "result": {} }
 { "method": "account/updated", "params": { "authMode": null, "planType": null } }
-{ "method": "accountLease/updated", "params": { "accountId": null, "poolId": "legacy-default", "suppressed": true } }
+{ "method": "accountLease/updated", "params": { "accountId": null, "poolId": "legacy-default", "suppressed": true, "leaseAcquiredAt": null, "minSwitchIntervalSecs": null, "proactiveSwitchPending": null, "proactiveSwitchSuppressed": null, "proactiveSwitchAllowedAt": null } }
 ```
 
 When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears only that in-memory auth context and does not durably suppress pooled startup selection.
@@ -1519,17 +1519,22 @@ When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears o
     "poolId": "legacy-default",
     "leaseId": null,
     "leaseEpoch": null,
+    "leaseAcquiredAt": 1710000000,
     "healthState": "healthy",
     "switchReason": "automaticAccountSelected",
     "suppressionReason": null,
     "transportResetGeneration": null,
     "lastRemoteContextResetTurnId": null,
+    "minSwitchIntervalSecs": 300,
+    "proactiveSwitchPending": false,
+    "proactiveSwitchSuppressed": false,
+    "proactiveSwitchAllowedAt": null,
     "nextEligibleAt": null
   }
 }
 { "method": "accountLease/resume", "id": 8 }
 { "id": 8, "result": {} }
-{ "method": "accountLease/updated", "params": { "accountId": "acct-1", "poolId": "legacy-default", "suppressed": false } }
+{ "method": "accountLease/updated", "params": { "accountId": "acct-1", "poolId": "legacy-default", "suppressed": false, "leaseAcquiredAt": null, "minSwitchIntervalSecs": null, "proactiveSwitchPending": null, "proactiveSwitchSuppressed": null, "proactiveSwitchAllowedAt": null } }
 ```
 
 Field notes:
@@ -1538,6 +1543,7 @@ Field notes:
 - The pooled lease reason fields reuse the same camelCase codes, depending on whether the response is a startup preview or a live thread snapshot: `automaticAccountSelected`, `preferredAccountSelected`, `missingPool`, `preferredAccountMissing`, `preferredAccountInOtherPool`, `preferredAccountDisabled`, `preferredAccountUnhealthy`, `preferredAccountBusy`, `noEligibleAccount`, `durablySuppressed`, and `nonReplayableTurn`.
 - `durablySuppressed` is returned on `suppressionReason` when pooled startup was manually suppressed and remains in effect until `accountLease/resume`.
 - `nonReplayableTurn` is returned on live snapshots when the current turn could not be replayed onto the next pooled account; future turns continue on the next eligible account instead of replaying the current turn.
+- `leaseAcquiredAt` is set only for live thread snapshots. `minSwitchIntervalSecs`, `proactiveSwitchPending`, `proactiveSwitchSuppressed`, and `proactiveSwitchAllowedAt` are also live-thread-only fields and remain `null` for startup previews and manually resumed durable state.
 
 ### 8) Rate limits (ChatGPT)
 

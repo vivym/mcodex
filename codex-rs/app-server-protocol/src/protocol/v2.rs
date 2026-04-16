@@ -1769,12 +1769,20 @@ pub struct AccountLeaseReadResponse {
     pub lease_id: Option<String>,
     #[ts(type = "number | null")]
     pub lease_epoch: Option<u64>,
+    #[ts(type = "number | null")]
+    pub lease_acquired_at: Option<i64>,
     pub health_state: Option<String>,
     pub switch_reason: Option<String>,
     pub suppression_reason: Option<String>,
     #[ts(type = "number | null")]
     pub transport_reset_generation: Option<u64>,
     pub last_remote_context_reset_turn_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub min_switch_interval_secs: Option<u64>,
+    pub proactive_switch_pending: Option<bool>,
+    pub proactive_switch_suppressed: Option<bool>,
+    #[ts(type = "number | null")]
+    pub proactive_switch_allowed_at: Option<i64>,
     #[ts(type = "number | null")]
     pub next_eligible_at: Option<i64>,
 }
@@ -3817,6 +3825,14 @@ pub struct AccountLeaseUpdatedNotification {
     pub account_id: Option<String>,
     pub pool_id: Option<String>,
     pub suppressed: bool,
+    #[ts(type = "number | null")]
+    pub lease_acquired_at: Option<i64>,
+    #[ts(type = "number | null")]
+    pub min_switch_interval_secs: Option<u64>,
+    pub proactive_switch_pending: Option<bool>,
+    pub proactive_switch_suppressed: Option<bool>,
+    #[ts(type = "number | null")]
+    pub proactive_switch_allowed_at: Option<i64>,
 }
 
 impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
@@ -3825,6 +3841,11 @@ impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
             account_id: value.account_id,
             pool_id: value.pool_id,
             suppressed: value.suppressed,
+            lease_acquired_at: value.lease_acquired_at,
+            min_switch_interval_secs: value.min_switch_interval_secs,
+            proactive_switch_pending: value.proactive_switch_pending,
+            proactive_switch_suppressed: value.proactive_switch_suppressed,
+            proactive_switch_allowed_at: value.proactive_switch_allowed_at,
         }
     }
 }
