@@ -925,13 +925,13 @@ fn status_account_lease_display_from_response(
             .suppression_reason
             .as_deref()
             .map(account_lease_reason_text)
+            .or(proactive_switch_note)
             .or_else(|| {
                 response
                     .switch_reason
                     .as_deref()
                     .map(account_lease_reason_text)
-            })
-            .or(proactive_switch_note),
+            }),
         proactive_switch_allowed_at,
         next_eligible_at,
         remote_reset: account_lease_remote_reset_text(
@@ -1812,6 +1812,53 @@ mod tests {
         );
 
         assert_eq!(display, None);
+    }
+
+    #[test]
+    fn status_account_lease_display_prefers_damping_note_over_switch_reason() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: true,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: Some(captured_at.with_timezone(&chrono::Utc).timestamp()),
+                health_state: Some("healthy".to_string()),
+                switch_reason: Some("automaticAccountSelected".to_string()),
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: Some(600),
+                proactive_switch_pending: Some(true),
+                proactive_switch_suppressed: Some(true),
+                proactive_switch_allowed_at: Some(
+                    (captured_at + chrono::Duration::minutes(20))
+                        .with_timezone(&chrono::Utc)
+                        .timestamp(),
+                ),
+                next_eligible_at: None,
+            },
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Active · Healthy".to_string(),
+                note: Some("Automatic switch held by minimum switch interval".to_string()),
+                proactive_switch_allowed_at: Some("03:24".to_string()),
+                next_eligible_at: None,
+                remote_reset: None,
+            })
+        );
     }
 
     #[test]

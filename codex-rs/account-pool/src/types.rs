@@ -65,11 +65,6 @@ impl AccountPoolConfig {
                 "accounts.lease_ttl_secs must be greater than accounts.heartbeat_interval_secs"
             );
         }
-        if self.min_switch_interval_secs >= self.lease_ttl_secs {
-            anyhow::bail!(
-                "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs"
-            );
-        }
 
         if self.derived_pre_turn_safety_margin().num_seconds() >= self.lease_ttl_secs as i64 {
             anyhow::bail!(
@@ -101,7 +96,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn validate_rejects_min_switch_interval_at_or_above_lease_ttl() {
+    fn validate_allows_min_switch_interval_at_or_above_lease_ttl() {
         let config = AccountPoolConfig {
             lease_ttl_secs: 300,
             heartbeat_interval_secs: 60,
@@ -109,12 +104,7 @@ mod tests {
             ..AccountPoolConfig::default()
         };
 
-        let err = config.validate().expect_err("config should be invalid");
-
-        assert_eq!(
-            err.to_string(),
-            "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs"
-        );
+        config.validate().expect("config should be valid");
     }
 
     #[test]
