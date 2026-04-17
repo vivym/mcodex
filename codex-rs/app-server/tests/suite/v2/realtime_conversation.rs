@@ -2184,10 +2184,22 @@ fn assert_call_create_multipart(
 }
 
 fn v1_session_create_json() -> Value {
-    serde_json::from_str(
-        r#"{"audio":{"input":{"format":{"type":"audio/pcm","rate":24000}},"output":{"voice":"cove"}},"type":"quicksilver","model":"gpt-realtime-1.5","instructions":"backend prompt\n\nstartup context"}"#,
-    )
-    .expect("valid v1 session create json")
+    serde_json::json!({
+        "audio": {
+            "input": {
+                "format": {
+                    "type": "audio/pcm",
+                    "rate": 24000,
+                },
+            },
+            "output": {
+                "voice": "cove",
+            },
+        },
+        "type": "quicksilver",
+        "model": "gpt-realtime-1.5",
+        "instructions": "backend prompt\n\nstartup context",
+    })
 }
 
 fn create_config_toml(

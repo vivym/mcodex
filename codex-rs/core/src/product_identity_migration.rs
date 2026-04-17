@@ -153,8 +153,7 @@ async fn maybe_migrate_product_identity_with_legacy_home(
     }
 
     if fs::try_exists(&pending_marker_path).await? {
-        let legacy_home =
-            resolve_pending_legacy_home_for_import(legacy_home_result, mcodex_home)?;
+        let legacy_home = resolve_pending_legacy_home_for_import(legacy_home_result, mcodex_home)?;
         return Ok(import_product_identity_with_pending_marker(
             &legacy_home,
             mcodex_home,
