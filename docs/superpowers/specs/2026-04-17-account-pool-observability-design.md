@@ -1,8 +1,8 @@
 # Account Pool Observability Design
 
 This document defines a complete read-only observability surface for pooled
-accounts, exposed through app-server v2 and implemented first for the local
-backend.
+accounts in one known pool, exposed through app-server v2 and implemented first
+for the local backend.
 
 It is intentionally scoped to pool/account snapshots, event history,
 diagnostics, and backend-neutral read seams. It does not add write-side
@@ -13,8 +13,8 @@ does not require immediate CLI or TUI consumption in the same slice.
 
 The recommended direction is:
 
-- freeze a complete app-server v2 read contract now instead of starting with a
-  narrower local-only snapshot API
+- freeze a complete app-server v2 read contract for one known `poolId` now
+  instead of starting with a narrower local-only snapshot API
 - implement four read-only RPCs:
   - `accountPool/read`
   - `accountPool/accounts/list`
@@ -30,13 +30,14 @@ The recommended direction is:
 - defer CLI and TUI consumers until the contract and local implementation are
   stable
 
-This provides a complete operator-visible read surface in one contract shape
-without taking the merge risk of also building all consumers and control-plane
-commands in the same change.
+This provides a complete operator-visible read surface for a known `poolId` in
+one contract shape without taking the merge risk of also building all consumers
+and control-plane commands in the same change.
 
 ## Goals
 
-- Give operators a complete read-only pooled-account observability surface.
+- Give operators a complete read-only pooled-account observability surface for
+  a known pool.
 - Keep the first operator contract stable enough for later CLI, TUI, and remote
   reuse.
 - Make it possible to answer both:
@@ -56,6 +57,9 @@ commands in the same change.
 - Do not add a full TUI pool-management page.
 - Do not add a large CLI operator experience in the same slice.
 - Do not backfill historical observability data from earlier runs.
+- Do not add pool inventory or pool discovery RPCs in this slice; these reads
+  assume the caller already knows a target `poolId` from config or from a
+  later inventory contract.
 
 ## Constraints
 
@@ -66,6 +70,9 @@ commands in the same change.
   app-server and TUI status.
 - Future remote support is expected, so the contract must not assume local
   SQLite is the only long-term source of truth.
+- Pool discovery is expected to evolve separately from observability, so this
+  contract must stay useful even when the caller obtains `poolId` from another
+  inventory surface.
 - Local product homes may persist non-secret control-plane identifiers, but
   must remain compatible with the future remote contract that keeps remote
   secret material remote-owned.
@@ -165,8 +172,8 @@ This approach is rejected.
 
 ### 1. Freeze four app-server v2 read RPCs
 
-The first stable observability contract should expose exactly four new
-read-only RPCs:
+The first stable observability contract for a known pool should expose exactly
+four new read-only RPCs:
 
 - `accountPool/read`
 - `accountPool/accounts/list`
@@ -177,7 +184,8 @@ These methods should live only in app-server v2. New observability surface area
 must not be added to app-server v1.
 
 The contract should be complete enough that later CLI, TUI, and remote-backed
-consumers can build on it without reshaping the wire format.
+consumers can observe a known pool without reshaping the wire format.
+Pool inventory and discovery are intentionally deferred to a separate contract.
 
 ### 2. Keep app-server dependent on a backend-neutral observability seam
 
@@ -307,6 +315,22 @@ execution paths.
 
 ## Wire Contract
 
+### Contract realism rule
+
+Any response field that lacks a backend-authoritative source in the active
+implementation must be nullable rather than synthesized from shadow state.
+
+For local v1 specifically:
+
+- current authoritative facts come from registered-account metadata, coarse
+  health/runtime state, lease records, startup-selection state, and config
+- fields such as paused/draining/exhausted bucket counts or fine-grained
+  operational states may remain `null` until the backend owns those facts
+  directly
+
+This keeps the contract stable without forcing the local implementation to
+invent operator-visible state that does not yet exist durably.
+
 ### 1. `accountPool/read`
 
 Purpose: return the current pool summary and effective policy.
@@ -326,14 +350,14 @@ Response:
 `summary` should include at least:
 
 - `totalAccounts`
-- `availableAccounts`
-- `leasedAccounts`
-- `pausedAccounts`
-- `drainingAccounts`
-- `nearExhaustedAccounts`
-- `exhaustedAccounts`
-- `errorAccounts`
 - `activeLeases`
+- `availableAccounts` nullable
+- `leasedAccounts` nullable
+- `pausedAccounts` nullable
+- `drainingAccounts` nullable
+- `nearExhaustedAccounts` nullable
+- `exhaustedAccounts` nullable
+- `errorAccounts` nullable
 
 `policy` should include at least:
 
@@ -353,7 +377,6 @@ Request:
 - `limit` optional
 - `states` optional
 - `accountKinds` optional
-- `query` optional
 
 Response:
 
@@ -365,8 +388,10 @@ Each account item should include at least:
 - `accountId`
 - `backendAccountRef` nullable
 - `accountKind`
-- `operationalState`
-- `allocatable`
+- `enabled`
+- `healthState` nullable
+- `operationalState` nullable
+- `allocatable` nullable
 - `statusReasonCode` nullable
 - `statusMessage` nullable
 - `currentLease` nullable
@@ -396,6 +421,18 @@ Each account item should include at least:
 - `preferred`
 - `suppressed`
 
+For local v1, `enabled`, `healthState`, `currentLease`, and `selection` are the
+authoritative base facts. `operationalState` and `allocatable` are nullable
+derived summaries and must not be backfilled from non-authoritative shadow
+state.
+
+Filter semantics:
+
+- `states` is an exact-match set over `AccountOperationalState`
+- accounts whose `operationalState` is `null` do not match a `states` filter
+- `accountKinds` is an exact-match set over the surfaced `accountKind` strings
+- filters combine with AND semantics
+
 ### 3. `accountPool/events/list`
 
 Purpose: list recent pool/account events and explain why they happened.
@@ -405,7 +442,6 @@ Request:
 - `poolId`
 - `accountId` optional
 - `types` optional
-- `since` optional
 - `cursor` optional
 - `limit` optional
 
@@ -453,6 +489,16 @@ Each diagnostic issue should include at least:
 
 ## Shared Enums and Semantics
 
+### Backend kind
+
+The top-level pool `backend` field should use a closed enum:
+
+- `local`
+- `remote`
+
+This field identifies the backend family authoritative for the observed pool's
+execution/control-plane facts. It is not merely display provenance.
+
 ### Account operational state
 
 The first stable account state enum should include:
@@ -468,6 +514,10 @@ The first stable account state enum should include:
 
 This enum answers "what is the account's current operational state?" It should
 not be overloaded as an event taxonomy or as a durable failure reason.
+
+The field may be `null` when the backend cannot distinguish one of these states
+from authoritative persisted facts alone. Clients must tolerate `null` and may
+fall back to `enabled`, `healthState`, `currentLease`, and `selection`.
 
 ### Event type
 
@@ -497,6 +547,15 @@ future remote contract without exposing backend-private transport details.
 
 The first stable reason-code enum should include:
 
+- `durablySuppressed`
+- `missingPool`
+- `preferredAccountSelected`
+- `automaticAccountSelected`
+- `preferredAccountMissing`
+- `preferredAccountInOtherPool`
+- `preferredAccountDisabled`
+- `preferredAccountUnhealthy`
+- `preferredAccountBusy`
 - `manualPause`
 - `manualDrain`
 - `quotaNearExhausted`
@@ -504,9 +563,9 @@ The first stable reason-code enum should include:
 - `authFailure`
 - `cooldownActive`
 - `minimumSwitchInterval`
-- `preferredAccountSuppressed`
 - `noEligibleAccount`
 - `leaseHeldByAnotherInstance`
+- `nonReplayableTurn`
 - `unknown`
 
 Reason-code rules:
@@ -517,6 +576,42 @@ Reason-code rules:
 - `details` carries structured additive context and may be backend-specific
 
 Clients should key logic off enums, not free-form message strings.
+
+This taxonomy should remain a lossless superset of the current pooled
+startup/runtime reasons already surfaced through `accountLease/read` so future
+observability work does not have to collapse them into `unknown`.
+
+### Diagnostics status
+
+The top-level diagnostics `status` field should use a closed enum:
+
+- `healthy`
+- `degraded`
+- `blocked`
+
+Status rules:
+
+- `healthy`: no current warning/error issues for the pool
+- `degraded`: at least one current warning or error issue exists, but the pool
+  still has a viable current lease or at least one allocatable account
+- `blocked`: the pool has no viable current lease and no allocatable account
+  for continued pooled use
+
+### Diagnostics severity
+
+Each diagnostics issue `severity` field should use a closed enum:
+
+- `info`
+- `warning`
+- `error`
+
+Severity rules:
+
+- `info`: operator-relevant observation that does not currently degrade pooled
+  service
+- `warning`: degraded condition that still leaves pooled service available
+- `error`: condition that currently blocks lease acquisition or continued
+  pooled service for the affected pool/account
 
 ## Errors and Pagination
 
@@ -544,6 +639,10 @@ Response fields:
 
 - `data: Vec<_>`
 - `nextCursor: Option<String>`
+
+The first version intentionally does not include an event-time filter such as
+`since`. `accountPool/events/list` should use cursor-only pagination so the
+descending event feed has one unambiguous boundary mechanism.
 
 Recommended sort order:
 
