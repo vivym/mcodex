@@ -4,6 +4,7 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
+use codex_core::config::find_codex_home;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::config_loader::LoaderOverrides;
@@ -102,6 +103,24 @@ enum LogFormat {
 }
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+struct NonInteractiveProductIdentityMigrationUi;
+
+impl codex_core::product_identity_migration::ProductIdentityMigrationUi
+    for NonInteractiveProductIdentityMigrationUi
+{
+    fn should_migrate_product_identity(
+        &mut self,
+        legacy_home: &std::path::Path,
+        mcodex_home: &std::path::Path,
+    ) -> IoResult<bool> {
+        Err(std::io::Error::other(format!(
+            "cannot import legacy Codex home {} into {} during noninteractive app-server startup; run mcodex interactively once to confirm migration",
+            legacy_home.display(),
+            mcodex_home.display()
+        )))
+    }
+}
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
@@ -382,7 +401,20 @@ pub async fn run_main_with_transport(
             format!("error parsing -c overrides: {e}"),
         )
     })?;
+    let codex_home = find_codex_home()?.to_path_buf();
+    let mut migration_ui = NonInteractiveProductIdentityMigrationUi;
+    if let Err(err) = codex_core::product_identity_migration::maybe_migrate_product_identity(
+        &codex_home,
+        &mut migration_ui,
+    )
+    .await
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to run product identity migration: {err}"
+        )));
+    }
     let cloud_requirements = match ConfigBuilder::default()
+        .codex_home(codex_home.clone())
         .cli_overrides(cli_kv_overrides.clone())
         .loader_overrides(loader_overrides.clone())
         .build()
@@ -423,6 +455,7 @@ pub async fn run_main_with_transport(
     let loader_overrides_for_config_api = loader_overrides.clone();
     let mut config_warnings = Vec::new();
     let config = match ConfigBuilder::default()
+        .codex_home(codex_home)
         .cli_overrides(cli_kv_overrides.clone())
         .loader_overrides(loader_overrides)
         .cloud_requirements(cloud_requirements.clone())

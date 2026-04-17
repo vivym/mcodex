@@ -112,6 +112,10 @@ pub mod legacy_core {
         pub use codex_core::personality_migration::*;
     }
 
+    pub mod product_identity_migration {
+        pub use codex_core::product_identity_migration::*;
+    }
+
     pub mod plugins {
         pub use codex_core::plugins::*;
     }

@@ -77,6 +77,37 @@ use uuid::Uuid;
 
 pub(crate) use codex_app_server_client::legacy_core;
 
+struct TerminalProductIdentityMigrationUi;
+
+impl crate::legacy_core::product_identity_migration::ProductIdentityMigrationUi
+    for TerminalProductIdentityMigrationUi
+{
+    #[allow(clippy::print_stdout, clippy::disallowed_methods)]
+    fn should_migrate_product_identity(
+        &mut self,
+        legacy_home: &Path,
+        mcodex_home: &Path,
+    ) -> std::io::Result<bool> {
+        use std::io::Write as _;
+
+        println!(
+            "mcodex found legacy Codex settings at {}.",
+            legacy_home.display()
+        );
+        println!(
+            "Import config.toml and auth.json into {}?",
+            mcodex_home.display()
+        );
+        print!("Import legacy Codex settings? [Y/n] ");
+        std::io::stdout().flush()?;
+
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        Ok(matches!(answer.as_str(), "" | "y" | "yes"))
+    }
+}
+
 mod additional_dirs;
 mod app;
 mod app_backtrack;
@@ -717,7 +748,6 @@ pub async fn run_main(
         }
     };
 
-    // we load config.toml here to determine project state.
     #[allow(clippy::print_stderr)]
     let codex_home = match find_codex_home() {
         Ok(codex_home) => codex_home.to_path_buf(),
@@ -736,6 +766,27 @@ pub async fn run_main(
     let cwd = cli.cwd.clone();
     let config_cwd =
         config_cwd_for_app_server_target(cwd.as_deref(), &app_server_target, &environment_manager)?;
+
+    let mut migration_ui = TerminalProductIdentityMigrationUi;
+    if let Err(err) = crate::legacy_core::product_identity_migration::run_startup_migrations(
+        &codex_home,
+        &mut migration_ui,
+        || {
+            let cli_kv_overrides = cli_kv_overrides.clone();
+            async {
+                load_config_as_toml_with_cli_overrides(
+                    &codex_home,
+                    config_cwd.as_ref(),
+                    cli_kv_overrides,
+                )
+                .await
+            }
+        },
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "failed to run startup migrations");
+    }
 
     #[allow(clippy::print_stderr)]
     let config_toml = match load_config_as_toml_with_cli_overrides(
@@ -762,15 +813,6 @@ pub async fn run_main(
             std::process::exit(1);
         }
     };
-
-    if let Err(err) = crate::legacy_core::personality_migration::maybe_migrate_personality(
-        &codex_home,
-        &config_toml,
-    )
-    .await
-    {
-        tracing::warn!(error = %err, "failed to run personality migration");
-    }
 
     let chatgpt_base_url = config_toml
         .chatgpt_base_url

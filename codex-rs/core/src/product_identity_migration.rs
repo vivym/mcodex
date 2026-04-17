@@ -1,6 +1,10 @@
+use crate::personality_migration::PersonalityMigrationStatus;
+use crate::personality_migration::maybe_migrate_personality;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::config_toml::ConfigToml;
 use codex_product_identity::MCODEX;
 use codex_utils_home_dir::find_legacy_codex_home_for_migration;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -37,6 +41,12 @@ pub struct ProductIdentityMigrationOutcome {
     pub marker_warning: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupMigrationOutcome {
+    pub product_identity: ProductIdentityMigrationStatus,
+    pub personality: PersonalityMigrationStatus,
+}
+
 /// Prompts the caller about whether legacy Codex home data should be imported.
 pub trait ProductIdentityMigrationUi {
     /// Returns `true` when supported legacy files should be imported.
@@ -51,15 +61,68 @@ pub async fn maybe_migrate_product_identity(
     mcodex_home: &Path,
     ui: &mut dyn ProductIdentityMigrationUi,
 ) -> io::Result<ProductIdentityMigrationOutcome> {
-    let legacy_home_env = std::env::var(MCODEX.legacy_home_env_var).ok();
-    maybe_migrate_product_identity_with_legacy_home(
-        mcodex_home,
-        find_legacy_codex_home_for_migration(legacy_home_env.as_deref()).map(|legacy_home| {
-            legacy_home.map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
-        }),
+    maybe_migrate_product_identity_with_legacy_home(mcodex_home, legacy_home_from_environment(), ui)
+        .await
+}
+
+pub async fn run_startup_migrations<LoadConfig, LoadConfigFuture>(
+    codex_home: &Path,
+    ui: &mut dyn ProductIdentityMigrationUi,
+    load_config_toml: LoadConfig,
+) -> io::Result<StartupMigrationOutcome>
+where
+    LoadConfig: FnOnce() -> LoadConfigFuture,
+    LoadConfigFuture: Future<Output = io::Result<ConfigToml>>,
+{
+    run_startup_migrations_with_loader_and_legacy_home(
+        codex_home,
+        legacy_home_from_environment(),
         ui,
+        load_config_toml,
     )
     .await
+}
+
+fn legacy_home_from_environment() -> io::Result<Option<PathBuf>> {
+    let legacy_home_env = std::env::var(MCODEX.legacy_home_env_var).ok();
+    find_legacy_codex_home_for_migration(legacy_home_env.as_deref()).map(|legacy_home| {
+        legacy_home.map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
+    })
+}
+
+#[cfg(test)]
+async fn run_startup_migrations_with_legacy_home(
+    codex_home: &Path,
+    config_toml: &ConfigToml,
+    legacy_home_result: io::Result<Option<PathBuf>>,
+    ui: &mut dyn ProductIdentityMigrationUi,
+) -> io::Result<StartupMigrationOutcome> {
+    run_startup_migrations_with_loader_and_legacy_home(codex_home, legacy_home_result, ui, || {
+        let config_toml = config_toml.clone();
+        async move { Ok(config_toml) }
+    })
+    .await
+}
+
+async fn run_startup_migrations_with_loader_and_legacy_home<LoadConfig, LoadConfigFuture>(
+    codex_home: &Path,
+    legacy_home_result: io::Result<Option<PathBuf>>,
+    ui: &mut dyn ProductIdentityMigrationUi,
+    load_config_toml: LoadConfig,
+) -> io::Result<StartupMigrationOutcome>
+where
+    LoadConfig: FnOnce() -> LoadConfigFuture,
+    LoadConfigFuture: Future<Output = io::Result<ConfigToml>>,
+{
+    let product_identity =
+        maybe_migrate_product_identity_with_legacy_home(codex_home, legacy_home_result, ui).await?;
+    let config_toml = load_config_toml().await?;
+    let personality = maybe_migrate_personality(codex_home, &config_toml).await?;
+
+    Ok(StartupMigrationOutcome {
+        product_identity: product_identity.status,
+        personality,
+    })
 }
 
 async fn maybe_migrate_product_identity_with_legacy_home(
