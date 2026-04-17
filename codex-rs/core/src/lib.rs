@@ -75,6 +75,7 @@ pub use message_history::lookup as lookup_message_history_entry;
 pub use utils::path_utils;
 pub mod personality_migration;
 pub mod plugins;
+pub mod product_identity_migration;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
