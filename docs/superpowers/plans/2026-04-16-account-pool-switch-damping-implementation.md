@@ -453,7 +453,7 @@ Add focused assertions in `codex-rs/app-server/tests/suite/v2/account_lease.rs`:
 
 ```rust
 #[tokio::test]
-async fn account_lease_read_reports_proactive_switch_suppression_fields() -> Result<()> {
+async fn account_lease_read_and_update_report_live_proactive_switch_suppression_fields() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(vec![
         create_final_assistant_message_sse_response("soft pressure")?,
     ]).await;
@@ -481,7 +481,7 @@ Also extend the rotated-notification test to assert the additive fields survive 
 
 - [x] **Step 2: Run the focused app-server tests and confirm they fail**
 
-Run: `cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppression_fields -- --nocapture`
+Run: `cargo test -p codex-app-server account_lease_read_and_update_report_live_proactive_switch_suppression_fields -- --nocapture`
 
 Expected: FAIL because the wire types and API mapping do not yet expose the new fields.
 
@@ -504,7 +504,7 @@ Run:
 ```bash
 just write-app-server-schema
 cargo test -p codex-app-server-protocol
-cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppression_fields -- --nocapture
+cargo test -p codex-app-server account_lease_read_and_update_report_live_proactive_switch_suppression_fields -- --nocapture
 ```
 
 Expected: PASS.
@@ -603,17 +603,17 @@ git commit -m "feat: show pooled switch damping in tui status"
 
 ## Verification Checklist
 
-- [ ] `cargo test -p codex-account-pool proactive_switch -- --nocapture`
-- [ ] `cargo test -p codex-account-pool --test lease_lifecycle -- --nocapture`
-- [ ] `cargo test -p codex-core account_pool -- --nocapture`
-- [ ] `just write-app-server-schema`
-- [ ] `cargo test -p codex-app-server-protocol`
-- [ ] `cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppression_fields -- --nocapture`
-- [ ] `cargo test -p codex-tui status_account_lease_display_from_response_formats_damped_proactive_switch -- --nocapture`
-- [ ] `cargo test -p codex-tui status_account_lease_display_from_response_hides_inert_damping_metadata -- --nocapture`
-- [ ] `cargo test -p codex-tui status_snapshot_shows_damped_account_lease_without_next_eligible_time -- --nocapture`
-- [ ] `cargo test -p codex-tui status_command_renders_damped_account_lease_without_next_eligible_hint -- --nocapture`
-- [ ] `cargo insta pending-snapshots --manifest-path tui/Cargo.toml`
+- [x] `cargo test -p codex-account-pool proactive_switch -- --nocapture`
+- [x] `cargo test -p codex-account-pool --test lease_lifecycle -- --nocapture`
+- [x] `cargo test -p codex-core account_pool -- --nocapture`
+- [x] `just write-app-server-schema`
+- [x] `cargo test -p codex-app-server-protocol`
+- [x] `cargo test -p codex-app-server account_lease_read_and_update_report_live_proactive_switch_suppression_fields -- --nocapture`
+- [x] `cargo test -p codex-tui status_account_lease_display_from_response_formats_damped_proactive_switch -- --nocapture`
+- [x] `cargo test -p codex-tui status_account_lease_display_from_response_hides_inert_damping_metadata -- --nocapture`
+- [x] `cargo test -p codex-tui status_snapshot_shows_damped_account_lease_without_next_eligible_time -- --nocapture`
+- [x] `cargo test -p codex-tui status_command_renders_damped_account_lease_without_next_eligible_hint -- --nocapture`
+- [x] `cargo insta pending-snapshots --manifest-path tui/Cargo.toml`
 
 ## Notes For The Implementer
 
