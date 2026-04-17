@@ -232,9 +232,15 @@ LEFT JOIN account_leases AS active_lease
             ));
         }
 
-        let next_cursor = entries
-            .get(limit as usize)
-            .map(|(position, account_id, _)| encode_account_cursor(*position, account_id.clone()));
+        let next_cursor = if entries.len() > limit as usize {
+            entries
+                .get(limit as usize - 1)
+                .map(|(position, account_id, _)| {
+                    encode_account_cursor(*position, account_id.clone())
+                })
+        } else {
+            None
+        };
         let data = entries
             .into_iter()
             .take(limit as usize)
@@ -831,6 +837,41 @@ mod tests {
             accounts.data[0].operational_state.as_deref(),
             Some("leased")
         );
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_paginates_without_skipping_rows() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+        seed_account(&runtime, "acct-3", "team-main", 2).await;
+
+        let first = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+        let second = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: first.next_cursor.clone(),
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(first.data.len(), 1);
+        assert_eq!(first.data[0].account_id, "acct-1");
+        assert_eq!(second.data.len(), 1);
+        assert_eq!(second.data[0].account_id, "acct-2");
+        assert_ne!(first.next_cursor, second.next_cursor);
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
