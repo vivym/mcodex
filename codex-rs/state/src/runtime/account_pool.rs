@@ -1325,18 +1325,48 @@ WHERE preferred_account_id = ?
         update: AccountStartupSelectionUpdate,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
+        let previous_selection = sqlx::query(
+            r#"
+SELECT default_pool_id, preferred_account_id
+FROM account_startup_selection
+WHERE singleton = 1
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let previous_default_pool_id = match previous_selection.as_ref() {
+            Some(row) => row.try_get::<Option<String>, _>("default_pool_id")?,
+            None => None,
+        };
+        let previous_preferred_account_id = match previous_selection.as_ref() {
+            Some(row) => row.try_get::<Option<String>, _>("preferred_account_id")?,
+            None => None,
+        };
         let event_pool_id = match update.default_pool_id.as_deref() {
-            Some(default_pool_id) => Some(default_pool_id.to_string()),
+            Some(default_pool_id) => default_pool_id.to_string(),
             None => match update.preferred_account_id.as_deref() {
-                Some(preferred_account_id) => Some(
+                Some(preferred_account_id) => {
                     super::account_pool_control::read_effective_account_pool_id(
                         &mut *tx,
                         preferred_account_id,
                     )
                     .await?
-                    .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string()),
-                ),
-                None => None,
+                    .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string())
+                }
+                None => match previous_default_pool_id {
+                    Some(previous_default_pool_id) => previous_default_pool_id,
+                    None => match previous_preferred_account_id.as_deref() {
+                        Some(previous_preferred_account_id) => {
+                            super::account_pool_control::read_effective_account_pool_id(
+                                &mut *tx,
+                                previous_preferred_account_id,
+                            )
+                            .await?
+                            .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string())
+                        }
+                        None => LEGACY_DEFAULT_POOL_ID.to_string(),
+                    },
+                },
             },
         };
         sqlx::query(
@@ -1361,43 +1391,47 @@ ON CONFLICT(singleton) DO UPDATE SET
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .execute(&mut *tx)
         .await?;
-        if let Some(pool_id) = event_pool_id {
-            let (event_type, reason_code, message) = if update.suppressed {
-                (
-                    "proactiveSwitchSuppressed",
-                    Some("durablySuppressed"),
-                    "startup selection is durably suppressed".to_string(),
-                )
-            } else if let Some(preferred_account_id) = update.preferred_account_id.as_deref() {
-                (
-                    "proactiveSwitchSelected",
-                    Some("preferredAccountSelected"),
-                    format!("startup selection durably prefers account {preferred_account_id}"),
-                )
-            } else {
-                (
-                    "proactiveSwitchSelected",
-                    Some("automaticAccountSelected"),
-                    format!("startup selection durably targets pool {pool_id}"),
-                )
-            };
-            super::account_pool_observability::append_account_pool_event_tx(
-                &mut *tx,
-                &account_pool_event(
-                    Utc::now(),
-                    AccountPoolEventSubject {
-                        pool_id: &pool_id,
-                        account_id: update.preferred_account_id.as_deref(),
-                        lease_id: None,
-                        holder_instance_id: None,
-                    },
-                    event_type,
-                    reason_code,
-                    message,
-                ),
+        let (event_type, reason_code, message) = if update.suppressed {
+            (
+                "proactiveSwitchSuppressed",
+                Some("durablySuppressed"),
+                "startup selection is durably suppressed".to_string(),
             )
-            .await?;
-        }
+        } else if let Some(preferred_account_id) = update.preferred_account_id.as_deref() {
+            (
+                "proactiveSwitchSelected",
+                Some("preferredAccountSelected"),
+                format!("startup selection durably prefers account {preferred_account_id}"),
+            )
+        } else if update.default_pool_id.is_some() {
+            (
+                "proactiveSwitchSelected",
+                Some("automaticAccountSelected"),
+                format!("startup selection durably targets pool {event_pool_id}"),
+            )
+        } else {
+            (
+                "proactiveSwitchSelected",
+                Some("missingPool"),
+                "startup selection durably clears the selected pool".to_string(),
+            )
+        };
+        super::account_pool_observability::append_account_pool_event_tx(
+            &mut *tx,
+            &account_pool_event(
+                Utc::now(),
+                AccountPoolEventSubject {
+                    pool_id: &event_pool_id,
+                    account_id: update.preferred_account_id.as_deref(),
+                    lease_id: None,
+                    holder_instance_id: None,
+                },
+                event_type,
+                reason_code,
+                message,
+            ),
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3383,6 +3417,27 @@ WHERE account_id = ?
                 None,
                 None,
                 Some("preferredAccountSelected".to_string()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_account_startup_selection_default_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "proactiveSwitchSelected").await,
+            vec![(
+                "legacy-default".to_string(),
+                None,
+                None,
+                None,
+                Some("missingPool".to_string()),
             )]
         );
     }
