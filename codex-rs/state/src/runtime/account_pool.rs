@@ -1325,6 +1325,20 @@ WHERE preferred_account_id = ?
         update: AccountStartupSelectionUpdate,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
+        let event_pool_id = match update.default_pool_id.as_deref() {
+            Some(default_pool_id) => Some(default_pool_id.to_string()),
+            None => match update.preferred_account_id.as_deref() {
+                Some(preferred_account_id) => Some(
+                    super::account_pool_control::read_effective_account_pool_id(
+                        &mut *tx,
+                        preferred_account_id,
+                    )
+                    .await?
+                    .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string()),
+                ),
+                None => None,
+            },
+        };
         sqlx::query(
             r#"
 INSERT INTO account_startup_selection (
@@ -1347,20 +1361,25 @@ ON CONFLICT(singleton) DO UPDATE SET
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .execute(&mut *tx)
         .await?;
-        if update.suppressed {
-            let pool_id = match update.default_pool_id.as_deref() {
-                Some(default_pool_id) => default_pool_id.to_string(),
-                None => match update.preferred_account_id.as_deref() {
-                    Some(preferred_account_id) => {
-                        super::account_pool_control::read_effective_account_pool_id(
-                            &mut *tx,
-                            preferred_account_id,
-                        )
-                        .await?
-                        .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string())
-                    }
-                    None => LEGACY_DEFAULT_POOL_ID.to_string(),
-                },
+        if let Some(pool_id) = event_pool_id {
+            let (event_type, reason_code, message) = if update.suppressed {
+                (
+                    "proactiveSwitchSuppressed",
+                    Some("durablySuppressed"),
+                    "startup selection is durably suppressed".to_string(),
+                )
+            } else if let Some(preferred_account_id) = update.preferred_account_id.as_deref() {
+                (
+                    "proactiveSwitchSelected",
+                    Some("preferredAccountSelected"),
+                    format!("startup selection durably prefers account {preferred_account_id}"),
+                )
+            } else {
+                (
+                    "proactiveSwitchSelected",
+                    Some("automaticAccountSelected"),
+                    format!("startup selection durably targets pool {pool_id}"),
+                )
             };
             super::account_pool_observability::append_account_pool_event_tx(
                 &mut *tx,
@@ -1372,9 +1391,9 @@ ON CONFLICT(singleton) DO UPDATE SET
                         lease_id: None,
                         holder_instance_id: None,
                     },
-                    "proactiveSwitchSuppressed",
-                    Some("durablySuppressed"),
-                    "startup selection is durably suppressed",
+                    event_type,
+                    reason_code,
+                    message,
                 ),
             )
             .await?;
@@ -3339,6 +3358,31 @@ WHERE account_id = ?
                 None,
                 None,
                 Some("durablySuppressed".to_string()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_account_startup_selection_unsuppressed_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "proactiveSwitchSelected").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                None,
+                None,
+                Some("preferredAccountSelected".to_string()),
             )]
         );
     }

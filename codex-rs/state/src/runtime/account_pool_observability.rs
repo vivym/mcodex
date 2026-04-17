@@ -381,6 +381,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
 
         let mut issues = Vec::new();
         let mut eligible_accounts = 0_u32;
+        let mut active_leases = 0_u32;
         let mut next_relevant_at: Option<chrono::DateTime<Utc>> = None;
         let mut preferred_in_pool = false;
         for row in rows {
@@ -396,6 +397,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
             }
 
             if let Some(expires_at) = expires_at {
+                active_leases += 1;
                 next_relevant_at = match next_relevant_at {
                     Some(current) => Some(current.min(expires_at)),
                     None => Some(expires_at),
@@ -416,7 +418,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
                     next_relevant_at: expires_at,
                 }),
                 Some("unauthorized") => issues.push(AccountPoolIssueRecord {
-                    severity: "critical".to_string(),
+                    severity: "error".to_string(),
                     reason_code: "authFailure".to_string(),
                     message: format!("account {account_id} is unauthorized"),
                     account_id: Some(account_id.clone()),
@@ -446,7 +448,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
                 .iter()
                 .find(|event| event.event_type == "leaseAcquireFailed");
             issues.push(AccountPoolIssueRecord {
-                severity: "critical".to_string(),
+                severity: "error".to_string(),
                 reason_code: lease_failure
                     .and_then(|event| event.reason_code.clone())
                     .unwrap_or_else(|| "noEligibleAccount".to_string()),
@@ -460,10 +462,10 @@ ORDER BY membership.position ASC, membership.account_id ASC
             });
         }
 
-        let status = if issues.iter().any(|issue| issue.severity == "critical") {
-            "unavailable"
-        } else if issues.is_empty() {
+        let status = if issues.is_empty() {
             "healthy"
+        } else if active_leases == 0 && eligible_accounts == 0 {
+            "blocked"
         } else {
             "degraded"
         };
@@ -634,6 +636,79 @@ mod tests {
         assert_eq!(snapshot.summary.near_exhausted_accounts, None);
         assert_eq!(snapshot.summary.exhausted_accounts, None);
         assert_eq!(snapshot.summary.error_accounts, None);
+    }
+
+    #[tokio::test]
+    async fn read_account_pool_diagnostics_uses_error_severity_and_blocked_status() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .record_account_health_event(crate::AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "team-main".to_string(),
+                health_state: crate::AccountHealthState::Unauthorized,
+                sequence_number: 1,
+                observed_at: timestamp(10),
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = runtime
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.status, "blocked");
+        assert_eq!(
+            diagnostics
+                .issues
+                .iter()
+                .find(|issue| issue.reason_code == "authFailure")
+                .map(|issue| issue.severity.as_str()),
+            Some("error")
+        );
+        assert!(
+            diagnostics
+                .issues
+                .iter()
+                .all(|issue| matches!(issue.severity.as_str(), "info" | "warning" | "error"))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_account_pool_diagnostics_keeps_active_lease_pool_degraded() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+        runtime
+            .acquire_account_lease("team-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+        runtime
+            .record_account_health_event(crate::AccountHealthEvent {
+                account_id: "acct-2".to_string(),
+                pool_id: "team-main".to_string(),
+                health_state: crate::AccountHealthState::Unauthorized,
+                sequence_number: 1,
+                observed_at: timestamp(11),
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = runtime
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.status, "degraded");
+        assert_eq!(
+            diagnostics
+                .issues
+                .iter()
+                .find(|issue| issue.reason_code == "authFailure")
+                .map(|issue| issue.severity.as_str()),
+            Some("error")
+        );
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
