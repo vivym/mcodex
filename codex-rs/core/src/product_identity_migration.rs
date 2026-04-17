@@ -17,12 +17,20 @@ use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 
 pub const PRODUCT_IDENTITY_MIGRATION_FILENAME: &str = ".product_identity_migration";
+pub const PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME: &str = ".product_identity_migration.pending";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationImportOutcome {
     NotAttempted,
     Imported,
+    AlreadyPresent,
     Failed { warning: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingTargetBehavior {
+    Warn,
+    Reuse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +142,7 @@ async fn maybe_migrate_product_identity_with_legacy_home(
     ui: &mut dyn ProductIdentityMigrationUi,
 ) -> io::Result<ProductIdentityMigrationOutcome> {
     let marker_path = mcodex_home.join(PRODUCT_IDENTITY_MIGRATION_FILENAME);
+    let pending_marker_path = mcodex_home.join(PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME);
     if fs::try_exists(&marker_path).await? {
         return Ok(ProductIdentityMigrationOutcome {
             status: ProductIdentityMigrationStatus::SkippedMarker,
@@ -141,6 +150,20 @@ async fn maybe_migrate_product_identity_with_legacy_home(
             auth_import: MigrationImportOutcome::NotAttempted,
             marker_warning: None,
         });
+    }
+
+    if fs::try_exists(&pending_marker_path).await? {
+        let legacy_home =
+            resolve_pending_legacy_home_for_import(legacy_home_result, mcodex_home)?;
+        return Ok(import_product_identity_with_pending_marker(
+            &legacy_home,
+            mcodex_home,
+            &pending_marker_path,
+            &marker_path,
+            ExistingTargetBehavior::Reuse,
+            None,
+        )
+        .await);
     }
 
     if active_home_is_initialized(mcodex_home).await? {
@@ -190,14 +213,79 @@ async fn maybe_migrate_product_identity_with_legacy_home(
         });
     }
 
-    let config_import = import_config(&legacy_home, mcodex_home).await;
-    let auth_import = import_auth(&legacy_home, mcodex_home).await;
-    let marker_warning = write_marker_warning(mcodex_home, &marker_path).await;
+    let pending_marker_warning = write_marker_warning(mcodex_home, &pending_marker_path).await;
+    Ok(import_product_identity_with_pending_marker(
+        &legacy_home,
+        mcodex_home,
+        &pending_marker_path,
+        &marker_path,
+        ExistingTargetBehavior::Warn,
+        pending_marker_warning,
+    )
+    .await)
+}
+
+fn resolve_pending_legacy_home_for_import(
+    legacy_home_result: io::Result<Option<PathBuf>>,
+    mcodex_home: &Path,
+) -> io::Result<PathBuf> {
+    let legacy_home = match legacy_home_result {
+        Ok(Some(legacy_home)) => legacy_home,
+        Ok(None) => {
+            return Err(io::Error::other(format!(
+                "cannot resume pending legacy Codex migration into {} because no readable legacy home is available via {} or {}",
+                mcodex_home.display(),
+                MCODEX.legacy_home_env_var,
+                MCODEX.legacy_home_dir_name
+            )));
+        }
+        Err(err) => {
+            return Err(io::Error::other(format!(
+                "cannot resume pending legacy Codex migration into {} because the legacy home could not be read: {err}",
+                mcodex_home.display()
+            )));
+        }
+    };
+
+    if legacy_home == mcodex_home {
+        return Err(io::Error::other(format!(
+            "cannot resume pending legacy Codex migration because legacy home {} resolves to the active mcodex home",
+            legacy_home.display()
+        )));
+    }
+
+    Ok(legacy_home)
+}
+
+async fn import_product_identity_with_pending_marker(
+    legacy_home: &Path,
+    mcodex_home: &Path,
+    pending_marker_path: &Path,
+    marker_path: &Path,
+    existing_target_behavior: ExistingTargetBehavior,
+    pending_marker_warning: Option<String>,
+) -> ProductIdentityMigrationOutcome {
+    let config_import = import_config_with_existing_target_behavior(
+        legacy_home,
+        mcodex_home,
+        existing_target_behavior,
+    )
+    .await;
+    let auth_import = import_auth_with_existing_target_behavior(
+        legacy_home,
+        mcodex_home,
+        existing_target_behavior,
+    )
+    .await;
+    let marker_warning = merge_warnings(
+        pending_marker_warning,
+        finalize_migration_marker(mcodex_home, pending_marker_path, marker_path).await,
+    );
     let has_warnings = matches!(config_import, MigrationImportOutcome::Failed { .. })
         || matches!(auth_import, MigrationImportOutcome::Failed { .. })
         || marker_warning.is_some();
 
-    Ok(ProductIdentityMigrationOutcome {
+    ProductIdentityMigrationOutcome {
         status: if has_warnings {
             ProductIdentityMigrationStatus::ImportedWithWarnings
         } else {
@@ -206,10 +294,24 @@ async fn maybe_migrate_product_identity_with_legacy_home(
         config_import,
         auth_import,
         marker_warning,
-    })
+    }
 }
 
+#[cfg(test)]
 async fn import_config(legacy_home: &Path, mcodex_home: &Path) -> MigrationImportOutcome {
+    import_config_with_existing_target_behavior(
+        legacy_home,
+        mcodex_home,
+        ExistingTargetBehavior::Warn,
+    )
+    .await
+}
+
+async fn import_config_with_existing_target_behavior(
+    legacy_home: &Path,
+    mcodex_home: &Path,
+    existing_target_behavior: ExistingTargetBehavior,
+) -> MigrationImportOutcome {
     let legacy_config_path = legacy_home.join(CONFIG_TOML_FILE);
     let config_contents = match fs::read_to_string(&legacy_config_path).await {
         Ok(config_contents) => config_contents,
@@ -250,11 +352,14 @@ async fn import_config(legacy_home: &Path, mcodex_home: &Path) -> MigrationImpor
     let active_config_path = mcodex_home.join(CONFIG_TOML_FILE);
     match write_new_file(&active_config_path, transformed.as_bytes()).await {
         Ok(()) => MigrationImportOutcome::Imported,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => MigrationImportOutcome::Failed {
-            warning: format!(
-                "refusing to overwrite existing mcodex config.toml at {} during legacy import",
-                active_config_path.display()
-            ),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match existing_target_behavior {
+            ExistingTargetBehavior::Warn => MigrationImportOutcome::Failed {
+                warning: format!(
+                    "refusing to overwrite existing mcodex config.toml at {} during legacy import",
+                    active_config_path.display()
+                ),
+            },
+            ExistingTargetBehavior::Reuse => MigrationImportOutcome::AlreadyPresent,
         },
         Err(err) => MigrationImportOutcome::Failed {
             warning: format!(
@@ -266,7 +371,21 @@ async fn import_config(legacy_home: &Path, mcodex_home: &Path) -> MigrationImpor
     }
 }
 
+#[cfg(test)]
 async fn import_auth(legacy_home: &Path, mcodex_home: &Path) -> MigrationImportOutcome {
+    import_auth_with_existing_target_behavior(
+        legacy_home,
+        mcodex_home,
+        ExistingTargetBehavior::Warn,
+    )
+    .await
+}
+
+async fn import_auth_with_existing_target_behavior(
+    legacy_home: &Path,
+    mcodex_home: &Path,
+    existing_target_behavior: ExistingTargetBehavior,
+) -> MigrationImportOutcome {
     let legacy_auth_path = legacy_home.join("auth.json");
     let auth_contents = match fs::read(&legacy_auth_path).await {
         Ok(auth_contents) => auth_contents,
@@ -295,11 +414,14 @@ async fn import_auth(legacy_home: &Path, mcodex_home: &Path) -> MigrationImportO
     let active_auth_path = mcodex_home.join("auth.json");
     match write_new_file(&active_auth_path, &auth_contents).await {
         Ok(()) => MigrationImportOutcome::Imported,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => MigrationImportOutcome::Failed {
-            warning: format!(
-                "refusing to overwrite existing mcodex auth.json at {} during legacy import",
-                active_auth_path.display()
-            ),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => match existing_target_behavior {
+            ExistingTargetBehavior::Warn => MigrationImportOutcome::Failed {
+                warning: format!(
+                    "refusing to overwrite existing mcodex auth.json at {} during legacy import",
+                    active_auth_path.display()
+                ),
+            },
+            ExistingTargetBehavior::Reuse => MigrationImportOutcome::AlreadyPresent,
         },
         Err(err) => MigrationImportOutcome::Failed {
             warning: format!(
@@ -381,6 +503,40 @@ async fn write_marker_warning(mcodex_home: &Path, marker_path: &Path) -> Option<
             marker_path.display()
         )
     })
+}
+
+async fn finalize_migration_marker(
+    mcodex_home: &Path,
+    pending_marker_path: &Path,
+    marker_path: &Path,
+) -> Option<String> {
+    let marker_warning = write_marker_warning(mcodex_home, marker_path).await;
+    if marker_warning.is_some() {
+        return marker_warning;
+    }
+
+    clear_pending_marker_warning(pending_marker_path).await
+}
+
+async fn clear_pending_marker_warning(pending_marker_path: &Path) -> Option<String> {
+    match fs::remove_file(pending_marker_path).await {
+        Ok(()) => None,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!(
+            "failed to clear pending product identity migration marker at {}: {err}",
+            pending_marker_path.display()
+        )),
+    }
+}
+
+fn merge_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(warning), None) | (None, Some(warning)) => Some(warning),
+        (Some(first_warning), Some(second_warning)) => {
+            Some(format!("{first_warning}; {second_warning}"))
+        }
+    }
 }
 
 async fn create_marker(marker_path: &Path) -> io::Result<()> {

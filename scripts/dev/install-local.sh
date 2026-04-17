@@ -21,32 +21,46 @@ MCODEX_ROOT="${MCODEX_ROOT:-$HOME/.mcodex-dev}"
 MCODEX_HOME_DEFAULT="$MCODEX_ROOT/home"
 INSTALL_BIN_DIR="$MCODEX_ROOT/bin"
 WRAPPER_DIR="${MCODEX_WRAPPER_DIR:-$HOME/.local/bin}"
-
-if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-  case "$CARGO_TARGET_DIR" in
-    /*) TARGET_DIR="$CARGO_TARGET_DIR" ;;
-    *) TARGET_DIR="$CODEX_RS_DIR/$CARGO_TARGET_DIR" ;;
-  esac
-else
-  TARGET_DIR="$CODEX_RS_DIR/target"
-fi
-
-if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
-  SOURCE_BINARY="$TARGET_DIR/$CARGO_BUILD_TARGET/release/mcodex"
-else
-  SOURCE_BINARY="$TARGET_DIR/release/mcodex"
-fi
 INSTALLED_BINARY="$INSTALL_BIN_DIR/mcodex"
 WRAPPER_PATH="$WRAPPER_DIR/mcodex"
+BUILD_OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/mcodex-build-output.XXXXXX")"
+
+cleanup() {
+  rm -f "$BUILD_OUTPUT_FILE"
+}
+
+trap cleanup EXIT HUP INT TERM
 
 step "Building release mcodex binary"
-(
+if (
   cd "$CODEX_RS_DIR"
-  cargo build --release --bin mcodex
-)
+  cargo build --release --bin mcodex --message-format=json-render-diagnostics >"$BUILD_OUTPUT_FILE"
+); then
+  :
+else
+  cat "$BUILD_OUTPUT_FILE" >&2 || true
+  exit 1
+fi
+
+SOURCE_BINARY="$(
+  awk '
+    /"reason":"compiler-artifact"/ && /"name":"mcodex"/ && /"executable":/ {
+      line = $0;
+      sub(/^.*"executable":"/, "", line);
+      sub(/".*$/, "", line);
+      print line;
+      exit;
+    }
+  ' "$BUILD_OUTPUT_FILE"
+)"
 
 step "Installing local mcodex binary to $INSTALL_BIN_DIR"
 mkdir -p "$INSTALL_BIN_DIR"
+if [ -z "$SOURCE_BINARY" ]; then
+  cat "$BUILD_OUTPUT_FILE" >&2 || true
+  printf '%s\n' "failed to determine the built mcodex binary path from cargo output" >&2
+  exit 1
+fi
 if [ ! -x "$SOURCE_BINARY" ]; then
   printf '%s\n' "built mcodex binary not found at $SOURCE_BINARY" >&2
   exit 1

@@ -1285,6 +1285,58 @@ async fn app_server_starts_when_mcodex_home_is_initialized_without_product_ident
 }
 
 #[tokio::test]
+async fn app_server_resumes_pending_product_identity_migration_noninteractively() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::Personality, true)]),
+    )?;
+    std::fs::write(
+        codex_home.path().join(
+            codex_core::product_identity_migration::PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME,
+        ),
+        "v1\n",
+    )?;
+
+    let legacy_home = TempDir::new()?;
+    write_legacy_migration_inputs(legacy_home.path())?;
+    let legacy_home_str = legacy_home.path().display().to_string();
+
+    let mut mcp = McpProcess::new_with_env_without_product_identity_marker(
+        codex_home.path(),
+        &[("CODEX_HOME", Some(legacy_home_str.as_str()))],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    assert!(
+        codex_home.path().join("auth.json").exists(),
+        "pending migration resume should import missing auth"
+    );
+    assert!(
+        codex_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists(),
+        "pending migration resume should finalize the migration marker"
+    );
+    assert!(
+        !codex_home
+            .path()
+            .join(
+                codex_core::product_identity_migration::PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME
+            )
+            .exists(),
+        "pending migration marker should be cleared after successful resume"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_start_accepts_local_image_input() -> Result<()> {
     // Two Codex turns hit the mock model (session start + turn/start).
     let responses = vec![

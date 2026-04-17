@@ -322,6 +322,112 @@ async fn skips_when_active_home_is_already_initialized() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn pending_migration_resumes_auth_import_without_prompting() -> io::Result<()> {
+    let legacy_home = TempDir::new()?;
+    let active_home = TempDir::new()?;
+    write_legacy_config(legacy_home.path())?;
+    write_legacy_auth(legacy_home.path())?;
+    fs::write(
+        active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME),
+        "v1\n",
+    )?;
+    fs::write(
+        active_home.path().join("config.toml"),
+        "model = \"already-imported\"\n",
+    )?;
+
+    let mut ui = StubUi::accepting();
+    let outcome = maybe_migrate_product_identity_with_legacy_home(
+        active_home.path(),
+        some_legacy_home(&legacy_home),
+        &mut ui,
+    )
+    .await?;
+
+    assert_eq!(ui.prompt_count, 0);
+    assert_eq!(outcome.status, ProductIdentityMigrationStatus::Imported);
+    assert_eq!(
+        outcome.config_import,
+        MigrationImportOutcome::AlreadyPresent
+    );
+    assert_eq!(outcome.auth_import, MigrationImportOutcome::Imported);
+    assert!(
+        active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists()
+    );
+    assert!(
+        !active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME)
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("config.toml"))?,
+        "model = \"already-imported\"\n"
+    );
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("auth.json"))?,
+        r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-legacy"}"#
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_migration_resumes_config_import_without_prompting() -> io::Result<()> {
+    let legacy_home = TempDir::new()?;
+    let active_home = TempDir::new()?;
+    write_legacy_config(legacy_home.path())?;
+    write_legacy_auth(legacy_home.path())?;
+    fs::write(
+        active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME),
+        "v1\n",
+    )?;
+    fs::write(
+        active_home.path().join("auth.json"),
+        r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-already"}"#,
+    )?;
+
+    let mut ui = StubUi::accepting();
+    let outcome = maybe_migrate_product_identity_with_legacy_home(
+        active_home.path(),
+        some_legacy_home(&legacy_home),
+        &mut ui,
+    )
+    .await?;
+
+    assert_eq!(ui.prompt_count, 0);
+    assert_eq!(outcome.status, ProductIdentityMigrationStatus::Imported);
+    assert_eq!(outcome.config_import, MigrationImportOutcome::Imported);
+    assert_eq!(outcome.auth_import, MigrationImportOutcome::AlreadyPresent);
+    assert!(
+        active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists()
+    );
+    assert!(
+        !active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_PENDING_FILENAME)
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("auth.json"))?,
+        r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-already"}"#
+    );
+    let migrated = read_config(active_home.path())?;
+    let accounts = migrated.accounts.expect("accounts should be preserved");
+    assert_eq!(accounts.default_pool, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn skips_when_no_legacy_home() -> io::Result<()> {
     let active_home = TempDir::new()?;
 
