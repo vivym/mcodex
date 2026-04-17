@@ -1,9 +1,15 @@
 use chrono::Duration;
+use codex_account_pool::AccountOperationalState;
 use codex_account_pool::AccountPoolAccountsListRequest;
+use codex_account_pool::AccountPoolAccountsPage;
+use codex_account_pool::AccountPoolDiagnostics;
 use codex_account_pool::AccountPoolDiagnosticsReadRequest;
+use codex_account_pool::AccountPoolEventType;
 use codex_account_pool::AccountPoolEventsListRequest;
+use codex_account_pool::AccountPoolEventsPage;
 use codex_account_pool::AccountPoolObservabilityReader;
 use codex_account_pool::AccountPoolReadRequest;
+use codex_account_pool::AccountPoolSnapshot;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
@@ -28,23 +34,23 @@ async fn local_observability_reader_passthroughs_runtime_reads() {
     expect_ok(
         runtime
             .append_account_pool_event(test_event(
-            "evt-1",
-            100,
-            "team-main",
-            Some("acct-1"),
-            "leaseAcquired",
-        ))
+                "evt-1",
+                100,
+                "team-main",
+                Some("acct-1"),
+                "leaseAcquired",
+            ))
             .await,
     );
     expect_ok(
         runtime
             .record_account_health_event(AccountHealthEvent {
-            account_id: "acct-2".to_string(),
-            pool_id: "team-main".to_string(),
-            health_state: AccountHealthState::Unauthorized,
-            sequence_number: 1,
-            observed_at: timestamp(10),
-        })
+                account_id: "acct-2".to_string(),
+                pool_id: "team-main".to_string(),
+                health_state: AccountHealthState::Unauthorized,
+                sequence_number: 1,
+                observed_at: timestamp(10),
+            })
             .await,
     );
 
@@ -52,15 +58,16 @@ async fn local_observability_reader_passthroughs_runtime_reads() {
 
     let observed_pool = expect_ok(
         backend
-        .read_pool(AccountPoolReadRequest {
-            pool_id: "team-main".to_string(),
-        })
-        .await
+            .read_pool(AccountPoolReadRequest {
+                pool_id: "team-main".to_string(),
+            })
+            .await,
     );
     let expected_pool = expect_ok(
         runtime
-        .read_account_pool_snapshot("team-main")
-        .await
+            .read_account_pool_snapshot("team-main")
+            .await
+            .and_then(AccountPoolSnapshot::try_from),
     );
     assert_eq!(
         normalize_snapshot(observed_pool),
@@ -69,68 +76,157 @@ async fn local_observability_reader_passthroughs_runtime_reads() {
 
     let observed_accounts = expect_ok(
         backend
-        .list_accounts(AccountPoolAccountsListRequest {
-            pool_id: "team-main".to_string(),
-            cursor: None,
-            limit: Some(10),
-            states: None,
-            account_kinds: None,
-        })
-        .await
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await,
     );
     let expected_accounts = expect_ok(
         runtime
-        .list_account_pool_accounts(codex_state::AccountPoolAccountsListQuery {
-            pool_id: "team-main".to_string(),
-            cursor: None,
-            limit: Some(10),
-            states: None,
-            account_kinds: None,
-        })
-        .await
+            .list_account_pool_accounts(AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .and_then(AccountPoolAccountsPage::try_from),
     );
     assert_eq!(observed_accounts, expected_accounts);
 
     let observed_events = expect_ok(
         backend
-        .list_events(AccountPoolEventsListRequest {
-            pool_id: "team-main".to_string(),
-            account_id: None,
-            types: None,
-            cursor: None,
-            limit: Some(10),
-        })
-        .await
+            .list_events(AccountPoolEventsListRequest {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                types: None,
+                cursor: None,
+                limit: Some(10),
+            })
+            .await,
     );
     let expected_events = expect_ok(
         runtime
-        .list_account_pool_events(AccountPoolEventsListQuery {
-            pool_id: "team-main".to_string(),
-            account_id: None,
-            types: None,
-            cursor: None,
-            limit: Some(10),
-        })
-        .await
+            .list_account_pool_events(AccountPoolEventsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                types: None,
+                cursor: None,
+                limit: Some(10),
+            })
+            .await
+            .and_then(AccountPoolEventsPage::try_from),
     );
     assert_eq!(observed_events, expected_events);
 
     let observed_diagnostics = expect_ok(
         backend
-        .read_diagnostics(AccountPoolDiagnosticsReadRequest {
-            pool_id: "team-main".to_string(),
-        })
-        .await
+            .read_diagnostics(AccountPoolDiagnosticsReadRequest {
+                pool_id: "team-main".to_string(),
+            })
+            .await,
     );
     let expected_diagnostics = expect_ok(
         runtime
-        .read_account_pool_diagnostics("team-main")
-        .await
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .and_then(AccountPoolDiagnostics::try_from),
     );
     assert_eq!(
         normalize_diagnostics(observed_diagnostics),
         normalize_diagnostics(expected_diagnostics)
     );
+}
+
+#[tokio::test]
+async fn local_observability_reader_forwards_account_and_event_filters() {
+    let runtime = test_runtime().await;
+    seed_account(&runtime, "acct-1", "team-main", 0, true, true).await;
+    seed_account(&runtime, "acct-2", "team-main", 1, true, true).await;
+    expect_ok(
+        runtime
+            .acquire_account_lease("team-main", "inst-a", Duration::seconds(300))
+            .await,
+    );
+    expect_ok(
+        runtime
+            .append_account_pool_event(test_event(
+                "evt-1",
+                100,
+                "team-main",
+                Some("acct-1"),
+                "leaseAcquired",
+            ))
+            .await,
+    );
+    expect_ok(
+        runtime
+            .append_account_pool_event(test_event(
+                "evt-2",
+                101,
+                "team-main",
+                Some("acct-2"),
+                "leaseReleased",
+            ))
+            .await,
+    );
+
+    let backend = LocalAccountPoolBackend::new(runtime.clone(), Duration::seconds(300));
+
+    let observed_accounts = expect_ok(
+        backend
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: Some(vec![AccountOperationalState::Available]),
+                account_kinds: Some(vec!["chatgpt".to_string()]),
+            })
+            .await,
+    );
+    let expected_accounts = expect_ok(
+        runtime
+            .list_account_pool_accounts(AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: Some(vec!["available".to_string()]),
+                account_kinds: Some(vec!["chatgpt".to_string()]),
+            })
+            .await
+            .and_then(AccountPoolAccountsPage::try_from),
+    );
+    assert_eq!(observed_accounts, expected_accounts);
+
+    let observed_events = expect_ok(
+        backend
+            .list_events(AccountPoolEventsListRequest {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-1".to_string()),
+                types: Some(vec![AccountPoolEventType::LeaseAcquired]),
+                cursor: None,
+                limit: Some(10),
+            })
+            .await,
+    );
+    let expected_events = expect_ok(
+        runtime
+            .list_account_pool_events(AccountPoolEventsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-1".to_string()),
+                types: Some(vec!["leaseAcquired".to_string()]),
+                cursor: None,
+                limit: Some(10),
+            })
+            .await
+            .and_then(AccountPoolEventsPage::try_from),
+    );
+    assert_eq!(observed_events, expected_events);
 }
 
 #[tokio::test]
@@ -141,25 +237,26 @@ async fn local_observability_reader_keeps_nulls_for_unknown_state() {
     let backend = LocalAccountPoolBackend::new(runtime.clone(), Duration::seconds(300));
     let observed = expect_ok(
         backend
-        .list_accounts(AccountPoolAccountsListRequest {
-            pool_id: "team-main".to_string(),
-            cursor: None,
-            limit: Some(10),
-            states: None,
-            account_kinds: None,
-        })
-        .await
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await,
     );
     let expected = expect_ok(
         runtime
-        .list_account_pool_accounts(AccountPoolAccountsListQuery {
-            pool_id: "team-main".to_string(),
-            cursor: None,
-            limit: Some(10),
-            states: None,
-            account_kinds: None,
-        })
-        .await
+            .list_account_pool_accounts(AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .and_then(AccountPoolAccountsPage::try_from),
     );
 
     assert_eq!(observed, expected);
@@ -181,40 +278,36 @@ async fn seed_account(
     expect_ok(
         runtime
             .upsert_account_registry_entry(AccountRegistryEntryUpdate {
-            account_id: account_id.to_string(),
-            pool_id: pool_id.to_string(),
-            position,
-            account_kind: "chatgpt".to_string(),
-            backend_family: "local".to_string(),
-            workspace_id: None,
-            enabled,
-            healthy,
-        })
+                account_id: account_id.to_string(),
+                pool_id: pool_id.to_string(),
+                position,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: None,
+                enabled,
+                healthy,
+            })
             .await,
     );
     expect_ok(
         runtime
             .record_account_health_event(AccountHealthEvent {
-            account_id: account_id.to_string(),
-            pool_id: pool_id.to_string(),
-            health_state: AccountHealthState::Healthy,
-            sequence_number: 1,
-            observed_at: timestamp(1),
-        })
+                account_id: account_id.to_string(),
+                pool_id: pool_id.to_string(),
+                health_state: AccountHealthState::Healthy,
+                sequence_number: 1,
+                observed_at: timestamp(1),
+            })
             .await,
     );
 }
 
-fn normalize_snapshot(
-    mut snapshot: codex_state::AccountPoolSnapshotRecord,
-) -> codex_state::AccountPoolSnapshotRecord {
+fn normalize_snapshot(mut snapshot: AccountPoolSnapshot) -> AccountPoolSnapshot {
     snapshot.refreshed_at = timestamp(0);
     snapshot
 }
 
-fn normalize_diagnostics(
-    mut diagnostics: codex_state::AccountPoolDiagnosticsRecord,
-) -> codex_state::AccountPoolDiagnosticsRecord {
+fn normalize_diagnostics(mut diagnostics: AccountPoolDiagnostics) -> AccountPoolDiagnostics {
     diagnostics.generated_at = timestamp(0);
     diagnostics
 }

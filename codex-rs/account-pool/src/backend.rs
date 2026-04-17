@@ -13,24 +13,27 @@ use codex_state::RegisteredAccountRecord;
 use codex_state::RegisteredAccountUpsert;
 
 pub mod local;
-#[allow(unused_imports)]
+pub use crate::observability::AccountOperationalState;
+pub use crate::observability::AccountPoolAccount;
 pub use crate::observability::AccountPoolAccountsListRequest;
-#[allow(unused_imports)]
 pub use crate::observability::AccountPoolAccountsPage;
-#[allow(unused_imports)]
 pub use crate::observability::AccountPoolDiagnostics;
-#[allow(unused_imports)]
 pub use crate::observability::AccountPoolDiagnosticsReadRequest;
-#[allow(unused_imports)]
+pub use crate::observability::AccountPoolDiagnosticsSeverity;
+pub use crate::observability::AccountPoolDiagnosticsStatus;
+pub use crate::observability::AccountPoolEvent;
+pub use crate::observability::AccountPoolEventType;
 pub use crate::observability::AccountPoolEventsListRequest;
-#[allow(unused_imports)]
 pub use crate::observability::AccountPoolEventsPage;
-#[allow(unused_imports)]
+pub use crate::observability::AccountPoolIssue;
+pub use crate::observability::AccountPoolLease;
 pub use crate::observability::AccountPoolObservabilityReader;
-#[allow(unused_imports)]
+pub use crate::observability::AccountPoolQuota;
 pub use crate::observability::AccountPoolReadRequest;
-#[allow(unused_imports)]
+pub use crate::observability::AccountPoolReasonCode;
+pub use crate::observability::AccountPoolSelection;
 pub use crate::observability::AccountPoolSnapshot;
+pub use crate::observability::AccountPoolSummary;
 
 /// Read-only account source used by the startup selection policy.
 ///
