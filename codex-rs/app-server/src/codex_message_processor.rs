@@ -1717,7 +1717,7 @@ impl CodexMessageProcessor {
         &self,
         transport: AppServerTransport,
     ) -> std::result::Result<(), JSONRPCErrorError> {
-        if !account_lease_api::pooled_mode_is_configured(self.config.as_ref()) {
+        if !account_lease_api::pooled_mode_is_enabled(self.config.as_ref()).await? {
             return Ok(());
         }
 

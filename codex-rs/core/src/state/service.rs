@@ -20,6 +20,8 @@ use anyhow::Context;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
+use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::read_shared_startup_status;
 use codex_analytics::AnalyticsEventsClient;
 use codex_config::types::AccountsConfigToml;
 use codex_exec_server::Environment;
@@ -82,20 +84,82 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
-    pub(crate) fn build_account_pool_manager(
+    pub(crate) async fn build_account_pool_manager(
         state_db: Option<StateDbHandle>,
         accounts: Option<AccountsConfigToml>,
         codex_home: PathBuf,
         holder_instance_id: String,
-    ) -> Option<Arc<Mutex<AccountPoolManager>>> {
-        let state_db = state_db?;
-        let accounts = accounts?;
-        Some(Arc::new(Mutex::new(AccountPoolManager::new(
+    ) -> anyhow::Result<Option<Arc<Mutex<AccountPoolManager>>>> {
+        let Some(state_db) = state_db else {
+            return Ok(None);
+        };
+        let lease_ttl_secs = accounts
+            .as_ref()
+            .and_then(|accounts| accounts.lease_ttl_secs)
+            .unwrap_or(300);
+        let backend = LocalAccountPoolBackend::new(
+            Arc::clone(&state_db),
+            Duration::seconds(lease_ttl_secs as i64),
+        );
+        let shared_status = read_shared_startup_status(
+            &backend,
+            accounts
+                .as_ref()
+                .and_then(|accounts| accounts.default_pool.as_deref()),
+            None,
+        )
+        .await?;
+        if !shared_status.pooled_applicable {
+            return Ok(None);
+        }
+        let accounts = accounts.unwrap_or(AccountsConfigToml {
+            backend: None,
+            default_pool: None,
+            proactive_switch_threshold_percent: None,
+            lease_ttl_secs: None,
+            heartbeat_interval_secs: None,
+            min_switch_interval_secs: None,
+            allocation_mode: None,
+            pools: None,
+        });
+        Ok(Some(Arc::new(Mutex::new(AccountPoolManager::new(
             state_db,
             accounts,
             codex_home,
             holder_instance_id,
-        ))))
+        )))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_state::LegacyAccountImport;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn build_account_pool_manager_uses_state_only_persisted_selection() -> anyhow::Result<()>
+    {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        state_db
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-state-only".to_string(),
+            })
+            .await?;
+
+        let manager = SessionServices::build_account_pool_manager(
+            Some(state_db),
+            None,
+            home.path().to_path_buf(),
+            "holder-state-only".to_string(),
+        )
+        .await?;
+
+        assert!(manager.is_some());
+        Ok(())
     }
 }
 

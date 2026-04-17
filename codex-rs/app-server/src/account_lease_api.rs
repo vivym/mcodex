@@ -1,3 +1,7 @@
+use chrono::Duration;
+use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::SharedStartupStatus;
+use codex_account_pool::read_shared_startup_status;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -11,48 +15,47 @@ use codex_state::AccountHealthState;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
 use codex_state::AccountStartupSelectionUpdate;
+use codex_state::AccountStartupStatus;
+use codex_state::EffectivePoolResolutionSource;
 use codex_state::StateRuntime;
-use codex_state::state_db_path;
 
 use crate::error_code::INTERNAL_ERROR_CODE;
 
-pub(crate) fn pooled_mode_is_configured(config: &Config) -> bool {
-    config.accounts.is_some()
+pub(crate) async fn pooled_mode_is_enabled(config: &Config) -> Result<bool, JSONRPCErrorError> {
+    Ok(read_account_lease_startup_context(config).await?.is_some())
+}
+
+pub(crate) fn account_lease_updated_notification_from_runtime_snapshot(
+    live_snapshot: &AccountLeaseRuntimeSnapshot,
+) -> AccountLeaseUpdatedNotification {
+    account_lease_response_from_runtime_snapshot(live_snapshot, None).into()
 }
 
 pub(crate) async fn read_account_lease(
     config: &Config,
     live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
 ) -> Result<AccountLeaseReadResponse, JSONRPCErrorError> {
+    let startup_context = read_account_lease_startup_context(config).await?;
     if let Some(live_snapshot) = live_snapshot {
-        return Ok(account_lease_response_from_runtime_snapshot(&live_snapshot));
+        return Ok(account_lease_response_from_runtime_snapshot(
+            &live_snapshot,
+            startup_context.as_ref().map(|startup| &startup.startup),
+        ));
     }
 
-    let Some(state_db) = maybe_open_state_db(config).await? else {
+    let Some(startup_context) = startup_context else {
         return Ok(empty_account_lease_response());
     };
 
-    let preview = state_db
-        .preview_account_startup_selection(configured_default_pool_id(config))
-        .await
-        .context("preview account startup selection")
-        .map_err(internal_error)?;
-
-    Ok(account_lease_response_from_preview(preview))
-}
-
-pub(crate) fn account_lease_updated_notification_from_runtime_snapshot(
-    live_snapshot: &AccountLeaseRuntimeSnapshot,
-) -> AccountLeaseUpdatedNotification {
-    account_lease_response_from_runtime_snapshot(live_snapshot).into()
+    Ok(account_lease_response_from_startup_status(
+        startup_context.startup,
+    ))
 }
 
 pub(crate) async fn resume_account_lease(
     config: &Config,
 ) -> Result<AccountLeaseUpdatedNotification, JSONRPCErrorError> {
-    let Some(state_db) = maybe_open_state_db(config).await? else {
-        return Ok(empty_account_lease_response().into());
-    };
+    let state_db = init_state_db(config).await?;
 
     let selection = state_db
         .read_account_startup_selection()
@@ -70,31 +73,31 @@ pub(crate) async fn resume_account_lease(
         .context("clear durable account startup selection suppression")
         .map_err(internal_error)?;
 
-    let preview = state_db
-        .preview_account_startup_selection(configured_default_pool_id(config))
-        .await
-        .context("preview resumed account startup selection")
-        .map_err(internal_error)?;
+    let Some(startup_context) =
+        read_account_lease_startup_context_with_state_db(config, state_db).await?
+    else {
+        return Ok(empty_account_lease_response().into());
+    };
 
-    Ok(account_lease_response_from_preview(preview).into())
+    Ok(account_lease_response_from_startup_status(startup_context.startup).into())
 }
 
 pub(crate) async fn suppress_account_lease_on_logout(
     config: &Config,
 ) -> Result<Option<AccountLeaseUpdatedNotification>, JSONRPCErrorError> {
-    let Some(state_db) = maybe_open_state_db(config).await? else {
-        return Ok(None);
-    };
+    let state_db = init_state_db(config).await?;
 
     let selection = state_db
         .read_account_startup_selection()
         .await
         .context("read account startup selection")
         .map_err(internal_error)?;
+    let startup_context =
+        read_account_lease_startup_context_with_state_db(config, Arc::clone(&state_db)).await?;
     let has_startup_selection = selection.default_pool_id.is_some()
         || selection.preferred_account_id.is_some()
         || selection.suppressed;
-    if !pooled_mode_is_configured(config) && !has_startup_selection {
+    if startup_context.is_none() && !has_startup_selection {
         return Ok(None);
     }
 
@@ -108,6 +111,14 @@ pub(crate) async fn suppress_account_lease_on_logout(
         .context("write durable suppressed account startup selection")
         .map_err(internal_error)?;
 
+    if let Some(startup_context) =
+        read_account_lease_startup_context_with_state_db(config, state_db.clone()).await?
+    {
+        return Ok(Some(
+            account_lease_response_from_startup_status(startup_context.startup).into(),
+        ));
+    }
+
     let preview = state_db
         .preview_account_startup_selection(configured_default_pool_id(config))
         .await
@@ -117,19 +128,43 @@ pub(crate) async fn suppress_account_lease_on_logout(
     Ok(Some(account_lease_response_from_preview(preview).into()))
 }
 
-async fn maybe_open_state_db(
-    config: &Config,
-) -> Result<Option<Arc<StateRuntime>>, JSONRPCErrorError> {
-    let state_path = state_db_path(config.sqlite_home.as_path());
-    if !pooled_mode_is_configured(config) && !state_path.exists() {
-        return Ok(None);
-    }
-
+async fn init_state_db(config: &Config) -> Result<Arc<StateRuntime>, JSONRPCErrorError> {
     StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
         .await
         .context("initialize account lease state db")
-        .map(Some)
         .map_err(internal_error)
+}
+
+async fn read_account_lease_startup_context(
+    config: &Config,
+) -> Result<Option<SharedStartupStatus>, JSONRPCErrorError> {
+    let state_db = init_state_db(config).await?;
+    read_account_lease_startup_context_with_state_db(config, state_db).await
+}
+
+async fn read_account_lease_startup_context_with_state_db(
+    config: &Config,
+    state_db: Arc<StateRuntime>,
+) -> Result<Option<SharedStartupStatus>, JSONRPCErrorError> {
+    let lease_ttl_secs = config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.lease_ttl_secs)
+        .unwrap_or(300);
+    let backend = LocalAccountPoolBackend::new(
+        Arc::clone(&state_db),
+        Duration::seconds(lease_ttl_secs as i64),
+    );
+    let shared_status =
+        read_shared_startup_status(&backend, configured_default_pool_id(config), None)
+            .await
+            .context("read shared account startup status")
+            .map_err(internal_error)?;
+    if !shared_status.pooled_applicable {
+        return Ok(None);
+    }
+
+    Ok(Some(shared_status))
 }
 
 fn configured_default_pool_id(config: &Config) -> Option<&str> {
@@ -153,12 +188,16 @@ fn empty_account_lease_response() -> AccountLeaseReadResponse {
         transport_reset_generation: None,
         last_remote_context_reset_turn_id: None,
         next_eligible_at: None,
+        effective_pool_resolution_source: None,
+        configured_default_pool_id: None,
+        persisted_default_pool_id: None,
     }
 }
 
-fn account_lease_response_from_preview(
-    preview: AccountStartupSelectionPreview,
+fn account_lease_response_from_startup_status(
+    startup: AccountStartupStatus,
 ) -> AccountLeaseReadResponse {
+    let preview = startup.preview;
     let active = !preview.suppressed && preview.predicted_account_id.is_some();
     let (switch_reason, suppression_reason) = selection_reasons(&preview.eligibility);
 
@@ -175,11 +214,20 @@ fn account_lease_response_from_preview(
         transport_reset_generation: None,
         last_remote_context_reset_turn_id: None,
         next_eligible_at: None,
+        effective_pool_resolution_source: Some(
+            effective_pool_resolution_source_to_wire_string(
+                startup.effective_pool_resolution_source,
+            )
+            .to_string(),
+        ),
+        configured_default_pool_id: startup.configured_default_pool_id,
+        persisted_default_pool_id: startup.persisted_default_pool_id,
     }
 }
 
 fn account_lease_response_from_runtime_snapshot(
     live_snapshot: &AccountLeaseRuntimeSnapshot,
+    startup: Option<&AccountStartupStatus>,
 ) -> AccountLeaseReadResponse {
     AccountLeaseReadResponse {
         active: live_snapshot.active,
@@ -202,6 +250,41 @@ fn account_lease_response_from_runtime_snapshot(
         next_eligible_at: live_snapshot
             .next_eligible_at
             .map(|timestamp| timestamp.timestamp()),
+        effective_pool_resolution_source: startup.map(|startup| {
+            effective_pool_resolution_source_to_wire_string(
+                startup.effective_pool_resolution_source,
+            )
+            .to_string()
+        }),
+        configured_default_pool_id: startup
+            .and_then(|startup| startup.configured_default_pool_id.clone()),
+        persisted_default_pool_id: startup
+            .and_then(|startup| startup.persisted_default_pool_id.clone()),
+    }
+}
+
+fn account_lease_response_from_preview(
+    preview: AccountStartupSelectionPreview,
+) -> AccountLeaseReadResponse {
+    let active = !preview.suppressed && preview.predicted_account_id.is_some();
+    let (switch_reason, suppression_reason) = selection_reasons(&preview.eligibility);
+
+    AccountLeaseReadResponse {
+        active,
+        suppressed: preview.suppressed,
+        account_id: preview.predicted_account_id.clone(),
+        pool_id: preview.effective_pool_id,
+        lease_id: None,
+        lease_epoch: None,
+        health_state: health_state_for_preview(&preview.eligibility, preview.predicted_account_id),
+        switch_reason,
+        suppression_reason,
+        transport_reset_generation: None,
+        last_remote_context_reset_turn_id: None,
+        next_eligible_at: None,
+        effective_pool_resolution_source: None,
+        configured_default_pool_id: None,
+        persisted_default_pool_id: None,
     }
 }
 
@@ -255,6 +338,17 @@ fn health_state_for_preview(
         | AccountStartupEligibility::AutomaticAccountSelected
         | AccountStartupEligibility::PreferredAccountMissing
         | AccountStartupEligibility::PreferredAccountInOtherPool { .. } => None,
+    }
+}
+
+fn effective_pool_resolution_source_to_wire_string(
+    source: EffectivePoolResolutionSource,
+) -> &'static str {
+    match source {
+        EffectivePoolResolutionSource::Override => "override",
+        EffectivePoolResolutionSource::ConfigDefault => "configDefault",
+        EffectivePoolResolutionSource::PersistedSelection => "persistedSelection",
+        EffectivePoolResolutionSource::None => "none",
     }
 }
 

@@ -2071,6 +2071,7 @@ impl Session {
                 config.codex_home.clone().to_path_buf(),
                 account_pool_holder_instance_id,
             )
+            .await?
         };
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(

@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
+use app_test_support::mark_product_identity_migration_complete;
 use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -381,13 +382,16 @@ pub(super) async fn spawn_websocket_server_with_args(
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
+    mark_product_identity_migration_complete(codex_home)
+        .context("should mark product identity migration complete for websocket tests")?;
     cmd.arg("--listen")
         .arg(listen_url)
         .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .env("CODEX_HOME", codex_home)
+        .env("MCODEX_HOME", codex_home)
+        .env_remove("CODEX_HOME")
         .env("RUST_LOG", "debug");
     let mut process = cmd
         .kill_on_drop(true)
@@ -516,13 +520,16 @@ async fn run_websocket_server_to_completion_with_args(
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
     let mut cmd = Command::new(program);
+    mark_product_identity_migration_complete(codex_home)
+        .context("should mark product identity migration complete for websocket tests")?;
     cmd.arg("--listen")
         .arg(listen_url)
         .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .env("CODEX_HOME", codex_home)
+        .env("MCODEX_HOME", codex_home)
+        .env_remove("CODEX_HOME")
         .env("RUST_LOG", "debug");
     timeout(Duration::from_secs(10), cmd.output())
         .await

@@ -487,6 +487,28 @@ async fn unauthorized_retry_uses_leased_auth_session_not_shared_auth_manager() -
         "shared-account",
         "shared-access-initial",
     )?;
+    let seeded_state_home = TempDir::new()?;
+    let runtime = codex_state::StateRuntime::init(
+        seeded_state_home.path().to_path_buf(),
+        "mock_provider".to_string(),
+    )
+    .await?;
+    runtime
+        .import_legacy_default_account(LegacyAccountImport {
+            account_id: PRIMARY_ACCOUNT_ID.to_string(),
+        })
+        .await?;
+    drop(runtime);
+    std::fs::copy(
+        codex_state::state_db_path(seeded_state_home.path()),
+        codex_state::state_db_path(shared_home.path()),
+    )?;
+    write_pooled_auth(
+        shared_home.path(),
+        PRIMARY_ACCOUNT_ID,
+        PRIMARY_ACCOUNT_ID,
+        &format!("pooled-access-{PRIMARY_ACCOUNT_ID}"),
+    )?;
     let shared_auth =
         CodexAuth::from_auth_storage(shared_home.path(), AuthCredentialsStoreMode::File)?
             .expect("expected shared auth from tempdir");

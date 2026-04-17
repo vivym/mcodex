@@ -10,6 +10,7 @@ use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 
+use crate::mark_product_identity_migration_complete;
 use anyhow::Context;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::CancelLoginAccountParams;
@@ -137,12 +138,15 @@ impl McpProcess {
         let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
             .context("should find binary for codex-app-server")?;
         let mut cmd = Command::new(program);
+        mark_product_identity_migration_complete(codex_home)
+            .context("should mark product identity migration complete for app-server tests")?;
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
-        cmd.env("CODEX_HOME", codex_home);
+        cmd.env("MCODEX_HOME", codex_home);
+        cmd.env_remove("CODEX_HOME");
         // The app-server integration suite spawns many child processes in parallel. Keeping the
         // default child log level at `warn` avoids stderr backpressure and harness capture
         // contention that can otherwise starve the JSON-RPC control flow and make tests flaky.

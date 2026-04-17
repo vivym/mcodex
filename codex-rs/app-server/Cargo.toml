@@ -29,6 +29,7 @@ axum = { workspace = true, default-features = false, features = [
     "tokio",
     "ws",
 ] }
+codex-account-pool = { workspace = true }
 codex-analytics = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-cloud-requirements = { workspace = true }

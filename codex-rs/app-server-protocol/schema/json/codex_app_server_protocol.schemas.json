@@ -5048,6 +5048,18 @@
           "active": {
             "type": "boolean"
           },
+          "configuredDefaultPoolId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effectivePoolResolutionSource": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "healthState": {
             "type": [
               "string",
@@ -5078,6 +5090,12 @@
             "format": "int64",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "persistedDefaultPoolId": {
+            "type": [
+              "string",
               "null"
             ]
           },

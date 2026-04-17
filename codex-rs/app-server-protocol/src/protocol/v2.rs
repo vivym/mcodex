@@ -1777,6 +1777,9 @@ pub struct AccountLeaseReadResponse {
     pub last_remote_context_reset_turn_id: Option<String>,
     #[ts(type = "number | null")]
     pub next_eligible_at: Option<i64>,
+    pub effective_pool_resolution_source: Option<String>,
+    pub configured_default_pool_id: Option<String>,
+    pub persisted_default_pool_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

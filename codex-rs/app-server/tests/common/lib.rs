@@ -13,6 +13,7 @@ pub use auth_fixtures::ChatGptIdTokenClaims;
 pub use auth_fixtures::encode_id_token;
 pub use auth_fixtures::write_chatgpt_auth;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_core::product_identity_migration::PRODUCT_IDENTITY_MIGRATION_FILENAME;
 pub use config::write_mock_responses_config_toml;
 pub use config::write_mock_responses_config_toml_with_chatgpt_base_url;
 pub use core_test_support::format_with_current_shell;
@@ -40,6 +41,15 @@ pub use rollout::create_fake_rollout_with_source;
 pub use rollout::create_fake_rollout_with_text_elements;
 pub use rollout::rollout_path;
 use serde::de::DeserializeOwned;
+use std::path::Path;
+
+pub fn mark_product_identity_migration_complete(codex_home: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(codex_home)?;
+    std::fs::write(
+        codex_home.join(PRODUCT_IDENTITY_MIGRATION_FILENAME),
+        Vec::<u8>::new(),
+    )
+}
 
 pub fn to_response<T: DeserializeOwned>(response: JSONRPCResponse) -> anyhow::Result<T> {
     let value = serde_json::to_value(response.result)?;

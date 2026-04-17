@@ -26,6 +26,7 @@ pub async fn read_shared_startup_status<B: AccountPoolExecutionBackend>(
             || matches!(
                 startup.effective_pool_resolution_source,
                 EffectivePoolResolutionSource::Override
+                    | EffectivePoolResolutionSource::ConfigDefault
                     | EffectivePoolResolutionSource::PersistedSelection
             ),
         startup,
