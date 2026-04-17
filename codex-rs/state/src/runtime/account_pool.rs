@@ -102,8 +102,30 @@ impl StateRuntime {
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
-        self.acquire_account_lease_excluding(pool_id, holder_instance_id, lease_ttl, &[])
+        let now = Utc::now();
+        match self
+            .acquire_account_lease_excluding(pool_id, holder_instance_id, lease_ttl, &[])
             .await
+        {
+            Err(AccountLeaseError::NoEligibleAccount) => {
+                self.append_account_pool_event(account_pool_event(
+                    now,
+                    AccountPoolEventSubject {
+                        pool_id,
+                        account_id: None,
+                        lease_id: None,
+                        holder_instance_id: Some(holder_instance_id),
+                    },
+                    "leaseAcquireFailed",
+                    Some("noEligibleAccount"),
+                    "no eligible account is available for lease acquisition",
+                ))
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                Err(AccountLeaseError::NoEligibleAccount)
+            }
+            result => result,
+        }
     }
 
     pub async fn acquire_account_lease_excluding(
@@ -132,20 +154,6 @@ impl StateRuntime {
                 .any(|excluded_account_id| excluded_account_id == &existing_lease.account_id)
             {
                 tx.commit().await.map_err(account_lease_storage_error)?;
-                self.append_account_pool_event(account_pool_event(
-                    now,
-                    AccountPoolEventSubject {
-                        pool_id,
-                        account_id: None,
-                        lease_id: None,
-                        holder_instance_id: Some(holder_instance_id),
-                    },
-                    "leaseAcquireFailed",
-                    Some("noEligibleAccount"),
-                    "no eligible account is available for lease acquisition",
-                ))
-                .await
-                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
                 return Err(AccountLeaseError::NoEligibleAccount);
             }
             tx.commit().await.map_err(account_lease_storage_error)?;
@@ -181,39 +189,11 @@ impl StateRuntime {
                         }) =>
                     {
                         drop(tx);
-                        self.append_account_pool_event(account_pool_event(
-                            now,
-                            AccountPoolEventSubject {
-                                pool_id,
-                                account_id: None,
-                                lease_id: None,
-                                holder_instance_id: Some(holder_instance_id),
-                            },
-                            "leaseAcquireFailed",
-                            Some("noEligibleAccount"),
-                            "no eligible account is available for lease acquisition",
-                        ))
-                        .await
-                        .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
                         Err(AccountLeaseError::NoEligibleAccount)
                     }
                     Some(existing_lease) => Ok(existing_lease),
                     None => {
                         drop(tx);
-                        self.append_account_pool_event(account_pool_event(
-                            now,
-                            AccountPoolEventSubject {
-                                pool_id,
-                                account_id: None,
-                                lease_id: None,
-                                holder_instance_id: Some(holder_instance_id),
-                            },
-                            "leaseAcquireFailed",
-                            Some("noEligibleAccount"),
-                            "no eligible account is available for lease acquisition",
-                        ))
-                        .await
-                        .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
                         Err(AccountLeaseError::NoEligibleAccount)
                     }
                 };
@@ -223,20 +203,6 @@ impl StateRuntime {
 
         if result.rows_affected() == 0 {
             drop(tx);
-            self.append_account_pool_event(account_pool_event(
-                now,
-                AccountPoolEventSubject {
-                    pool_id,
-                    account_id: None,
-                    lease_id: None,
-                    holder_instance_id: Some(holder_instance_id),
-                },
-                "leaseAcquireFailed",
-                Some("noEligibleAccount"),
-                "no eligible account is available for lease acquisition",
-            ))
-            .await
-            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
             return Err(AccountLeaseError::NoEligibleAccount);
         }
 
@@ -2777,6 +2743,39 @@ WHERE version = 26
                 Some("inst-b".to_string()),
                 Some("noEligibleAccount".to_string()),
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_excluding_probe_failure_does_not_persist_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let probe = runtime
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "inst-a",
+                chrono::Duration::seconds(30),
+                &["acct-1".to_string()],
+            )
+            .await;
+        assert_eq!(probe.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-1");
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "leaseAcquireFailed").await,
+            Vec::<(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )>::new()
         );
     }
 

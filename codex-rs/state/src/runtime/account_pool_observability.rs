@@ -90,17 +90,6 @@ WHERE membership.pool_id = ?
         &self,
         request: AccountPoolAccountsListQuery,
     ) -> anyhow::Result<AccountPoolAccountsPage> {
-        if request
-            .states
-            .as_ref()
-            .is_some_and(|states| !states.is_empty())
-        {
-            return Ok(AccountPoolAccountsPage {
-                data: Vec::new(),
-                next_cursor: None,
-            });
-        }
-
         let selection = self.read_account_startup_selection().await?;
         let now = Utc::now();
         let limit = normalize_page_limit(
@@ -108,6 +97,7 @@ WHERE membership.pool_id = ?
             DEFAULT_ACCOUNT_PAGE_LIMIT,
             MAX_ACCOUNT_PAGE_LIMIT,
         );
+        let states = request.states.filter(|states| !states.is_empty());
         let cursor = request
             .cursor
             .as_deref()
@@ -169,15 +159,20 @@ LEFT JOIN account_leases AS active_lease
             builder.push("))");
         }
 
-        builder.push(" ORDER BY membership.position ASC, membership.account_id ASC LIMIT ");
-        builder.push_bind(i64::from(limit) + 1);
+        builder.push(" ORDER BY membership.position ASC, membership.account_id ASC");
+        if states.is_none() {
+            builder.push(" LIMIT ");
+            builder.push_bind(i64::from(limit) + 1);
+        }
 
         let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
-        let mut data = Vec::with_capacity(rows.len().min(limit as usize));
-        for row in rows.iter().take(limit as usize) {
+        let mut entries = Vec::with_capacity(rows.len().min(limit as usize + 1));
+        for row in &rows {
+            let position: i64 = row.try_get("position")?;
             let account_id: String = row.try_get("account_id")?;
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
+            let health_state = row.try_get::<Option<String>, _>("health_state")?;
             let current_lease = match row.try_get::<Option<String>, _>("lease_id")? {
                 Some(lease_id) => Some(AccountPoolLeaseRecord {
                     lease_id,
@@ -189,50 +184,62 @@ LEFT JOIN account_leases AS active_lease
                 }),
                 None => None,
             };
-            let next_eligible_at = current_lease.as_ref().map(|lease| lease.expires_at);
-            data.push(AccountPoolAccountRecord {
-                account_id: account_id.clone(),
-                backend_account_ref: row
-                    .try_get::<String, _>("backend_account_handle")
-                    .ok()
-                    .filter(|value| !value.is_empty()),
-                account_kind: row.try_get("account_kind")?,
+            let operational_state = derive_account_operational_state(
                 enabled,
-                health_state: row.try_get("health_state")?,
-                operational_state: None,
-                allocatable: None,
-                status_reason_code: None,
-                status_message: None,
-                current_lease,
-                quota: None::<AccountPoolQuotaRecord>,
-                selection: Some(AccountPoolSelectionRecord {
-                    eligible: !selection.suppressed
-                        && enabled
-                        && healthy
-                        && next_eligible_at.is_none(),
-                    next_eligible_at,
-                    preferred: selection.preferred_account_id.as_deref()
-                        == Some(account_id.as_str()),
-                    suppressed: selection.suppressed,
-                }),
-                updated_at: account_epoch_seconds_to_datetime(
-                    row.try_get::<i64, _>("health_updated_at")
-                        .or_else(|_| row.try_get::<i64, _>("registry_updated_at"))?,
-                )?,
-            });
+                health_state.as_deref(),
+                current_lease.is_some(),
+            )
+            .map(ToOwned::to_owned);
+            if let Some(states) = states.as_ref()
+                && !matches_account_state_filter(operational_state.as_deref(), states)
+            {
+                continue;
+            }
+            let next_eligible_at = current_lease.as_ref().map(|lease| lease.expires_at);
+            entries.push((
+                position,
+                account_id.clone(),
+                AccountPoolAccountRecord {
+                    account_id: account_id.clone(),
+                    backend_account_ref: row
+                        .try_get::<String, _>("backend_account_handle")
+                        .ok()
+                        .filter(|value| !value.is_empty()),
+                    account_kind: row.try_get("account_kind")?,
+                    enabled,
+                    health_state,
+                    operational_state,
+                    allocatable: None,
+                    status_reason_code: None,
+                    status_message: None,
+                    current_lease,
+                    quota: None::<AccountPoolQuotaRecord>,
+                    selection: Some(AccountPoolSelectionRecord {
+                        eligible: !selection.suppressed
+                            && enabled
+                            && healthy
+                            && next_eligible_at.is_none(),
+                        next_eligible_at,
+                        preferred: selection.preferred_account_id.as_deref()
+                            == Some(account_id.as_str()),
+                        suppressed: selection.suppressed,
+                    }),
+                    updated_at: account_epoch_seconds_to_datetime(
+                        row.try_get::<i64, _>("health_updated_at")
+                            .or_else(|_| row.try_get::<i64, _>("registry_updated_at"))?,
+                    )?,
+                },
+            ));
         }
 
-        let next_cursor = if rows.len() > limit as usize {
-            match rows.get(limit as usize - 1) {
-                Some(row) => Some(encode_account_cursor(
-                    row.try_get("position")?,
-                    row.try_get::<String, _>("account_id")?,
-                )),
-                None => None,
-            }
-        } else {
-            None
-        };
+        let next_cursor = entries
+            .get(limit as usize)
+            .map(|(position, account_id, _)| encode_account_cursor(*position, account_id.clone()));
+        let data = entries
+            .into_iter()
+            .take(limit as usize)
+            .map(|(_, _, record)| record)
+            .collect();
 
         Ok(AccountPoolAccountsPage { data, next_cursor })
     }
@@ -380,7 +387,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
         .await?;
 
         let mut issues = Vec::new();
-        let mut eligible_accounts = 0_u32;
+        let mut allocatable_accounts = 0_u32;
         let mut viable_active_leases = 0_u32;
         let mut next_relevant_at: Option<chrono::DateTime<Utc>> = None;
         let mut preferred_in_pool = false;
@@ -392,8 +399,8 @@ ORDER BY membership.position ASC, membership.account_id ASC
                 .map(account_epoch_seconds_to_datetime)
                 .transpose()?;
 
-            if enabled && healthy && expires_at.is_none() && !selection.suppressed {
-                eligible_accounts += 1;
+            if enabled && healthy && expires_at.is_none() {
+                allocatable_accounts += 1;
             }
 
             let health_state = row.try_get::<Option<String>, _>("health_state")?;
@@ -446,7 +453,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
             });
         }
 
-        if eligible_accounts == 0 {
+        if allocatable_accounts == 0 {
             let lease_failure = recent_events
                 .data
                 .iter()
@@ -468,7 +475,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
 
         let status = if issues.is_empty() {
             "healthy"
-        } else if viable_active_leases == 0 && eligible_accounts == 0 {
+        } else if viable_active_leases == 0 && allocatable_accounts == 0 {
             "blocked"
         } else {
             "degraded"
@@ -528,6 +535,25 @@ INSERT INTO account_pool_events (
 
 fn normalize_page_limit(limit: Option<u32>, default_limit: u32, max_limit: u32) -> u32 {
     limit.unwrap_or(default_limit).max(1).min(max_limit)
+}
+
+fn derive_account_operational_state(
+    enabled: bool,
+    health_state: Option<&str>,
+    has_active_lease: bool,
+) -> Option<&'static str> {
+    match health_state {
+        Some("unauthorized") => Some("error"),
+        Some("rate_limited") if !has_active_lease => Some("coolingDown"),
+        _ if has_active_lease => Some("leased"),
+        _ if enabled => Some("available"),
+        _ => None,
+    }
+}
+
+fn matches_account_state_filter(operational_state: Option<&str>, states: &[String]) -> bool {
+    operational_state
+        .is_some_and(|operational_state| states.iter().any(|state| state == operational_state))
 }
 
 fn encode_account_cursor(position: i64, account_id: String) -> String {
@@ -740,6 +766,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(diagnostics.status, "blocked");
+    }
+
+    #[tokio::test]
+    async fn read_account_pool_diagnostics_keeps_suppressed_pool_degraded() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: true,
+            })
+            .await
+            .unwrap();
+
+        let diagnostics = runtime
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.status, "degraded");
+        assert_eq!(
+            diagnostics
+                .issues
+                .iter()
+                .find(|issue| issue.reason_code == "durablySuppressed")
+                .map(|issue| issue.severity.as_str()),
+            Some("warning")
+        );
+        assert!(
+            diagnostics
+                .issues
+                .iter()
+                .all(|issue| issue.reason_code != "noEligibleAccount")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_filters_by_operational_state() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+        runtime
+            .acquire_account_lease("team-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: Some(vec!["leased".to_string()]),
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 1);
+        assert_eq!(accounts.data[0].account_id, "acct-1");
+        assert_eq!(
+            accounts.data[0].operational_state.as_deref(),
+            Some("leased")
+        );
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
