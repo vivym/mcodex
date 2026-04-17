@@ -50,11 +50,16 @@
         }
       },
       "required": [
+        "accountId",
+        "details",
         "eventId",
         "eventType",
+        "holderInstanceId",
+        "leaseId",
         "message",
         "occurredAt",
-        "poolId"
+        "poolId",
+        "reasonCode"
       ],
       "type": "object"
     },
@@ -120,7 +125,8 @@
     }
   },
   "required": [
-    "data"
+    "data",
+    "nextCursor"
   ],
   "title": "AccountPoolEventsListResponse",
   "type": "object"

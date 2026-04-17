@@ -1852,6 +1852,7 @@ pub struct AccountPoolReadResponse {
 #[ts(export_to = "v2/")]
 pub struct AccountPoolAccountsListResponse {
     pub data: Vec<AccountPoolAccountResponse>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub next_cursor: Option<String>,
 }
 
@@ -1860,6 +1861,7 @@ pub struct AccountPoolAccountsListResponse {
 #[ts(export_to = "v2/")]
 pub struct AccountPoolEventsListResponse {
     pub data: Vec<AccountPoolEventResponse>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub next_cursor: Option<String>,
 }
 
@@ -1879,12 +1881,19 @@ pub struct AccountPoolDiagnosticsReadResponse {
 pub struct AccountPoolSummaryResponse {
     pub total_accounts: u32,
     pub active_leases: u32,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub available_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub leased_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub paused_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub draining_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub near_exhausted_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub exhausted_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
     pub error_accounts: Option<u32>,
 }
 
@@ -1894,7 +1903,9 @@ pub struct AccountPoolSummaryResponse {
 pub struct AccountPoolPolicyResponse {
     pub allocation_mode: String,
     pub allow_context_reuse: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<u8>")]
     pub proactive_switch_threshold_percent: Option<u8>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u64>")]
     pub min_switch_interval_secs: Option<u64>,
 }
 
@@ -1903,16 +1914,40 @@ pub struct AccountPoolPolicyResponse {
 #[ts(export_to = "v2/")]
 pub struct AccountPoolAccountResponse {
     pub account_id: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub backend_account_ref: Option<String>,
     pub account_kind: String,
     pub enabled: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub health_state: Option<String>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountOperationalState>"
+    )]
     pub operational_state: Option<AccountOperationalState>,
+    #[schemars(required, schema_with = "nullable_field_schema::<bool>")]
     pub allocatable: Option<bool>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolReasonCode>"
+    )]
     pub status_reason_code: Option<AccountPoolReasonCode>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub status_message: Option<String>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolLeaseResponse>"
+    )]
     pub current_lease: Option<AccountPoolLeaseResponse>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolQuotaResponse>"
+    )]
     pub quota: Option<AccountPoolQuotaResponse>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolSelectionResponse>"
+    )]
     pub selection: Option<AccountPoolSelectionResponse>,
     pub updated_at: i64,
 }
@@ -1933,7 +1968,9 @@ pub struct AccountPoolLeaseResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountPoolQuotaResponse {
+    #[schemars(required, schema_with = "nullable_field_schema::<f64>")]
     pub remaining_percent: Option<f64>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
     pub resets_at: Option<i64>,
     pub observed_at: i64,
 }
@@ -1943,6 +1980,7 @@ pub struct AccountPoolQuotaResponse {
 #[ts(export_to = "v2/")]
 pub struct AccountPoolSelectionResponse {
     pub eligible: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
     pub next_eligible_at: Option<i64>,
     pub preferred: bool,
     pub suppressed: bool,
@@ -1955,12 +1993,20 @@ pub struct AccountPoolEventResponse {
     pub event_id: String,
     pub occurred_at: i64,
     pub pool_id: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub account_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub lease_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub holder_instance_id: Option<String>,
     pub event_type: AccountPoolEventType,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolReasonCode>"
+    )]
     pub reason_code: Option<AccountPoolReasonCode>,
     pub message: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<serde_json::Value>")]
     pub details: Option<serde_json::Value>,
 }
 
@@ -1971,8 +2017,11 @@ pub struct AccountPoolDiagnosticsIssueResponse {
     pub severity: AccountPoolDiagnosticsSeverity,
     pub reason_code: AccountPoolReasonCode,
     pub message: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub account_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub holder_instance_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
     pub next_relevant_at: Option<i64>,
 }
 
@@ -2062,6 +2111,15 @@ pub enum AccountPoolDiagnosticsSeverity {
     Info,
     Warning,
     Error,
+}
+
+fn nullable_field_schema<T>(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema
+where
+    Option<T>: JsonSchema,
+{
+    <Option<T> as JsonSchema>::json_schema(generator)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]

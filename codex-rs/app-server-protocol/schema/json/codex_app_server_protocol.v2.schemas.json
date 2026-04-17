@@ -360,7 +360,16 @@
       "required": [
         "accountId",
         "accountKind",
+        "allocatable",
+        "backendAccountRef",
+        "currentLease",
         "enabled",
+        "healthState",
+        "operationalState",
+        "quota",
+        "selection",
+        "statusMessage",
+        "statusReasonCode",
         "updatedAt"
       ],
       "type": "object"
@@ -427,7 +436,8 @@
         }
       },
       "required": [
-        "data"
+        "data",
+        "nextCursor"
       ],
       "title": "AccountPoolAccountsListResponse",
       "type": "object"
@@ -471,7 +481,10 @@
         }
       },
       "required": [
+        "accountId",
+        "holderInstanceId",
         "message",
+        "nextRelevantAt",
         "reasonCode",
         "severity"
       ],
@@ -584,11 +597,16 @@
         }
       },
       "required": [
+        "accountId",
+        "details",
         "eventId",
         "eventType",
+        "holderInstanceId",
+        "leaseId",
         "message",
         "occurredAt",
-        "poolId"
+        "poolId",
+        "reasonCode"
       ],
       "type": "object"
     },
@@ -672,7 +690,8 @@
         }
       },
       "required": [
-        "data"
+        "data",
+        "nextCursor"
       ],
       "title": "AccountPoolEventsListResponse",
       "type": "object"
@@ -740,7 +759,9 @@
       },
       "required": [
         "allocationMode",
-        "allowContextReuse"
+        "allowContextReuse",
+        "minSwitchIntervalSecs",
+        "proactiveSwitchThresholdPercent"
       ],
       "type": "object"
     },
@@ -766,7 +787,9 @@
         }
       },
       "required": [
-        "observedAt"
+        "observedAt",
+        "remainingPercent",
+        "resetsAt"
       ],
       "type": "object"
     },
@@ -859,6 +882,7 @@
       },
       "required": [
         "eligible",
+        "nextEligibleAt",
         "preferred",
         "suppressed"
       ],
@@ -935,6 +959,13 @@
       },
       "required": [
         "activeLeases",
+        "availableAccounts",
+        "drainingAccounts",
+        "errorAccounts",
+        "exhaustedAccounts",
+        "leasedAccounts",
+        "nearExhaustedAccounts",
+        "pausedAccounts",
         "totalAccounts"
       ],
       "type": "object"

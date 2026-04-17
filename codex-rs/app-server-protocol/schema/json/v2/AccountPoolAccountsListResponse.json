@@ -107,7 +107,16 @@
       "required": [
         "accountId",
         "accountKind",
+        "allocatable",
+        "backendAccountRef",
+        "currentLease",
         "enabled",
+        "healthState",
+        "operationalState",
+        "quota",
+        "selection",
+        "statusMessage",
+        "statusReasonCode",
         "updatedAt"
       ],
       "type": "object"
@@ -170,7 +179,9 @@
         }
       },
       "required": [
-        "observedAt"
+        "observedAt",
+        "remainingPercent",
+        "resetsAt"
       ],
       "type": "object"
     },
@@ -220,6 +231,7 @@
       },
       "required": [
         "eligible",
+        "nextEligibleAt",
         "preferred",
         "suppressed"
       ],
@@ -241,7 +253,8 @@
     }
   },
   "required": [
-    "data"
+    "data",
+    "nextCursor"
   ],
   "title": "AccountPoolAccountsListResponse",
   "type": "object"

@@ -33,7 +33,10 @@
         }
       },
       "required": [
+        "accountId",
+        "holderInstanceId",
         "message",
+        "nextRelevantAt",
         "reasonCode",
         "severity"
       ],

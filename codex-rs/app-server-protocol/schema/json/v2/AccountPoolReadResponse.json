@@ -35,7 +35,9 @@
       },
       "required": [
         "allocationMode",
-        "allowContextReuse"
+        "allowContextReuse",
+        "minSwitchIntervalSecs",
+        "proactiveSwitchThresholdPercent"
       ],
       "type": "object"
     },
@@ -110,6 +112,13 @@
       },
       "required": [
         "activeLeases",
+        "availableAccounts",
+        "drainingAccounts",
+        "errorAccounts",
+        "exhaustedAccounts",
+        "leasedAccounts",
+        "nearExhaustedAccounts",
+        "pausedAccounts",
         "totalAccounts"
       ],
       "type": "object"
