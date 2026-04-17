@@ -1,4 +1,3 @@
-use crate::personality_migration::PERSONALITY_MIGRATION_FILENAME;
 use crate::personality_migration::PersonalityMigrationStatus;
 use crate::personality_migration::maybe_migrate_personality;
 use codex_config::CONFIG_TOML_FILE;
@@ -454,20 +453,8 @@ fn transform_imported_config(config_contents: &str) -> io::Result<String> {
 }
 
 async fn active_home_is_initialized(mcodex_home: &Path) -> io::Result<bool> {
-    for relative_path in [
-        CONFIG_TOML_FILE,
-        "auth.json",
-        PRODUCT_IDENTITY_MIGRATION_FILENAME,
-        PERSONALITY_MIGRATION_FILENAME,
-        "skills",
-        "sessions",
-        "plugins",
-        "marketplace",
-        "log",
-        "logs",
-        "themes",
-    ] {
-        if fs::try_exists(&mcodex_home.join(relative_path)).await? {
+    for relative_path in [CONFIG_TOML_FILE, "auth.json"] {
+        if path_exists_as_file(&mcodex_home.join(relative_path)).await? {
             return Ok(true);
         }
     }
@@ -486,6 +473,14 @@ async fn active_home_is_initialized(mcodex_home: &Path) -> io::Result<bool> {
     }
 
     Ok(false)
+}
+
+async fn path_exists_as_file(path: &Path) -> io::Result<bool> {
+    match fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 async fn write_marker_warning(mcodex_home: &Path, marker_path: &Path) -> Option<String> {

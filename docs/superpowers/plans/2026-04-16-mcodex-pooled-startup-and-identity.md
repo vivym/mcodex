@@ -90,6 +90,12 @@ Keep product-private state separate from reusable user tooling:
 - Modify `codex-rs/tui/src/updates.rs`, `codex-rs/tui/src/update_prompt.rs`, `scripts/install/install.sh`, `scripts/install/install.ps1`, and `scripts/dev/install-local.sh` to point at `mcodex` product identity and home naming.
 - Update `docs/config.md` and `docs/install.md` for the new home/env names and first-run migration behavior.
 
+## Branch Status Snapshot
+
+- Tasks 1A through 7 are implemented on this branch.
+- Tasks 3 through 6 overlap heavily with ongoing `main` work in `state`, `account-pool`, `app-server-protocol`, `app-server`, and `tui` startup probing. Treat those areas as frozen until `main` is ready for a resync.
+- Task 8 remains the final revalidation and handoff checklist. Run its full pass again after any further identity-only fixes and once the branch can be resynced with `main`.
+
 ### Task 1A: Establish Product Identity And Home Resolution
 
 **Files:**
@@ -103,7 +109,7 @@ Keep product-private state separate from reusable user tooling:
 - Test: `codex-rs/product-identity/src/lib.rs`
 - Test: `codex-rs/utils/home-dir/src/lib.rs`
 
-- [ ] **Step 1: Write failing product-identity tests**
+- [x] **Step 1: Write failing product-identity tests**
 
 Add focused tests in `codex-rs/product-identity/src/lib.rs`:
 
@@ -123,7 +129,7 @@ fn mcodex_identity_defines_active_and_legacy_roots() {
 }
 ```
 
-- [ ] **Step 2: Write failing home-resolution tests**
+- [x] **Step 2: Write failing home-resolution tests**
 
 Add focused tests in `codex-rs/utils/home-dir/src/lib.rs`:
 
@@ -169,7 +175,7 @@ fn find_codex_home_ignores_codex_home_when_mcodex_home_is_unset() {
 }
 ```
 
-- [ ] **Step 3: Implement the product identity unit**
+- [x] **Step 3: Implement the product identity unit**
 
 Create `codex-rs/product-identity/src/lib.rs` with a small data-only API. Keep it free of runtime config parsing and business logic:
 
@@ -215,7 +221,7 @@ pub const MCODEX: ProductIdentity = ProductIdentity {
 };
 ```
 
-- [ ] **Step 4: Implement active and legacy home helpers**
+- [x] **Step 4: Implement active and legacy home helpers**
 
 Update `codex-rs/utils/home-dir/src/lib.rs` so the active API resolves `MCODEX_HOME` / `~/.mcodex`, while a separate helper handles legacy import probing:
 
@@ -233,7 +239,7 @@ pub fn find_legacy_codex_home_for_migration(
 
 Do not add a normal runtime fallback from `MCODEX_HOME` to `CODEX_HOME`.
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -245,7 +251,7 @@ cargo test -p codex-utils-home-dir
 
 Expected: PASS. The new tests prove `MCODEX_HOME` is authoritative, legacy probing still sees `CODEX_HOME`, and the active default home is `~/.mcodex`.
 
-- [ ] **Step 6: Format, lint, lock, and commit**
+- [x] **Step 6: Format, lint, lock, and commit**
 
 Run:
 
@@ -281,7 +287,7 @@ git commit -m "feat(identity): add mcodex product identity roots"
 - Test: `codex-rs/core-skills/src/loader_tests.rs`
 - Test: `codex-rs/tui/src/debug_config.rs`
 
-- [ ] **Step 1: Write failing system/admin root tests**
+- [x] **Step 1: Write failing system/admin root tests**
 
 Add targeted tests in `codex-rs/core/src/config_loader/tests.rs` or the closest existing config-loader unit module:
 
@@ -311,7 +317,7 @@ fn managed_preferences_source_uses_active_mcodex_domain() {
 }
 ```
 
-- [ ] **Step 2: Write failing skill-root tests**
+- [x] **Step 2: Write failing skill-root tests**
 
 Add targeted tests in `codex-rs/core-skills/src/loader_tests.rs`:
 
@@ -336,17 +342,17 @@ fn user_agents_skills_root_is_preserved_with_mcodex_home() {
 }
 ```
 
-- [ ] **Step 3: Update debug-config expectations**
+- [x] **Step 3: Update debug-config expectations**
 
 Update `codex-rs/tui/src/debug_config.rs` tests so expected rendered paths use `/etc/mcodex/...` and the active Windows admin root, not `/etc/codex/...` or `C:\ProgramData\OpenAI\Codex\...`, except in tests that explicitly exercise a legacy managed-config shim.
 
-- [ ] **Step 4: Implement active identity roots in config and skills**
+- [x] **Step 4: Implement active identity roots in config and skills**
 
 Update the config-loader, macOS managed-preferences loader, managed-config loader, admin-skills loader, and debug-config code to consume `codex-product-identity` rather than hard-coded upstream roots.
 
 Do not rename repo-local `.agents/skills`, repo-local `.agents/plugins`, or user-global `~/.agents/skills`. Only product-private roots and admin/system roots should move to `mcodex`.
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -359,7 +365,7 @@ cargo test -p codex-tui debug_config -- --nocapture
 
 Expected: PASS. Active system/admin roots resolve to `mcodex`, legacy upstream roots are not loaded by default, admin skills use `/etc/mcodex/skills`, and user-global `~/.agents/skills` discovery remains unchanged.
 
-- [ ] **Step 6: Format, lint, lock, and commit**
+- [x] **Step 6: Format, lint, lock, and commit**
 
 Run:
 
@@ -384,7 +390,7 @@ git commit -m "feat(identity): route config roots through mcodex identity"
 - Modify: `codex-rs/core/src/lib.rs`
 - Test: `codex-rs/core/src/product_identity_migration_tests.rs`
 
-- [ ] **Step 1: Write failing product-migration tests**
+- [x] **Step 1: Write failing product-migration tests**
 
 Add targeted tests in `codex-rs/core/src/product_identity_migration_tests.rs`:
 
@@ -422,7 +428,7 @@ async fn migration_does_not_import_legacy_skill_or_plugin_caches_by_default() ->
 }
 ```
 
-- [ ] **Step 2: Implement the shared migration service**
+- [x] **Step 2: Implement the shared migration service**
 
 Create `codex-rs/core/src/product_identity_migration.rs` with a small, testable service:
 
@@ -463,7 +469,7 @@ The config transform must drop startup-selection-bearing fields whose meaning de
 
 Do not import legacy skills, plugin caches, marketplace caches, logs, session history, or SQLite state in this task. Keep `~/.agents/skills` available through normal skill discovery instead.
 
-- [ ] **Step 3: Run targeted tests**
+- [x] **Step 3: Run targeted tests**
 
 Run:
 
@@ -474,7 +480,7 @@ cargo test -p codex-core product_identity_migration -- --nocapture
 
 Expected: PASS. Migration prompts and imports config/auth only, records its own marker, drops startup-selection-bearing config, and does not copy legacy skills/plugins/runtime caches.
 
-- [ ] **Step 4: Format, lint, and commit**
+- [x] **Step 4: Format, lint, and commit**
 
 Run:
 
@@ -495,7 +501,7 @@ git commit -m "feat(startup): add mcodex identity migration service"
 - Test: `codex-rs/core/tests/suite/personality_migration.rs`
 - Test: `codex-rs/core/src/product_identity_migration_tests.rs`
 
-- [ ] **Step 1: Write failing sequencing tests**
+- [x] **Step 1: Write failing sequencing tests**
 
 Extend `codex-rs/core/tests/suite/personality_migration.rs` or the new product-migration tests:
 
@@ -513,7 +519,7 @@ async fn personality_marker_does_not_suppress_product_migration() -> Result<()> 
 }
 ```
 
-- [ ] **Step 2: Add a shared startup-migration orchestration helper**
+- [x] **Step 2: Add a shared startup-migration orchestration helper**
 
 In `codex-rs/core/src/product_identity_migration.rs`, add a narrow orchestration entry point:
 
@@ -537,7 +543,7 @@ pub async fn run_startup_migrations(
 }
 ```
 
-- [ ] **Step 3: Wire TUI startup to prompt before personality migration**
+- [x] **Step 3: Wire TUI startup to prompt before personality migration**
 
 Update `codex-rs/tui/src/lib.rs` so startup:
 
@@ -548,11 +554,11 @@ Update `codex-rs/tui/src/lib.rs` so startup:
 
 Keep the migration prompt line-oriented and pre-alt-screen in this slice so no new ratatui onboarding surface is required.
 
-- [ ] **Step 4: Wire app-server startup to the same ordering**
+- [x] **Step 4: Wire app-server startup to the same ordering**
 
 Update `codex-rs/app-server/src/lib.rs` to invoke the same startup-migration orchestration before the existing personality-migration call. Use the same disclosure text and keep markers separate. If app-server startup is noninteractive, fail clearly rather than silently half-running migration logic.
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -563,7 +569,7 @@ cargo test -p codex-core product_identity_migration -- --nocapture
 
 Expected: PASS. Ordering is explicit, and each marker suppresses only its own migration.
 
-- [ ] **Step 6: Format, lint, and commit**
+- [x] **Step 6: Format, lint, and commit**
 
 Run:
 
@@ -579,6 +585,8 @@ git commit -m "feat(startup): order product and personality migrations"
 
 ### Task 3: Add The Shared Additive Startup-Status Surface
 
+> Status: Implemented on this branch. Do not extend this area further while `main` is still moving; re-run the targeted validation after the eventual resync.
+
 **Files:**
 - Modify: `codex-rs/state/src/model/account_pool.rs`
 - Modify: `codex-rs/state/src/runtime/account_pool.rs`
@@ -587,7 +595,7 @@ git commit -m "feat(startup): order product and personality migrations"
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 - Test: `codex-rs/account-pool/tests/lease_lifecycle.rs`
 
-- [ ] **Step 1: Write failing state/account-pool tests**
+- [x] **Step 1: Write failing state/account-pool tests**
 
 Add tests covering resolution source and applicability:
 
@@ -621,7 +629,7 @@ async fn startup_applicability_rejects_policy_only_migrated_config_without_membe
 }
 ```
 
-- [ ] **Step 2: Add additive model types in `codex-state`**
+- [x] **Step 2: Add additive model types in `codex-state`**
 
 Extend `codex-rs/state/src/model/account_pool.rs` additively:
 
@@ -643,7 +651,7 @@ pub struct AccountStartupStatus {
 
 Do not change existing `AccountStartupSelectionPreview` field meanings.
 
-- [ ] **Step 3: Extend the state runtime with a companion status reader**
+- [x] **Step 3: Extend the state runtime with a companion status reader**
 
 Implement a companion API in `codex-rs/state/src/runtime/account_pool.rs`:
 
@@ -656,7 +664,7 @@ pub async fn read_account_startup_status(
 }
 ```
 
-- [ ] **Step 4: Add the thin `codex-account-pool` adapter**
+- [x] **Step 4: Add the thin `codex-account-pool` adapter**
 
 Create `codex-rs/account-pool/src/startup_status.rs`:
 
@@ -677,7 +685,7 @@ pub async fn read_shared_startup_status<B: AccountPoolExecutionBackend>(
 
 The adapter must remain thin: no duplicated membership resolver, no second precedence tree, no silent contract rewrite.
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -688,7 +696,7 @@ cargo test -p codex-account-pool
 
 Expected: PASS. The status surface is additive, and pooled applicability differentiates local explicit intent from migrated policy-only config.
 
-- [ ] **Step 6: Format, lint, and commit**
+- [x] **Step 6: Format, lint, and commit**
 
 Run:
 
@@ -703,6 +711,8 @@ git commit -m "feat(account-pool): add shared startup status adapter"
 
 ### Task 4: Adopt Shared Startup Status In Core And App-Server
 
+> Status: Implemented on this branch and validated before the latest `main` divergence. Hold here until `main` is ready for a resync.
+
 **Files:**
 - Modify: `codex-rs/core/Cargo.toml`
 - Modify: `codex-rs/app-server/Cargo.toml`
@@ -714,7 +724,7 @@ git commit -m "feat(account-pool): add shared startup status adapter"
 - Modify: `codex-rs/app-server/tests/suite/v2/account_lease.rs`
 - Generate: `codex-rs/app-server-protocol/schema` via `just write-app-server-schema`
 
-- [ ] **Step 1: Write failing core and app-server tests**
+- [x] **Step 1: Write failing core and app-server tests**
 
 Add focused tests:
 
@@ -742,7 +752,7 @@ async fn account_lease_read_adds_resolution_fields_without_changing_legacy_field
 }
 ```
 
-- [ ] **Step 2: Add workspace dependencies and refresh Bazel locks**
+- [x] **Step 2: Add workspace dependencies and refresh Bazel locks**
 
 If `codex-core` and `codex-app-server` consume `codex-account-pool` directly, update:
 
@@ -758,7 +768,7 @@ just bazel-lock-update
 just bazel-lock-check
 ```
 
-- [ ] **Step 3: Replace config-only gating in `codex-core`**
+- [x] **Step 3: Replace config-only gating in `codex-core`**
 
 Update `codex-rs/core/src/state/service.rs` so manager construction uses the shared startup-status/applicability result rather than `accounts?` short-circuiting:
 
@@ -771,7 +781,7 @@ if !shared_status.pooled_applicable {
 
 Preserve `account_pool_manager: Option<_>` as the top-level non-pooled gate.
 
-- [ ] **Step 4: Replace config-only gating in app-server**
+- [x] **Step 4: Replace config-only gating in app-server**
 
 Update `codex-rs/app-server/src/account_lease_api.rs` and `codex-rs/app-server/src/codex_message_processor.rs` so:
 
@@ -785,7 +795,7 @@ pub configured_default_pool_id: Option<String>,
 pub persisted_default_pool_id: Option<String>,
 ```
 
-- [ ] **Step 5: Regenerate protocol schema and run targeted tests**
+- [x] **Step 5: Regenerate protocol schema and run targeted tests**
 
 Run:
 
@@ -799,7 +809,7 @@ cargo test -p codex-app-server account_lease -- --nocapture
 
 Expected: PASS. Public protocol changes stay additive, and pooled gating now matches the shared startup-status rules.
 
-- [ ] **Step 6: Format, lint, and commit**
+- [x] **Step 6: Format, lint, and commit**
 
 Run:
 
@@ -815,6 +825,8 @@ git commit -m "feat(runtime): share pooled startup status across core and app-se
 
 ### Task 5: Update CLI Diagnostics And Registration Semantics
 
+> Status: Implemented on this branch. Keep the current behavior stable and defer any further startup-status changes until the branch can absorb `main`.
+
 **Files:**
 - Modify: `codex-rs/cli/src/accounts/diagnostics.rs`
 - Modify: `codex-rs/cli/src/accounts/output.rs`
@@ -822,7 +834,7 @@ git commit -m "feat(runtime): share pooled startup status across core and app-se
 - Modify: `codex-rs/cli/src/accounts/mod.rs` only if new plumbing is required
 - Test: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Add focused tests in `codex-rs/cli/tests/accounts.rs`:
 
@@ -852,7 +864,7 @@ async fn add_account_pool_does_not_override_existing_config_default() -> Result<
 }
 ```
 
-- [ ] **Step 2: Switch diagnostics to the shared status adapter**
+- [x] **Step 2: Switch diagnostics to the shared status adapter**
 
 Update `codex-rs/cli/src/accounts/diagnostics.rs` to read the shared startup status once and fan out from that:
 
@@ -865,7 +877,7 @@ pub(crate) struct AccountsStatusDiagnostic {
 }
 ```
 
-- [ ] **Step 3: Preserve legacy JSON while adding resolution fields**
+- [x] **Step 3: Preserve legacy JSON while adding resolution fields**
 
 Update `codex-rs/cli/src/accounts/output.rs` so:
 
@@ -873,7 +885,7 @@ Update `codex-rs/cli/src/accounts/output.rs` so:
 - `configuredPoolCount` keeps its current config-policy meaning
 - new fields such as `registeredPoolCount`, `configuredDefaultPoolId`, `persistedDefaultPoolId`, and `effectivePoolResolutionSource` are added additively
 
-- [ ] **Step 4: Fix `accounts add --account-pool ...` persistence rules**
+- [x] **Step 4: Fix `accounts add --account-pool ...` persistence rules**
 
 Update `codex-rs/cli/src/accounts/registration.rs`:
 
@@ -889,7 +901,7 @@ if configured_default_pool_id.is_none() && persisted_default_pool_id.is_none() {
 }
 ```
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -899,7 +911,7 @@ cargo test -p codex-cli accounts -- --nocapture
 
 Expected: PASS. `accounts status` now tells the truth about config vs runtime, and fresh-home registration establishes local startup selection only when the spec allows it.
 
-- [ ] **Step 6: Format, lint, and commit**
+- [x] **Step 6: Format, lint, and commit**
 
 Run:
 
@@ -913,13 +925,15 @@ git commit -m "feat(cli): report pooled startup status consistently"
 
 ### Task 6: Update TUI Startup Probing To Use Shared Startup Status
 
+> Status: Implemented on this branch. Do not expand the TUI startup-access integration further until the shared pooled-startup files can be resynced with `main`.
+
 **Files:**
 - Modify: `codex-rs/tui/Cargo.toml`
 - Modify: `codex-rs/tui/src/startup_access.rs`
 - Modify: `codex-rs/tui/src/lib.rs`
 - Test: `codex-rs/tui/src/startup_access.rs`
 
-- [ ] **Step 1: Write failing TUI startup-access tests**
+- [x] **Step 1: Write failing TUI startup-access tests**
 
 Extend `codex-rs/tui/src/startup_access.rs` tests:
 
@@ -943,7 +957,7 @@ async fn local_probe_does_not_require_preexisting_sqlite_file_for_config_default
 }
 ```
 
-- [ ] **Step 2: Add any required workspace dependency**
+- [x] **Step 2: Add any required workspace dependency**
 
 If `codex-tui` consumes `codex-account-pool` directly, add it to `codex-rs/tui/Cargo.toml`, then rerun:
 
@@ -953,7 +967,7 @@ just bazel-lock-update
 just bazel-lock-check
 ```
 
-- [ ] **Step 3: Replace the local file-existence gate**
+- [x] **Step 3: Replace the local file-existence gate**
 
 Update `codex-rs/tui/src/startup_access.rs` to remove:
 
@@ -965,7 +979,7 @@ if configured_default_pool_id(config).is_none() && !state_path.exists() {
 
 and instead call the shared startup-status/applicability adapter after initializing the local state runtime for the active product home.
 
-- [ ] **Step 4: Keep existing notice behavior intact**
+- [x] **Step 4: Keep existing notice behavior intact**
 
 Only the probe source changes in this slice. Preserve:
 
@@ -976,7 +990,7 @@ Only the probe source changes in this slice. Preserve:
 
 Do not redesign onboarding.
 
-- [ ] **Step 5: Run targeted tests**
+- [x] **Step 5: Run targeted tests**
 
 Run:
 
@@ -986,7 +1000,7 @@ cargo test -p codex-tui startup_access -- --nocapture
 
 Expected: PASS. The local TUI probe no longer falls back to the login wall for valid pooled state/defaults.
 
-- [ ] **Step 6: Format, lint, and commit**
+- [x] **Step 6: Format, lint, and commit**
 
 Run:
 
@@ -1012,11 +1026,11 @@ git commit -m "feat(tui): use shared pooled startup status"
 - Modify: `docs/config.md`
 - Modify: `docs/install.md`
 
-- [ ] **Step 1: Write or extend the smallest available tests/checks**
+- [x] **Step 1: Write or extend the smallest available tests/checks**
 
 If no automated coverage exists for the installer/update paths, at minimum add assertions where there is existing unit coverage and otherwise document manual smoke checks in the commit message and PR notes. For any existing unit tests around update URLs or product naming, extend them first.
 
-- [ ] **Step 2: Switch install/update identity**
+- [x] **Step 2: Switch install/update identity**
 
 Update scripts and update surfaces so they no longer point at upstream `openai/codex` or `.codex` defaults:
 
@@ -1040,7 +1054,7 @@ struct Cli {
 }
 ```
 
-- [ ] **Step 3: Refresh user-facing docs**
+- [x] **Step 3: Refresh user-facing docs**
 
 Update `docs/config.md` and `docs/install.md` so they describe:
 
@@ -1049,7 +1063,7 @@ Update `docs/config.md` and `docs/install.md` so they describe:
 - first-run migration from legacy `CODEX_HOME`/`~/.codex`
 - the fact that pooled startup selection is re-established locally after import
 
-- [ ] **Step 4: Run targeted checks**
+- [x] **Step 4: Run targeted checks**
 
 Run:
 
@@ -1074,7 +1088,7 @@ Review the grep output against this allowlist instead of mechanically deleting e
 
 Any hit outside that allowlist needs either a code change or a short inline rationale in the implementation notes.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -1091,6 +1105,8 @@ git commit -m "docs: switch install and update surfaces to mcodex"
 ```
 
 ### Task 8: Final Validation And Handoff
+
+> Status: One full targeted validation pass already landed while Tasks 1 through 7 were implemented. Until `main` stabilizes, use this section as the final identity-only revalidation and handoff checklist rather than as a prompt to keep changing the shared pooled-startup integration.
 
 **Files:**
 - Review only; no new source files expected unless a previous task exposed a gap

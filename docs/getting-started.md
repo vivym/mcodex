@@ -1,3 +1,3 @@
-# Getting started with Codex CLI
+# Getting started with mcodex
 
-For an overview of Codex CLI features, see [this documentation](https://developers.openai.com/codex/cli/features#running-in-interactive-mode).
+For an overview of `mcodex` interactive mode and related CLI features, see the [Codex CLI documentation](https://developers.openai.com/codex/cli/features#running-in-interactive-mode).
