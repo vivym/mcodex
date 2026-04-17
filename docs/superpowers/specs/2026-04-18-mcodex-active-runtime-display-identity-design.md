@@ -4,8 +4,9 @@
 
 This document defines a narrow follow-up to the `mcodex` product-identity work:
 the explicitly listed active-runtime display surfaces reached through the
-`mcodex` binary must present `mcodex` as the active product name, while
-preserving clear attribution that the fork is derived from OpenAI Codex.
+`mcodex` binary and its first-run login flow must present `mcodex` as the
+active product name, while preserving clear attribution that the fork is
+derived from OpenAI Codex.
 
 The goal is to remove the current runtime branding drift where path, home, and
 installer identity have already switched to `mcodex`, but release binary output
@@ -29,8 +30,9 @@ internally inconsistent and undermines the product-identity work already landed.
 
 ## Goals
 
-- Ensure user-visible runtime surfaces reached through `mcodex` present
-  `mcodex` as the active product.
+- Ensure the explicitly listed active-runtime surfaces reached through
+  `mcodex` and its first-run login flow present `mcodex` as the active
+  product.
 - Use a consistent secondary description that preserves source attribution,
   such as `an OpenAI Codex-derived command-line coding agent`.
 - Keep the fix upstream-friendly by limiting changes to display identity, not
@@ -50,9 +52,12 @@ internally inconsistent and undermines the product-identity work already landed.
 
 This design applies only to the following active runtime display surfaces:
 
-- CLI version/help-facing identity shown directly to the user
+- CLI version/help-facing identity shown directly to the user, including
+  top-level and public subcommand help text rendered by `mcodex --help`
 - TUI onboarding welcome/auth copy
 - device-code login prompt
+- browser-visible login success/error pages and adjacent server-generated
+  auth error copy shown during the same sign-in journey
 - adjacent onboarding runtime strings and snapshots that would otherwise leave
   the same screen internally inconsistent
 
@@ -99,7 +104,7 @@ Examples:
 This keeps product naming consistent without overfitting the identity crate to
 one specific screen layout.
 
-### 3. Fix User-Facing Version Identity Without Renaming the Crate
+### 3. Fix User-Facing Version And Help Identity Without Renaming the Crate
 
 `mcodex --version` must no longer expose `codex-cli`.
 
@@ -110,15 +115,16 @@ version output layer, not the package identity itself.
 The selected implementation should ensure:
 
 - `mcodex --version` presents `mcodex`
-- `mcodex --help` remains aligned with the same active binary identity
+- `mcodex --help` presents `mcodex` as the active binary identity in both the
+  command name and public help descriptions shown to the user
 - crate/package metadata remains unchanged unless a future independent effort
   explicitly chooses to rename it
 
-### 4. Update Onboarding and Device-Code Surfaces Together
+### 4. Update Onboarding And The Full First-Run Login Surface Together
 
-The onboarding welcome screen, onboarding auth picker, and device-code prompt
-must move together. Fixing only one of them would preserve a split-brain first
-run experience.
+The onboarding welcome screen, onboarding auth picker, device-code prompt, and
+browser-visible login success/error pages must move together. Fixing only one
+portion of that flow would preserve a split-brain first-run experience.
 
 The minimum runtime copy change set is:
 
@@ -127,10 +133,12 @@ The minimum runtime copy change set is:
 - auth picker sentence updated so the active product is `mcodex`, while
   preserving existing context-specific wording and plan/login logic
 - device-code prompt header and tagline with the same identity
+- browser login success/error pages and server-generated login error copy
+  updated so the active product is `mcodex` throughout the same sign-in flow
 
-Any adjacent runtime copy on the same onboarding path that still identifies the
-active product as `Codex` should be updated in the same change if leaving it
-behind would make the screen internally inconsistent.
+Any adjacent runtime copy on the same onboarding or login path that still
+identifies the active product as `Codex` should be updated in the same change
+if leaving it behind would make the screen internally inconsistent.
 
 ### 5. Treat Snapshots as Part of the Product Surface
 
@@ -148,18 +156,24 @@ The implementation should verify both direct output and rendered UI:
 
 Coverage should include:
 
-- a CLI assertion that `mcodex --version` presents `mcodex`
-- a CLI assertion that `mcodex --help` continues presenting the active binary
-  identity as `mcodex`
+- a black-box CLI assertion that `mcodex --version` presents `mcodex`
+- a black-box CLI assertion that `mcodex --help` presents `mcodex` as the
+  active binary identity and does not leak user-facing `Codex`/`codex-cli`
+  branding in public help output
 - a device-code prompt assertion for the updated title/tagline
+- browser auth success/error page assertions for the updated product identity
+- server-generated login error assertions for the updated product identity
 - onboarding snapshot coverage for the updated welcome/auth surfaces
 
 Manual smoke should confirm:
 
 - release `mcodex --version` no longer prints `codex-cli`
-- release `mcodex --help` continues using `mcodex` as the active binary name
+- release `mcodex --help` continues using `mcodex` across user-visible public
+  help output
 - release TTY startup reaches onboarding with `mcodex` as the active product
 - release login/device-code prompts no longer say `Welcome to Codex`
+- release browser login success/error pages and related auth failures no longer
+  identify the active product as `Codex`
 
 ## Risks and Mitigations
 
@@ -184,10 +198,14 @@ primitives and keep full sentence composition in each UI surface.
 ## Acceptance Criteria
 
 - `mcodex --version` presents `mcodex`, not `codex-cli`
-- `mcodex --help` continues presenting `mcodex` as the active binary identity
+- `mcodex --help` presents `mcodex` as the active binary identity across
+  user-visible public help output
 - onboarding welcome/auth screens no longer identify the active product as
   `Codex`
 - device-code login prompts no longer identify the active product as `Codex`
-- the affected onboarding path uses one consistent runtime identity on-screen
+- browser login success/error pages and related auth failures no longer
+  identify the active product as `Codex`
+- the affected onboarding/login path uses one consistent runtime identity
+  on-screen
 - the fix remains confined to active runtime display surfaces and does not
   expand into an unrelated repo-wide rebrand
