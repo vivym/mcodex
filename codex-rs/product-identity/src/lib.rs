@@ -3,6 +3,8 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProductIdentity {
     pub product_name: &'static str,
+    pub display_name: &'static str,
+    pub runtime_tagline: &'static str,
     pub binary_name: &'static str,
     pub default_home_dir_name: &'static str,
     pub home_env_var: &'static str,
@@ -27,6 +29,8 @@ pub struct ProductIdentity {
 
 pub const MCODEX: ProductIdentity = ProductIdentity {
     product_name: "mcodex",
+    display_name: "mcodex",
+    runtime_tagline: "an OpenAI Codex-derived command-line coding agent",
     binary_name: "mcodex",
     default_home_dir_name: ".mcodex",
     home_env_var: "MCODEX_HOME",
@@ -57,6 +61,11 @@ mod tests {
     #[test]
     fn mcodex_identity_defines_active_and_legacy_roots() {
         assert_eq!(MCODEX.product_name, "mcodex");
+        assert_eq!(MCODEX.display_name, "mcodex");
+        assert_eq!(
+            MCODEX.runtime_tagline,
+            "an OpenAI Codex-derived command-line coding agent"
+        );
         assert_eq!(MCODEX.binary_name, "mcodex");
         assert_eq!(MCODEX.default_home_dir_name, ".mcodex");
         assert_eq!(MCODEX.home_env_var, "MCODEX_HOME");
