@@ -3,9 +3,9 @@
 ## Summary
 
 This document defines a narrow follow-up to the `mcodex` product-identity work:
-all user-visible runtime surfaces reached through the `mcodex` binary must
-present `mcodex` as the active product name, while preserving clear attribution
-that the fork is derived from OpenAI Codex.
+the explicitly listed active-runtime display surfaces reached through the
+`mcodex` binary must present `mcodex` as the active product name, while
+preserving clear attribution that the fork is derived from OpenAI Codex.
 
 The goal is to remove the current runtime branding drift where path, home, and
 installer identity have already switched to `mcodex`, but release binary output
@@ -48,7 +48,7 @@ internally inconsistent and undermines the product-identity work already landed.
 
 ## Scope
 
-This design applies to active runtime display surfaces only:
+This design applies only to the following active runtime display surfaces:
 
 - CLI version/help-facing identity shown directly to the user
 - TUI onboarding welcome/auth copy
@@ -56,9 +56,11 @@ This design applies to active runtime display surfaces only:
 - adjacent onboarding runtime strings and snapshots that would otherwise leave
   the same screen internally inconsistent
 
-This design does not automatically include:
+This design explicitly excludes:
 
 - README or broader docs branding
+- update prompts and installer text
+- generic diagnostics, error messages, and unrelated command output
 - internal prompt templates
 - crate names, package names, or binary target names other than what is shown
   to the user at runtime
@@ -92,7 +94,7 @@ Examples:
 
 - `Welcome to mcodex`
 - `mcodex, an OpenAI Codex-derived command-line coding agent`
-- `Sign in with ChatGPT to use mcodex as part of your paid plan`
+- existing auth copy with the active product noun replaced by `mcodex`
 
 This keeps product naming consistent without overfitting the identity crate to
 one specific screen layout.
@@ -122,7 +124,8 @@ The minimum runtime copy change set is:
 
 - welcome header: `Welcome to mcodex`
 - welcome tagline: `an OpenAI Codex-derived command-line coding agent`
-- auth picker sentence: `Sign in with ChatGPT to use mcodex as part of your paid plan`
+- auth picker sentence updated so the active product is `mcodex`, while
+  preserving existing context-specific wording and plan/login logic
 - device-code prompt header and tagline with the same identity
 
 Any adjacent runtime copy on the same onboarding path that still identifies the
@@ -145,14 +148,16 @@ The implementation should verify both direct output and rendered UI:
 
 Coverage should include:
 
-- a CLI assertion that the version/help-facing identity shown to the user uses
-  `mcodex`
+- a CLI assertion that `mcodex --version` presents `mcodex`
+- a CLI assertion that `mcodex --help` continues presenting the active binary
+  identity as `mcodex`
 - a device-code prompt assertion for the updated title/tagline
 - onboarding snapshot coverage for the updated welcome/auth surfaces
 
 Manual smoke should confirm:
 
 - release `mcodex --version` no longer prints `codex-cli`
+- release `mcodex --help` continues using `mcodex` as the active binary name
 - release TTY startup reaches onboarding with `mcodex` as the active product
 - release login/device-code prompts no longer say `Welcome to Codex`
 
@@ -179,6 +184,7 @@ primitives and keep full sentence composition in each UI surface.
 ## Acceptance Criteria
 
 - `mcodex --version` presents `mcodex`, not `codex-cli`
+- `mcodex --help` continues presenting `mcodex` as the active binary identity
 - onboarding welcome/auth screens no longer identify the active product as
   `Codex`
 - device-code login prompts no longer identify the active product as `Codex`
