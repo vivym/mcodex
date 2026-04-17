@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountOperationalState": {
+      "enum": [
+        "available",
+        "leased",
+        "paused",
+        "draining",
+        "coolingDown",
+        "nearExhausted",
+        "exhausted",
+        "error"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "accountKinds": {
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limit": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "poolId": {
+      "type": "string"
+    },
+    "states": {
+      "items": {
+        "$ref": "#/definitions/AccountOperationalState"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "poolId"
+  ],
+  "title": "AccountPoolAccountsListParams",
+  "type": "object"
+}

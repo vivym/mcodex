@@ -517,6 +517,22 @@ client_request_definitions! {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::AccountLeaseResumeResponse,
     },
+    AccountPoolRead => "accountPool/read" {
+        params: v2::AccountPoolReadParams,
+        response: v2::AccountPoolReadResponse,
+    },
+    AccountPoolAccountsList => "accountPool/accounts/list" {
+        params: v2::AccountPoolAccountsListParams,
+        response: v2::AccountPoolAccountsListResponse,
+    },
+    AccountPoolEventsList => "accountPool/events/list" {
+        params: v2::AccountPoolEventsListParams,
+        response: v2::AccountPoolEventsListResponse,
+    },
+    AccountPoolDiagnosticsRead => "accountPool/diagnostics/read" {
+        params: v2::AccountPoolDiagnosticsReadParams,
+        response: v2::AccountPoolDiagnosticsReadResponse,
+    },
 
     GetAccountRateLimits => "account/rateLimits/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,

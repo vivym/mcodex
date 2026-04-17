@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolDiagnosticsIssueResponse": {
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "holderInstanceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "nextRelevantAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reasonCode": {
+          "$ref": "#/definitions/AccountPoolReasonCode"
+        },
+        "severity": {
+          "$ref": "#/definitions/AccountPoolDiagnosticsSeverity"
+        }
+      },
+      "required": [
+        "message",
+        "reasonCode",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "AccountPoolDiagnosticsSeverity": {
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ],
+      "type": "string"
+    },
+    "AccountPoolDiagnosticsStatus": {
+      "enum": [
+        "healthy",
+        "degraded",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "AccountPoolReasonCode": {
+      "enum": [
+        "durablySuppressed",
+        "missingPool",
+        "preferredAccountSelected",
+        "automaticAccountSelected",
+        "preferredAccountMissing",
+        "preferredAccountInOtherPool",
+        "preferredAccountDisabled",
+        "preferredAccountUnhealthy",
+        "preferredAccountBusy",
+        "manualPause",
+        "manualDrain",
+        "quotaNearExhausted",
+        "quotaExhausted",
+        "authFailure",
+        "cooldownActive",
+        "minimumSwitchInterval",
+        "noEligibleAccount",
+        "leaseHeldByAnotherInstance",
+        "nonReplayableTurn",
+        "unknown"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "generatedAt": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "issues": {
+      "items": {
+        "$ref": "#/definitions/AccountPoolDiagnosticsIssueResponse"
+      },
+      "type": "array"
+    },
+    "poolId": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/definitions/AccountPoolDiagnosticsStatus"
+    }
+  },
+  "required": [
+    "generatedAt",
+    "issues",
+    "poolId",
+    "status"
+  ],
+  "title": "AccountPoolDiagnosticsReadResponse",
+  "type": "object"
+}
