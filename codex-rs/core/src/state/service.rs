@@ -25,6 +25,8 @@ use codex_account_pool::ProactiveSwitchOutcome;
 use codex_account_pool::ProactiveSwitchSnapshot;
 use codex_account_pool::ProactiveSwitchState;
 use codex_analytics::AnalyticsEventsClient;
+use codex_app_server_protocol::AccountPoolEventType;
+use codex_app_server_protocol::AccountPoolReasonCode;
 use codex_config::types::AccountsConfigToml;
 use codex_exec_server::Environment;
 use codex_hooks::Hooks;
@@ -41,6 +43,7 @@ use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
 use codex_state::AccountLeaseError;
 use codex_state::AccountLeaseRecord;
+use codex_state::AccountPoolEventRecord;
 use codex_state::AccountStartupEligibility;
 use codex_state::LeaseRenewal;
 use std::path::PathBuf;
@@ -48,6 +51,7 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<RwLock<McpConnectionManager>>,
@@ -365,6 +369,41 @@ impl AccountPoolManager {
             };
             match lease_result {
                 Ok(lease) => {
+                    match rotation_context.clone() {
+                        Some((PendingRotation::SoftProactive, pool_id, current_account_id))
+                            if lease.account_id != current_account_id =>
+                        {
+                            self.last_proactively_replaced_account_id = Some(current_account_id);
+                            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                                occurred_at: lease.acquired_at,
+                                pool_id: &pool_id,
+                                account_id: Some(lease.account_id.as_str()),
+                                lease_id: Some(lease.lease_id.as_str()),
+                                event_type: AccountPoolEventType::ProactiveSwitchSelected,
+                                reason_code: Some(AccountPoolReasonCode::QuotaNearExhausted),
+                                message: format!(
+                                    "proactive switch selected {} after quota pressure",
+                                    lease.account_id
+                                ),
+                            })
+                            .await?;
+                        }
+                        Some((PendingRotation::SoftProactive, pool_id, current_account_id)) => {
+                            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                                occurred_at: lease.acquired_at,
+                                pool_id: &pool_id,
+                                account_id: None,
+                                lease_id: None,
+                                event_type: AccountPoolEventType::LeaseAcquireFailed,
+                                reason_code: Some(AccountPoolReasonCode::NoEligibleAccount),
+                                message: format!(
+                                    "proactive switch could not select an alternate eligible account for {current_account_id}"
+                                ),
+                            })
+                            .await?;
+                        }
+                        _ => {}
+                    }
                     let auth_session = self.create_auth_session(&lease).await?;
                     self.next_health_event_sequence = self
                         .state_db
@@ -372,13 +411,6 @@ impl AccountPoolManager {
                         .await?
                         .unwrap_or(0);
                     self.suppression_reason = None;
-                    if let Some((PendingRotation::SoftProactive, _, current_account_id)) =
-                        rotation_context.as_ref()
-                        && lease.account_id != *current_account_id
-                    {
-                        self.last_proactively_replaced_account_id =
-                            Some(current_account_id.clone());
-                    }
                     if self
                         .previous_turn_account_id
                         .as_deref()
@@ -500,14 +532,40 @@ impl AccountPoolManager {
         let Some(active_lease) = self.active_lease.as_ref() else {
             return Ok(());
         };
+        let observed_at = Utc::now();
+        let pool_id = active_lease.record.pool_id.clone();
+        let account_id = active_lease.record.account_id.clone();
+        let lease_id = active_lease.record.lease_id.clone();
+        let lease_acquired_at = active_lease.record.acquired_at;
+        let was_suppressed = self
+            .proactive_switch_state
+            .clone()
+            .snapshot(observed_at)
+            .suppressed;
         match self
             .proactive_switch_state
             .observe_soft_pressure(ProactiveSwitchObservation {
-                lease_acquired_at: active_lease.record.acquired_at,
-                observed_at: Utc::now(),
+                lease_acquired_at,
+                observed_at,
                 min_switch_interval: self.min_switch_interval,
             }) {
-            ProactiveSwitchOutcome::NoAction | ProactiveSwitchOutcome::Suppressed { .. } => {}
+            ProactiveSwitchOutcome::NoAction => {}
+            ProactiveSwitchOutcome::Suppressed { .. } => {
+                if !was_suppressed {
+                    self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                        occurred_at: observed_at,
+                        pool_id: &pool_id,
+                        account_id: Some(account_id.as_str()),
+                        lease_id: Some(lease_id.as_str()),
+                        event_type: AccountPoolEventType::ProactiveSwitchSuppressed,
+                        reason_code: Some(AccountPoolReasonCode::MinimumSwitchInterval),
+                        message: format!(
+                            "proactive switch suppressed for {account_id} until the minimum switch interval elapses"
+                        ),
+                    })
+                    .await?;
+                }
+            }
             ProactiveSwitchOutcome::RotateOnNextTurn => {
                 if self.pending_rotation != Some(PendingRotation::HardFailure) {
                     self.pending_rotation = Some(PendingRotation::SoftProactive);
@@ -663,10 +721,53 @@ impl AccountPoolManager {
         Ok(())
     }
 
+    async fn append_runtime_account_pool_event(
+        &self,
+        event: RuntimeAccountPoolEvent<'_>,
+    ) -> anyhow::Result<()> {
+        self.state_db
+            .append_account_pool_event(AccountPoolEventRecord {
+                event_id: Uuid::new_v4().to_string(),
+                occurred_at: event.occurred_at,
+                pool_id: event.pool_id.to_string(),
+                account_id: event.account_id.map(ToOwned::to_owned),
+                lease_id: event.lease_id.map(ToOwned::to_owned),
+                holder_instance_id: Some(self.holder_instance_id.clone()),
+                event_type: serialized_protocol_enum_name(&event.event_type)?,
+                reason_code: event
+                    .reason_code
+                    .as_ref()
+                    .map(serialized_protocol_enum_name)
+                    .transpose()?,
+                message: event.message,
+                details_json: None,
+            })
+            .await
+    }
+
     fn backend_private_auth_home(&self, backend_account_handle: &str) -> PathBuf {
         self.codex_home
             .join(".pooled-auth/backends/local/accounts")
             .join(backend_account_handle)
+    }
+}
+
+struct RuntimeAccountPoolEvent<'a> {
+    occurred_at: DateTime<Utc>,
+    pool_id: &'a str,
+    account_id: Option<&'a str>,
+    lease_id: Option<&'a str>,
+    event_type: AccountPoolEventType,
+    reason_code: Option<AccountPoolReasonCode>,
+    message: String,
+}
+
+fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(name) => Ok(name),
+        other => Err(anyhow::anyhow!(
+            "protocol enum serialized to a non-string value: {other:?}"
+        )),
     }
 }
 

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use base64::Engine;
 use chrono::Utc;
+use codex_app_server_protocol::AccountPoolEventType;
+use codex_app_server_protocol::AccountPoolReasonCode;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_core::AccountLeaseRuntimeReason;
@@ -18,6 +20,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
+use codex_state::AccountPoolEventRecord;
+use codex_state::AccountPoolEventsListQuery;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use core_test_support::responses::ResponseMock;
@@ -246,6 +250,211 @@ async fn proactive_rotation_does_not_immediately_switch_back_to_just_replaced_ac
     );
 
     Ok(())
+}
+
+mod observability_event {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_suppressed_records_minimum_switch_interval_event() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        mount_response_sequence(
+            &server,
+            vec![sse_with_primary_usage_percent("resp-1", 92.0)],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(5);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let suppressed_event_type =
+            event_type_name(AccountPoolEventType::ProactiveSwitchSuppressed);
+        let minimum_switch_interval =
+            reason_code_name(AccountPoolReasonCode::MinimumSwitchInterval);
+
+        let turn_error = submit_turn_and_wait(&test, "soft pressure observability turn").await?;
+        assert!(turn_error.is_none());
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == suppressed_event_type
+                    && event.reason_code.as_deref() == Some(minimum_switch_interval.as_str())
+            }),
+            "expected proactive-switch suppression event in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_selected_records_rotation_event() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        let response_mock = mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 18.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(0);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+
+        let first_turn_error = submit_turn_and_wait(&test, "rotation observability turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error =
+            submit_turn_and_wait(&test, "rotation observability turn 2").await?;
+        assert!(second_turn_error.is_none());
+        assert_account_ids_in_order(
+            &response_mock.requests(),
+            &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+        );
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == selected_event_type
+                    && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+            }),
+            "expected proactive-switch selection event in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_suppressed_records_only_one_event_while_pending() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 91.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(300);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let suppressed_event_type =
+            event_type_name(AccountPoolEventType::ProactiveSwitchSuppressed);
+        let minimum_switch_interval =
+            reason_code_name(AccountPoolReasonCode::MinimumSwitchInterval);
+
+        let first_turn_error = submit_turn_and_wait(&test, "suppression dedupe turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error = submit_turn_and_wait(&test, "suppression dedupe turn 2").await?;
+        assert!(second_turn_error.is_none());
+
+        let events = list_account_pool_events(&test).await?;
+        let suppressed_events = events
+            .iter()
+            .filter(|event| {
+                event.event_type == suppressed_event_type
+                    && event.reason_code.as_deref() == Some(minimum_switch_interval.as_str())
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            suppressed_events,
+            1,
+            "expected exactly one proactive-switch suppression event while pending in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_without_alternate_account_records_runtime_classified_acquire_failure()
+    -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        let response_mock = mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 18.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(0);
+        });
+        let test = builder.build(&server).await?;
+        seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let failure_event_type = event_type_name(AccountPoolEventType::LeaseAcquireFailed);
+        let no_eligible_account = reason_code_name(AccountPoolReasonCode::NoEligibleAccount);
+        let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+
+        let first_turn_error =
+            submit_turn_and_wait(&test, "single-account rotation turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error =
+            submit_turn_and_wait(&test, "single-account rotation turn 2").await?;
+        assert!(second_turn_error.is_none());
+        assert_account_ids_in_order(
+            &response_mock.requests(),
+            &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID],
+        );
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == failure_event_type
+                    && event.reason_code.as_deref() == Some(no_eligible_account.as_str())
+            }),
+            "expected runtime-classified lease acquisition failure in {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != selected_event_type),
+            "did not expect proactive-switch selection event in {events:#?}"
+        );
+
+        Ok(())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1664,6 +1873,40 @@ async fn seed_account_health_state(
         })
         .await?;
     Ok(())
+}
+
+async fn list_account_pool_events(test: &TestCodex) -> Result<Vec<AccountPoolEventRecord>> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    let events = state_db
+        .list_account_pool_events(AccountPoolEventsListQuery {
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            account_id: None,
+            types: None,
+            cursor: None,
+            limit: Some(20),
+        })
+        .await?;
+    Ok(events.data)
+}
+
+fn event_type_name(value: AccountPoolEventType) -> String {
+    serialized_protocol_enum_name(&value)
+}
+
+fn reason_code_name(value: AccountPoolReasonCode) -> String {
+    serialized_protocol_enum_name(&value)
+}
+
+fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(other) => panic!("protocol enum serialized to a non-string value: {other:?}"),
+        Err(err) => panic!("protocol enum should serialize to a string: {err}"),
+    }
 }
 
 async fn wait_for_compact_request(mock_response: &ResponseMock) {
