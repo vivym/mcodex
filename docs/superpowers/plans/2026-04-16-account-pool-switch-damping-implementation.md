@@ -66,7 +66,7 @@ Out of scope:
 - Modify: `codex-rs/account-pool/src/types.rs`
 - Test: `codex-rs/account-pool/src/proactive_switch.rs`
 
-- [ ] **Step 1: Write failing unit tests for the shared policy helper**
+- [x] **Step 1: Write failing unit tests for the shared policy helper**
 
 Add focused tests in `codex-rs/account-pool/src/proactive_switch.rs` that lock the desired state machine without involving SQLite or the full managers:
 
@@ -135,13 +135,13 @@ fn fresh_soft_pressure_after_window_requests_rotation() {
 }
 ```
 
-- [ ] **Step 2: Run the new unit tests and confirm they fail**
+- [x] **Step 2: Run the new unit tests and confirm they fail**
 
 Run: `cargo test -p codex-account-pool proactive_switch -- --nocapture`
 
 Expected: compile/test failure because the proactive-switch helper types and behavior do not exist yet.
 
-- [ ] **Step 3: Implement the shared helper and config accessor**
+- [x] **Step 3: Implement the shared helper and config accessor**
 
 Create `codex-rs/account-pool/src/proactive_switch.rs` with a small, reusable API. Keep it data-only and runtime-local:
 
@@ -176,13 +176,13 @@ Rules to implement:
 
 Add `min_switch_interval_secs` plus `min_switch_interval_duration()` to `AccountPoolConfig`, defaulting to `0`.
 
-- [ ] **Step 4: Re-run the shared-policy tests**
+- [x] **Step 4: Re-run the shared-policy tests**
 
 Run: `cargo test -p codex-account-pool proactive_switch -- --nocapture`
 
 Expected: PASS for the new shared-policy tests.
 
-- [ ] **Step 5: Commit the shared helper**
+- [x] **Step 5: Commit the shared helper**
 
 ```bash
 git add codex-rs/account-pool/src/proactive_switch.rs codex-rs/account-pool/src/lib.rs codex-rs/account-pool/src/types.rs
@@ -195,7 +195,7 @@ git commit -m "feat: add pooled proactive switch policy helper"
 - Modify: `codex-rs/account-pool/src/manager.rs`
 - Test: `codex-rs/account-pool/tests/lease_lifecycle.rs`
 
-- [ ] **Step 1: Write failing manager tests for soft-pressure suppression and hard-failure bypass**
+- [x] **Step 1: Write failing manager tests for soft-pressure suppression and hard-failure bypass**
 
 Add focused tests in `codex-rs/account-pool/tests/lease_lifecycle.rs`:
 
@@ -314,13 +314,13 @@ async fn hard_usage_limit_bypasses_min_switch_interval() {
 }
 ```
 
-- [ ] **Step 2: Run the focused manager tests and confirm they fail**
+- [x] **Step 2: Run the focused manager tests and confirm they fail**
 
 Run: `cargo test -p codex-account-pool --test lease_lifecycle -- --nocapture`
 
 Expected: FAIL because `report_rate_limits(...)` still persists `RateLimited` and the manager has no damping state.
 
-- [ ] **Step 3: Implement the manager wiring**
+- [x] **Step 3: Implement the manager wiring**
 
 Update `codex-rs/account-pool/src/manager.rs` so that:
 
@@ -332,13 +332,13 @@ Update `codex-rs/account-pool/src/manager.rs` so that:
 
 Keep the public `HealthEventDisposition` surface unchanged unless tests prove the current enum is too coarse.
 
-- [ ] **Step 4: Re-run the focused manager tests**
+- [x] **Step 4: Re-run the focused manager tests**
 
 Run: `cargo test -p codex-account-pool --test lease_lifecycle -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the local-manager behavior change**
+- [x] **Step 5: Commit the local-manager behavior change**
 
 ```bash
 git add codex-rs/account-pool/src/manager.rs codex-rs/account-pool/tests/lease_lifecycle.rs
@@ -353,7 +353,7 @@ git commit -m "feat: damp proactive pool switching"
 - Modify: `codex-rs/core/src/state/service.rs`
 - Test: `codex-rs/core/tests/suite/account_pool.rs`
 
-- [ ] **Step 1: Write failing core integration tests for live damping state**
+- [x] **Step 1: Write failing core integration tests for live damping state**
 
 Add focused tests in `codex-rs/core/tests/suite/account_pool.rs`:
 
@@ -404,13 +404,13 @@ async fn proactive_rotation_does_not_immediately_switch_back_to_just_replaced_ac
 
 Also add an assertion in the existing hard-failure rotation tests that `usage_limit_reached` continues to rotate even when `min_switch_interval_secs` is configured.
 
-- [ ] **Step 2: Run the focused core tests and confirm they fail**
+- [x] **Step 2: Run the focused core tests and confirm they fail**
 
 Run: `cargo test -p codex-core account_pool -- --nocapture`
 
 Expected: FAIL because the live snapshot has no proactive-switch fields and `report_rate_limits(...)` still records `RateLimited`.
 
-- [ ] **Step 3: Implement the core runtime wiring**
+- [x] **Step 3: Implement the core runtime wiring**
 
 Update `codex-rs/core/src/state/service.rs` so that:
 
@@ -427,13 +427,13 @@ Update `codex-rs/core/src/state/service.rs` so that:
 
 Do not reuse `suppression_reason` or `next_eligible_at` for these live-only facts.
 
-- [ ] **Step 4: Re-run the focused core tests**
+- [x] **Step 4: Re-run the focused core tests**
 
 Run: `cargo test -p codex-core account_pool -- --nocapture`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the core runtime changes**
+- [x] **Step 5: Commit the core runtime changes**
 
 ```bash
 git add codex-rs/core/Cargo.toml codex-rs/core/BUILD.bazel codex-rs/core/src/state/service.rs codex-rs/core/tests/suite/account_pool.rs
@@ -447,7 +447,7 @@ git commit -m "feat: expose live pooled switch damping"
 - Modify: `codex-rs/app-server/src/account_lease_api.rs`
 - Test: `codex-rs/app-server/tests/suite/v2/account_lease.rs`
 
-- [ ] **Step 1: Write failing app-server tests for additive damping fields**
+- [x] **Step 1: Write failing app-server tests for additive damping fields**
 
 Add focused assertions in `codex-rs/app-server/tests/suite/v2/account_lease.rs`:
 
@@ -479,13 +479,13 @@ async fn account_lease_read_reports_proactive_switch_suppression_fields() -> Res
 
 Also extend the rotated-notification test to assert the additive fields survive the `AccountLeaseUpdatedNotification` conversion.
 
-- [ ] **Step 2: Run the focused app-server tests and confirm they fail**
+- [x] **Step 2: Run the focused app-server tests and confirm they fail**
 
 Run: `cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppression_fields -- --nocapture`
 
 Expected: FAIL because the wire types and API mapping do not yet expose the new fields.
 
-- [ ] **Step 3: Implement the additive protocol and mapping**
+- [x] **Step 3: Implement the additive protocol and mapping**
 
 Update `codex-rs/app-server-protocol/src/protocol/v2.rs` and `codex-rs/app-server/src/account_lease_api.rs`:
 
@@ -497,7 +497,7 @@ Update `codex-rs/app-server-protocol/src/protocol/v2.rs` and `codex-rs/app-serve
 
 Keep `AccountLeaseUpdatedNotification` as an additive `From<AccountLeaseReadResponse>` wrapper so no second mapping path drifts.
 
-- [ ] **Step 4: Regenerate schema fixtures and rerun protocol/app-server tests**
+- [x] **Step 4: Regenerate schema fixtures and rerun protocol/app-server tests**
 
 Run:
 
@@ -509,7 +509,7 @@ cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppr
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the protocol update**
+- [x] **Step 5: Commit the protocol update**
 
 ```bash
 git add codex-rs/app-server-protocol/src/protocol/v2.rs codex-rs/app-server/src/account_lease_api.rs codex-rs/app-server/tests/suite/v2/account_lease.rs codex-rs/app-server/README.md
@@ -527,7 +527,7 @@ If `codex-rs/app-server/README.md` does not need changes after the wire contract
 - Test: `codex-rs/tui/src/status/tests.rs`
 - Test: `codex-rs/tui/src/chatwidget/tests/status_command_tests.rs`
 
-- [ ] **Step 1: Write failing TUI status tests**
+- [x] **Step 1: Write failing TUI status tests**
 
 Update `codex-rs/tui/src/status/tests.rs` and `codex-rs/tui/src/chatwidget/tests/status_command_tests.rs` so a live lease with soft-pressure suppression renders a dedicated damping line instead of reusing “Next eligible”:
 
@@ -552,18 +552,18 @@ Add snapshot assertions that the status card shows:
 
 and does **not** show `Next eligible` for the same scenario.
 
-- [ ] **Step 2: Run the focused TUI tests and confirm they fail**
+- [x] **Step 2: Run the focused TUI tests and confirm they fail**
 
 Run:
 
 ```bash
-cargo test -p codex-tui status::tests::renders_damped_account_lease_display -- --nocapture
-cargo test -p codex-tui chatwidget::tests::status_command_tests::renders_damped_account_lease_display -- --nocapture
+cargo test -p codex-tui status_snapshot_shows_damped_account_lease_without_next_eligible_time -- --nocapture
+cargo test -p codex-tui status_command_renders_damped_account_lease_without_next_eligible_hint -- --nocapture
 ```
 
 Expected: FAIL because `StatusAccountLeaseDisplay` and the account-lease response adapter do not yet have the new field.
 
-- [ ] **Step 3: Implement the TUI mapping and rendering**
+- [x] **Step 3: Implement the TUI mapping and rendering**
 
 Update:
 
@@ -574,25 +574,27 @@ Update:
   - a distinct `Can switch at` value formatted from `proactive_switch_allowed_at`
 - `codex-rs/tui/src/status/card.rs` to print the new label only when present and to leave `Next eligible` reserved for real cooldown
 
-- [ ] **Step 4: Re-run TUI tests, inspect snapshots, and accept intentional updates**
+- [x] **Step 4: Re-run TUI tests, inspect snapshots, and accept intentional updates**
 
 Run:
 
 ```bash
-cargo test -p codex-tui status::tests::renders_damped_account_lease_display -- --nocapture
-cargo test -p codex-tui chatwidget::tests::status_command_tests::renders_damped_account_lease_display -- --nocapture
-cargo insta pending-snapshots -p codex-tui
+cargo test -p codex-tui status_account_lease_display_from_response_formats_damped_proactive_switch -- --nocapture
+cargo test -p codex-tui status_account_lease_display_from_response_hides_inert_damping_metadata -- --nocapture
+cargo test -p codex-tui status_snapshot_shows_damped_account_lease_without_next_eligible_time -- --nocapture
+cargo test -p codex-tui status_command_renders_damped_account_lease_without_next_eligible_hint -- --nocapture
+cargo insta pending-snapshots --manifest-path tui/Cargo.toml
 ```
 
 Review the generated `*.snap.new` files, then accept only the intended TUI changes:
 
 ```bash
-cargo insta accept -p codex-tui
+cargo insta accept --snapshot 'tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_damped_account_lease_without_next_eligible_time.snap'
 ```
 
 Expected: PASS with only the new damping-render snapshots accepted.
 
-- [ ] **Step 5: Commit the TUI status changes**
+- [x] **Step 5: Commit the TUI status changes**
 
 ```bash
 git add codex-rs/tui/src/status/account.rs codex-rs/tui/src/app_server_session.rs codex-rs/tui/src/status/card.rs codex-rs/tui/src/status/tests.rs codex-rs/tui/src/chatwidget/tests/status_command_tests.rs
@@ -607,9 +609,11 @@ git commit -m "feat: show pooled switch damping in tui status"
 - [ ] `just write-app-server-schema`
 - [ ] `cargo test -p codex-app-server-protocol`
 - [ ] `cargo test -p codex-app-server account_lease_read_reports_proactive_switch_suppression_fields -- --nocapture`
-- [ ] `cargo test -p codex-tui status::tests::renders_damped_account_lease_display -- --nocapture`
-- [ ] `cargo test -p codex-tui chatwidget::tests::status_command_tests::renders_damped_account_lease_display -- --nocapture`
-- [ ] `cargo insta pending-snapshots -p codex-tui`
+- [ ] `cargo test -p codex-tui status_account_lease_display_from_response_formats_damped_proactive_switch -- --nocapture`
+- [ ] `cargo test -p codex-tui status_account_lease_display_from_response_hides_inert_damping_metadata -- --nocapture`
+- [ ] `cargo test -p codex-tui status_snapshot_shows_damped_account_lease_without_next_eligible_time -- --nocapture`
+- [ ] `cargo test -p codex-tui status_command_renders_damped_account_lease_without_next_eligible_hint -- --nocapture`
+- [ ] `cargo insta pending-snapshots --manifest-path tui/Cargo.toml`
 
 ## Notes For The Implementer
 
