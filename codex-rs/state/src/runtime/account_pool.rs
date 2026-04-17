@@ -5,6 +5,7 @@ use crate::model::AccountLeaseError;
 use crate::model::AccountLeaseRecord;
 use crate::model::AccountPoolAccountDiagnostic;
 use crate::model::AccountPoolDiagnostic;
+use crate::model::AccountPoolEventRecord;
 use crate::model::AccountPoolMembership;
 use crate::model::AccountRegistryEntryUpdate;
 use crate::model::AccountSource;
@@ -131,6 +132,20 @@ impl StateRuntime {
                 .any(|excluded_account_id| excluded_account_id == &existing_lease.account_id)
             {
                 tx.commit().await.map_err(account_lease_storage_error)?;
+                self.append_account_pool_event(account_pool_event(
+                    now,
+                    AccountPoolEventSubject {
+                        pool_id,
+                        account_id: None,
+                        lease_id: None,
+                        holder_instance_id: Some(holder_instance_id),
+                    },
+                    "leaseAcquireFailed",
+                    Some("noEligibleAccount"),
+                    "no eligible account is available for lease acquisition",
+                ))
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
                 return Err(AccountLeaseError::NoEligibleAccount);
             }
             tx.commit().await.map_err(account_lease_storage_error)?;
@@ -165,27 +180,90 @@ impl StateRuntime {
                             excluded_account_id == &existing_lease.account_id
                         }) =>
                     {
+                        drop(tx);
+                        self.append_account_pool_event(account_pool_event(
+                            now,
+                            AccountPoolEventSubject {
+                                pool_id,
+                                account_id: None,
+                                lease_id: None,
+                                holder_instance_id: Some(holder_instance_id),
+                            },
+                            "leaseAcquireFailed",
+                            Some("noEligibleAccount"),
+                            "no eligible account is available for lease acquisition",
+                        ))
+                        .await
+                        .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
                         Err(AccountLeaseError::NoEligibleAccount)
                     }
                     Some(existing_lease) => Ok(existing_lease),
-                    None => Err(AccountLeaseError::NoEligibleAccount),
+                    None => {
+                        drop(tx);
+                        self.append_account_pool_event(account_pool_event(
+                            now,
+                            AccountPoolEventSubject {
+                                pool_id,
+                                account_id: None,
+                                lease_id: None,
+                                holder_instance_id: Some(holder_instance_id),
+                            },
+                            "leaseAcquireFailed",
+                            Some("noEligibleAccount"),
+                            "no eligible account is available for lease acquisition",
+                        ))
+                        .await
+                        .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
+                        Err(AccountLeaseError::NoEligibleAccount)
+                    }
                 };
             }
             Err(err) => return Err(account_lease_storage_error(err)),
         };
 
         if result.rows_affected() == 0 {
+            drop(tx);
+            self.append_account_pool_event(account_pool_event(
+                now,
+                AccountPoolEventSubject {
+                    pool_id,
+                    account_id: None,
+                    lease_id: None,
+                    holder_instance_id: Some(holder_instance_id),
+                },
+                "leaseAcquireFailed",
+                Some("noEligibleAccount"),
+                "no eligible account is available for lease acquisition",
+            ))
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
             return Err(AccountLeaseError::NoEligibleAccount);
         }
 
-        tx.commit().await.map_err(account_lease_storage_error)?;
-
-        let lease = load_lease(self.pool.as_ref(), &lease.lease_id)
+        let lease = load_lease(&mut *tx, &lease.lease_id)
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
             .ok_or_else(|| {
                 AccountLeaseError::Storage(format!("missing inserted lease {}", lease.lease_id))
             })?;
+        super::account_pool_observability::append_account_pool_event_tx(
+            &mut *tx,
+            &account_pool_event(
+                lease.acquired_at,
+                AccountPoolEventSubject {
+                    pool_id: &lease.pool_id,
+                    account_id: Some(lease.account_id.as_str()),
+                    lease_id: Some(lease.lease_id.as_str()),
+                    holder_instance_id: Some(lease.holder_instance_id.as_str()),
+                },
+                "leaseAcquired",
+                None,
+                format!("lease {} acquired for {}", lease.lease_id, lease.account_id),
+            ),
+        )
+        .await
+        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+        tx.commit().await.map_err(account_lease_storage_error)?;
 
         Ok(lease)
     }
@@ -238,24 +316,72 @@ impl StateRuntime {
                         .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
                 return match existing_lease {
                     Some(existing_lease) => Ok(existing_lease),
-                    None => Err(AccountLeaseError::NoEligibleAccount),
+                    None => {
+                        drop(tx);
+                        self.append_account_pool_event(account_pool_event(
+                            now,
+                            AccountPoolEventSubject {
+                                pool_id,
+                                account_id: Some(account_id),
+                                lease_id: None,
+                                holder_instance_id: Some(holder_instance_id),
+                            },
+                            "leaseAcquireFailed",
+                            Some("noEligibleAccount"),
+                            "preferred account is not eligible for lease acquisition",
+                        ))
+                        .await
+                        .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
+                        Err(AccountLeaseError::NoEligibleAccount)
+                    }
                 };
             }
             Err(err) => return Err(account_lease_storage_error(err)),
         };
 
         if result.rows_affected() == 0 {
+            drop(tx);
+            self.append_account_pool_event(account_pool_event(
+                now,
+                AccountPoolEventSubject {
+                    pool_id,
+                    account_id: Some(account_id),
+                    lease_id: None,
+                    holder_instance_id: Some(holder_instance_id),
+                },
+                "leaseAcquireFailed",
+                Some("noEligibleAccount"),
+                "preferred account is not eligible for lease acquisition",
+            ))
+            .await
+            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
             return Err(AccountLeaseError::NoEligibleAccount);
         }
 
-        tx.commit().await.map_err(account_lease_storage_error)?;
-
-        let lease = load_lease(self.pool.as_ref(), &lease.lease_id)
+        let lease = load_lease(&mut *tx, &lease.lease_id)
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
             .ok_or_else(|| {
                 AccountLeaseError::Storage(format!("missing inserted lease {}", lease.lease_id))
             })?;
+        super::account_pool_observability::append_account_pool_event_tx(
+            &mut *tx,
+            &account_pool_event(
+                lease.acquired_at,
+                AccountPoolEventSubject {
+                    pool_id: &lease.pool_id,
+                    account_id: Some(lease.account_id.as_str()),
+                    lease_id: Some(lease.lease_id.as_str()),
+                    holder_instance_id: Some(lease.holder_instance_id.as_str()),
+                },
+                "leaseAcquired",
+                None,
+                format!("lease {} acquired for {}", lease.lease_id, lease.account_id),
+            ),
+        )
+        .await
+        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+        tx.commit().await.map_err(account_lease_storage_error)?;
 
         Ok(lease)
     }
@@ -267,6 +393,7 @@ impl StateRuntime {
         lease_ttl: chrono::Duration,
     ) -> anyhow::Result<LeaseRenewal> {
         let expires_at = now + lease_ttl;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
 UPDATE account_leases
@@ -284,17 +411,42 @@ WHERE lease_id = ?
         .bind(&lease.account_id)
         .bind(lease.lease_epoch)
         .bind(account_datetime_to_epoch_seconds(now))
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Ok(LeaseRenewal::Missing);
         }
 
-        let renewed = load_lease(self.pool.as_ref(), &lease.lease_id).await?;
+        let renewed = load_lease(&mut *tx, &lease.lease_id).await?;
         match renewed {
-            Some(record) => Ok(LeaseRenewal::Renewed(record)),
-            None => Ok(LeaseRenewal::Missing),
+            Some(record) => {
+                super::account_pool_observability::append_account_pool_event_tx(
+                    &mut *tx,
+                    &account_pool_event(
+                        now,
+                        AccountPoolEventSubject {
+                            pool_id: &record.pool_id,
+                            account_id: Some(record.account_id.as_str()),
+                            lease_id: Some(record.lease_id.as_str()),
+                            holder_instance_id: Some(record.holder_instance_id.as_str()),
+                        },
+                        "leaseRenewed",
+                        None,
+                        format!(
+                            "lease {} renewed for {}",
+                            record.lease_id, record.account_id
+                        ),
+                    ),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(LeaseRenewal::Renewed(record))
+            }
+            None => {
+                tx.commit().await?;
+                Ok(LeaseRenewal::Missing)
+            }
         }
     }
 
@@ -303,6 +455,7 @@ WHERE lease_id = ?
         lease: &LeaseKey,
         now: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
 UPDATE account_leases
@@ -317,10 +470,37 @@ WHERE lease_id = ?
         .bind(&lease.lease_id)
         .bind(&lease.account_id)
         .bind(lease.lease_epoch)
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await?;
 
-        Ok(result.rows_affected() != 0)
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        if let Some(released) = load_lease(&mut *tx, &lease.lease_id).await? {
+            super::account_pool_observability::append_account_pool_event_tx(
+                &mut *tx,
+                &account_pool_event(
+                    now,
+                    AccountPoolEventSubject {
+                        pool_id: &released.pool_id,
+                        account_id: Some(released.account_id.as_str()),
+                        lease_id: Some(released.lease_id.as_str()),
+                        holder_instance_id: Some(released.holder_instance_id.as_str()),
+                    },
+                    "leaseReleased",
+                    None,
+                    format!(
+                        "lease {} released for {}",
+                        released.lease_id, released.account_id
+                    ),
+                ),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+
+        Ok(true)
     }
 
     pub async fn read_active_holder_lease(
@@ -640,6 +820,40 @@ WHERE account_id = ?
                         .await?;
                     }
                 }
+
+                let (event_type, reason_code, message) = match event.health_state {
+                    AccountHealthState::Healthy => (
+                        "cooldownCleared",
+                        None,
+                        format!("account {} health recovered", event.account_id),
+                    ),
+                    AccountHealthState::RateLimited => (
+                        "cooldownStarted",
+                        Some("cooldownActive"),
+                        format!("account {} entered cooldown", event.account_id),
+                    ),
+                    AccountHealthState::Unauthorized => (
+                        "authFailed",
+                        Some("authFailure"),
+                        format!("account {} authorization failed", event.account_id),
+                    ),
+                };
+                super::account_pool_observability::append_account_pool_event_tx(
+                    &mut *tx,
+                    &account_pool_event(
+                        event.observed_at,
+                        AccountPoolEventSubject {
+                            pool_id: &event.pool_id,
+                            account_id: Some(event.account_id.as_str()),
+                            lease_id: None,
+                            holder_instance_id: None,
+                        },
+                        event_type,
+                        reason_code,
+                        message,
+                    ),
+                )
+                .await?;
 
                 tx.commit().await?;
                 Ok::<(), anyhow::Error>(())
@@ -1110,6 +1324,7 @@ WHERE preferred_account_id = ?
         &self,
         update: AccountStartupSelectionUpdate,
     ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
 INSERT INTO account_startup_selection (
@@ -1126,12 +1341,45 @@ ON CONFLICT(singleton) DO UPDATE SET
     updated_at = excluded.updated_at
             "#,
         )
-        .bind(update.default_pool_id)
-        .bind(update.preferred_account_id)
+        .bind(update.default_pool_id.as_deref())
+        .bind(update.preferred_account_id.as_deref())
         .bind(i64::from(update.suppressed))
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
-        .execute(self.pool.as_ref())
+        .execute(&mut *tx)
         .await?;
+        if update.suppressed {
+            let pool_id = match update.default_pool_id.as_deref() {
+                Some(default_pool_id) => default_pool_id.to_string(),
+                None => match update.preferred_account_id.as_deref() {
+                    Some(preferred_account_id) => {
+                        super::account_pool_control::read_effective_account_pool_id(
+                            &mut *tx,
+                            preferred_account_id,
+                        )
+                        .await?
+                        .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string())
+                    }
+                    None => LEGACY_DEFAULT_POOL_ID.to_string(),
+                },
+            };
+            super::account_pool_observability::append_account_pool_event_tx(
+                &mut *tx,
+                &account_pool_event(
+                    Utc::now(),
+                    AccountPoolEventSubject {
+                        pool_id: &pool_id,
+                        account_id: update.preferred_account_id.as_deref(),
+                        lease_id: None,
+                        holder_instance_id: None,
+                    },
+                    "proactiveSwitchSuppressed",
+                    Some("durablySuppressed"),
+                    "startup selection is durably suppressed",
+                ),
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1177,6 +1425,34 @@ WHERE account_id = ?
 
 fn account_lease_storage_error(err: sqlx::Error) -> AccountLeaseError {
     AccountLeaseError::Storage(err.to_string())
+}
+
+struct AccountPoolEventSubject<'a> {
+    pool_id: &'a str,
+    account_id: Option<&'a str>,
+    lease_id: Option<&'a str>,
+    holder_instance_id: Option<&'a str>,
+}
+
+fn account_pool_event(
+    occurred_at: DateTime<Utc>,
+    subject: AccountPoolEventSubject<'_>,
+    event_type: &str,
+    reason_code: Option<&str>,
+    message: impl Into<String>,
+) -> AccountPoolEventRecord {
+    AccountPoolEventRecord {
+        event_id: Uuid::new_v4().to_string(),
+        occurred_at,
+        pool_id: subject.pool_id.to_string(),
+        account_id: subject.account_id.map(ToOwned::to_owned),
+        lease_id: subject.lease_id.map(ToOwned::to_owned),
+        holder_instance_id: subject.holder_instance_id.map(ToOwned::to_owned),
+        event_type: event_type.to_string(),
+        reason_code: reason_code.map(ToOwned::to_owned),
+        message: message.into(),
+        details_json: None,
+    }
 }
 
 fn account_lease_is_contention_error(err: &sqlx::Error) -> bool {
@@ -2351,6 +2627,107 @@ WHERE version = 26
     }
 
     #[tokio::test]
+    async fn acquire_account_lease_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "leaseAcquired").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                Some(lease.lease_id),
+                Some("inst-a".to_string()),
+                None,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_account_lease_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let renew_at = lease.acquired_at + chrono::Duration::seconds(15);
+        runtime
+            .renew_account_lease(&lease.lease_key(), renew_at, chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "leaseRenewed").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                Some(lease.lease_id),
+                Some("inst-a".to_string()),
+                None,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn release_account_lease_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        runtime
+            .release_account_lease(&lease.lease_key(), test_timestamp(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "leaseReleased").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                Some(lease.lease_id),
+                Some("inst-a".to_string()),
+                None,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_failure_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(30))
+            .await
+            .unwrap();
+        let second = runtime
+            .acquire_account_lease("pool-main", "inst-b", chrono::Duration::seconds(30))
+            .await;
+
+        assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "leaseAcquireFailed").await,
+            vec![(
+                "pool-main".to_string(),
+                None,
+                None,
+                Some("inst-b".to_string()),
+                Some("noEligibleAccount".to_string()),
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn read_account_health_event_sequence_returns_persisted_sequence() {
         let runtime = test_runtime().await;
         seed_account(runtime.as_ref(), "acct-1").await;
@@ -2372,6 +2749,34 @@ WHERE version = 26
                 .await
                 .unwrap(),
             Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_account_health_event_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+
+        runtime
+            .record_account_health_event(AccountHealthEvent {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                health_state: AccountHealthState::RateLimited,
+                sequence_number: 7,
+                observed_at: test_timestamp(7),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "cooldownStarted").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                None,
+                None,
+                Some("cooldownActive".to_string()),
+            )]
         );
     }
 
@@ -2910,6 +3315,31 @@ WHERE account_id = ?
                 predicted_account_id: Some("acct-2".to_string()),
                 eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn write_account_startup_selection_persists_account_pool_event() {
+        let runtime = test_runtime().await;
+
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_account_pool_event_fields(runtime.as_ref(), "proactiveSwitchSuppressed").await,
+            vec![(
+                "pool-main".to_string(),
+                Some("acct-1".to_string()),
+                None,
+                None,
+                Some("durablySuppressed".to_string()),
+            )]
         );
     }
 
@@ -4188,6 +4618,30 @@ INSERT INTO account_pool_membership (
         .execute(runtime.pool.as_ref())
         .await
         .expect("seed account membership");
+    }
+
+    async fn load_account_pool_event_fields(
+        runtime: &StateRuntime,
+        event_type: &str,
+    ) -> Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        sqlx::query_as(
+            r#"
+SELECT pool_id, account_id, lease_id, holder_instance_id, reason_code
+FROM account_pool_events
+WHERE event_type = ?
+ORDER BY occurred_at ASC, event_id ASC
+            "#,
+        )
+        .bind(event_type)
+        .fetch_all(runtime.pool.as_ref())
+        .await
+        .expect("load account pool events")
     }
 
     fn test_timestamp(seconds: i64) -> DateTime<Utc> {
