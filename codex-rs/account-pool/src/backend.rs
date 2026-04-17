@@ -13,6 +13,24 @@ use codex_state::RegisteredAccountRecord;
 use codex_state::RegisteredAccountUpsert;
 
 pub mod local;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolAccountsListRequest;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolAccountsPage;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolDiagnostics;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolDiagnosticsReadRequest;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolEventsListRequest;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolEventsPage;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolObservabilityReader;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolReadRequest;
+#[allow(unused_imports)]
+pub use crate::observability::AccountPoolSnapshot;
 
 /// Read-only account source used by the startup selection policy.
 ///

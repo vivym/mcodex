@@ -1,5 +1,6 @@
 mod control;
 mod execution;
+mod observability;
 
 use chrono::Duration;
 use codex_login::auth::LocalLeaseScopedAuthSession;
