@@ -1664,6 +1664,9 @@ mod tests {
                 transport_reset_generation: None,
                 last_remote_context_reset_turn_id: None,
                 next_eligible_at: None,
+                effective_pool_resolution_source: None,
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
             },
             captured_at,
         );
@@ -1695,6 +1698,9 @@ mod tests {
                         .with_timezone(&chrono::Utc)
                         .timestamp(),
                 ),
+                effective_pool_resolution_source: Some("persistedSelection".to_string()),
+                configured_default_pool_id: None,
+                persisted_default_pool_id: Some("legacy-default".to_string()),
             },
             captured_at,
         );
@@ -1736,6 +1742,9 @@ mod tests {
                         .with_timezone(&chrono::Utc)
                         .timestamp(),
                 ),
+                effective_pool_resolution_source: Some("persistedSelection".to_string()),
+                configured_default_pool_id: None,
+                persisted_default_pool_id: Some("legacy-default".to_string()),
             },
             captured_at,
         );

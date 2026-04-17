@@ -5,8 +5,10 @@ use crate::app_server_session::AppServerSession;
 use crate::legacy_core::config::Config;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::read_shared_startup_status;
 use codex_state::StateRuntime;
-use codex_state::state_db_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartupProbe {
@@ -75,16 +77,28 @@ pub(crate) async fn probe_startup_access(
 }
 
 async fn probe_local_startup_access(config: &Config) -> Result<StartupProbe> {
-    let state_path = state_db_path(config.sqlite_home.as_path());
-    if configured_default_pool_id(config).is_none() && !state_path.exists() {
+    let runtime =
+        StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone()).await?;
+    let lease_ttl_secs = config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.lease_ttl_secs)
+        .unwrap_or(AccountPoolConfig::default().lease_ttl_secs);
+    let backend = LocalAccountPoolBackend::new(
+        runtime.clone(),
+        AccountPoolConfig {
+            lease_ttl_secs,
+            ..AccountPoolConfig::default()
+        }
+        .lease_ttl_duration(),
+    );
+    let startup_status =
+        read_shared_startup_status(&backend, configured_default_pool_id(config), None).await?;
+    if !startup_status.pooled_applicable {
         return Ok(StartupProbe::Unavailable);
     }
 
-    let runtime =
-        StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone()).await?;
-    let preview = runtime
-        .preview_account_startup_selection(configured_default_pool_id(config))
-        .await?;
+    let preview = &startup_status.startup.preview;
     let Some(pool_id) = preview.effective_pool_id.as_deref() else {
         return Ok(StartupProbe::Unavailable);
     };
@@ -150,11 +164,26 @@ mod tests {
     use codex_config::types::AccountsConfigToml;
     use codex_state::AccountRegistryEntryUpdate;
     use codex_state::AccountStartupSelectionUpdate;
+    use codex_state::state_db_path;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     async fn test_config(fixture_root: &std::path::Path) -> Config {
+        test_config_with_accounts(
+            fixture_root,
+            Some(AccountsConfigToml {
+                default_pool: Some("pool-main".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    async fn test_config_with_accounts(
+        fixture_root: &std::path::Path,
+        accounts: Option<AccountsConfigToml>,
+    ) -> Config {
         let cwd = fixture_root.join("cwd");
         let sqlite_home = fixture_root.join("sqlite");
         std::fs::create_dir_all(&cwd).expect("create cwd fixture");
@@ -167,10 +196,7 @@ mod tests {
             .build()
             .await
             .expect("load config");
-        config.accounts = Some(AccountsConfigToml {
-            default_pool: Some("pool-main".to_string()),
-            ..Default::default()
-        });
+        config.accounts = accounts;
         config.cwd = AbsolutePathBuf::try_from(cwd).expect("cwd should be absolute");
         config.sqlite_home = sqlite_home;
         config
@@ -242,6 +268,61 @@ mod tests {
         );
 
         assert_eq!(decision, StartupPromptDecision::NoPrompt);
+    }
+
+    #[tokio::test]
+    async fn local_probe_uses_state_only_membership_without_config_accounts() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config_with_accounts(codex_home.path(), None).await;
+        let runtime =
+            StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                .await
+                .expect("initialize runtime");
+
+        seed_account(runtime.as_ref(), "acct-1", true)
+            .await
+            .expect("seed enabled account");
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            })
+            .await
+            .expect("write state-only selection");
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::PooledAvailable { remote: false });
+    }
+
+    #[tokio::test]
+    async fn local_probe_rejects_policy_only_migrated_config_without_membership() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config(codex_home.path()).await;
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn local_probe_does_not_require_preexisting_sqlite_file_for_config_default() {
+        let codex_home = tempdir().expect("tempdir");
+        let config = test_config(codex_home.path()).await;
+        let state_path = state_db_path(config.sqlite_home.as_path());
+        assert!(!state_path.exists());
+
+        let probe = probe_local_startup_access(&config)
+            .await
+            .expect("probe local startup access");
+
+        assert_eq!(probe, StartupProbe::Unavailable);
+        assert!(state_path.exists());
     }
 
     #[tokio::test]
@@ -353,6 +434,9 @@ mod tests {
             transport_reset_generation: None,
             last_remote_context_reset_turn_id: None,
             next_eligible_at: None,
+            effective_pool_resolution_source: Some("persistedSelection".to_string()),
+            configured_default_pool_id: None,
+            persisted_default_pool_id: Some("pool-main".to_string()),
         });
 
         assert_eq!(probe, StartupProbe::PooledSuppressed { remote: true });
@@ -373,6 +457,9 @@ mod tests {
             transport_reset_generation: None,
             last_remote_context_reset_turn_id: None,
             next_eligible_at: None,
+            effective_pool_resolution_source: Some("persistedSelection".to_string()),
+            configured_default_pool_id: None,
+            persisted_default_pool_id: Some("pool-main".to_string()),
         });
 
         assert_eq!(probe, StartupProbe::PooledAvailable { remote: true });
@@ -393,6 +480,9 @@ mod tests {
             transport_reset_generation: None,
             last_remote_context_reset_turn_id: None,
             next_eligible_at: None,
+            effective_pool_resolution_source: None,
+            configured_default_pool_id: None,
+            persisted_default_pool_id: None,
         });
 
         assert_eq!(probe, StartupProbe::Unavailable);
