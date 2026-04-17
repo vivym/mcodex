@@ -335,7 +335,8 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             let current = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
                 .await
                 .context("read account startup preview")?;
-            let Some(effective_pool_id) = current.preview.effective_pool_id.clone() else {
+            let Some(effective_pool_id) = current.startup.startup.preview.effective_pool_id.clone()
+            else {
                 anyhow::bail!("no effective pool is configured for pooled account selection");
             };
             let membership = runtime

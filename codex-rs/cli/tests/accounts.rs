@@ -48,7 +48,8 @@ async fn prepared_legacy_auth_with_accounts_config_home() -> Result<TempDir> {
 
 async fn run_codex(codex_home: &TempDir, args: &[&str]) -> Result<CodexOutput> {
     let output = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
-        .env("CODEX_HOME", codex_home.path())
+        .env("MCODEX_HOME", codex_home.path())
+        .env_remove("CODEX_HOME")
         .args(args)
         .output()?;
 
@@ -529,6 +530,7 @@ async fn accounts_current_json_reports_startup_preview() -> Result<()> {
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["effectivePoolResolutionSource"], "configDefault");
     assert_eq!(json["preferredAccountId"], "acct-1");
     assert_eq!(json["predictedAccountId"], serde_json::Value::Null);
     assert_eq!(json["suppressed"], true);
@@ -584,6 +586,11 @@ async fn accounts_status_json_marks_migrated_effective_pool_and_account_source()
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "legacy-default");
     assert_eq!(json["effectivePoolSource"], "migrated");
+    assert_eq!(json["configuredPoolCount"], 0);
+    assert_eq!(json["registeredPoolCount"], 1);
+    assert_eq!(json["configuredDefaultPoolId"], serde_json::Value::Null);
+    assert_eq!(json["persistedDefaultPoolId"], "legacy-default");
+    assert_eq!(json["effectivePoolResolutionSource"], "persistedSelection");
     assert_eq!(json["predictedAccountId"], "acct-legacy");
 
     let accounts = json["accounts"].as_array().expect("accounts array");
@@ -591,6 +598,35 @@ async fn accounts_status_json_marks_migrated_effective_pool_and_account_source()
     assert_eq!(accounts[0]["accountId"], "acct-legacy");
     assert_eq!(accounts[0]["poolId"], "legacy-default");
     assert_eq!(accounts[0]["source"], "migrated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_distinguishes_configured_default_from_persisted_default() -> Result<()>
+{
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-other".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["configuredPoolCount"], 1);
+    assert_eq!(json["registeredPoolCount"], 2);
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["effectivePoolSource"], serde_json::Value::Null);
+    assert_eq!(json["configuredDefaultPoolId"], "team-main");
+    assert_eq!(json["persistedDefaultPoolId"], "team-other");
+    assert_eq!(json["effectivePoolResolutionSource"], "configDefault");
 
     Ok(())
 }
@@ -988,6 +1024,9 @@ async fn accounts_status_accepts_account_pool_override_without_persisting_it() -
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
     assert_eq!(json["effectivePoolId"], "team-other");
     assert_eq!(json["accountPoolOverrideId"], "team-other");
+    assert_eq!(json["effectivePoolResolutionSource"], "override");
+    assert_eq!(json["configuredDefaultPoolId"], "team-main");
+    assert_eq!(json["persistedDefaultPoolId"], "team-main");
     assert_eq!(json["healthState"], "healthy");
     assert_eq!(json["predictedAccountId"], "acct-other");
     assert_eq!(json["switchReason"]["code"], "automaticAccountSelected");

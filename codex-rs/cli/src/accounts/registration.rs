@@ -1,4 +1,4 @@
-use super::diagnostics::read_current_diagnostic;
+use super::diagnostics::read_accounts_startup_status;
 use anyhow::Context;
 use codex_account_pool::AccountPoolConfig;
 use codex_account_pool::AccountPoolControlPlane;
@@ -173,10 +173,13 @@ async fn add_chatgpt_account_with_dependencies(
     control_plane: &impl AddRegistrationControlPlane,
     finalizer: &impl PendingRegistrationFinalizer,
 ) -> anyhow::Result<RegisteredAddAccount> {
-    let diagnostic = read_current_diagnostic(runtime.as_ref(), config, account_pool_override)
+    let startup_status = read_accounts_startup_status(runtime, config, account_pool_override)
         .await
         .context("resolve current account pool")?;
-    let Some(pool_id) = diagnostic.preview.effective_pool_id else {
+    let should_persist_startup_default =
+        startup_status.startup.configured_default_pool_id.is_none()
+            && startup_status.startup.persisted_default_pool_id.is_none();
+    let Some(pool_id) = startup_status.startup.preview.effective_pool_id else {
         anyhow::bail!(
             "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
         );
@@ -339,6 +342,17 @@ async fn add_chatgpt_account_with_dependencies(
             }
         }
         return Err(err);
+    }
+
+    if should_persist_startup_default {
+        runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some(pool_id.clone()),
+                preferred_account_id: None,
+                suppressed: false,
+            })
+            .await
+            .context("record first durable account pool selection")?;
     }
 
     Ok(RegisteredAddAccount {
@@ -587,6 +601,73 @@ mod tests {
 
         assert_eq!(result.pool_id, "team-other");
         assert_eq!(result.provider_account_id, "provider-acct-new");
+        assert_eq!(
+            harness.runtime.read_account_startup_selection().await?,
+            AccountStartupSelectionState {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_persists_startup_default_when_override_is_first_durable_default()
+    -> Result<()> {
+        let harness = RegistrationHarness::without_configured_pool().await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            Some("team-other"),
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.pool_id, "team-other");
+        assert_eq!(
+            harness.runtime.read_account_startup_selection().await?,
+            AccountStartupSelectionState {
+                default_pool_id: Some("team-other".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_does_not_override_existing_persisted_default() -> Result<()> {
+        let harness = RegistrationHarness::without_configured_pool().await?;
+        harness
+            .runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            Some("team-other"),
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.pool_id, "team-other");
         assert_eq!(
             harness.runtime.read_account_startup_selection().await?,
             AccountStartupSelectionState {

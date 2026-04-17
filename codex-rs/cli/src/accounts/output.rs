@@ -6,6 +6,7 @@ use codex_state::AccountPoolDiagnostic;
 use codex_state::AccountSource;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
+use codex_state::EffectivePoolResolutionSource;
 
 struct EligibilityView {
     code: &'static str,
@@ -13,10 +14,10 @@ struct EligibilityView {
 }
 
 pub(crate) fn print_current_text(diagnostic: &AccountsCurrentDiagnostic) {
-    print_preview(&diagnostic.preview);
+    print_preview(&diagnostic.startup.startup.preview);
     println!(
         "automatic selection: {}",
-        if diagnostic.preview.suppressed {
+        if diagnostic.startup.startup.preview.suppressed {
             "suppressed"
         } else {
             "enabled"
@@ -25,15 +26,20 @@ pub(crate) fn print_current_text(diagnostic: &AccountsCurrentDiagnostic) {
 }
 
 pub(crate) fn print_current_json(diagnostic: &AccountsCurrentDiagnostic) -> anyhow::Result<()> {
+    let startup = &diagnostic.startup.startup;
+    let preview = &startup.preview;
     let output = serde_json::to_string_pretty(&serde_json::json!({
         "accountPoolOverrideId": diagnostic.account_pool_override_id.as_deref(),
-        "effectivePoolId": diagnostic.preview.effective_pool_id.as_deref(),
-        "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
-        "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
-        "suppressed": diagnostic.preview.suppressed,
+        "effectivePoolId": preview.effective_pool_id.as_deref(),
+        "effectivePoolResolutionSource": effective_pool_resolution_source_to_wire_string(
+            startup.effective_pool_resolution_source
+        ),
+        "preferredAccountId": preview.preferred_account_id.as_deref(),
+        "predictedAccountId": preview.predicted_account_id.as_deref(),
+        "suppressed": preview.suppressed,
         "eligibility": {
-            "code": eligibility_code(&diagnostic.preview.eligibility),
-            "reason": eligibility_reason(&diagnostic.preview.eligibility),
+            "code": eligibility_code(&preview.eligibility),
+            "reason": eligibility_reason(&preview.eligibility),
         },
     }))?;
     println!("{output}");
@@ -41,20 +47,41 @@ pub(crate) fn print_current_json(diagnostic: &AccountsCurrentDiagnostic) -> anyh
 }
 
 pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
+    let startup = &diagnostic.startup.startup;
+    let preview = &startup.preview;
     println!(
         "suppression: {}",
-        if diagnostic.preview.suppressed {
+        if preview.suppressed {
             "enabled"
         } else {
             "disabled"
         }
     );
-    print_status_preview(&diagnostic.preview, effective_pool_source(diagnostic));
+    print_status_preview(preview, effective_pool_source(diagnostic));
     println!(
         "health state: {}",
-        status_health_state(&diagnostic.preview, diagnostic.pool.as_ref()).unwrap_or("unknown")
+        status_health_state(preview, diagnostic.pool.as_ref()).unwrap_or("unknown")
     );
     println!("configured pools: {}", diagnostic.configured_pool_count);
+    println!("registered pools: {}", diagnostic.registered_pool_count);
+    println!(
+        "configured default pool: {}",
+        startup
+            .configured_default_pool_id
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "persisted default pool: {}",
+        startup
+            .persisted_default_pool_id
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "effective pool resolution: {}",
+        effective_pool_resolution_source_to_wire_string(startup.effective_pool_resolution_source)
+    );
 
     if let Some(account_pool_override_id) = diagnostic.account_pool_override_id.as_deref() {
         println!("account pool override: {account_pool_override_id}");
@@ -66,7 +93,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
             format_optional_timestamp(pool.next_eligible_at.as_ref())
         );
         for account in &pool.accounts {
-            let eligibility = normalized_account_eligibility(account, &diagnostic.preview);
+            let eligibility = normalized_account_eligibility(account, preview);
             println!(
                 "account {}: enabled={}, health={}, eligibility={}, next eligible at={}{}",
                 account.account_id,
@@ -81,18 +108,26 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
 }
 
 pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow::Result<()> {
+    let startup = &diagnostic.startup.startup;
+    let preview = &startup.preview;
     let output = serde_json::to_string_pretty(&serde_json::json!({
         "accountPoolOverrideId": diagnostic.account_pool_override_id.as_deref(),
         "configuredPoolCount": diagnostic.configured_pool_count,
-        "effectivePoolId": diagnostic.preview.effective_pool_id.as_deref(),
+        "registeredPoolCount": diagnostic.registered_pool_count,
+        "effectivePoolId": preview.effective_pool_id.as_deref(),
         "effectivePoolSource": effective_pool_source(diagnostic).map(AccountSource::as_str),
-        "preferredAccountId": diagnostic.preview.preferred_account_id.as_deref(),
-        "predictedAccountId": diagnostic.preview.predicted_account_id.as_deref(),
-        "suppressed": diagnostic.preview.suppressed,
-        "healthState": status_health_state(&diagnostic.preview, diagnostic.pool.as_ref()),
+        "effectivePoolResolutionSource": effective_pool_resolution_source_to_wire_string(
+            startup.effective_pool_resolution_source
+        ),
+        "configuredDefaultPoolId": startup.configured_default_pool_id.as_deref(),
+        "persistedDefaultPoolId": startup.persisted_default_pool_id.as_deref(),
+        "preferredAccountId": preview.preferred_account_id.as_deref(),
+        "predictedAccountId": preview.predicted_account_id.as_deref(),
+        "suppressed": preview.suppressed,
+        "healthState": status_health_state(preview, diagnostic.pool.as_ref()),
         "switchReason": {
-            "code": eligibility_code(&diagnostic.preview.eligibility),
-            "reason": eligibility_reason(&diagnostic.preview.eligibility),
+            "code": eligibility_code(&preview.eligibility),
+            "reason": eligibility_reason(&preview.eligibility),
         },
         "nextEligibleAt": diagnostic
             .pool
@@ -106,7 +141,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                     .iter()
                     .map(|account| {
                         let eligibility =
-                            normalized_account_eligibility(account, &diagnostic.preview);
+                            normalized_account_eligibility(account, preview);
                         serde_json::json!({
                             "accountId": &account.account_id,
                             "poolId": &account.pool_id,
@@ -260,16 +295,27 @@ fn status_health_state(
 }
 
 fn effective_pool_source(diagnostic: &AccountsStatusDiagnostic) -> Option<AccountSource> {
-    let selected_account_id = diagnostic
-        .preview
+    let preview = &diagnostic.startup.startup.preview;
+    let selected_account_id = preview
         .preferred_account_id
         .as_deref()
-        .or(diagnostic.preview.predicted_account_id.as_deref())?;
+        .or(preview.predicted_account_id.as_deref())?;
     let pool = diagnostic.pool.as_ref()?;
     pool.accounts
         .iter()
         .find(|account| account.account_id == selected_account_id)
         .and_then(|account| account.source)
+}
+
+fn effective_pool_resolution_source_to_wire_string(
+    source: EffectivePoolResolutionSource,
+) -> &'static str {
+    match source {
+        EffectivePoolResolutionSource::Override => "override",
+        EffectivePoolResolutionSource::ConfigDefault => "configDefault",
+        EffectivePoolResolutionSource::PersistedSelection => "persistedSelection",
+        EffectivePoolResolutionSource::None => "none",
+    }
 }
 
 fn source_suffix(source: Option<AccountSource>) -> String {

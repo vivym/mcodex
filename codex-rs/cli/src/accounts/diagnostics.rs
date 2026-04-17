@@ -1,48 +1,54 @@
+use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::SharedStartupStatus;
+use codex_account_pool::read_shared_startup_status;
 use codex_core::config::Config;
 use codex_state::AccountPoolDiagnostic;
-use codex_state::AccountStartupSelectionPreview;
 use codex_state::StateRuntime;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub(crate) struct AccountsCurrentDiagnostic {
     pub account_pool_override_id: Option<String>,
-    pub preview: AccountStartupSelectionPreview,
+    pub startup: SharedStartupStatus,
 }
 
 pub(crate) struct AccountsStatusDiagnostic {
     pub account_pool_override_id: Option<String>,
     pub configured_pool_count: usize,
-    pub preview: AccountStartupSelectionPreview,
+    pub registered_pool_count: usize,
+    pub startup: SharedStartupStatus,
     pub pool: Option<AccountPoolDiagnostic>,
 }
 
 pub(crate) async fn read_current_diagnostic(
-    runtime: &StateRuntime,
+    runtime: &Arc<StateRuntime>,
     config: &Config,
     account_pool_override_id: Option<&str>,
 ) -> anyhow::Result<AccountsCurrentDiagnostic> {
     Ok(AccountsCurrentDiagnostic {
         account_pool_override_id: account_pool_override_id.map(ToOwned::to_owned),
-        preview: runtime
-            .preview_account_startup_selection(configured_default_pool_id(
-                config,
-                account_pool_override_id,
-            ))
-            .await?,
+        startup: read_accounts_startup_status(runtime, config, account_pool_override_id).await?,
     })
 }
 
 pub(crate) async fn read_status_diagnostic(
-    runtime: &StateRuntime,
+    runtime: &Arc<StateRuntime>,
     config: &Config,
     account_pool_override_id: Option<&str>,
 ) -> anyhow::Result<AccountsStatusDiagnostic> {
     let current = read_current_diagnostic(runtime, config, account_pool_override_id).await?;
-    let pool = match current.preview.effective_pool_id.as_deref() {
+    let pool = match current.startup.startup.preview.effective_pool_id.as_deref() {
         Some(pool_id) => Some(
             runtime
                 .read_account_pool_diagnostic(
                     pool_id,
-                    current.preview.preferred_account_id.as_deref(),
+                    current
+                        .startup
+                        .startup
+                        .preview
+                        .preferred_account_id
+                        .as_deref(),
                 )
                 .await?,
         ),
@@ -52,21 +58,41 @@ pub(crate) async fn read_status_diagnostic(
     Ok(AccountsStatusDiagnostic {
         account_pool_override_id: current.account_pool_override_id,
         configured_pool_count: configured_pool_count(config),
-        preview: current.preview,
+        registered_pool_count: registered_pool_count(runtime).await?,
+        startup: current.startup,
         pool,
     })
 }
 
-fn configured_default_pool_id<'a>(
-    config: &'a Config,
-    account_pool_override_id: Option<&'a str>,
-) -> Option<&'a str> {
-    account_pool_override_id.or_else(|| {
-        config
-            .accounts
-            .as_ref()
-            .and_then(|accounts| accounts.default_pool.as_deref())
-    })
+pub(crate) async fn read_accounts_startup_status(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    account_pool_override_id: Option<&str>,
+) -> anyhow::Result<SharedStartupStatus> {
+    let lease_ttl_secs = config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.lease_ttl_secs)
+        .unwrap_or(AccountPoolConfig::default().lease_ttl_secs);
+    let lease_ttl = AccountPoolConfig {
+        lease_ttl_secs,
+        ..AccountPoolConfig::default()
+    }
+    .lease_ttl_duration();
+    let backend = LocalAccountPoolBackend::new(Arc::clone(runtime), lease_ttl);
+    read_shared_startup_status(
+        &backend,
+        configured_default_pool_id(config),
+        account_pool_override_id,
+    )
+    .await
+}
+
+fn configured_default_pool_id(config: &Config) -> Option<&str> {
+    config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.default_pool.as_deref())
 }
 
 fn configured_pool_count(config: &Config) -> usize {
@@ -75,4 +101,14 @@ fn configured_pool_count(config: &Config) -> usize {
         .as_ref()
         .and_then(|accounts| accounts.pools.as_ref())
         .map_or(0, std::collections::HashMap::len)
+}
+
+async fn registered_pool_count(runtime: &StateRuntime) -> anyhow::Result<usize> {
+    Ok(runtime
+        .list_account_pool_memberships(None)
+        .await?
+        .into_iter()
+        .map(|membership| membership.pool_id)
+        .collect::<HashSet<_>>()
+        .len())
 }
