@@ -13,6 +13,7 @@ pub(crate) struct StatusAccountLeaseDisplay {
     pub(crate) account_id: Option<String>,
     pub(crate) status: String,
     pub(crate) note: Option<String>,
+    pub(crate) proactive_switch_allowed_at: Option<String>,
     pub(crate) next_eligible_at: Option<String>,
     pub(crate) remote_reset: Option<String>,
 }

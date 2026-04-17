@@ -871,6 +871,8 @@ fn status_account_lease_display_from_response(
     response: AccountLeaseReadResponse,
     captured_at: chrono::DateTime<Local>,
 ) -> Option<StatusAccountLeaseDisplay> {
+    let has_proactive_switch_note = response.proactive_switch_pending == Some(true)
+        && response.proactive_switch_suppressed == Some(true);
     let has_visible_state = response.active
         || response.suppressed
         || response.pool_id.is_some()
@@ -880,11 +882,17 @@ fn status_account_lease_display_from_response(
         || response.suppression_reason.is_some()
         || response.transport_reset_generation.is_some()
         || response.last_remote_context_reset_turn_id.is_some()
+        || has_proactive_switch_note
+        || response.proactive_switch_allowed_at.is_some()
         || response.next_eligible_at.is_some();
     if !has_visible_state {
         return None;
     }
 
+    let proactive_switch_allowed_at = response
+        .proactive_switch_allowed_at
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .map(|dt| format_reset_timestamp(dt, captured_at));
     let next_eligible_at = response
         .next_eligible_at
         .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
@@ -906,6 +914,8 @@ fn status_account_lease_display_from_response(
         Some(health) if !response.suppressed => format!("{status_primary} · {health}"),
         Some(_) | None => status_primary.to_string(),
     };
+    let proactive_switch_note = has_proactive_switch_note
+        .then(|| "Automatic switch held by minimum switch interval".to_string());
 
     Some(StatusAccountLeaseDisplay {
         pool_id: response.pool_id,
@@ -920,7 +930,9 @@ fn status_account_lease_display_from_response(
                     .switch_reason
                     .as_deref()
                     .map(account_lease_reason_text)
-            }),
+            })
+            .or(proactive_switch_note),
+        proactive_switch_allowed_at,
         next_eligible_at,
         remote_reset: account_lease_remote_reset_text(
             response.transport_reset_generation,
@@ -1658,11 +1670,16 @@ mod tests {
                 pool_id: None,
                 lease_id: None,
                 lease_epoch: None,
+                lease_acquired_at: None,
                 health_state: None,
                 switch_reason: None,
                 suppression_reason: None,
                 transport_reset_generation: None,
                 last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
                 next_eligible_at: None,
             },
             captured_at,
@@ -1685,11 +1702,16 @@ mod tests {
                 pool_id: Some("legacy-default".to_string()),
                 lease_id: None,
                 lease_epoch: None,
+                lease_acquired_at: None,
                 health_state: Some("busy".to_string()),
                 switch_reason: Some("automaticAccountSelected".to_string()),
                 suppression_reason: None,
                 transport_reset_generation: Some(2),
                 last_remote_context_reset_turn_id: Some("turn-17".to_string()),
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
                 next_eligible_at: Some(
                     (captured_at + chrono::Duration::days(1))
                         .with_timezone(&chrono::Utc)
@@ -1706,10 +1728,90 @@ mod tests {
                 account_id: Some("acct-2".to_string()),
                 status: "Cooling down · Busy".to_string(),
                 note: Some("Automatic selection in use".to_string()),
+                proactive_switch_allowed_at: None,
                 next_eligible_at: Some("03:04 on 11 Apr".to_string()),
                 remote_reset: Some("gen 2 after turn turn-17".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn status_account_lease_display_from_response_formats_damped_proactive_switch() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: true,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: Some(captured_at.with_timezone(&chrono::Utc).timestamp()),
+                health_state: Some("healthy".to_string()),
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: Some(600),
+                proactive_switch_pending: Some(true),
+                proactive_switch_suppressed: Some(true),
+                proactive_switch_allowed_at: Some(
+                    (captured_at + chrono::Duration::minutes(20))
+                        .with_timezone(&chrono::Utc)
+                        .timestamp(),
+                ),
+                next_eligible_at: None,
+            },
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Active · Healthy".to_string(),
+                note: Some("Automatic switch held by minimum switch interval".to_string()),
+                proactive_switch_allowed_at: Some("03:24".to_string()),
+                next_eligible_at: None,
+                remote_reset: None,
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_from_response_hides_inert_damping_metadata() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: None,
+                pool_id: None,
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: Some(captured_at.with_timezone(&chrono::Utc).timestamp()),
+                health_state: None,
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: Some(600),
+                proactive_switch_pending: Some(false),
+                proactive_switch_suppressed: Some(false),
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+            },
+            captured_at,
+        );
+
+        assert_eq!(display, None);
     }
 
     #[test]
@@ -1726,11 +1828,16 @@ mod tests {
                 pool_id: Some("legacy-default".to_string()),
                 lease_id: None,
                 lease_epoch: None,
+                lease_acquired_at: None,
                 health_state: Some("healthy".to_string()),
                 switch_reason: Some("nonReplayableTurn".to_string()),
                 suppression_reason: None,
                 transport_reset_generation: None,
                 last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
                 next_eligible_at: Some(
                     (captured_at + chrono::Duration::minutes(20))
                         .with_timezone(&chrono::Utc)
@@ -1750,6 +1857,7 @@ mod tests {
                     "Current turn was not replayed; future turns will use the next eligible account"
                         .to_string(),
                 ),
+                proactive_switch_allowed_at: None,
                 next_eligible_at: Some("03:24".to_string()),
                 remote_reset: None,
             })
