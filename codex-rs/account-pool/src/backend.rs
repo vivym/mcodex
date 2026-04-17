@@ -7,6 +7,7 @@ use codex_login::ChatgptManagedRegistrationTokens;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
 use codex_state::AccountStartupSelectionState;
+use codex_state::AccountStartupStatus;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
 use codex_state::RegisteredAccountRecord;
@@ -54,6 +55,12 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
 
     /// Read persisted startup selection state.
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState>;
+
+    /// Read startup selection facts annotated with effective source metadata.
+    async fn read_account_startup_status(
+        &self,
+        configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupStatus>;
 }
 
 /// Control-plane backend for pooled account registration and deletion.

@@ -21,6 +21,8 @@ pub use account_pool::AccountStartupEligibility;
 pub use account_pool::AccountStartupSelectionPreview;
 pub use account_pool::AccountStartupSelectionState;
 pub use account_pool::AccountStartupSelectionUpdate;
+pub use account_pool::AccountStartupStatus;
+pub use account_pool::EffectivePoolResolutionSource;
 pub use account_pool::LeaseKey;
 pub use account_pool::LeaseRenewal;
 pub use account_pool::LegacyAccountImport;

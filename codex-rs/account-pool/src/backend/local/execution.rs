@@ -9,6 +9,7 @@ use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
 use codex_state::AccountStartupSelectionState;
+use codex_state::AccountStartupStatus;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
 use std::sync::Arc;
@@ -105,6 +106,15 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
 
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState> {
         self.runtime.read_account_startup_selection().await
+    }
+
+    async fn read_account_startup_status(
+        &self,
+        configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupStatus> {
+        self.runtime
+            .read_account_startup_status(configured_default_pool_id)
+            .await
     }
 }
 

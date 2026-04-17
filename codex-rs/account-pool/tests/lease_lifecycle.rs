@@ -15,6 +15,7 @@ use codex_account_pool::RateLimitSnapshot;
 use codex_account_pool::RegisteredAccountRegistration;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
+use codex_account_pool::read_shared_startup_status;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::ChatgptManagedRegistrationTokens;
@@ -22,6 +23,7 @@ use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
+use codex_state::EffectivePoolResolutionSource;
 use codex_state::LegacyAccountImport;
 use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
@@ -78,6 +80,58 @@ async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
     assert_eq!(
         result.expect("report stale health event"),
         HealthEventDisposition::IgnoredAsStale
+    );
+}
+
+#[tokio::test]
+async fn shared_startup_status_rejects_policy_only_config_without_local_selection() {
+    let harness = fixture_with_legacy_auth("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+
+    let status = read_shared_startup_status(&backend, Some("configured-main"), None)
+        .await
+        .expect("read shared startup status");
+
+    assert_eq!(status.pooled_applicable, false);
+    assert_eq!(
+        status.startup.effective_pool_resolution_source,
+        EffectivePoolResolutionSource::ConfigDefault
+    );
+    assert_eq!(
+        status.startup.configured_default_pool_id.as_deref(),
+        Some("configured-main")
+    );
+    assert_eq!(status.startup.persisted_default_pool_id, None);
+}
+
+#[tokio::test]
+async fn shared_startup_status_treats_explicit_override_as_pooled_applicable() {
+    let harness = fixture_with_registered_account("acct-legacy").await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+
+    let status =
+        read_shared_startup_status(&backend, Some("configured-main"), Some("legacy-default"))
+            .await
+            .expect("read shared startup status");
+
+    assert_eq!(status.pooled_applicable, true);
+    assert_eq!(
+        status.startup.effective_pool_resolution_source,
+        EffectivePoolResolutionSource::Override
+    );
+    assert_eq!(
+        status.startup.configured_default_pool_id.as_deref(),
+        Some("configured-main")
+    );
+    assert_eq!(
+        status.startup.preview.effective_pool_id.as_deref(),
+        Some("legacy-default")
     );
 }
 

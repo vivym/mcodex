@@ -140,6 +140,22 @@ pub struct AccountStartupSelectionPreview {
     pub eligibility: AccountStartupEligibility,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectivePoolResolutionSource {
+    Override,
+    ConfigDefault,
+    PersistedSelection,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStartupStatus {
+    pub preview: AccountStartupSelectionPreview,
+    pub configured_default_pool_id: Option<String>,
+    pub persisted_default_pool_id: Option<String>,
+    pub effective_pool_resolution_source: EffectivePoolResolutionSource,
+}
+
 /// Eligibility result for fresh-runtime startup selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountStartupEligibility {

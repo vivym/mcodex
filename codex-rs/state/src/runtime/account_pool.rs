@@ -12,6 +12,8 @@ use crate::model::AccountStartupEligibility;
 use crate::model::AccountStartupSelectionPreview;
 use crate::model::AccountStartupSelectionState;
 use crate::model::AccountStartupSelectionUpdate;
+use crate::model::AccountStartupStatus;
+use crate::model::EffectivePoolResolutionSource;
 use crate::model::LeaseKey;
 use crate::model::LeaseRenewal;
 use crate::model::LegacyAccountImport;
@@ -861,6 +863,31 @@ WHERE singleton = 1
         })
     }
 
+    pub async fn read_account_startup_status(
+        &self,
+        configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupStatus> {
+        let persisted_default_pool_id =
+            self.read_account_startup_selection().await?.default_pool_id;
+        let preview = self
+            .preview_account_startup_selection(configured_default_pool_id)
+            .await?;
+        let effective_pool_resolution_source = if configured_default_pool_id.is_some() {
+            EffectivePoolResolutionSource::ConfigDefault
+        } else if persisted_default_pool_id.is_some() {
+            EffectivePoolResolutionSource::PersistedSelection
+        } else {
+            EffectivePoolResolutionSource::None
+        };
+
+        Ok(AccountStartupStatus {
+            preview,
+            configured_default_pool_id: configured_default_pool_id.map(ToOwned::to_owned),
+            persisted_default_pool_id,
+            effective_pool_resolution_source,
+        })
+    }
+
     pub async fn read_account_pool_membership(
         &self,
         account_id: &str,
@@ -1518,6 +1545,8 @@ mod tests {
     use crate::AccountSource;
     use crate::AccountStartupEligibility;
     use crate::AccountStartupSelectionPreview;
+    use crate::AccountStartupStatus;
+    use crate::EffectivePoolResolutionSource;
     use crate::LeaseRenewal;
     use crate::LegacyAccountImport;
     use crate::NewPendingAccountRegistration;
@@ -2682,6 +2711,40 @@ WHERE account_id = ?
                 suppressed: true,
                 predicted_account_id: None,
                 eligibility: crate::AccountStartupEligibility::Suppressed,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_status_prefers_configured_default_over_persisted_default() {
+        let runtime = test_runtime().await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("persisted-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        let status = runtime
+            .read_account_startup_status(Some("configured-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            AccountStartupStatus {
+                preview: AccountStartupSelectionPreview {
+                    effective_pool_id: Some("configured-main".to_string()),
+                    preferred_account_id: None,
+                    suppressed: false,
+                    predicted_account_id: None,
+                    eligibility: AccountStartupEligibility::NoEligibleAccount,
+                },
+                configured_default_pool_id: Some("configured-main".to_string()),
+                persisted_default_pool_id: Some("persisted-main".to_string()),
+                effective_pool_resolution_source: EffectivePoolResolutionSource::ConfigDefault,
             }
         );
     }

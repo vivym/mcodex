@@ -4,6 +4,7 @@ mod lease_lifecycle;
 mod manager;
 mod policy;
 mod selection;
+mod startup_status;
 mod types;
 
 pub use backend::AccountPoolBackend;
@@ -16,6 +17,8 @@ pub use bootstrap::NoLegacyAuthBootstrap;
 pub use manager::AccountPoolManager;
 pub use policy::select_startup_account;
 pub use selection::evaluate_context_reuse;
+pub use startup_status::SharedStartupStatus;
+pub use startup_status::read_shared_startup_status;
 pub use types::AccountKind;
 pub use types::AccountPoolConfig;
 pub use types::AccountRecord;
