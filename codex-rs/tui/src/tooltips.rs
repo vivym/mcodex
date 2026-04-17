@@ -3,9 +3,6 @@ use codex_protocol::account::PlanType;
 use lazy_static::lazy_static;
 use rand::Rng;
 
-const ANNOUNCEMENT_TIP_URL: &str =
-    "https://raw.githubusercontent.com/openai/codex/main/announcement_tip.toml";
-
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
@@ -120,10 +117,10 @@ fn pick_tooltip<R: Rng + ?Sized>(rng: &mut R) -> Option<&'static str> {
 }
 
 pub(crate) mod announcement {
-    use crate::tooltips::ANNOUNCEMENT_TIP_URL;
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
+    use codex_product_identity::MCODEX;
     use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
@@ -206,13 +203,17 @@ pub(crate) mod announcement {
     }
 
     fn blocking_init_announcement_tip() -> Option<String> {
+        let announcement_tip_url = format!(
+            "https://raw.githubusercontent.com/{}/{}/main/announcement_tip.toml",
+            MCODEX.github_repo_owner, MCODEX.github_repo_name
+        );
         // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .build()
             .ok()?;
         let response = client
-            .get(ANNOUNCEMENT_TIP_URL)
+            .get(announcement_tip_url)
             .timeout(Duration::from_millis(2000))
             .send()
             .ok()?;

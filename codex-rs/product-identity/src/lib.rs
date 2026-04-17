@@ -15,9 +15,12 @@ pub struct ProductIdentity {
     pub legacy_windows_admin_config_components: &'static [&'static str],
     pub github_repo_owner: &'static str,
     pub github_repo_name: &'static str,
+    pub repository_url: &'static str,
     pub release_api_url: &'static str,
     pub release_notes_url: &'static str,
     pub installer_dir_name: &'static str,
+    pub npm_package_name: &'static str,
+    pub homebrew_cask_token: &'static str,
     pub macos_managed_config_domain: &'static str,
     pub legacy_macos_managed_config_domain: &'static str,
 }
@@ -36,9 +39,12 @@ pub const MCODEX: ProductIdentity = ProductIdentity {
     legacy_windows_admin_config_components: &["OpenAI", "Codex"],
     github_repo_owner: "vivym",
     github_repo_name: "mcodex",
+    repository_url: "https://github.com/vivym/mcodex",
     release_api_url: "https://api.github.com/repos/vivym/mcodex/releases/latest",
     release_notes_url: "https://github.com/vivym/mcodex/releases/latest",
     installer_dir_name: "mcodex",
+    npm_package_name: "@vivym/mcodex",
+    homebrew_cask_token: "mcodex",
     macos_managed_config_domain: "com.vivym.mcodex",
     legacy_macos_managed_config_domain: "com.openai.codex",
 };
@@ -67,5 +73,8 @@ mod tests {
             MCODEX.legacy_macos_managed_config_domain,
             "com.openai.codex"
         );
+        assert_eq!(MCODEX.repository_url, "https://github.com/vivym/mcodex");
+        assert_eq!(MCODEX.npm_package_name, "@vivym/mcodex");
+        assert_eq!(MCODEX.homebrew_cask_token, "mcodex");
     }
 }

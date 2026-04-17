@@ -55,11 +55,12 @@ use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
 use codex_features::Stage;
 use codex_features::is_known_feature_key;
+use codex_product_identity::MCODEX;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::TerminalName;
 
-/// Codex CLI
+/// mcodex CLI
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
@@ -69,10 +70,10 @@ use codex_terminal_detection::TerminalName;
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
-    // `codex-x86_64-unknown-linux-musl`, but the help output should always use
-    // the generic `codex` command name that users run.
-    bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    // `mcodex-x86_64-unknown-linux-musl`, but the help output should always use
+    // the generic `mcodex` command name that users run.
+    bin_name = "mcodex",
+    override_usage = "mcodex [OPTIONS] [PROMPT]\n       mcodex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -310,7 +311,7 @@ struct LoginCommand {
 
     #[arg(
         long = "with-api-key",
-        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
+        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | mcodex login --with-api-key`)"
     )]
     with_api_key: bool,
 
@@ -509,7 +510,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
 fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     println!();
     let cmd_str = action.command_str();
-    println!("Updating Codex via `{cmd_str}`...");
+    println!("Updating {} via `{cmd_str}`...", MCODEX.product_name);
 
     let status = {
         #[cfg(windows)]
@@ -535,7 +536,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!("`{cmd_str}` failed with status {status}");
     }
-    println!("\n🎉 Update ran successfully! Please restart Codex.");
+    println!(
+        "\n🎉 Update ran successfully! Please restart {}.",
+        MCODEX.product_name
+    );
     Ok(())
 }
 
@@ -862,7 +866,7 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                         .await;
                     } else if login_cli.api_key.is_some() {
                         eprintln!(
-                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
+                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | mcodex login --with-api-key`."
                         );
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
@@ -1320,12 +1324,14 @@ fn reject_remote_mode_for_subcommand(
 ) -> anyhow::Result<()> {
     if let Some(remote) = remote {
         anyhow::bail!(
-            "`--remote {remote}` is only supported for interactive TUI commands, not `codex {subcommand}`"
+            "`--remote {remote}` is only supported for interactive TUI commands, not `{} {subcommand}`",
+            MCODEX.binary_name
         );
     }
     if remote_auth_token_env.is_some() {
         anyhow::bail!(
-            "`--remote-auth-token-env` is only supported for interactive TUI commands, not `codex {subcommand}`"
+            "`--remote-auth-token-env` is only supported for interactive TUI commands, not `{} {subcommand}`",
+            MCODEX.binary_name
         );
     }
     Ok(())
@@ -1534,8 +1540,12 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
 
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
-    let name = "codex";
-    generate(cmd.shell, &mut app, name, &mut std::io::stdout());
+    generate(
+        cmd.shell,
+        &mut app,
+        MCODEX.binary_name,
+        &mut std::io::stdout(),
+    );
 }
 
 #[cfg(test)]
@@ -1601,6 +1611,29 @@ mod tests {
         };
 
         finalize_fork_interactive(interactive, root_overrides, session_id, last, all, fork_cli)
+    }
+
+    #[test]
+    fn help_uses_mcodex_binary_name() {
+        let mut output = Vec::new();
+        MultitoolCli::command()
+            .write_long_help(&mut output)
+            .expect("render help");
+        let help = String::from_utf8(output).expect("help should be utf8");
+
+        assert!(help.contains("Usage: mcodex [OPTIONS] [PROMPT]"));
+        assert!(!help.contains("Usage: codex [OPTIONS] [PROMPT]"));
+    }
+
+    #[test]
+    fn login_help_uses_mcodex_api_key_hint() {
+        let mut output = Vec::new();
+        LoginCommand::command()
+            .write_long_help(&mut output)
+            .expect("render login help");
+        let help = String::from_utf8(output).expect("help should be utf8");
+
+        assert!(help.contains("mcodex login --with-api-key"));
     }
 
     #[test]
@@ -1724,7 +1757,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
+                "To continue this session, run mcodex resume 123e4567-e89b-12d3-a456-426614174000"
                     .to_string(),
             ]
         );
@@ -1752,7 +1785,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume my-thread".to_string(),
+                "To continue this session, run mcodex resume my-thread".to_string(),
             ]
         );
     }

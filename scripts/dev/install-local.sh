@@ -22,14 +22,14 @@ MCODEX_HOME_DEFAULT="$MCODEX_ROOT/home"
 INSTALL_BIN_DIR="$MCODEX_ROOT/bin"
 WRAPPER_DIR="${MCODEX_WRAPPER_DIR:-$HOME/.local/bin}"
 
-SOURCE_BINARY="$CODEX_RS_DIR/target/release/codex"
-INSTALLED_BINARY="$INSTALL_BIN_DIR/codex"
+SOURCE_BINARY="$CODEX_RS_DIR/target/release/mcodex"
+INSTALLED_BINARY="$INSTALL_BIN_DIR/mcodex"
 WRAPPER_PATH="$WRAPPER_DIR/mcodex"
 
-step "Building release codex binary"
+step "Building release mcodex binary"
 (
   cd "$CODEX_RS_DIR"
-  cargo build --release --bin codex
+  cargo build --release --bin mcodex
 )
 
 step "Installing local mcodex binary to $INSTALL_BIN_DIR"
@@ -47,7 +47,7 @@ set -eu
 
 MCODEX_ROOT="\${MCODEX_ROOT:-$MCODEX_ROOT}"
 MCODEX_HOME="\${MCODEX_HOME:-\${MCODEX_ROOT}/home}"
-MCODEX_BIN="\${MCODEX_BIN:-\${MCODEX_ROOT}/bin/codex}"
+MCODEX_BIN="\${MCODEX_BIN:-\${MCODEX_ROOT}/bin/mcodex}"
 
 if [ ! -x "\$MCODEX_BIN" ]; then
   printf '%s\n' "mcodex binary not found at \$MCODEX_BIN; run $REPO_ROOT/scripts/dev/install-local.sh again." >&2
@@ -55,7 +55,7 @@ if [ ! -x "\$MCODEX_BIN" ]; then
 fi
 
 mkdir -p "\$MCODEX_HOME"
-export CODEX_HOME="\$MCODEX_HOME"
+export MCODEX_HOME="\$MCODEX_HOME"
 
 exec "\$MCODEX_BIN" "\$@"
 EOF

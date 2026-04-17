@@ -1705,6 +1705,7 @@ dependencies = [
  "codex-login",
  "codex-mcp",
  "codex-mcp-server",
+ "codex-product-identity",
  "codex-protocol",
  "codex-responses-api-proxy",
  "codex-rmcp-client",

@@ -2208,7 +2208,7 @@ impl App {
     }
 
     /// Intercept composer-history operations and handle them locally against
-    /// `$CODEX_HOME/history.jsonl`, bypassing the app-server RPC layer.
+    /// `$MCODEX_HOME/history.jsonl`, bypassing the app-server RPC layer.
     async fn try_handle_local_history_op(
         &mut self,
         thread_id: ThreadId,

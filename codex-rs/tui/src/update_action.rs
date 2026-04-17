@@ -1,11 +1,13 @@
+use codex_product_identity::MCODEX;
+
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// Update via `npm install -g @openai/codex@latest`.
+    /// Update via npm.
     NpmGlobalLatest,
-    /// Update via `bun install -g @openai/codex@latest`.
+    /// Update via bun.
     BunGlobalLatest,
-    /// Update via `brew upgrade codex`.
+    /// Update via Homebrew.
     BrewUpgrade,
 }
 
@@ -13,9 +15,11 @@ impl UpdateAction {
     /// Returns the list of command-line arguments for invoking the update.
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
-            UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
+            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", MCODEX.npm_package_name]),
+            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", MCODEX.npm_package_name]),
+            UpdateAction::BrewUpgrade => {
+                ("brew", &["upgrade", "--cask", MCODEX.homebrew_cask_token])
+            }
         }
     }
 
@@ -111,6 +115,22 @@ mod tests {
                 /*managed_by_bun*/ false
             ),
             Some(UpdateAction::BrewUpgrade)
+        );
+    }
+
+    #[test]
+    fn update_commands_use_mcodex_identity() {
+        assert_eq!(
+            UpdateAction::NpmGlobalLatest.command_str(),
+            "npm install -g @vivym/mcodex"
+        );
+        assert_eq!(
+            UpdateAction::BunGlobalLatest.command_str(),
+            "bun install -g @vivym/mcodex"
+        );
+        assert_eq!(
+            UpdateAction::BrewUpgrade.command_str(),
+            "brew upgrade --cask mcodex"
         );
     }
 }

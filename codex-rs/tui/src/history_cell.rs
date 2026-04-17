@@ -49,6 +49,7 @@ use codex_config::types::McpServerTransportConfig;
 #[cfg(test)]
 use codex_mcp::qualified_mcp_tool_name_prefix;
 use codex_otel::RuntimeMetricsSummary;
+use codex_product_identity::MCODEX;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ServiceTier;
 #[cfg(test)]
@@ -526,7 +527,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
         } else {
             line![
                 "See ",
-                "https://github.com/openai/codex".cyan().underlined(),
+                MCODEX.repository_url.cyan().underlined(),
                 " for installation options."
             ]
         };
@@ -541,9 +542,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             update_instruction,
             "",
             "See full release notes:",
-            "https://github.com/openai/codex/releases/latest"
-                .cyan()
-                .underlined(),
+            MCODEX.release_notes_url.cyan().underlined(),
         ];
 
         let inner_width = content
