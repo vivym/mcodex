@@ -71,6 +71,7 @@ async fn status_command_renders_pooled_lease_details() {
         account_id: Some("acct-2".to_string()),
         status: "Cooling down · Busy".to_string(),
         note: Some("Automatic selection in use".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24 on 11 Apr".to_string()),
         remote_reset: Some("gen 2 after turn turn-17".to_string()),
     });
@@ -105,6 +106,7 @@ async fn account_lease_updated_adds_automatic_switch_notice_when_account_changes
         account_id: Some("acct-1".to_string()),
         status: "Active · Healthy".to_string(),
         note: Some("Automatic selection in use".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         remote_reset: None,
     }));
@@ -115,6 +117,7 @@ async fn account_lease_updated_adds_automatic_switch_notice_when_account_changes
         account_id: Some("acct-2".to_string()),
         status: "Active · Healthy".to_string(),
         note: Some("Automatic selection in use".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         remote_reset: Some("gen 1 after turn turn-2".to_string()),
     }));
@@ -140,6 +143,7 @@ async fn account_lease_updated_adds_non_replayable_turn_notice() {
         account_id: Some("acct-1".to_string()),
         status: "Active · Healthy".to_string(),
         note: Some("Automatic selection in use".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         remote_reset: None,
     }));
@@ -153,6 +157,7 @@ async fn account_lease_updated_adds_non_replayable_turn_notice() {
             "Current turn was not replayed; future turns will use the next eligible account"
                 .to_string(),
         ),
+        proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24".to_string()),
         remote_reset: None,
     }));
@@ -178,6 +183,7 @@ async fn account_lease_updated_adds_no_eligible_account_error_notice() {
         account_id: Some("acct-1".to_string()),
         status: "Active · Healthy".to_string(),
         note: Some("Automatic selection in use".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         remote_reset: None,
     }));
@@ -188,6 +194,7 @@ async fn account_lease_updated_adds_no_eligible_account_error_notice() {
         account_id: None,
         status: "Waiting · Unavailable".to_string(),
         note: Some("No eligible account is available".to_string()),
+        proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24".to_string()),
         remote_reset: None,
     }));
@@ -202,6 +209,45 @@ async fn account_lease_updated_adds_no_eligible_account_error_notice() {
     assert!(
         rendered.contains("03:24"),
         "expected next eligible hint, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn status_command_renders_damped_account_lease_without_next_eligible_hint() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_lease_display = Some(StatusAccountLeaseDisplay {
+        pool_id: Some("team-main".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Active · Healthy".to_string(),
+        note: Some("Automatic switch held by minimum switch interval".to_string()),
+        proactive_switch_allowed_at: Some("03:24".to_string()),
+        next_eligible_at: None,
+        remote_reset: None,
+    });
+
+    chat.dispatch_command(SlashCommand::Status);
+
+    let rendered = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 80))
+        }
+        other => panic!("expected status output, got {other:?}"),
+    };
+    assert!(
+        rendered.contains("Lease note:"),
+        "expected lease note line, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Automatic switch held by minimum switch interval"),
+        "expected damping note, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("Can switch at:"),
+        "expected damping timestamp label, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Next eligible:"),
+        "damping should not reuse next eligible label, got: {rendered}"
     );
 }
 

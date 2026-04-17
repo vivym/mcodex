@@ -672,6 +672,14 @@ impl HistoryCell for StatusHistoryCell {
         if self
             .account_lease
             .as_ref()
+            .and_then(|lease| lease.proactive_switch_allowed_at.as_ref())
+            .is_some()
+        {
+            push_label(&mut labels, &mut seen, "Can switch at");
+        }
+        if self
+            .account_lease
+            .as_ref()
             .and_then(|lease| lease.next_eligible_at.as_ref())
             .is_some()
         {
@@ -754,6 +762,14 @@ impl HistoryCell for StatusHistoryCell {
             ));
             if let Some(note) = account_lease.note.as_ref() {
                 lines.push(formatter.line("Lease note", vec![Span::from(note.clone())]));
+            }
+            if let Some(proactive_switch_allowed_at) =
+                account_lease.proactive_switch_allowed_at.as_ref()
+            {
+                lines.push(formatter.line(
+                    "Can switch at",
+                    vec![Span::from(proactive_switch_allowed_at.clone())],
+                ));
             }
             if let Some(next_eligible_at) = account_lease.next_eligible_at.as_ref() {
                 lines.push(

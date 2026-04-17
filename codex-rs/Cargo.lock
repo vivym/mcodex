@@ -1919,6 +1919,7 @@ dependencies = [
  "bm25",
  "chrono",
  "clap",
+ "codex-account-pool",
  "codex-analytics",
  "codex-api",
  "codex-app-server-protocol",

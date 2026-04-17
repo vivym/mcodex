@@ -353,8 +353,8 @@ fn load_config_rejects_accounts_lease_safety_margin_not_less_than_lease_ttl() {
 }
 
 #[test]
-fn load_config_rejects_accounts_min_switch_interval_not_less_than_lease_ttl() {
-    let err = Config::load_from_base_config_with_overrides(
+fn load_config_allows_accounts_min_switch_interval_at_or_above_lease_ttl() {
+    let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
             accounts: Some(AccountsConfigToml {
                 lease_ttl_secs: Some(90),
@@ -366,13 +366,13 @@ fn load_config_rejects_accounts_min_switch_interval_not_less_than_lease_ttl() {
         ConfigOverrides::default(),
         tempdir().expect("tempdir").abs(),
     )
-    .expect_err("config should reject min_switch_interval_secs >= lease_ttl_secs");
+    .expect("config should allow min_switch_interval_secs >= lease_ttl_secs");
 
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string().contains(
-            "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs"
-        )
+    assert_eq!(
+        config
+            .accounts
+            .and_then(|accounts| accounts.min_switch_interval_secs),
+        Some(90)
     );
 }
 

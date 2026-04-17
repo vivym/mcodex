@@ -20,6 +20,10 @@ use anyhow::Context;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
+use codex_account_pool::ProactiveSwitchObservation;
+use codex_account_pool::ProactiveSwitchOutcome;
+use codex_account_pool::ProactiveSwitchSnapshot;
+use codex_account_pool::ProactiveSwitchState;
 use codex_analytics::AnalyticsEventsClient;
 use codex_config::types::AccountsConfigToml;
 use codex_exec_server::Environment;
@@ -107,11 +111,16 @@ pub struct AccountLeaseRuntimeSnapshot {
     pub pool_id: Option<String>,
     pub lease_id: Option<String>,
     pub lease_epoch: Option<i64>,
+    pub lease_acquired_at: Option<DateTime<Utc>>,
     pub health_state: Option<AccountHealthState>,
     pub switch_reason: Option<AccountLeaseRuntimeReason>,
     pub suppression_reason: Option<AccountLeaseRuntimeReason>,
     pub transport_reset_generation: Option<u64>,
     pub last_remote_context_reset_turn_id: Option<String>,
+    pub min_switch_interval_secs: Option<u64>,
+    pub proactive_switch_pending: Option<bool>,
+    pub proactive_switch_suppressed: Option<bool>,
+    pub proactive_switch_allowed_at: Option<DateTime<Utc>>,
     pub next_eligible_at: Option<DateTime<Utc>>,
 }
 
@@ -149,11 +158,18 @@ impl From<&AccountStartupEligibility> for AccountLeaseRuntimeReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRotation {
+    HardFailure,
+    SoftProactive,
+}
+
 pub(crate) struct AccountPoolManager {
     state_db: StateDbHandle,
     codex_home: PathBuf,
     default_pool_id: Option<String>,
     proactive_switch_threshold_percent: u8,
+    min_switch_interval: Duration,
     allow_context_reuse_by_pool_id: HashMap<String, bool>,
     lease_ttl: Duration,
     heartbeat_interval: StdDuration,
@@ -161,7 +177,9 @@ pub(crate) struct AccountPoolManager {
     active_lease: Option<ActiveAccountLease>,
     next_health_event_sequence: i64,
     previous_turn_account_id: Option<String>,
-    rotate_on_next_turn: bool,
+    proactive_switch_state: ProactiveSwitchState,
+    pending_rotation: Option<PendingRotation>,
+    last_proactively_replaced_account_id: Option<String>,
     switch_reason: Option<AccountLeaseRuntimeReason>,
     suppression_reason: Option<AccountLeaseRuntimeReason>,
     transport_reset_generation: u64,
@@ -172,6 +190,8 @@ pub(crate) struct AccountPoolManagerSnapshotSeed {
     state_db: StateDbHandle,
     holder_instance_id: String,
     active_lease: Option<AccountLeaseRecord>,
+    min_switch_interval_secs: u64,
+    proactive_switch_snapshot: Option<ProactiveSwitchSnapshot>,
     switch_reason: Option<AccountLeaseRuntimeReason>,
     suppression_reason: Option<AccountLeaseRuntimeReason>,
     transport_reset_generation: u64,
@@ -206,6 +226,7 @@ impl AccountPoolManager {
             .collect();
         let proactive_switch_threshold_percent =
             accounts.proactive_switch_threshold_percent.unwrap_or(85);
+        let min_switch_interval_secs = accounts.min_switch_interval_secs.unwrap_or(0);
         let lease_ttl_secs = accounts.lease_ttl_secs.unwrap_or(300);
         let default_heartbeat_interval_secs = (lease_ttl_secs / 3).max(1);
         let max_heartbeat_interval_secs = lease_ttl_secs.saturating_sub(1).max(1);
@@ -219,6 +240,7 @@ impl AccountPoolManager {
             codex_home,
             default_pool_id,
             proactive_switch_threshold_percent,
+            min_switch_interval: Duration::seconds(min_switch_interval_secs as i64),
             allow_context_reuse_by_pool_id,
             lease_ttl: Duration::seconds(lease_ttl_secs as i64),
             heartbeat_interval: StdDuration::from_secs(heartbeat_interval_secs),
@@ -226,7 +248,9 @@ impl AccountPoolManager {
             active_lease: None,
             next_health_event_sequence: 0,
             previous_turn_account_id: None,
-            rotate_on_next_turn: false,
+            proactive_switch_state: ProactiveSwitchState::default(),
+            pending_rotation: None,
+            last_proactively_replaced_account_id: None,
             switch_reason: None,
             suppression_reason: None,
             transport_reset_generation: 0,
@@ -235,11 +259,24 @@ impl AccountPoolManager {
     }
 
     pub(crate) async fn prepare_turn(&mut self) -> anyhow::Result<Option<TurnAccountSelection>> {
-        let rotating_for_health_event = self.rotate_on_next_turn;
+        let now = Utc::now();
+        let _ = self.proactive_switch_state.revalidate_before_turn(now);
         self.switch_reason = None;
-        if self.rotate_on_next_turn {
+        let pending_rotation = self.pending_rotation.take();
+        let rotation_context = pending_rotation.and_then(|pending_rotation| {
+            self.active_lease.as_ref().map(|active_lease| {
+                (
+                    pending_rotation,
+                    active_lease.record.pool_id.clone(),
+                    active_lease.record.account_id.clone(),
+                )
+            })
+        });
+        if let Some(pending_rotation) = pending_rotation {
             self.release_active_lease().await?;
-            self.rotate_on_next_turn = false;
+            if pending_rotation == PendingRotation::HardFailure {
+                self.last_proactively_replaced_account_id = None;
+            }
         }
 
         self.renew_active_lease().await?;
@@ -257,21 +294,26 @@ impl AccountPoolManager {
                 return Ok(None);
             };
             let selection_reason = AccountLeaseRuntimeReason::from(&startup_preview.eligibility);
-            if rotating_for_health_event
-                && matches!(
-                    startup_preview.eligibility,
-                    AccountStartupEligibility::Suppressed
-                )
-            {
-                self.suppression_reason = Some(selection_reason);
-                return Ok(None);
-            }
-            let lease_result = if rotating_for_health_event {
-                self.state_db
-                    .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
-                    .await
-            } else {
-                match (
+            let lease_result = match rotation_context.as_ref() {
+                Some((_, _, _))
+                    if matches!(
+                        startup_preview.eligibility,
+                        AccountStartupEligibility::Suppressed
+                    ) =>
+                {
+                    self.suppression_reason = Some(selection_reason);
+                    return Ok(None);
+                }
+                Some((PendingRotation::HardFailure, _, _)) => {
+                    self.state_db
+                        .acquire_account_lease(&pool_id, &self.holder_instance_id, self.lease_ttl)
+                        .await
+                }
+                Some((PendingRotation::SoftProactive, _, current_account_id)) => {
+                    self.acquire_proactively_rotated_lease(&pool_id, current_account_id)
+                        .await
+                }
+                None => match (
                     startup_preview.predicted_account_id.as_deref(),
                     &startup_preview.eligibility,
                 ) {
@@ -319,7 +361,7 @@ impl AccountPoolManager {
                             "startup-selection preview did not include a predicted account"
                         ));
                     }
-                }
+                },
             };
             match lease_result {
                 Ok(lease) => {
@@ -330,6 +372,13 @@ impl AccountPoolManager {
                         .await?
                         .unwrap_or(0);
                     self.suppression_reason = None;
+                    if let Some((PendingRotation::SoftProactive, _, current_account_id)) =
+                        rotation_context.as_ref()
+                        && lease.account_id != *current_account_id
+                    {
+                        self.last_proactively_replaced_account_id =
+                            Some(current_account_id.clone());
+                    }
                     if self
                         .previous_turn_account_id
                         .as_deref()
@@ -375,10 +424,16 @@ impl AccountPoolManager {
     }
 
     pub(crate) fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
+        let proactive_switch_snapshot = self.active_lease.as_ref().map(|_| {
+            let mut proactive_switch_state = self.proactive_switch_state.clone();
+            proactive_switch_state.snapshot(Utc::now())
+        });
         AccountPoolManagerSnapshotSeed {
             state_db: Arc::clone(&self.state_db),
             holder_instance_id: self.holder_instance_id.clone(),
             active_lease: self.active_lease.as_ref().map(|lease| lease.record.clone()),
+            min_switch_interval_secs: self.min_switch_interval.num_seconds().max(0) as u64,
+            proactive_switch_snapshot,
             switch_reason: self.switch_reason,
             suppression_reason: self.suppression_reason,
             transport_reset_generation: self.transport_reset_generation,
@@ -412,6 +467,9 @@ impl AccountPoolManager {
                     self.clear_auth_marker(&active_lease.record).await?;
                     self.active_lease = None;
                     self.next_health_event_sequence = 0;
+                    self.proactive_switch_state.reset();
+                    self.pending_rotation = None;
+                    self.last_proactively_replaced_account_id = None;
                 }
             }
         }
@@ -419,18 +477,42 @@ impl AccountPoolManager {
     }
 
     pub(crate) async fn release_for_shutdown(&mut self) -> anyhow::Result<()> {
-        self.release_active_lease().await
+        self.release_active_lease().await?;
+        self.pending_rotation = None;
+        self.last_proactively_replaced_account_id = None;
+        Ok(())
     }
 
     pub(crate) async fn report_rate_limits(
         &mut self,
         snapshot: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
-        if snapshot.primary.as_ref().is_some_and(|window| {
-            window.used_percent >= f64::from(self.proactive_switch_threshold_percent)
-        }) {
-            self.record_health_event(AccountHealthState::RateLimited, Utc::now())
-                .await?;
+        let Some(window) = snapshot.primary.as_ref() else {
+            return Ok(());
+        };
+        if window.used_percent < f64::from(self.proactive_switch_threshold_percent) {
+            self.proactive_switch_state.reset();
+            if matches!(self.pending_rotation, Some(PendingRotation::SoftProactive)) {
+                self.pending_rotation = None;
+            }
+            return Ok(());
+        }
+        let Some(active_lease) = self.active_lease.as_ref() else {
+            return Ok(());
+        };
+        match self
+            .proactive_switch_state
+            .observe_soft_pressure(ProactiveSwitchObservation {
+                lease_acquired_at: active_lease.record.acquired_at,
+                observed_at: Utc::now(),
+                min_switch_interval: self.min_switch_interval,
+            }) {
+            ProactiveSwitchOutcome::NoAction | ProactiveSwitchOutcome::Suppressed { .. } => {}
+            ProactiveSwitchOutcome::RotateOnNextTurn => {
+                if self.pending_rotation != Some(PendingRotation::HardFailure) {
+                    self.pending_rotation = Some(PendingRotation::SoftProactive);
+                }
+            }
         }
 
         Ok(())
@@ -455,6 +537,7 @@ impl AccountPoolManager {
         }
         self.active_lease = None;
         self.next_health_event_sequence = 0;
+        self.proactive_switch_state.reset();
         Ok(())
     }
 
@@ -477,10 +560,68 @@ impl AccountPoolManager {
                 observed_at,
             })
             .await?;
-        self.rotate_on_next_turn = true;
+        self.proactive_switch_state.reset();
+        self.pending_rotation = Some(PendingRotation::HardFailure);
         self.switch_reason = Some(AccountLeaseRuntimeReason::NonReplayableTurn);
         self.suppression_reason = None;
         Ok(())
+    }
+
+    async fn acquire_proactively_rotated_lease(
+        &self,
+        pool_id: &str,
+        current_account_id: &str,
+    ) -> Result<AccountLeaseRecord, AccountLeaseError> {
+        let current_only = vec![current_account_id.to_string()];
+        let mut excluded_account_ids = current_only.clone();
+        if let Some(last_replaced_account_id) = self.last_proactively_replaced_account_id.as_ref()
+            && last_replaced_account_id != current_account_id
+        {
+            excluded_account_ids.push(last_replaced_account_id.clone());
+        }
+
+        match self
+            .state_db
+            .acquire_account_lease_excluding(
+                pool_id,
+                &self.holder_instance_id,
+                self.lease_ttl,
+                &excluded_account_ids,
+            )
+            .await
+        {
+            Ok(lease) => Ok(lease),
+            Err(AccountLeaseError::NoEligibleAccount) if excluded_account_ids.len() > 1 => {
+                match self
+                    .state_db
+                    .acquire_account_lease_excluding(
+                        pool_id,
+                        &self.holder_instance_id,
+                        self.lease_ttl,
+                        &current_only,
+                    )
+                    .await
+                {
+                    Ok(lease) => Ok(lease),
+                    Err(AccountLeaseError::NoEligibleAccount) => {
+                        self.state_db
+                            .acquire_account_lease(
+                                pool_id,
+                                &self.holder_instance_id,
+                                self.lease_ttl,
+                            )
+                            .await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(AccountLeaseError::NoEligibleAccount) => {
+                self.state_db
+                    .acquire_account_lease(pool_id, &self.holder_instance_id, self.lease_ttl)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn create_auth_session(
@@ -562,6 +703,7 @@ impl AccountPoolManagerSnapshotSeed {
             }
         }
         let active_lease = active_lease.as_ref();
+        let proactive_switch_snapshot = active_lease.and(self.proactive_switch_snapshot.as_ref());
         AccountLeaseRuntimeSnapshot {
             active: active_lease.is_some(),
             suppressed: active_lease.is_none()
@@ -570,12 +712,19 @@ impl AccountPoolManagerSnapshotSeed {
             pool_id: active_lease.map(|lease| lease.pool_id.clone()),
             lease_id: active_lease.map(|lease| lease.lease_id.clone()),
             lease_epoch: active_lease.map(|lease| lease.lease_epoch),
+            lease_acquired_at: active_lease.map(|lease| lease.acquired_at),
             health_state,
             switch_reason: self.switch_reason,
             suppression_reason: self.suppression_reason,
             transport_reset_generation: (self.transport_reset_generation != 0)
                 .then_some(self.transport_reset_generation),
             last_remote_context_reset_turn_id: self.last_remote_context_reset_turn_id.clone(),
+            min_switch_interval_secs: active_lease.map(|_| self.min_switch_interval_secs),
+            proactive_switch_pending: proactive_switch_snapshot.map(|snapshot| snapshot.pending),
+            proactive_switch_suppressed: proactive_switch_snapshot
+                .map(|snapshot| snapshot.suppressed),
+            proactive_switch_allowed_at: proactive_switch_snapshot
+                .and_then(|snapshot| snapshot.allowed_at),
             next_eligible_at,
         }
     }

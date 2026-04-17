@@ -101,6 +101,17 @@ impl StateRuntime {
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        self.acquire_account_lease_excluding(pool_id, holder_instance_id, lease_ttl, &[])
+            .await
+    }
+
+    pub async fn acquire_account_lease_excluding(
+        &self,
+        pool_id: &str,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+        excluded_account_ids: &[String],
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         let now = Utc::now();
         let mut tx = self
             .pool
@@ -115,6 +126,13 @@ impl StateRuntime {
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
         {
+            if excluded_account_ids
+                .iter()
+                .any(|excluded_account_id| excluded_account_id == &existing_lease.account_id)
+            {
+                tx.commit().await.map_err(account_lease_storage_error)?;
+                return Err(AccountLeaseError::NoEligibleAccount);
+            }
             tx.commit().await.map_err(account_lease_storage_error)?;
             return Ok(existing_lease);
         }
@@ -131,7 +149,8 @@ impl StateRuntime {
             released_at: None,
         };
 
-        let result = insert_next_eligible_lease(&mut *tx, &lease, pool_id).await;
+        let result =
+            insert_next_eligible_lease(&mut *tx, &lease, pool_id, excluded_account_ids).await;
 
         let result = match result {
             Ok(result) => result,
@@ -141,6 +160,13 @@ impl StateRuntime {
                         .await
                         .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
                 return match existing_lease {
+                    Some(existing_lease)
+                        if excluded_account_ids.iter().any(|excluded_account_id| {
+                            excluded_account_id == &existing_lease.account_id
+                        }) =>
+                    {
+                        Err(AccountLeaseError::NoEligibleAccount)
+                    }
                     Some(existing_lease) => Ok(existing_lease),
                     None => Err(AccountLeaseError::NoEligibleAccount),
                 };
@@ -1214,11 +1240,12 @@ async fn insert_next_eligible_lease<'e, E>(
     executor: E,
     lease: &AccountLeaseRecord,
     pool_id: &str,
+    excluded_account_ids: &[String],
 ) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    sqlx::query(
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
 INSERT INTO account_leases (
     lease_id,
@@ -1231,23 +1258,43 @@ INSERT INTO account_leases (
     expires_at,
     released_at
 ) SELECT
-    ?,
+        "#,
+    );
+    query.push_bind(&lease.lease_id);
+    query.push(
+        r#",
     membership.account_id,
-    ?,
-    ?,
+        "#,
+    );
+    query.push_bind(&lease.pool_id);
+    query.push(", ");
+    query.push_bind(&lease.holder_instance_id);
+    query.push(
+        r#",
     COALESCE((
         SELECT MAX(existing.lease_epoch) + 1
         FROM account_leases AS existing
         WHERE existing.account_id = membership.account_id
     ), 1),
-    ?,
-    ?,
-    ?,
+        "#,
+    );
+    query.push_bind(account_datetime_to_epoch_seconds(lease.acquired_at));
+    query.push(", ");
+    query.push_bind(account_datetime_to_epoch_seconds(lease.renewed_at));
+    query.push(", ");
+    query.push_bind(account_datetime_to_epoch_seconds(lease.expires_at));
+    query.push(
+        r#",
     NULL
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
-WHERE membership.pool_id = ?
+        "#,
+    );
+    query.push("WHERE membership.pool_id = ");
+    query.push_bind(pool_id);
+    query.push(
+        r#"
   AND account_registry.enabled = 1
   AND account_registry.healthy = 1
   AND NOT EXISTS (
@@ -1256,19 +1303,22 @@ WHERE membership.pool_id = ?
       WHERE account_leases.account_id = membership.account_id
         AND account_leases.released_at IS NULL
   )
-ORDER BY membership.position ASC, membership.account_id ASC
+        "#,
+    );
+    if !excluded_account_ids.is_empty() {
+        query.push("  AND membership.account_id NOT IN (");
+        let mut separated = query.separated(", ");
+        for account_id in excluded_account_ids {
+            separated.push_bind(account_id);
+        }
+        query.push(")\n");
+    }
+    query.push(
+        r#"ORDER BY membership.position ASC, membership.account_id ASC
 LIMIT 1
         "#,
-    )
-    .bind(&lease.lease_id)
-    .bind(&lease.pool_id)
-    .bind(&lease.holder_instance_id)
-    .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
-    .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
-    .bind(account_datetime_to_epoch_seconds(lease.expires_at))
-    .bind(pool_id)
-    .execute(executor)
-    .await
+    );
+    query.build().execute(executor).await
 }
 
 async fn insert_requested_lease<'e, E>(
@@ -1610,6 +1660,95 @@ WHERE released_at IS NULL;
 
         assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
         assert_eq!(first.account_id, "acct-1");
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_excluding_skips_excluded_accounts() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+
+        let excluded_account_ids = vec!["acct-1".to_string()];
+        let lease = runtime
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "inst-a",
+                chrono::Duration::seconds(300),
+                &excluded_account_ids,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-2");
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_excluding_rejects_when_all_accounts_are_excluded() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+
+        let excluded_account_ids = vec!["acct-1".to_string(), "acct-2".to_string()];
+        let lease = runtime
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "inst-a",
+                chrono::Duration::seconds(300),
+                &excluded_account_ids,
+            )
+            .await;
+
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_excluding_rejects_existing_holder_lease_when_excluded() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account(runtime.as_ref(), "acct-2").await;
+
+        let first = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+        let excluded_account_ids = vec![first.account_id.clone()];
+
+        let second = runtime
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "inst-a",
+                chrono::Duration::seconds(300),
+                &excluded_account_ids,
+            )
+            .await;
+
+        assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_excluding_keeps_existing_holder_lease_when_not_excluded() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account(runtime.as_ref(), "acct-2").await;
+
+        let first = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+        let excluded_account_ids = vec!["acct-2".to_string()];
+
+        let second = runtime
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "inst-a",
+                chrono::Duration::seconds(300),
+                &excluded_account_ids,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.lease_id, first.lease_id);
+        assert_eq!(second.account_id, first.account_id);
     }
 
     #[tokio::test]

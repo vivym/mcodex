@@ -73,6 +73,13 @@
             "null"
           ]
         },
+        "leaseAcquiredAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "leaseEpoch": {
           "format": "uint64",
           "minimum": 0.0,
@@ -87,6 +94,14 @@
             "null"
           ]
         },
+        "minSwitchIntervalSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "nextEligibleAt": {
           "format": "int64",
           "type": [
@@ -97,6 +112,25 @@
         "poolId": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "proactiveSwitchAllowedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "proactiveSwitchPending": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "proactiveSwitchSuppressed": {
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -145,9 +179,43 @@
             "null"
           ]
         },
+        "leaseAcquiredAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "minSwitchIntervalSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "poolId": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "proactiveSwitchAllowedAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "proactiveSwitchPending": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "proactiveSwitchSuppressed": {
+          "type": [
+            "boolean",
             "null"
           ]
         },

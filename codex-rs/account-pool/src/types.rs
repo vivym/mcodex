@@ -43,6 +43,7 @@ pub struct AccountPoolConfig {
     pub proactive_switch_threshold_percent: u8,
     pub lease_ttl_secs: u64,
     pub heartbeat_interval_secs: u64,
+    pub min_switch_interval_secs: u64,
 }
 
 impl Default for AccountPoolConfig {
@@ -52,6 +53,7 @@ impl Default for AccountPoolConfig {
             proactive_switch_threshold_percent: 85,
             lease_ttl_secs: 300,
             heartbeat_interval_secs: 60,
+            min_switch_interval_secs: 0,
         }
     }
 }
@@ -80,6 +82,39 @@ impl AccountPoolConfig {
 
     pub fn lease_ttl_duration(&self) -> Duration {
         Duration::seconds(self.lease_ttl_secs as i64)
+    }
+
+    pub fn min_switch_interval_duration(&self) -> Duration {
+        Duration::seconds(self.min_switch_interval_secs as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountPoolConfig;
+    use chrono::Duration;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn validate_allows_min_switch_interval_at_or_above_lease_ttl() {
+        let config = AccountPoolConfig {
+            lease_ttl_secs: 300,
+            heartbeat_interval_secs: 60,
+            min_switch_interval_secs: 300,
+            ..AccountPoolConfig::default()
+        };
+
+        config.validate().expect("config should be valid");
+    }
+
+    #[test]
+    fn min_switch_interval_duration_uses_configured_seconds() {
+        let config = AccountPoolConfig {
+            min_switch_interval_secs: 90,
+            ..AccountPoolConfig::default()
+        };
+
+        assert_eq!(config.min_switch_interval_duration(), Duration::seconds(90));
     }
 }
 

@@ -20,9 +20,24 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         pool_id: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        self.acquire_lease_excluding(pool_id, holder_instance_id, &[])
+            .await
+    }
+
+    async fn acquire_lease_excluding(
+        &self,
+        pool_id: &str,
+        holder_instance_id: &str,
+        excluded_account_ids: &[String],
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let lease = self
             .runtime
-            .acquire_account_lease(pool_id, holder_instance_id, self.lease_ttl)
+            .acquire_account_lease_excluding(
+                pool_id,
+                holder_instance_id,
+                self.lease_ttl,
+                excluded_account_ids,
+            )
             .await?;
         let registered_account = match self
             .runtime

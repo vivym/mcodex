@@ -22,6 +22,7 @@ use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
+use codex_state::AccountRegistryEntryUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
@@ -79,6 +80,263 @@ async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
         result.expect("report stale health event"),
         HealthEventDisposition::IgnoredAsStale
     );
+}
+
+#[tokio::test]
+async fn soft_pressure_before_min_interval_does_not_persist_rate_limited_health() {
+    let harness = fixture_with_registered_accounts(&["acct-a", "acct-b"]).await;
+    let mut manager = harness
+        .manager("test-holder", damping_config())
+        .expect("create manager");
+    let first = manager
+        .ensure_active_lease(SelectionRequest::default())
+        .await
+        .expect("acquire initial lease");
+
+    manager
+        .report_rate_limits(
+            first.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                first.acquired_at() + Duration::seconds(30),
+            ),
+        )
+        .await
+        .expect("record soft pressure");
+
+    let second = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(first.acquired_at() + Duration::seconds(60)),
+            pool_id: None,
+        })
+        .await
+        .expect("reuse sticky lease");
+
+    assert_eq!(first.account_id(), second.account_id());
+    assert_eq!(
+        harness
+            .runtime
+            .read_account_health_event_sequence(first.account_id())
+            .await
+            .expect("read health sequence"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn stale_soft_pressure_does_not_force_delayed_rotation_after_window_opens() {
+    let harness = fixture_with_registered_accounts(&["acct-a", "acct-b"]).await;
+    let mut manager = harness
+        .manager("test-holder", damping_config())
+        .expect("create manager");
+    let first = manager
+        .ensure_active_lease(SelectionRequest::default())
+        .await
+        .expect("acquire initial lease");
+
+    manager
+        .report_rate_limits(
+            first.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                first.acquired_at() + Duration::seconds(30),
+            ),
+        )
+        .await
+        .expect("record soft pressure");
+
+    let same = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(first.acquired_at() + Duration::seconds(121)),
+            pool_id: None,
+        })
+        .await
+        .expect("stale soft pressure should not rotate");
+
+    assert_eq!(same.account_id(), first.account_id());
+    assert_eq!(
+        harness
+            .runtime
+            .read_account_health_event_sequence(first.account_id())
+            .await
+            .expect("read health sequence"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn hard_usage_limit_bypasses_min_switch_interval() {
+    let harness = fixture_with_registered_accounts(&["acct-a", "acct-b"]).await;
+    let mut manager = harness
+        .manager("test-holder", damping_config())
+        .expect("create manager");
+    let first = manager
+        .ensure_active_lease(SelectionRequest::default())
+        .await
+        .expect("acquire initial lease");
+
+    manager
+        .report_usage_limit_reached(
+            first.key(),
+            usage_limit_event_at(first.acquired_at() + Duration::seconds(30)),
+        )
+        .await
+        .expect("record hard limit");
+
+    let rotated = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(first.acquired_at() + Duration::seconds(31)),
+            pool_id: None,
+        })
+        .await
+        .expect("hard failure should rotate immediately");
+
+    assert_ne!(rotated.account_id(), first.account_id());
+    assert_eq!(
+        harness
+            .runtime
+            .read_account_health_event_sequence(first.account_id())
+            .await
+            .expect("read health sequence"),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn proactive_rotation_avoids_just_replaced_account_when_another_candidate_exists() {
+    let harness = fixture_with_registered_accounts(&["acct-a", "acct-b", "acct-c"]).await;
+    let mut manager = harness
+        .manager("test-holder", damping_config())
+        .expect("create manager");
+    let first = manager
+        .ensure_active_lease(SelectionRequest::default())
+        .await
+        .expect("acquire initial lease");
+    assert_eq!(first.account_id(), "acct-a");
+
+    manager
+        .report_rate_limits(
+            first.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                first.acquired_at() + Duration::seconds(121),
+            ),
+        )
+        .await
+        .expect("record proactive pressure for first account");
+
+    let second = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(first.acquired_at() + Duration::seconds(122)),
+            pool_id: None,
+        })
+        .await
+        .expect("rotate to second account");
+    assert_eq!(second.account_id(), "acct-b");
+
+    manager
+        .report_rate_limits(
+            second.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                second.acquired_at() + Duration::seconds(121),
+            ),
+        )
+        .await
+        .expect("record proactive pressure for second account");
+
+    let third = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(second.acquired_at() + Duration::seconds(122)),
+            pool_id: None,
+        })
+        .await
+        .expect("rotate to third account");
+
+    assert_eq!(third.account_id(), "acct-c");
+}
+
+#[tokio::test]
+async fn non_proactive_replacement_clears_just_replaced_exclusion() {
+    let harness = fixture_with_registered_accounts(&["acct-a", "acct-b", "acct-c", "acct-d"]).await;
+    let mut manager = harness
+        .manager("test-holder", damping_config())
+        .expect("create manager");
+    let first = manager
+        .ensure_active_lease(SelectionRequest::default())
+        .await
+        .expect("acquire initial lease");
+    assert_eq!(first.account_id(), "acct-a");
+
+    manager
+        .report_rate_limits(
+            first.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                first.acquired_at() + Duration::seconds(121),
+            ),
+        )
+        .await
+        .expect("record proactive pressure for first account");
+
+    let second = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(first.acquired_at() + Duration::seconds(122)),
+            pool_id: None,
+        })
+        .await
+        .expect("rotate to second account");
+    assert_eq!(second.account_id(), "acct-b");
+
+    harness
+        .runtime
+        .upsert_account_registry_entry(registry_entry_update("acct-a", /* enabled */ false))
+        .await
+        .expect("disable first account before hard rotation");
+
+    manager
+        .report_usage_limit_reached(
+            second.key(),
+            usage_limit_event_at(second.acquired_at() + Duration::seconds(30)),
+        )
+        .await
+        .expect("record hard failure on second account");
+
+    let third = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(second.acquired_at() + Duration::seconds(31)),
+            pool_id: None,
+        })
+        .await
+        .expect("hard failure should rotate to next eligible account");
+    assert_eq!(third.account_id(), "acct-c");
+
+    harness
+        .runtime
+        .upsert_account_registry_entry(registry_entry_update("acct-a", /* enabled */ true))
+        .await
+        .expect("re-enable first account");
+
+    manager
+        .report_rate_limits(
+            third.key(),
+            snapshot_at(
+                /* used_percent */ 95.0,
+                third.acquired_at() + Duration::seconds(121),
+            ),
+        )
+        .await
+        .expect("record proactive pressure for third account");
+
+    let fourth = manager
+        .ensure_active_lease(SelectionRequest {
+            now: Some(third.acquired_at() + Duration::seconds(122)),
+            pool_id: None,
+        })
+        .await
+        .expect("proactive rotation should not retain stale exclusion");
+
+    assert_eq!(fourth.account_id(), "acct-a");
 }
 
 mod lease_lifecycle {
@@ -227,7 +485,7 @@ async fn rehydrated_existing_lease_seeds_next_health_event_sequence() {
         .await
         .expect("acquire lease");
     first
-        .report_rate_limits(lease.key(), snapshot(/* used_percent */ 95.0))
+        .report_unauthorized(lease.key())
         .await
         .expect("record initial health event");
 
@@ -956,6 +1214,25 @@ async fn fixture_with_registered_account(account_id: &str) -> TestHarness {
     harness
 }
 
+async fn fixture_with_registered_accounts(account_ids: &[&str]) -> TestHarness {
+    let harness = fixture_with_legacy_auth(account_ids[0]).await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    for account_id in account_ids {
+        backend
+            .register_account(pooled_registration(
+                account_id,
+                &format!("backend-handle-{account_id}"),
+                &format!("fingerprint-{account_id}"),
+            ))
+            .await
+            .unwrap_or_else(|err| panic!("register pooled account failed: {err}"));
+    }
+    harness
+}
+
 #[derive(Clone)]
 struct TestLegacyBootstrap {
     account_id: Option<String>,
@@ -990,14 +1267,42 @@ fn snapshot(used_percent: f64) -> RateLimitSnapshot {
     RateLimitSnapshot::new(used_percent, Utc::now())
 }
 
+fn snapshot_at(used_percent: f64, observed_at: chrono::DateTime<Utc>) -> RateLimitSnapshot {
+    RateLimitSnapshot::new(used_percent, observed_at)
+}
+
 fn usage_limit_event() -> UsageLimitEvent {
     UsageLimitEvent::new(Utc::now())
+}
+
+fn usage_limit_event_at(observed_at: chrono::DateTime<Utc>) -> UsageLimitEvent {
+    UsageLimitEvent::new(observed_at)
 }
 
 fn default_config() -> AccountPoolConfig {
     AccountPoolConfig {
         default_pool_id: Some("legacy-default".to_string()),
         ..AccountPoolConfig::default()
+    }
+}
+
+fn damping_config() -> AccountPoolConfig {
+    AccountPoolConfig {
+        min_switch_interval_secs: 120,
+        ..default_config()
+    }
+}
+
+fn registry_entry_update(account_id: &str, enabled: bool) -> AccountRegistryEntryUpdate {
+    AccountRegistryEntryUpdate {
+        account_id: account_id.to_string(),
+        pool_id: "legacy-default".to_string(),
+        position: 1,
+        account_kind: "chatgpt".to_string(),
+        backend_family: "local".to_string(),
+        workspace_id: None,
+        enabled,
+        healthy: true,
     }
 }
 
