@@ -107,7 +107,7 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
 
 impl McpProcess {
     pub async fn new(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, &[], &[]).await
+        Self::new_with_env_and_args_and_marker(codex_home, &[], &[], true).await
     }
 
     pub async fn new_without_managed_config(codex_home: &Path) -> anyhow::Result<Self> {
@@ -115,7 +115,7 @@ impl McpProcess {
     }
 
     pub async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, &[], args).await
+        Self::new_with_env_and_args_and_marker(codex_home, &[], args, true).await
     }
 
     /// Creates a new MCP process, allowing tests to override or remove
@@ -127,19 +127,29 @@ impl McpProcess {
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args(codex_home, env_overrides, &[]).await
+        Self::new_with_env_and_args_and_marker(codex_home, env_overrides, &[], true).await
     }
 
-    async fn new_with_env_and_args(
+    pub async fn new_with_env_without_product_identity_marker(
+        codex_home: &Path,
+        env_overrides: &[(&str, Option<&str>)],
+    ) -> anyhow::Result<Self> {
+        Self::new_with_env_and_args_and_marker(codex_home, env_overrides, &[], false).await
+    }
+
+    async fn new_with_env_and_args_and_marker(
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
         args: &[&str],
+        mark_migration_complete: bool,
     ) -> anyhow::Result<Self> {
         let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
             .context("should find binary for codex-app-server")?;
         let mut cmd = Command::new(program);
-        mark_product_identity_migration_complete(codex_home)
-            .context("should mark product identity migration complete for app-server tests")?;
+        if mark_migration_complete {
+            mark_product_identity_migration_complete(codex_home)
+                .context("should mark product identity migration complete for app-server tests")?;
+        }
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

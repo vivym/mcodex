@@ -47,6 +47,7 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::config_toml::ConfigToml;
 use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
+use codex_core::product_identity_migration::PRODUCT_IDENTITY_MIGRATION_FILENAME;
 use codex_features::FEATURES;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
@@ -63,7 +64,9 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use tempfile::TempDir;
+use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::analytics::enable_analytics_capture;
@@ -1201,6 +1204,81 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
     assert!(
         instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
         "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn app_server_fails_noninteractively_when_product_identity_migration_needs_prompt()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    let legacy_home = TempDir::new()?;
+    write_legacy_migration_inputs(legacy_home.path())?;
+    let legacy_home_str = legacy_home.path().display().to_string();
+
+    let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")?;
+    let output = timeout(
+        DEFAULT_READ_TIMEOUT,
+        Command::new(program)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .env("MCODEX_HOME", codex_home.path())
+            .env("CODEX_HOME", legacy_home_str)
+            .output(),
+    )
+    .await??;
+
+    assert!(
+        !output.status.success(),
+        "expected noninteractive app-server startup to fail when migration requires confirmation"
+    );
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("run mcodex interactively once to confirm migration"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !codex_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists(),
+        "noninteractive failure should not write the migration marker"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn app_server_starts_when_mcodex_home_is_initialized_without_product_identity_marker()
+-> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "never",
+        &BTreeMap::from([(Feature::Personality, true)]),
+    )?;
+
+    let legacy_home = TempDir::new()?;
+    write_legacy_migration_inputs(legacy_home.path())?;
+    let legacy_home_str = legacy_home.path().display().to_string();
+
+    let mut mcp = McpProcess::new_with_env_without_product_identity_marker(
+        codex_home.path(),
+        &[("CODEX_HOME", Some(legacy_home_str.as_str()))],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    assert!(
+        codex_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists(),
+        "initialized active homes should be marked complete without prompting"
     );
 
     Ok(())
@@ -2897,8 +2975,23 @@ name = "Mock provider for test"
 base_url = "{server_uri}/v1"
 wire_api = "responses"
 request_max_retries = 0
-stream_max_retries = 0
+            stream_max_retries = 0
 "#
         ),
     )
+}
+
+fn write_legacy_migration_inputs(legacy_home: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        legacy_home.join("config.toml"),
+        r#"
+[accounts]
+default_pool = "legacy-default"
+"#,
+    )?;
+    std::fs::write(
+        legacy_home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":"sk-legacy"}"#,
+    )?;
+    Ok(())
 }

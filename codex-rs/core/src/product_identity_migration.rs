@@ -1,9 +1,11 @@
+use crate::personality_migration::PERSONALITY_MIGRATION_FILENAME;
 use crate::personality_migration::PersonalityMigrationStatus;
 use crate::personality_migration::maybe_migrate_personality;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::config_toml::ConfigToml;
 use codex_product_identity::MCODEX;
 use codex_utils_home_dir::find_legacy_codex_home_for_migration;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -26,6 +28,7 @@ pub enum MigrationImportOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductIdentityMigrationStatus {
     SkippedMarker,
+    SkippedInitializedHome,
     SkippedNoLegacyHome,
     SkippedUnreadableLegacyHome,
     SkippedByUser,
@@ -140,6 +143,15 @@ async fn maybe_migrate_product_identity_with_legacy_home(
         });
     }
 
+    if active_home_is_initialized(mcodex_home).await? {
+        return Ok(ProductIdentityMigrationOutcome {
+            status: ProductIdentityMigrationStatus::SkippedInitializedHome,
+            config_import: MigrationImportOutcome::NotAttempted,
+            auth_import: MigrationImportOutcome::NotAttempted,
+            marker_warning: write_marker_warning(mcodex_home, &marker_path).await,
+        });
+    }
+
     let legacy_home = match legacy_home_result {
         Ok(Some(legacy_home)) => legacy_home,
         Ok(None) => {
@@ -236,8 +248,14 @@ async fn import_config(legacy_home: &Path, mcodex_home: &Path) -> MigrationImpor
     }
 
     let active_config_path = mcodex_home.join(CONFIG_TOML_FILE);
-    match fs::write(&active_config_path, transformed).await {
+    match write_new_file(&active_config_path, transformed.as_bytes()).await {
         Ok(()) => MigrationImportOutcome::Imported,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => MigrationImportOutcome::Failed {
+            warning: format!(
+                "refusing to overwrite existing mcodex config.toml at {} during legacy import",
+                active_config_path.display()
+            ),
+        },
         Err(err) => MigrationImportOutcome::Failed {
             warning: format!(
                 "failed to import legacy config.toml from {} to {}: {err}",
@@ -275,8 +293,14 @@ async fn import_auth(legacy_home: &Path, mcodex_home: &Path) -> MigrationImportO
     }
 
     let active_auth_path = mcodex_home.join("auth.json");
-    match fs::write(&active_auth_path, auth_contents).await {
+    match write_new_file(&active_auth_path, &auth_contents).await {
         Ok(()) => MigrationImportOutcome::Imported,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => MigrationImportOutcome::Failed {
+            warning: format!(
+                "refusing to overwrite existing mcodex auth.json at {} during legacy import",
+                active_auth_path.display()
+            ),
+        },
         Err(err) => MigrationImportOutcome::Failed {
             warning: format!(
                 "failed to import legacy auth.json from {} to {}: {err}",
@@ -308,6 +332,41 @@ fn transform_imported_config(config_contents: &str) -> io::Result<String> {
     Ok(doc.to_string())
 }
 
+async fn active_home_is_initialized(mcodex_home: &Path) -> io::Result<bool> {
+    for relative_path in [
+        CONFIG_TOML_FILE,
+        "auth.json",
+        PRODUCT_IDENTITY_MIGRATION_FILENAME,
+        PERSONALITY_MIGRATION_FILENAME,
+        "skills",
+        "sessions",
+        "plugins",
+        "marketplace",
+        "log",
+        "logs",
+        "themes",
+    ] {
+        if fs::try_exists(&mcodex_home.join(relative_path)).await? {
+            return Ok(true);
+        }
+    }
+
+    let mut entries = match fs::read_dir(mcodex_home).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if file_type.is_file() && entry.path().extension() == Some(OsStr::new("sqlite")) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 async fn write_marker_warning(mcodex_home: &Path, marker_path: &Path) -> Option<String> {
     if let Err(err) = fs::create_dir_all(mcodex_home).await {
         return Some(format!(
@@ -335,6 +394,15 @@ async fn create_marker(marker_path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+async fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await?;
+    file.write_all(contents).await
 }
 
 #[cfg(test)]

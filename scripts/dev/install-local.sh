@@ -22,7 +22,20 @@ MCODEX_HOME_DEFAULT="$MCODEX_ROOT/home"
 INSTALL_BIN_DIR="$MCODEX_ROOT/bin"
 WRAPPER_DIR="${MCODEX_WRAPPER_DIR:-$HOME/.local/bin}"
 
-SOURCE_BINARY="$CODEX_RS_DIR/target/release/mcodex"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  case "$CARGO_TARGET_DIR" in
+    /*) TARGET_DIR="$CARGO_TARGET_DIR" ;;
+    *) TARGET_DIR="$CODEX_RS_DIR/$CARGO_TARGET_DIR" ;;
+  esac
+else
+  TARGET_DIR="$CODEX_RS_DIR/target"
+fi
+
+if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+  SOURCE_BINARY="$TARGET_DIR/$CARGO_BUILD_TARGET/release/mcodex"
+else
+  SOURCE_BINARY="$TARGET_DIR/release/mcodex"
+fi
 INSTALLED_BINARY="$INSTALL_BIN_DIR/mcodex"
 WRAPPER_PATH="$WRAPPER_DIR/mcodex"
 
@@ -34,6 +47,10 @@ step "Building release mcodex binary"
 
 step "Installing local mcodex binary to $INSTALL_BIN_DIR"
 mkdir -p "$INSTALL_BIN_DIR"
+if [ ! -x "$SOURCE_BINARY" ]; then
+  printf '%s\n' "built mcodex binary not found at $SOURCE_BINARY" >&2
+  exit 1
+fi
 cp "$SOURCE_BINARY" "$INSTALLED_BINARY"
 chmod 0755 "$INSTALLED_BINARY"
 

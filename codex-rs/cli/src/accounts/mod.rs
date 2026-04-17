@@ -7,6 +7,7 @@ use anyhow::Context;
 use clap::Args;
 use clap::Parser;
 use codex_core::config::Config;
+use codex_product_identity::MCODEX;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
@@ -211,7 +212,8 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         let state_path = state_db_path(config.sqlite_home.as_path());
         if !config_has_accounts && !tokio::fs::try_exists(&state_path).await? {
             anyhow::bail!(
-                "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
+                "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `{} accounts add chatgpt`",
+                MCODEX.binary_name
             );
         }
     }

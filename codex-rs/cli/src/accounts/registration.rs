@@ -12,6 +12,7 @@ use codex_login::LegacyAuthView;
 use codex_login::ServerOptions;
 use codex_login::run_pooled_browser_registration;
 use codex_login::run_pooled_device_code_registration;
+use codex_product_identity::MCODEX;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::NewPendingAccountRegistration;
@@ -181,7 +182,8 @@ async fn add_chatgpt_account_with_dependencies(
             && startup_status.startup.persisted_default_pool_id.is_none();
     let Some(pool_id) = startup_status.startup.preview.effective_pool_id else {
         anyhow::bail!(
-            "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `codex accounts add chatgpt`"
+            "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `{} accounts add chatgpt`",
+            MCODEX.binary_name
         );
     };
 
@@ -231,8 +233,9 @@ async fn add_chatgpt_account_with_dependencies(
         }
         if membership.pool_id != pool_id {
             anyhow::bail!(
-                "provider identity `{provider_account_id}` is already registered in pool `{}`; use `codex accounts pool assign` if you need to move it",
-                membership.pool_id
+                "provider identity `{provider_account_id}` is already registered in pool `{}`; use `{} accounts pool assign` if you need to move it",
+                membership.pool_id,
+                MCODEX.binary_name
             );
         }
         if same_pool_existing_account_id.is_none() {
@@ -449,7 +452,9 @@ async fn reconcile_pending_add_registration(
 
 pub(crate) fn api_key_add_is_unsupported() -> anyhow::Result<RegisteredAddAccount> {
     anyhow::bail!(
-        "phase 1 only supports `codex accounts add chatgpt`; `codex accounts add api-key` is not supported yet"
+        "phase 1 only supports `{} accounts add chatgpt`; `{} accounts add api-key` is not supported yet",
+        MCODEX.binary_name,
+        MCODEX.binary_name
     )
 }
 

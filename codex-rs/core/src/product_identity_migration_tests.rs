@@ -283,6 +283,45 @@ async fn skips_when_marker_exists() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn skips_when_active_home_is_already_initialized() -> io::Result<()> {
+    let legacy_home = TempDir::new()?;
+    let active_home = TempDir::new()?;
+    write_legacy_config(legacy_home.path())?;
+    write_legacy_auth(legacy_home.path())?;
+    fs::write(
+        active_home.path().join("auth.json"),
+        r#"{"auth_mode":"chatgpt"}"#,
+    )?;
+
+    let mut ui = StubUi::accepting();
+    let outcome = maybe_migrate_product_identity_with_legacy_home(
+        active_home.path(),
+        some_legacy_home(&legacy_home),
+        &mut ui,
+    )
+    .await?;
+
+    assert_eq!(ui.prompt_count, 0);
+    assert_eq!(
+        outcome.status,
+        ProductIdentityMigrationStatus::SkippedInitializedHome
+    );
+    assert_eq!(outcome.config_import, MigrationImportOutcome::NotAttempted);
+    assert_eq!(outcome.auth_import, MigrationImportOutcome::NotAttempted);
+    assert!(
+        active_home
+            .path()
+            .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("auth.json"))?,
+        r#"{"auth_mode":"chatgpt"}"#
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn skips_when_no_legacy_home() -> io::Result<()> {
     let active_home = TempDir::new()?;
 
@@ -528,6 +567,59 @@ async fn imports_config_and_auth_when_user_accepts() -> io::Result<()> {
             .path()
             .join(PRODUCT_IDENTITY_MIGRATION_FILENAME)
             .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_config_refuses_to_overwrite_existing_target() -> io::Result<()> {
+    let legacy_home = TempDir::new()?;
+    let active_home = TempDir::new()?;
+    write_legacy_config(legacy_home.path())?;
+    fs::write(
+        active_home.path().join("config.toml"),
+        "model = \"keep-me\"\n",
+    )?;
+
+    let outcome = import_config(legacy_home.path(), active_home.path()).await;
+
+    match outcome {
+        MigrationImportOutcome::Failed { warning } => {
+            assert!(
+                warning.contains("refusing to overwrite existing mcodex config.toml"),
+                "unexpected warning: {warning}"
+            );
+        }
+        other => panic!("unexpected config import outcome: {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("config.toml"))?,
+        "model = \"keep-me\"\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_auth_refuses_to_overwrite_existing_target() -> io::Result<()> {
+    let legacy_home = TempDir::new()?;
+    let active_home = TempDir::new()?;
+    write_legacy_auth(legacy_home.path())?;
+    fs::write(active_home.path().join("auth.json"), r#"{"keep":"me"}"#)?;
+
+    let outcome = import_auth(legacy_home.path(), active_home.path()).await;
+
+    match outcome {
+        MigrationImportOutcome::Failed { warning } => {
+            assert!(
+                warning.contains("refusing to overwrite existing mcodex auth.json"),
+                "unexpected warning: {warning}"
+            );
+        }
+        other => panic!("unexpected auth import outcome: {other:?}"),
+    }
+    assert_eq!(
+        fs::read_to_string(active_home.path().join("auth.json"))?,
+        r#"{"keep":"me"}"#
     );
     Ok(())
 }
