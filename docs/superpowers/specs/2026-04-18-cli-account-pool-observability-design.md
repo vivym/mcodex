@@ -187,7 +187,7 @@ Per-command scope and pagination rules:
 
 | Command | Default pool resolution | Pagination | Text cursor behavior |
 |---------|-------------------------|------------|----------------------|
-| `accounts status` | honor top-level `--account-pool` first; otherwise use current effective pool when one exists; otherwise omit pooled observability summary instead of failing | none | none |
+| `accounts status` | honor top-level `--account-pool` first; otherwise use the command's resolved effective pool; otherwise omit pooled observability summary instead of failing | none | none |
 | `accounts pool show` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over account rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
 | `accounts diagnostics` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | none | none |
 | `accounts events` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over event rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
@@ -198,11 +198,20 @@ The precedence rule is therefore:
 2. top-level `--account-pool`
 3. existing effective-pool resolution from startup diagnostics/config/state
 
+If command-specific `--pool` and top-level `--account-pool` are both present and
+their values differ, the command should fail with an explicit conflict error
+instead of silently applying precedence.
+
 ### 2. Keep `status` concise and additive
 
 `codex accounts status` already owns startup-selection and effective-pool
 explanation. This slice should preserve that role and append a pooled
 observability summary rather than replacing the existing diagnostic path.
+
+For `status`, top-level `--account-pool` applies to the entire command. It
+changes the startup-resolution/effective-pool interpretation and therefore also
+changes the pooled observability target. `status` must not show startup
+diagnostics for one pool while showing pooled observability for another.
 
 The first text output should include:
 
@@ -220,6 +229,10 @@ The first text output should include:
 
 `status` should not become a full dump of accounts, issues, and events. It
 should point users to `diagnostics`, `events`, and `pool show` for detail.
+
+The high-signal issue summary should be chosen deterministically as the first
+issue returned by the diagnostics read. `status` should not add a separate
+sorting or ranking pass in this slice.
 
 `status` uses two additive observability reads:
 
@@ -292,9 +305,22 @@ Pool selection rules:
   diagnostic path
 - if neither exists, fail with an explicit message telling the user to pass
   `--pool <POOL_ID>`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
 - `--limit` and `--cursor` page account rows, not summary metadata
+- omitting `--limit` should use the backend/default reader page size; the CLI
+  must not treat it as unbounded output
 - when another account page exists, text mode should print the returned next
   cursor after the rows; JSON mode should preserve the raw `nextCursor` field
+- account rows must preserve backend order exactly; the CLI must not add a
+  client-side sorting pass over paged results
+
+Failure behavior:
+
+- `pool show` is a strict drill-down command
+- it requires both the pool summary read and the account-row read
+- if either read fails, the command fails; no partial summary-only or rows-only
+  output is allowed in this slice
 
 First-pass parameters:
 
@@ -344,6 +370,57 @@ in the first text implementation.
 - `data`
 - `nextCursor`
 
+`summary` should use the same shape described for `status.poolObservability.summary`.
+
+`data` item shape:
+
+- `accountId`
+- `backendAccountRef`
+- `accountKind`
+- `enabled`
+- `healthState`
+- `operationalState`
+- `allocatable`
+- `statusReasonCode`
+- `statusMessage`
+- `currentLease`
+- `quota`
+- `selection`
+- `updatedAt`
+
+`currentLease` shape:
+
+- `leaseId`
+- `leaseEpoch`
+- `holderInstanceId`
+- `acquiredAt`
+- `renewedAt`
+- `expiresAt`
+
+`quota` shape:
+
+- `remainingPercent`
+- `resetsAt`
+- `observedAt`
+
+`selection` shape:
+
+- `eligible`
+- `nextEligibleAt`
+- `preferred`
+- `suppressed`
+
+JSON contract rules:
+
+- `data` is always present as an array; use `[]` when no rows match
+- `nextCursor` is always present; use `null` when no further page exists
+- nullable row fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- if no account rows match the request, still print the pool header/summary and
+  then print `accounts: none`
+
 `backend` and `policy` are intentionally out of scope for CLI v1 because the
 current backend-neutral observability seam does not expose them and this slice
 should not widen that seam or duplicate app-server-only assembly logic.
@@ -361,6 +438,8 @@ Pool selection rules:
   diagnostic path
 - if neither exists, fail with the same explicit `--pool` guidance used by
   `pool show`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
 
 First-pass parameters:
 
@@ -392,6 +471,24 @@ who want chronology should move to `events`.
 - `status`
 - `issues`
 
+`issues` item shape:
+
+- `severity`
+- `reasonCode`
+- `message`
+- `accountId`
+- `holderInstanceId`
+- `nextRelevantAt`
+
+JSON contract rules:
+
+- `issues` is always present as an array; use `[]` when there are no current issues
+- nullable issue fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- when diagnostics are healthy and `issues` is empty, print `issues: none`
+
 ### 5. Add `events` as the chronological debugging view
 
 `codex accounts events` should expose recent append-only pooled history with the
@@ -405,6 +502,8 @@ Pool selection rules:
   diagnostic path
 - if neither exists, fail with the same explicit `--pool` guidance used by
   `pool show`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
 
 First-pass parameters:
 
@@ -414,6 +513,12 @@ First-pass parameters:
 - `--limit <N>`
 - `--cursor <CURSOR>`
 - `--json`
+
+Repeatable `--type` flags compose as OR semantics:
+
+- an event matches when its type is any of the requested values
+- this should map directly to the backend filter list rather than a CLI-side
+  intersection rule
 
 Text output should include:
 
@@ -432,6 +537,8 @@ Event order should match the backend contract exactly:
 Pagination rules:
 
 - `--limit` and `--cursor` page event rows only
+- omitting `--limit` should use the backend/default reader page size; the CLI
+  must not treat it as unbounded output
 - text mode should print the returned next cursor when another page exists
 - JSON mode should preserve the raw `nextCursor` field unchanged
 
@@ -445,6 +552,29 @@ the operator can request the next page without a separate pagination protocol.
 - `poolId`
 - `data`
 - `nextCursor`
+
+`data` item shape:
+
+- `eventId`
+- `occurredAt`
+- `poolId`
+- `accountId`
+- `leaseId`
+- `holderInstanceId`
+- `eventType`
+- `reasonCode`
+- `message`
+- `details`
+
+JSON contract rules:
+
+- `data` is always present as an array; use `[]` when no rows match
+- `nextCursor` is always present; use `null` when no further page exists
+- nullable event fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- when no event rows match the request, print `events: none`
 
 ### 6. Keep CLI dependent on the backend-neutral observability seam
 
@@ -523,7 +653,7 @@ The first slice should keep a small, explicit error model:
     pool-not-found error
   - for additive `status` observability reads, do not fail the command; treat
     pool-not-found the same as any other observability-read failure and surface
-    it as a warning / `poolObservabilityError`
+    it as `poolObservability.warning`
 - invalid cursor:
   - fail with an explicit cursor error
 - empty event page:
@@ -555,6 +685,8 @@ Use temporary homes and seeded pooled state to verify:
 - healthy pool summary
 - degraded diagnostics with at least one issue
 - blocked diagnostics
+- stale/missing resolved pool causing `status` to degrade with
+  `poolObservability.warning` instead of failing
 - event pagination through cursors
 - `--pool` overriding the current effective pool
 - explicit pool requirement when no effective pool can be resolved
@@ -573,7 +705,7 @@ Cover:
 This design is complete when:
 
 - `codex accounts status` shows additive pooled observability summary for the
-  effective pool when one is available
+  status-resolved target pool when one is available
 - `codex accounts pool show` returns current summary plus account rows for one
   pool
 - `codex accounts diagnostics` explains current pool issues through the
