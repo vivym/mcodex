@@ -65,6 +65,7 @@ use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod account_lease_api;
+mod account_pool_api;
 mod app_server_tracing;
 mod bespoke_event_handling;
 mod codex_message_processor;

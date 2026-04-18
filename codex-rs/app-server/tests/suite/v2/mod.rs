@@ -1,5 +1,6 @@
 mod account;
 mod account_lease;
+mod account_pool;
 mod analytics;
 mod app_list;
 mod client_metadata;

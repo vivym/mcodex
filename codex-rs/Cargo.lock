@@ -1456,6 +1456,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "codex-account-pool",
  "codex-analytics",
  "codex-app-server-protocol",
  "codex-arg0",
