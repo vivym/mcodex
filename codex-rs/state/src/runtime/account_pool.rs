@@ -548,6 +548,11 @@ ORDER BY
                 .as_deref()
                 .map(AccountHealthState::try_from)
                 .transpose()?;
+            let selector_auth_eligible = match health_state {
+                Some(AccountHealthState::Unauthorized) => false,
+                Some(AccountHealthState::Healthy | AccountHealthState::RateLimited) => true,
+                None => healthy,
+            };
             let active_lease = match row.try_get::<Option<String>, _>("lease_id")? {
                 Some(lease_id) => Some(AccountLeaseRecord {
                     lease_id,
@@ -565,7 +570,7 @@ ORDER BY
                 }),
                 None => None,
             };
-            let account_next_eligible_at = if enabled && healthy {
+            let account_next_eligible_at = if enabled && selector_auth_eligible {
                 active_lease.as_ref().map(|lease| lease.expires_at)
             } else {
                 None
@@ -576,7 +581,7 @@ ORDER BY
                 AccountStartupEligibility::PreferredAccountDisabled
             } else if active_lease.is_some() {
                 AccountStartupEligibility::PreferredAccountBusy
-            } else if !healthy {
+            } else if !selector_auth_eligible {
                 AccountStartupEligibility::PreferredAccountUnhealthy
             } else if !enabled {
                 AccountStartupEligibility::NoEligibleAccount
@@ -1005,28 +1010,51 @@ WHERE singleton = 1
                 .await?;
             let eligibility = match membership {
                 None => AccountStartupEligibility::PreferredAccountMissing,
-                Some(membership) if membership.pool_id != pool_id => {
-                    AccountStartupEligibility::PreferredAccountInOtherPool {
-                        actual_pool_id: membership.pool_id,
+                Some(membership) => {
+                    if membership.pool_id != pool_id {
+                        AccountStartupEligibility::PreferredAccountInOtherPool {
+                            actual_pool_id: membership.pool_id,
+                        }
+                    } else if !membership.enabled {
+                        AccountStartupEligibility::PreferredAccountDisabled
+                    } else {
+                        let health_state = sqlx::query_scalar::<_, Option<String>>(
+                            r#"
+SELECT health_state
+FROM account_runtime_state
+WHERE account_id = ?
+                            "#,
+                        )
+                        .bind(&preferred_account_id)
+                        .fetch_optional(self.pool.as_ref())
+                        .await?
+                        .flatten()
+                        .as_deref()
+                        .map(AccountHealthState::try_from)
+                        .transpose()?;
+                        let selector_auth_eligible = match health_state {
+                            Some(AccountHealthState::Unauthorized) => false,
+                            Some(AccountHealthState::Healthy | AccountHealthState::RateLimited) => {
+                                true
+                            }
+                            None => membership.healthy,
+                        };
+
+                        if !selector_auth_eligible {
+                            AccountStartupEligibility::PreferredAccountUnhealthy
+                        } else if account_has_active_lease(
+                            self.pool.as_ref(),
+                            &preferred_account_id,
+                            Utc::now(),
+                        )
+                        .await?
+                        {
+                            AccountStartupEligibility::PreferredAccountBusy
+                        } else {
+                            AccountStartupEligibility::PreferredAccountSelected
+                        }
                     }
                 }
-                Some(membership) if !membership.enabled => {
-                    AccountStartupEligibility::PreferredAccountDisabled
-                }
-                Some(membership) if !membership.healthy => {
-                    AccountStartupEligibility::PreferredAccountUnhealthy
-                }
-                Some(_)
-                    if account_has_active_lease(
-                        self.pool.as_ref(),
-                        &preferred_account_id,
-                        Utc::now(),
-                    )
-                    .await? =>
-                {
-                    AccountStartupEligibility::PreferredAccountBusy
-                }
-                Some(_) => AccountStartupEligibility::PreferredAccountSelected,
             };
             let predicted_account_id = match eligibility {
                 AccountStartupEligibility::PreferredAccountSelected => {
@@ -1611,6 +1639,8 @@ INSERT INTO account_leases (
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
         "#,
     );
     query.push("WHERE membership.pool_id = ");
@@ -1618,7 +1648,11 @@ JOIN account_registry
     query.push(
         r#"
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+  AND (
+      account_registry.healthy = 1
+      OR account_runtime_state.health_state IN ('healthy', 'rate_limited')
+  )
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
@@ -1680,10 +1714,16 @@ INSERT INTO account_leases (
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
 WHERE membership.pool_id = ?
   AND membership.account_id = ?
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+  AND (
+      account_registry.healthy = 1
+      OR account_runtime_state.health_state IN ('healthy', 'rate_limited')
+  )
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
@@ -1743,9 +1783,15 @@ SELECT membership.account_id
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
 WHERE membership.pool_id = ?
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+  AND (
+      account_registry.healthy = 1
+      OR account_runtime_state.health_state IN ('healthy', 'rate_limited')
+  )
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
@@ -2147,7 +2193,7 @@ WHERE holder_instance_id = ?
             .unwrap();
 
         assert_eq!(diagnostic.pool_id, "team-main");
-        assert_eq!(diagnostic.next_eligible_at, Some(lease.expires_at));
+        assert_eq!(diagnostic.next_eligible_at, None);
         assert_eq!(diagnostic.accounts.len(), 2);
         assert_eq!(diagnostic.accounts[0].account_id, "acct-1");
         assert_eq!(diagnostic.accounts[0].pool_id, "team-main");
@@ -2172,9 +2218,74 @@ WHERE holder_instance_id = ?
         );
         assert_eq!(
             diagnostic.accounts[1].eligibility,
-            crate::AccountStartupEligibility::PreferredAccountUnhealthy
+            crate::AccountStartupEligibility::AutomaticAccountSelected
         );
         assert_eq!(diagnostic.accounts[1].next_eligible_at, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_rate_limited_state_does_not_block_startup_preview_or_lease_acquisition() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+
+        sqlx::query(
+            r#"
+UPDATE account_registry
+SET healthy = 0
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .execute(runtime.pool.as_ref())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+INSERT INTO account_runtime_state (
+    account_id,
+    pool_id,
+    health_state,
+    last_health_event_sequence,
+    last_health_event_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    pool_id = excluded.pool_id,
+    health_state = excluded.health_state,
+    last_health_event_sequence = excluded.last_health_event_sequence,
+    last_health_event_at = excluded.last_health_event_at,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind("acct-1")
+        .bind("pool-main")
+        .bind(AccountHealthState::RateLimited.as_str())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(runtime.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .preview_account_startup_selection(Some("pool-main"))
+                .await
+                .unwrap(),
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-1".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
+        );
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "holder-1", chrono::Duration::seconds(60))
+            .await
+            .unwrap();
+        assert_eq!(lease.account_id, "acct-1");
     }
 
     #[tokio::test]

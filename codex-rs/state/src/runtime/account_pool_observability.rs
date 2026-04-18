@@ -47,7 +47,12 @@ SELECT
     COALESCE(SUM(CASE WHEN active_lease.lease_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS active_leases,
     COALESCE(SUM(CASE
         WHEN account_registry.enabled = 1
-          AND account_registry.healthy = 1
+          AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+          AND (
+              account_registry.healthy = 1
+              OR account_runtime_state.health_state IN ('healthy', 'rate_limited')
+          )
+          AND COALESCE(quota_state.exhausted_windows, 'none') = 'none'
           AND active_lease.lease_id IS NULL
             THEN 1
         ELSE 0
@@ -56,6 +61,11 @@ SELECT
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+LEFT JOIN account_quota_state AS quota_state
+  ON quota_state.account_id = membership.account_id
+ AND quota_state.limit_id = 'codex'
 LEFT JOIN account_leases AS active_lease
   ON active_lease.account_id = membership.account_id
  AND active_lease.pool_id = membership.pool_id
@@ -116,6 +126,8 @@ SELECT
     account_registry.updated_at AS registry_updated_at,
     account_runtime_state.health_state,
     account_runtime_state.updated_at AS health_updated_at,
+    quota_state.exhausted_windows AS quota_exhausted_windows,
+    quota_state.updated_at AS quota_updated_at,
     active_lease.lease_id,
     active_lease.lease_epoch,
     active_lease.holder_instance_id,
@@ -127,6 +139,9 @@ JOIN account_registry
   ON account_registry.account_id = membership.account_id
 LEFT JOIN account_runtime_state
   ON account_runtime_state.account_id = membership.account_id
+LEFT JOIN account_quota_state AS quota_state
+  ON quota_state.account_id = membership.account_id
+ AND quota_state.limit_id = 'codex'
 LEFT JOIN account_leases AS active_lease
   ON active_lease.account_id = membership.account_id
  AND active_lease.pool_id = membership.pool_id
@@ -172,7 +187,16 @@ LEFT JOIN account_leases AS active_lease
             let account_id: String = row.try_get("account_id")?;
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
-            let health_state = row.try_get::<Option<String>, _>("health_state")?;
+            let legacy_health_state = row.try_get::<Option<String>, _>("health_state")?;
+            let quota_exhausted = quota_exhausted_windows_is_exhausted(
+                row.try_get::<Option<String>, _>("quota_exhausted_windows")?
+                    .as_deref(),
+            );
+            let selector_auth_eligible =
+                selector_auth_eligible(healthy, legacy_health_state.as_deref());
+            let health_state =
+                derive_account_compat_health_state(legacy_health_state.as_deref(), quota_exhausted)
+                    .map(ToOwned::to_owned);
             let current_lease = match row.try_get::<Option<String>, _>("lease_id")? {
                 Some(lease_id) => Some(AccountPoolLeaseRecord {
                     lease_id,
@@ -187,6 +211,7 @@ LEFT JOIN account_leases AS active_lease
             let operational_state = derive_account_operational_state(
                 enabled,
                 health_state.as_deref(),
+                quota_exhausted,
                 current_lease.is_some(),
             )
             .map(ToOwned::to_owned);
@@ -217,7 +242,8 @@ LEFT JOIN account_leases AS active_lease
                     selection: Some(AccountPoolSelectionRecord {
                         eligible: !selection.suppressed
                             && enabled
-                            && healthy
+                            && selector_auth_eligible
+                            && !quota_exhausted
                             && next_eligible_at.is_none(),
                         next_eligible_at,
                         preferred: selection.preferred_account_id.as_deref()
@@ -225,7 +251,8 @@ LEFT JOIN account_leases AS active_lease
                         suppressed: selection.suppressed,
                     }),
                     updated_at: account_epoch_seconds_to_datetime(
-                        row.try_get::<i64, _>("health_updated_at")
+                        row.try_get::<i64, _>("quota_updated_at")
+                            .or_else(|_| row.try_get::<i64, _>("health_updated_at"))
                             .or_else(|_| row.try_get::<i64, _>("registry_updated_at"))?,
                     )?,
                 },
@@ -371,6 +398,9 @@ SELECT
     account_registry.enabled,
     account_registry.healthy,
     account_runtime_state.health_state,
+    quota_state.exhausted_windows AS quota_exhausted_windows,
+    quota_state.predicted_blocked_until AS quota_predicted_blocked_until,
+    quota_state.next_probe_after AS quota_next_probe_after,
     active_lease.holder_instance_id,
     active_lease.expires_at
 FROM account_pool_membership AS membership
@@ -378,6 +408,9 @@ JOIN account_registry
   ON account_registry.account_id = membership.account_id
 LEFT JOIN account_runtime_state
   ON account_runtime_state.account_id = membership.account_id
+LEFT JOIN account_quota_state AS quota_state
+  ON quota_state.account_id = membership.account_id
+ AND quota_state.limit_id = 'codex'
 LEFT JOIN account_leases AS active_lease
   ON active_lease.account_id = membership.account_id
  AND active_lease.pool_id = membership.pool_id
@@ -400,16 +433,20 @@ ORDER BY membership.position ASC, membership.account_id ASC
         for row in rows {
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
+            let health_state = row.try_get::<Option<String>, _>("health_state")?;
+            let selector_auth_eligible = selector_auth_eligible(healthy, health_state.as_deref());
+            let quota_exhausted = quota_exhausted_windows_is_exhausted(
+                row.try_get::<Option<String>, _>("quota_exhausted_windows")?
+                    .as_deref(),
+            );
             let expires_at = row
                 .try_get::<Option<i64>, _>("expires_at")?
                 .map(account_epoch_seconds_to_datetime)
                 .transpose()?;
 
-            if enabled && healthy && expires_at.is_none() {
+            if enabled && selector_auth_eligible && !quota_exhausted && expires_at.is_none() {
                 allocatable_accounts += 1;
             }
-
-            let health_state = row.try_get::<Option<String>, _>("health_state")?;
 
             if let Some(expires_at) = expires_at {
                 if health_state.as_deref() != Some("unauthorized") {
@@ -425,24 +462,35 @@ ORDER BY membership.position ASC, membership.account_id ASC
             if selection.preferred_account_id.as_deref() == Some(account_id.as_str()) {
                 preferred_in_pool = true;
             }
-            match health_state.as_deref() {
-                Some("rate_limited") => issues.push(AccountPoolIssueRecord {
+            if quota_exhausted {
+                let quota_next_relevant_at = row
+                    .try_get::<Option<i64>, _>("quota_predicted_blocked_until")?
+                    .or(row.try_get::<Option<i64>, _>("quota_next_probe_after")?)
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?;
+                next_relevant_at = match (next_relevant_at, quota_next_relevant_at) {
+                    (Some(current), Some(next)) => Some(current.min(next)),
+                    (None, Some(next)) => Some(next),
+                    (current, None) => current,
+                };
+                issues.push(AccountPoolIssueRecord {
                     severity: "warning".to_string(),
                     reason_code: "cooldownActive".to_string(),
                     message: format!("account {account_id} is in cooldown"),
                     account_id: Some(account_id.clone()),
                     holder_instance_id: row.try_get("holder_instance_id")?,
-                    next_relevant_at: expires_at,
-                }),
-                Some("unauthorized") => issues.push(AccountPoolIssueRecord {
+                    next_relevant_at: quota_next_relevant_at,
+                });
+            }
+            if let Some("unauthorized") = health_state.as_deref() {
+                issues.push(AccountPoolIssueRecord {
                     severity: "error".to_string(),
                     reason_code: "authFailure".to_string(),
                     message: format!("account {account_id} is unauthorized"),
                     account_id: Some(account_id.clone()),
                     holder_instance_id: row.try_get("holder_instance_id")?,
                     next_relevant_at: None,
-                }),
-                _ => {}
+                })
             }
         }
 
@@ -546,15 +594,43 @@ fn normalize_page_limit(limit: Option<u32>, default_limit: u32, max_limit: u32) 
 fn derive_account_operational_state(
     enabled: bool,
     health_state: Option<&str>,
+    quota_exhausted: bool,
     has_active_lease: bool,
 ) -> Option<&'static str> {
     match health_state {
         Some("unauthorized") => Some("error"),
-        Some("rate_limited") if !has_active_lease => Some("coolingDown"),
+        _ if quota_exhausted && !has_active_lease => Some("coolingDown"),
         _ if has_active_lease => Some("leased"),
         _ if enabled => Some("available"),
         _ => None,
     }
+}
+
+fn derive_account_compat_health_state(
+    legacy_health_state: Option<&str>,
+    quota_exhausted: bool,
+) -> Option<&'static str> {
+    if legacy_health_state == Some("unauthorized") {
+        Some("unauthorized")
+    } else if quota_exhausted {
+        Some("rate_limited")
+    } else if legacy_health_state == Some("healthy") {
+        Some("healthy")
+    } else {
+        None
+    }
+}
+
+fn selector_auth_eligible(healthy: bool, health_state: Option<&str>) -> bool {
+    match health_state {
+        Some("unauthorized") => false,
+        Some("healthy" | "rate_limited") => true,
+        _ => healthy,
+    }
+}
+
+fn quota_exhausted_windows_is_exhausted(exhausted_windows: Option<&str>) -> bool {
+    exhausted_windows.is_some_and(|exhausted_windows| exhausted_windows != "none")
 }
 
 fn matches_account_state_filter(operational_state: Option<&str>, states: &[String]) -> bool {
@@ -854,6 +930,102 @@ mod tests {
         assert_eq!(
             accounts.data[0].operational_state.as_deref(),
             Some("leased")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_projects_cooling_down_from_quota_rows() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(98.0),
+                primary_resets_at: Some(timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(timestamp(120)),
+                next_probe_after: Some(timestamp(90)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: Some(vec!["coolingDown".to_string()]),
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 1);
+        assert_eq!(accounts.data[0].account_id, "acct-1");
+        assert_eq!(
+            accounts.data[0].health_state.as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            accounts.data[0].operational_state.as_deref(),
+            Some("coolingDown")
+        );
+        assert_eq!(
+            accounts.data[0]
+                .selection
+                .as_ref()
+                .map(|selection| selection.eligible),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_and_snapshot_project_cooldown_from_quota_rows() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: timestamp(100),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: Some(timestamp(180)),
+                next_probe_after: Some(timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: Some(crate::QuotaProbeResult::StillBlocked),
+            })
+            .await
+            .unwrap();
+
+        let snapshot = runtime
+            .read_account_pool_snapshot("team-main")
+            .await
+            .unwrap();
+        let diagnostics = runtime
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.summary.available_accounts, Some(0));
+        assert_eq!(diagnostics.status, "blocked");
+        assert_eq!(
+            diagnostics
+                .issues
+                .iter()
+                .find(|issue| issue.reason_code == "cooldownActive")
+                .map(|issue| issue.severity.as_str()),
+            Some("warning")
         );
     }
 
