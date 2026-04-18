@@ -33,6 +33,23 @@ The recommended direction is:
 This gives the fork an immediately useful local operator/debug surface without
 expanding the pooled runtime contract or increasing merge risk in state/core.
 
+JSON timestamp rule for this CLI slice:
+
+- all new CLI JSON timestamps should be RFC 3339 UTC strings
+- absent timestamps remain `null`
+- this applies to top-level and nested fields such as:
+  - `refreshedAt`
+  - `generatedAt`
+  - `occurredAt`
+  - `updatedAt`
+  - lease timestamps
+  - quota timestamps
+  - selection timestamps
+  - diagnostics issue timestamps
+
+This keeps CLI JSON aligned with the existing CLI preference for human-readable
+timestamps while staying explicit and deterministic.
+
 ## Goals
 
 - Improve day-to-day operator UX for pooled accounts.
@@ -292,6 +309,10 @@ and add one new additive field:
 The new JSON contract should keep keys present with `null` values where the
 corresponding read failed, rather than omitting the field dynamically.
 
+Unless stated otherwise, nested CLI JSON should mirror seam nullability and
+value semantics, with the timestamp normalization rule above applied at the
+output boundary.
+
 ### 3. Add `pool show` as the operational detail view
 
 `codex accounts pool show` should present the current summary and account rows
@@ -347,8 +368,7 @@ Text output should show:
 The `lease` column should render:
 
 - `-` when no active lease exists
-- `leaseId` when a lease exists but no holder is present
-- `leaseId@holderInstanceId` when both values are present
+- `leaseId@holderInstanceId` when an active lease exists
 
 Other nullable text fields should render conservatively:
 
@@ -565,6 +585,12 @@ the operator can request the next page without a separate pagination protocol.
 - `reasonCode`
 - `message`
 - `details`
+
+`details` should be an opaque raw JSON passthrough:
+
+- preserve any JSON value shape emitted by the seam/backend
+- do not stringify JSON into a text blob
+- do not narrow it to object-only payloads
 
 JSON contract rules:
 
