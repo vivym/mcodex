@@ -1,6 +1,8 @@
 mod diagnostics;
 mod mutate;
 mod observability;
+mod observability_output;
+mod observability_types;
 mod output;
 mod registration;
 
@@ -20,7 +22,10 @@ use mutate::list_account_pools;
 use mutate::list_accounts;
 use mutate::remove_account;
 use mutate::set_account_enabled;
+use observability::read_pool_show;
 use observability::resolve_target_pool;
+use observability_output::print_pool_show_json;
+use observability_output::print_pool_show_text;
 use output::print_current_json;
 use output::print_current_text;
 use output::print_status_json;
@@ -284,7 +289,20 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                 command.pool.as_deref(),
                 account_pool.as_deref(),
             )?;
-            anyhow::bail!("accounts pool show is not implemented yet")
+            let runtime = Arc::new(
+                StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                    .await
+                    .context("initialize account startup selection state")?,
+            );
+            let view = read_pool_show(&runtime, &config, account_pool.as_deref(), &command)
+                .await
+                .context("read account pool view")?;
+            if command.json {
+                print_pool_show_json(&view)?;
+            } else {
+                print_pool_show_text(&view);
+            }
+            Ok(())
         }
         AccountsSubcommand::Diagnostics(command) => {
             validate_explicit_observability_target(
