@@ -1614,11 +1614,7 @@ List accounts in the pool:
           "renewedAt": 1710000030,
           "expiresAt": 1710000300
         },
-        "quota": {
-          "remainingPercent": 42.5,
-          "resetsAt": 1710003600,
-          "observedAt": 1710000030
-        },
+        "quota": null,
         "selection": {
           "eligible": false,
           "nextEligibleAt": 1710000300,

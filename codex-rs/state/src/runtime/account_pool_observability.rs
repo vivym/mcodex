@@ -459,7 +459,7 @@ ORDER BY membership.position ASC, membership.account_id ASC
             });
         }
 
-        if allocatable_accounts == 0 {
+        if allocatable_accounts == 0 && viable_active_leases == 0 {
             let lease_failure = recent_events
                 .data
                 .iter()
@@ -745,6 +745,24 @@ mod tests {
                 .map(|issue| issue.severity.as_str()),
             Some("error")
         );
+    }
+
+    #[tokio::test]
+    async fn read_account_pool_diagnostics_keeps_single_healthy_active_lease_pool_healthy() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .acquire_account_lease("team-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        let diagnostics = runtime
+            .read_account_pool_diagnostics("team-main")
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostics.status, "healthy");
+        assert!(diagnostics.issues.is_empty());
     }
 
     #[tokio::test]
