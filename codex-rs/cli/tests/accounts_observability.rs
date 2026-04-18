@@ -48,6 +48,47 @@ async fn accounts_diagnostics_rejects_conflicting_pool_flags() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn accounts_events_parse_flags() {
+    let events = AccountsCommand::try_parse_from([
+        "codex",
+        "events",
+        "--pool",
+        "team-main",
+        "--limit",
+        "25",
+        "--cursor",
+        "cursor-1",
+        "--json",
+    ])
+    .expect("events parses");
+    assert_eq!(
+        format!("{:?}", events.subcommand),
+        "Events(AccountsEventsCommand { pool: Some(\"team-main\"), limit: Some(25), cursor: Some(\"cursor-1\"), json: true })"
+    );
+}
+
+#[tokio::test]
+async fn accounts_events_rejects_conflicting_pool_flags() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "team-main",
+            "events",
+            "--pool",
+            "team-other",
+        ],
+    )
+    .await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("conflicts with --account-pool"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn accounts_diagnostics_without_explicit_pool_keeps_placeholder_behavior() -> Result<()> {
     let codex_home = prepared_empty_home()?;
@@ -63,6 +104,34 @@ async fn accounts_diagnostics_without_explicit_pool_keeps_placeholder_behavior()
         !output
             .stderr
             .contains("no account pool is configured; pass --pool <POOL_ID> or configure a pool")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_diagnostics_placeholder_does_not_require_runtime_init() -> Result<()> {
+    let codex_home = prepared_empty_home()?;
+    let output = run_codex(
+        &codex_home,
+        &[
+            "-c",
+            "sqlite_home=\"/dev/null/nope\"",
+            "accounts",
+            "diagnostics",
+        ],
+    )
+    .await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(
+        output
+            .stderr
+            .contains("Error managing accounts: accounts diagnostics is not implemented yet")
+    );
+    assert!(
+        !output
+            .stderr
+            .contains("initialize account startup selection state")
     );
     Ok(())
 }

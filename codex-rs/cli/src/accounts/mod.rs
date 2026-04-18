@@ -276,76 +276,16 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         }
     }
 
-    let runtime = Arc::new(
-        StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
-            .await
-            .context("initialize account startup selection state")?,
-    );
-
     match subcommand {
-        AccountsSubcommand::Add(command) => {
-            let registered = match command.subcommand {
-                None => {
-                    add_chatgpt_account(&runtime, &config, account_pool.as_deref(), false).await?
-                }
-                Some(AddAccountSubcommand::Chatgpt(command)) => {
-                    add_chatgpt_account(
-                        &runtime,
-                        &config,
-                        account_pool.as_deref(),
-                        command.device_auth,
-                    )
-                    .await?
-                }
-                Some(AddAccountSubcommand::ApiKey) => {
-                    return api_key_add_is_unsupported().map(|_| ());
-                }
-            };
-            debug_assert!(
-                !registered.provider_account_id.is_empty(),
-                "registered ChatGPT provider account id should not be empty"
-            );
-            println!(
-                "registered account: {} pool={}",
-                registered.account_id, registered.pool_id
-            );
-            Ok(())
-        }
-        AccountsSubcommand::ImportLegacy(command) => {
-            let imported = import_legacy_account(
-                &runtime,
-                &config,
+        AccountsSubcommand::Pool(PoolCommand {
+            subcommand: PoolSubcommand::Show(command),
+        }) => {
+            validate_explicit_observability_target(
                 command.pool.as_deref(),
                 account_pool.as_deref(),
-            )
-            .await?;
-            println!(
-                "imported legacy account: {} pool={}",
-                imported.account_id, imported.pool_id
-            );
-            Ok(())
+            )?;
+            anyhow::bail!("accounts pool show is not implemented yet")
         }
-        AccountsSubcommand::Enable(command) => {
-            set_account_enabled(&runtime, &command.account_id, true).await
-        }
-        AccountsSubcommand::Disable(command) => {
-            set_account_enabled(&runtime, &command.account_id, false).await
-        }
-        AccountsSubcommand::Remove(command) => remove_account(&runtime, &command.account_id).await,
-        AccountsSubcommand::List => list_accounts(&runtime).await,
-        AccountsSubcommand::Pool(command) => match command.subcommand {
-            PoolSubcommand::List => list_account_pools(&runtime).await,
-            PoolSubcommand::Assign(command) => {
-                assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
-            }
-            PoolSubcommand::Show(command) => {
-                validate_explicit_observability_target(
-                    command.pool.as_deref(),
-                    account_pool.as_deref(),
-                )?;
-                anyhow::bail!("accounts pool show is not implemented yet")
-            }
-        },
         AccountsSubcommand::Diagnostics(command) => {
             validate_explicit_observability_target(
                 command.pool.as_deref(),
@@ -360,80 +300,164 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             )?;
             anyhow::bail!("accounts events is not implemented yet")
         }
-        AccountsSubcommand::Current(current_command) => {
-            let diagnostic = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
-                .await
-                .context("read account startup preview")?;
-            if current_command.json {
-                print_current_json(&diagnostic)?;
-            } else {
-                print_current_text(&diagnostic);
+        subcommand => {
+            let runtime = Arc::new(
+                StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                    .await
+                    .context("initialize account startup selection state")?,
+            );
+
+            match subcommand {
+                AccountsSubcommand::Add(command) => {
+                    let registered = match command.subcommand {
+                        None => {
+                            add_chatgpt_account(&runtime, &config, account_pool.as_deref(), false)
+                                .await?
+                        }
+                        Some(AddAccountSubcommand::Chatgpt(command)) => {
+                            add_chatgpt_account(
+                                &runtime,
+                                &config,
+                                account_pool.as_deref(),
+                                command.device_auth,
+                            )
+                            .await?
+                        }
+                        Some(AddAccountSubcommand::ApiKey) => {
+                            return api_key_add_is_unsupported().map(|_| ());
+                        }
+                    };
+                    debug_assert!(
+                        !registered.provider_account_id.is_empty(),
+                        "registered ChatGPT provider account id should not be empty"
+                    );
+                    println!(
+                        "registered account: {} pool={}",
+                        registered.account_id, registered.pool_id
+                    );
+                    Ok(())
+                }
+                AccountsSubcommand::ImportLegacy(command) => {
+                    let imported = import_legacy_account(
+                        &runtime,
+                        &config,
+                        command.pool.as_deref(),
+                        account_pool.as_deref(),
+                    )
+                    .await?;
+                    println!(
+                        "imported legacy account: {} pool={}",
+                        imported.account_id, imported.pool_id
+                    );
+                    Ok(())
+                }
+                AccountsSubcommand::Enable(command) => {
+                    set_account_enabled(&runtime, &command.account_id, true).await
+                }
+                AccountsSubcommand::Disable(command) => {
+                    set_account_enabled(&runtime, &command.account_id, false).await
+                }
+                AccountsSubcommand::Remove(command) => {
+                    remove_account(&runtime, &command.account_id).await
+                }
+                AccountsSubcommand::List => list_accounts(&runtime).await,
+                AccountsSubcommand::Pool(command) => match command.subcommand {
+                    PoolSubcommand::List => list_account_pools(&runtime).await,
+                    PoolSubcommand::Assign(command) => {
+                        assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
+                    }
+                    PoolSubcommand::Show(_) => {
+                        unreachable!("handled before runtime initialization")
+                    }
+                },
+                AccountsSubcommand::Diagnostics(_) => {
+                    unreachable!("handled before runtime initialization")
+                }
+                AccountsSubcommand::Events(_) => {
+                    unreachable!("handled before runtime initialization")
+                }
+                AccountsSubcommand::Current(current_command) => {
+                    let diagnostic =
+                        read_current_diagnostic(&runtime, &config, account_pool.as_deref())
+                            .await
+                            .context("read account startup preview")?;
+                    if current_command.json {
+                        print_current_json(&diagnostic)?;
+                    } else {
+                        print_current_text(&diagnostic);
+                    }
+                    Ok(())
+                }
+                AccountsSubcommand::Status(status_command) => {
+                    let diagnostic =
+                        read_status_diagnostic(&runtime, &config, account_pool.as_deref())
+                            .await
+                            .context("read account startup status")?;
+                    if status_command.json {
+                        print_status_json(&diagnostic)?;
+                    } else {
+                        print_status_text(&diagnostic);
+                    }
+                    Ok(())
+                }
+                AccountsSubcommand::Resume => {
+                    let selection = runtime
+                        .read_account_startup_selection()
+                        .await
+                        .context("read account startup selection")?;
+                    runtime
+                        .write_account_startup_selection(AccountStartupSelectionUpdate {
+                            default_pool_id: selection.default_pool_id,
+                            preferred_account_id: None,
+                            suppressed: false,
+                        })
+                        .await
+                        .context("clear account startup selection suppression")?;
+                    println!("automatic selection resumed");
+                    Ok(())
+                }
+                AccountsSubcommand::Switch(command) => {
+                    let current =
+                        read_current_diagnostic(&runtime, &config, account_pool.as_deref())
+                            .await
+                            .context("read account startup preview")?;
+                    let Some(effective_pool_id) =
+                        current.startup.startup.preview.effective_pool_id.clone()
+                    else {
+                        anyhow::bail!(
+                            "no effective pool is configured for pooled account selection"
+                        );
+                    };
+                    let membership = runtime
+                        .read_account_pool_membership(&command.account_id)
+                        .await
+                        .context("read preferred account membership")?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("account `{}` is not registered", command.account_id)
+                        })?;
+                    if membership.pool_id != effective_pool_id {
+                        anyhow::bail!(
+                            "account `{}` belongs to pool `{}`; current effective pool is `{effective_pool_id}`",
+                            command.account_id,
+                            membership.pool_id
+                        );
+                    }
+                    let selection = runtime
+                        .read_account_startup_selection()
+                        .await
+                        .context("read account startup selection")?;
+                    runtime
+                        .write_account_startup_selection(AccountStartupSelectionUpdate {
+                            default_pool_id: selection.default_pool_id,
+                            preferred_account_id: Some(command.account_id.clone()),
+                            suppressed: false,
+                        })
+                        .await
+                        .context("write preferred account startup selection")?;
+                    println!("preferred account: {}", command.account_id);
+                    Ok(())
+                }
             }
-            Ok(())
-        }
-        AccountsSubcommand::Status(status_command) => {
-            let diagnostic = read_status_diagnostic(&runtime, &config, account_pool.as_deref())
-                .await
-                .context("read account startup status")?;
-            if status_command.json {
-                print_status_json(&diagnostic)?;
-            } else {
-                print_status_text(&diagnostic);
-            }
-            Ok(())
-        }
-        AccountsSubcommand::Resume => {
-            let selection = runtime
-                .read_account_startup_selection()
-                .await
-                .context("read account startup selection")?;
-            runtime
-                .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: selection.default_pool_id,
-                    preferred_account_id: None,
-                    suppressed: false,
-                })
-                .await
-                .context("clear account startup selection suppression")?;
-            println!("automatic selection resumed");
-            Ok(())
-        }
-        AccountsSubcommand::Switch(command) => {
-            let current = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
-                .await
-                .context("read account startup preview")?;
-            let Some(effective_pool_id) = current.startup.startup.preview.effective_pool_id.clone()
-            else {
-                anyhow::bail!("no effective pool is configured for pooled account selection");
-            };
-            let membership = runtime
-                .read_account_pool_membership(&command.account_id)
-                .await
-                .context("read preferred account membership")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("account `{}` is not registered", command.account_id)
-                })?;
-            if membership.pool_id != effective_pool_id {
-                anyhow::bail!(
-                    "account `{}` belongs to pool `{}`; current effective pool is `{effective_pool_id}`",
-                    command.account_id,
-                    membership.pool_id
-                );
-            }
-            let selection = runtime
-                .read_account_startup_selection()
-                .await
-                .context("read account startup selection")?;
-            runtime
-                .write_account_startup_selection(AccountStartupSelectionUpdate {
-                    default_pool_id: selection.default_pool_id,
-                    preferred_account_id: Some(command.account_id.clone()),
-                    suppressed: false,
-                })
-                .await
-                .context("write preferred account startup selection")?;
-            println!("preferred account: {}", command.account_id);
-            Ok(())
         }
     }
 }
