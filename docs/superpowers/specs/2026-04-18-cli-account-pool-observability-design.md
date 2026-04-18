@@ -182,6 +182,15 @@ Command roles:
 existing subtree, avoiding a grammar conflict with the current `pool`
 management commands.
 
+Per-command scope and pagination rules:
+
+| Command | Default pool resolution | Pagination | Text cursor behavior |
+|---------|-------------------------|------------|----------------------|
+| `accounts status` | use current effective pool when one exists; otherwise omit pooled observability summary instead of failing | none | none |
+| `accounts pool show` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | yes, over account rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+| `accounts diagnostics` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | none | none |
+| `accounts events` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | yes, over event rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+
 ### 2. Keep `status` concise and additive
 
 `codex accounts status` already owns startup-selection and effective-pool
@@ -217,6 +226,9 @@ Pool selection rules:
   diagnostic path
 - if neither exists, fail with an explicit message telling the user to pass
   `--pool <POOL_ID>`
+- `--limit` and `--cursor` page account rows, not summary metadata
+- when another account page exists, text mode should print the returned next
+  cursor after the rows; JSON mode should preserve the raw `nextCursor` field
 
 First-pass parameters:
 
@@ -250,6 +262,14 @@ in the first text implementation.
 `codex accounts diagnostics` should show why a pool is currently healthy,
 degraded, or blocked.
 
+Pool selection rules:
+
+- if `--pool <POOL_ID>` is present, use it
+- otherwise, resolve the current effective pool from the existing startup
+  diagnostic path
+- if neither exists, fail with the same explicit `--pool` guidance used by
+  `pool show`
+
 First-pass parameters:
 
 - `--pool <POOL_ID>`
@@ -275,6 +295,14 @@ who want chronology should move to `events`.
 `codex accounts events` should expose recent append-only pooled history with the
 existing cursor model.
 
+Pool selection rules:
+
+- if `--pool <POOL_ID>` is present, use it
+- otherwise, resolve the current effective pool from the existing startup
+  diagnostic path
+- if neither exists, fail with the same explicit `--pool` guidance used by
+  `pool show`
+
 First-pass parameters:
 
 - `--pool <POOL_ID>`
@@ -291,6 +319,18 @@ Text output should include:
 - account id when present
 - reason code when present
 - message
+
+Event order should match the backend contract exactly:
+
+- newest first
+- descending by `occurredAt`
+- tie-broken by descending event id/cursor order
+
+Pagination rules:
+
+- `--limit` and `--cursor` page event rows only
+- text mode should print the returned next cursor when another page exists
+- JSON mode should preserve the raw `nextCursor` field unchanged
 
 When another page exists, text output should print the next cursor explicitly so
 the operator can request the next page without a separate pagination protocol.
