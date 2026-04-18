@@ -280,9 +280,26 @@ The `lease` column should render:
 - `leaseId` when a lease exists but no holder is present
 - `leaseId@holderInstanceId` when both values are present
 
+Other nullable text fields should render conservatively:
+
+- missing `health` or `state`: `unknown`
+- missing `eligible`: `unknown`
+- missing `preferred`: `no`
+- missing quota/selection detail not shown in the default text table: omit rather
+  than invent placeholders
+
 Less critical fields such as `backendAccountRef`, `statusReasonCode`,
 `statusMessage`, and the full `selection` object may remain primarily JSON-only
 in the first text implementation.
+
+`pool show --json` should expose:
+
+- `poolId`
+- `backend`
+- `refreshedAt`
+- `summary`
+- `data`
+- `nextCursor`
 
 ### 4. Add `diagnostics` as the current-state explanation view
 
@@ -320,6 +337,13 @@ sorting pass over diagnostics rows in this slice.
 
 This command is intentionally about current issues, not historical order. Users
 who want chronology should move to `events`.
+
+`diagnostics --json` should expose:
+
+- `poolId`
+- `generatedAt`
+- `status`
+- `issues`
 
 ### 5. Add `events` as the chronological debugging view
 
@@ -368,6 +392,12 @@ When another page exists, text output should print the next cursor explicitly so
 the operator can request the next page without a separate pagination protocol.
 
 `events --follow` and live streaming behavior are intentionally deferred.
+
+`events --json` should expose:
+
+- `poolId`
+- `data`
+- `nextCursor`
 
 ### 6. Keep CLI dependent on the backend-neutral observability seam
 
@@ -442,7 +472,11 @@ The first slice should keep a small, explicit error model:
 - no effective pool resolved and no `--pool` passed:
   - fail with: `no effective pool is configured; pass --pool <POOL_ID>`
 - target pool not found:
-  - propagate a clear pool-not-found error
+  - for `pool show`, `diagnostics`, and `events`, propagate a clear
+    pool-not-found error
+  - for additive `status` observability reads, do not fail the command; treat
+    pool-not-found the same as any other observability-read failure and surface
+    it as a warning / `poolObservabilityError`
 - invalid cursor:
   - fail with an explicit cursor error
 - empty event page:
