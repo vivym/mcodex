@@ -226,6 +226,8 @@ Semantics:
 - `exhausted_windows` records what the latest known quota state actually says
 - `unknown` is necessary because some `usage_limit_reached` paths may not let us
   reliably infer which window was exhausted
+- `probe_backoff_level` starts at `0`
+- `last_probe_result` starts as `null` until the first completed reprobe
 
 ### 3. Make quota truth live-backend authoritative
 
@@ -266,12 +268,15 @@ or reinterpret `accounts.min_switch_interval_secs` inside quota ranking.
 
 The engine input should include:
 
+- selection context facts:
+  - `current_account_id`
+  - `just_replaced_account_id`
+  - `selection_family`
 - registry facts
 - lease facts
 - auth facts
-- quota facts for the preferred or active limit family
-- fallback quota facts for the default `codex` family when the preferred family
-  is absent
+- caller-resolved quota facts for `selection_family`
+- optional fallback quota facts for the default `codex` family
 - current time
 - proactive threshold
 
@@ -281,11 +286,69 @@ The engine output should be a structured `SelectionPlan` containing:
 - `probe_candidate`
 - `rejected_candidates` with reasons
 - `decision_reason`
+- a terminal action:
+  - `Select(account_id)`
+  - `Probe(account_id)`
+  - `StayOnCurrent`
+  - `NoCandidate`
 
 This shared output is also the right source for diagnostics and operator-facing
 selection explanations.
 
-### 5. Use a four-stage selection pipeline
+If acquiring an ordinary ranked candidate fails because lease state changed
+under contention, the runtime reruns selection immediately rather than walking
+the remainder of the stale candidate list from the old plan.
+
+`just_replaced_account_id` is a first-class input owned by the shared selector,
+not an implicit caller-side prefilter. `core` provides the current runtime-local
+anti-bounce fact, and the policy engine itself decides how that fact affects
+`SoftRotation` and `HardFailover`.
+
+### 5. Define per-intent admissibility explicitly
+
+The selector must not leave admissibility to caller convention. In the first
+slice, each `SelectionIntent` has a fixed candidate contract.
+
+`Startup`
+
+- there is no current leased account
+- all accounts that pass hard filtering are admissible to ordinary ranking
+- blocked accounts may become reprobe candidates only after ordinary candidates
+  are exhausted
+
+`SoftRotation`
+
+- the current active account is never an ordinary candidate
+- the current active account is never a reprobe candidate
+- the most recently proactively replaced account from the switch-damping design
+  is excluded from ordinary ranking and reprobe during the same soft-rotation
+  attempt in order to avoid immediate bounce-back
+- if no admissible non-blocked candidate exists and no probe succeeds, the
+  selector returns `StayOnCurrent`; soft rotation does not release and reacquire
+  the current account merely to pick it again
+
+`HardFailover`
+
+- the current failed account is never admissible
+- the most recently proactively replaced account is admissible again; hard
+  failure is allowed to override the soft no-bounce rule
+- blocked accounts may become reprobe candidates only after ordinary candidates
+  are exhausted
+
+`ProbeRecovery`
+
+- no ordinary ranking is performed
+- the selector operates only on the single reserved probe target handed to it
+- success writes refreshed quota knowledge and then reruns the original caller
+  intent from scratch rather than directly selecting the probed account by
+  special case
+
+This contract is intentionally aligned with
+`2026-04-16-account-pool-switch-damping-design.md`: quota-aware selection must
+respect the runtime-local "do not immediately switch back" rule during
+`SoftRotation`, while `HardFailover` may bypass that soft anti-flap constraint.
+
+### 6. Use a four-stage selection pipeline
 
 Selection should proceed in four stages.
 
@@ -297,6 +360,9 @@ Remove accounts that are definitely unavailable:
 - unauthorized
 - currently leased by another holder
 - otherwise failing required hard constraints
+
+Then apply the intent-specific exclusions from the previous section before
+ordinary ranking begins.
 
 #### Stage 2: Soft-block classification
 
@@ -317,13 +383,19 @@ An account is `ProbeEligibleBlocked` when:
 - it is currently predicted blocked
 - `now >= next_probe_after`
 - and the current selection attempt has exhausted ordinary `NotBlocked`
-  candidates or the intent is `HardFailover` or `ProbeRecovery`
+  candidates, or the intent is `ProbeRecovery`
 
 In the first slice, "stale enough to reprobe" is defined only through
 `next_probe_after`. Planners should not invent an additional implicit staleness
 timeout in the selector. Writers compute `next_probe_after` from the last
 `observed_at`, the exhausted-window shape, and the probe backoff level; readers
 simply compare `now` against that stored boundary.
+
+`predicted_blocked_until` expiring by itself does not move an account back to
+`NotBlocked`. If `exhausted_windows != none`, the account remains blocked until
+a fresh live observation or successful reprobe clears or overwrites that
+exhausted state. `predicted_blocked_until` is a recovery prediction, not an
+automatic state-transition timer.
 
 Missing or partial quota data must default deterministically:
 
@@ -366,6 +438,61 @@ pipeline.
 If no ordinary candidate remains, the selector may choose one blocked account
 for reprobe.
 
+Reprobe is an execution contract, not only a classification:
+
+1. the selector nominates at most one `Probe(account_id)` action
+2. the state layer attempts an atomic probe reservation by advancing
+   `next_probe_after` from a value `<= now` to a short reservation horizon
+3. if that compare-and-set fails, the runtime reruns selection and does not
+   probe opportunistically outside shared-state coordination
+4. if reservation succeeds, the runtime acquires a short-lived verification
+   lease for that account
+5. while holding that verification lease, the backend performs a lightweight
+   lease-scoped quota refresh request that does not consume the next user turn
+6. the probe result writes fresh quota knowledge:
+   - success clears exhaustion for the relevant family and updates `observed_at`
+   - still blocked refreshes exhausted windows, `predicted_blocked_until`, and
+     `next_probe_after`
+   - ambiguous keeps the account blocked conservatively and raises backoff
+7. after the probe lease is released, the runtime reruns the original
+   non-probe selection intent from scratch using the refreshed quota rows
+
+Verification-lease mechanics are fixed in the first slice:
+
+- `SoftRotation` keeps the current active lease held while probing
+- probe execution does not use release-and-reacquire semantics
+- the verification lease uses a dedicated probe holder identity derived from the
+  runtime's main holder identity
+- the lease model therefore permits one main active lease plus at most one
+  auxiliary verification lease per runtime instance
+- the verification lease never becomes the runtime's selected active lease by
+  promotion; after probe completion it is always released, and any real switch
+  reacquires the chosen account under the runtime's primary holder identity
+
+Probe reservation is therefore coordinated through shared quota state, while
+probe execution uses an ordinary exclusive lease so two runtimes do not probe
+the same account concurrently with live backend traffic.
+
+Probe capability is explicit at the core/backend boundary:
+
+- the backend interface must expose a quota-refresh capability that can perform
+  a lease-scoped quota observation without consuming the next user turn
+- if a backend does not support that capability, `ProbeRecovery` is disabled for
+  that backend in the first slice
+- when probe capability is unavailable, selection may still use durable quota
+  knowledge, but blocked accounts do not become executable reprobe candidates
+
+If probe reservation succeeds but verification-lease acquisition then fails
+because another holder wins the exclusive lease first:
+
+- the reservation is not rolled back
+- it is left to expire at the short reservation horizon already written into
+  `next_probe_after`
+- the runtime immediately reruns selection without probing that account
+
+This keeps reservation and exclusive lease acquisition simple in the first
+slice while still avoiding unbounded repeated probe races.
+
 Reprobe preference:
 
 - older or more stale primary-only blocked accounts first
@@ -376,7 +503,7 @@ Reprobe preference:
 Each selection attempt should have a very small reprobe budget. The default
 budget should be one reprobe candidate per attempt.
 
-### 6. Make 5-hour safety the primary ranking objective
+### 7. Make 5-hour safety the primary ranking objective
 
 The system should explicitly optimize for minimizing avoidable account
 switching. That means the selector should prefer the account least likely to
@@ -391,7 +518,7 @@ This is why:
 Using layered comparisons is easier to reason about and easier to expose in
 operator-facing explanations.
 
-### 7. Distinguish prediction from probe throttle
+### 8. Distinguish prediction from probe throttle
 
 The design must keep these concepts separate:
 
@@ -413,7 +540,7 @@ They are not interchangeable.
 This distinction is what makes provider-side early reset compatible with stable
 runtime behavior.
 
-### 8. Scope reprobe differently for startup and runtime
+### 9. Scope reprobe differently for startup and runtime
 
 Startup behavior:
 
@@ -430,7 +557,47 @@ Runtime behavior:
 
 This keeps reprobe a recovery mechanism rather than a constant source of churn.
 
-### 9. Integrate through shared policy helpers, not SQL-only ordering
+### 10. Resolve first-slice multi-family handling now
+
+The first slice must not leave family resolution open-ended.
+
+The selector consumes exactly two quota views per candidate:
+
+- `selection_family`
+- optional `codex` fallback family
+
+The selector does not ingest or rank across an arbitrary set of families in the
+first slice.
+
+Caller responsibility:
+
+- `Startup` always resolves `selection_family = codex`
+- `SoftRotation` and `HardFailover` resolve `selection_family` from the active
+  runtime limit family when known
+- if the active runtime family is unknown or a `usage_limit_reached` path is
+  ambiguous, the caller passes `selection_family = codex`
+
+Selector responsibility:
+
+- use the row for `selection_family` when present
+- fall back to the `codex` row only when the selected family row is absent
+- ignore all other observed families in the first slice
+
+Write-side family resolution follows the same contract:
+
+- live observations and hard errors write the row for the caller-resolved active
+  family when known
+- if a `usage_limit_reached` path is ambiguous and there is no known active
+  family, the writer updates the `codex` row
+- the first slice does not introduce a synthetic unknown-family quota row;
+  ambiguity is represented inside the chosen row via
+  `exhausted_windows = unknown`
+
+This keeps the selector API narrow enough for planning while still supporting
+the active-family-plus-`codex` contract already implied by current runtime
+surfaces.
+
+### 11. Integrate through shared policy helpers, not SQL-only ordering
 
 The state layer may still perform a coarse candidate fetch, but the full
 selection policy should run in Rust, not in a single SQL `ORDER BY`.
@@ -458,12 +625,17 @@ The account-pool crate should provide:
 - soft-block evaluation
 - reprobe candidate selection
 
-### 10. Expand observability to reflect real quota knowledge
+### 12. Expand observability to reflect real quota knowledge
 
 Observability should stop collapsing quota state into one opaque remaining
 percentage.
 
-Account-pool account surfaces should eventually include:
+Account-pool account surfaces should eventually expose a collection of quota
+families rather than one singular quota projection:
+
+- `quotas: Vec<AccountPoolQuotaFamily>`
+
+Where each `AccountPoolQuotaFamily` contains:
 
 - `limit_id`
 - `primary`
@@ -477,21 +649,32 @@ Account-pool account surfaces should eventually include:
 - `next_probe_after`
 - `observed_at`
 
-Event surfaces should distinguish at least:
+First-slice surfaced `quotas` rows are ordered by `limit_id` ascending so UI,
+tests, and snapshots remain deterministic.
 
-- `QuotaObserved`
-- `QuotaBlocked`
-- `QuotaRecovered`
-- `ProbeScheduled`
-- `ProbeSucceeded`
-- `ProbeFailed`
+First-slice observability boundary:
 
-If introducing new event types in the first slice is too broad, the event
-payload may temporarily use richer `details_json` while keeping wire-compatible
-top-level event typing. The longer-term architecture, however, should expose
-quota-specific events explicitly.
+- account-row quota facts are expanded as typed `quotas` collection fields in
+  scope
+- app-server compatibility is additive in the first slice: the existing
+  singular `quota` field remains, and the new `quotas` field is added beside it
+- the singular compatibility `quota` field is projected only from the `codex`
+  family row; if no `codex` row exists, `quota` is `null`
+- new CLI/TUI and app-server consumers should migrate to `quotas`; legacy
+  consumers may continue reading `quota` during the transition
+- diagnostics and selection explanations may still project one family-specific
+  explanation when a runtime supplies `selection_family`, but the underlying
+  account API shape does not collapse multi-family state into one singular quota
+- no new top-level account-pool event enums are introduced in the first slice
+- existing event families stay wire-compatible
+- richer probe and multi-window details are carried in structured
+  `details_json`
 
-### 11. Keep coarse auth health, but remove quota from its semantic center
+This keeps the first implementation planning scope bounded across
+`codex-state`, app-server protocol, CLI, and TUI while still giving operators
+enough information to understand selection decisions.
+
+### 13. Keep coarse auth health, but remove quota from its semantic center
 
 `Unauthorized` should remain a durable auth-state concept.
 
@@ -500,7 +683,31 @@ health. Existing compatibility surfaces may still expose a broad cooling-down or
 rate-limited status where needed, but selector truth must come from
 `QuotaKnowledge`, not from a single coarse durable health enum.
 
-This allows compatibility while still fixing the underlying architecture.
+First-slice coexistence rule:
+
+- `account_quota_state` is the only authoritative source for quota blocking and
+  selector eligibility
+- startup-selection and lease-acquisition paths must stop consulting legacy
+  `RateLimited` state or `healthy` as quota veto signals
+- in the first slice, legacy `healthy` continues only as an auth-health
+  compatibility projection:
+  - `Unauthorized` may still drive unhealthy auth state
+  - quota exhaustion must not
+- `AccountHealthState::RateLimited` is removed from selector-facing truth
+- durable auth truth continues to use `AccountHealthState::Unauthorized`
+- legacy cooling-down and coarse rate-limited read surfaces are derived from
+  quota rows at read time rather than treated as an independent durable quota
+  signal
+- therefore, first-slice writers stop treating `RateLimited` as a standalone
+  source of truth, even if the legacy enum and compatibility projections remain
+  in storage and API code during migration
+- upgrade handling for preexisting persisted `RateLimited` rows is explicit:
+  after migration they are ignored by selector paths and are normalized into
+  compatibility projections derived from quota rows rather than preserved as
+  blocking truth
+
+This names one source of truth for planning and prevents `RateLimited` from
+competing with quota rows during the migration.
 
 ## Data Flow
 
@@ -519,8 +726,9 @@ When the runtime receives a new rate-limit snapshot:
 
 When a turn ends in `usage_limit_reached`:
 
-- update the relevant account quota state using the best available error and
-  header data
+- update the caller-resolved quota-family row using the best available error and
+  header data; if the family is ambiguous and there is no known active family,
+  update `codex` with `exhausted_windows = unknown`
 - mark the current lease unusable for the current turn path
 - trigger hard-failure selection intent for the next attempt
 
@@ -529,7 +737,7 @@ When a turn ends in `usage_limit_reached`:
 When startup or runtime selection needs an account:
 
 - load coarse candidates
-- attach lease, auth, and quota facts
+- attach lease, auth, and caller-resolved family-scoped quota facts
 - run the shared policy engine
 - try ordered ordinary candidates first
 - if no ordinary candidate exists, try the single reprobe candidate if present
@@ -544,7 +752,10 @@ Owns:
 - durable `account_quota_state`
 - quota observation persistence
 - coordinated `next_probe_after` updates
+- atomic probe reservation updates
 - coarse candidate fetches with attached quota state
+- read-time compatibility projection for legacy coarse cooldown and
+  rate-limited surfaces
 
 ### `codex-rs/account-pool`
 
@@ -555,14 +766,17 @@ Owns:
 - blocked and reprobe classification
 - candidate comparison rules
 - shared selection policy engine
+- per-intent admissibility rules
 
 ### `codex-rs/core`
 
 Owns:
 
 - feeding live quota observations into state
+- resolving the per-attempt `selection_family`
 - invoking the shared policy engine for runtime rotation and failover
 - adapting selection outcomes into existing turn/failover flows
+- invoking the backend quota-refresh probe while holding a verification lease
 
 ### `app-server` and CLI/TUI surfaces
 
@@ -602,10 +816,10 @@ The first implementation should include at least:
 
 ## Open Questions
 
-- Whether the first slice should introduce explicit new account-pool event types
-  or use richer event details with existing event families.
-- Whether selection should look only at the active limit family plus `codex`
-  fallback, or whether a broader multi-family policy is needed immediately.
+- Whether a later slice should extend the selector from
+  `selection_family + codex fallback` to true multi-family joint reasoning.
+- Whether a later slice should promote probe outcomes from `details_json` into
+  explicit top-level event enums.
 - Whether a later slice should introduce an optional background recovery worker
   for very large pools, or whether on-demand reprobe remains sufficient.
 
