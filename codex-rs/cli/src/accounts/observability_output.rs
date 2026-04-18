@@ -1,3 +1,5 @@
+use crate::accounts::observability_types::DiagnosticsIssueView;
+use crate::accounts::observability_types::DiagnosticsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
 use crate::accounts::observability_types::PoolQuotaView;
@@ -12,6 +14,18 @@ pub(crate) fn print_pool_show_json(view: &PoolShowView) -> anyhow::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&pool_show_json_value(view))?
+    );
+    Ok(())
+}
+
+pub(crate) fn print_diagnostics_text(view: &DiagnosticsView) {
+    print!("{}", render_diagnostics_text(view));
+}
+
+pub(crate) fn print_diagnostics_json(view: &DiagnosticsView) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&diagnostics_json_value(view))?
     );
     Ok(())
 }
@@ -162,13 +176,69 @@ fn pool_selection_json_value(selection: &PoolSelectionView) -> serde_json::Value
     })
 }
 
+fn render_diagnostics_text(view: &DiagnosticsView) -> String {
+    let mut lines = vec![
+        format!("pool id: {}", view.pool_id),
+        format!(
+            "generated at: {}",
+            view.generated_at.as_deref().unwrap_or("unknown")
+        ),
+        format!("status: {}", view.status),
+    ];
+
+    if view.issues.is_empty() {
+        lines.push("issues: none".to_string());
+    } else {
+        lines.push(
+            "severity | reasonCode | message | accountId | holderInstanceId | nextRelevantAt"
+                .to_string(),
+        );
+        for issue in &view.issues {
+            lines.push(format!(
+                "{} | {} | {} | {} | {} | {}",
+                issue.severity,
+                issue.reason_code,
+                issue.message,
+                issue.account_id.as_deref().unwrap_or("none"),
+                issue.holder_instance_id.as_deref().unwrap_or("none"),
+                issue.next_relevant_at.as_deref().unwrap_or("none"),
+            ));
+        }
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn diagnostics_json_value(view: &DiagnosticsView) -> serde_json::Value {
+    serde_json::json!({
+        "poolId": view.pool_id,
+        "generatedAt": view.generated_at,
+        "status": view.status,
+        "issues": view.issues.iter().map(diagnostics_issue_json_value).collect::<Vec<_>>(),
+    })
+}
+
+fn diagnostics_issue_json_value(issue: &DiagnosticsIssueView) -> serde_json::Value {
+    serde_json::json!({
+        "severity": issue.severity,
+        "reasonCode": issue.reason_code,
+        "message": issue.message,
+        "accountId": issue.account_id,
+        "holderInstanceId": issue.holder_instance_id,
+        "nextRelevantAt": issue.next_relevant_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::PoolAccountView;
     use super::PoolLeaseView;
     use super::PoolShowView;
     use super::lease_text;
+    use super::render_diagnostics_text;
     use super::render_pool_show_text;
+    use crate::accounts::observability_types::DiagnosticsIssueView;
+    use crate::accounts::observability_types::DiagnosticsView;
     use crate::accounts::observability_types::PoolSelectionView;
     use crate::accounts::observability_types::PoolSummaryView;
     use pretty_assertions::assert_eq;
@@ -208,6 +278,27 @@ mod tests {
         assert!(json["data"][0]["quota"].is_null());
         assert!(json["data"][0]["statusReasonCode"].is_null());
         assert!(json["nextCursor"].is_null());
+    }
+
+    #[test]
+    fn diagnostics_text_reports_issues_none() {
+        let text = render_diagnostics_text(&sample_diagnostics(Vec::new()));
+
+        assert!(text.contains("issues: none"));
+    }
+
+    #[test]
+    fn diagnostics_text_formats_issue_rows() {
+        let text = render_diagnostics_text(&sample_diagnostics(vec![DiagnosticsIssueView {
+            severity: "warning".to_string(),
+            reason_code: "leaseHeldByAnotherInstance".to_string(),
+            message: "account is leased".to_string(),
+            account_id: Some("acct-1".to_string()),
+            holder_instance_id: Some("holder-1".to_string()),
+            next_relevant_at: Some("2026-04-18T00:05:00Z".to_string()),
+        }]));
+
+        assert!(text.contains("warning | leaseHeldByAnotherInstance | account is leased | acct-1 | holder-1 | 2026-04-18T00:05:00Z"));
     }
 
     fn sample_view(data: Vec<PoolAccountView>, next_cursor: Option<&str>) -> PoolShowView {
@@ -250,6 +341,19 @@ mod tests {
                 suppressed: false,
             }),
             updated_at: Some("2026-04-18T00:00:00Z".to_string()),
+        }
+    }
+
+    fn sample_diagnostics(issues: Vec<DiagnosticsIssueView>) -> DiagnosticsView {
+        DiagnosticsView {
+            pool_id: "team-main".to_string(),
+            generated_at: Some("2026-04-18T00:00:00Z".to_string()),
+            status: if issues.is_empty() {
+                "healthy".to_string()
+            } else {
+                "degraded".to_string()
+            },
+            issues,
         }
     }
 }

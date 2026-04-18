@@ -61,3 +61,21 @@ pub(crate) struct PoolSelectionView {
     pub preferred: bool,
     pub suppressed: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticsView {
+    pub pool_id: String,
+    pub generated_at: Option<String>,
+    pub status: String,
+    pub issues: Vec<DiagnosticsIssueView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticsIssueView {
+    pub severity: String,
+    pub reason_code: String,
+    pub message: String,
+    pub account_id: Option<String>,
+    pub holder_instance_id: Option<String>,
+    pub next_relevant_at: Option<String>,
+}

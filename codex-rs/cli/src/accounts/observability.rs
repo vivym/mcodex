@@ -4,6 +4,11 @@ use codex_account_pool::AccountOperationalState;
 use codex_account_pool::AccountPoolAccountsListRequest;
 use codex_account_pool::AccountPoolAccountsPage;
 use codex_account_pool::AccountPoolConfig;
+use codex_account_pool::AccountPoolDiagnostics;
+use codex_account_pool::AccountPoolDiagnosticsReadRequest;
+use codex_account_pool::AccountPoolDiagnosticsSeverity;
+use codex_account_pool::AccountPoolDiagnosticsStatus;
+use codex_account_pool::AccountPoolIssue;
 use codex_account_pool::AccountPoolLease;
 use codex_account_pool::AccountPoolObservabilityReader;
 use codex_account_pool::AccountPoolQuota;
@@ -19,6 +24,8 @@ use std::sync::Arc;
 
 use crate::accounts::PoolShowCommand;
 use crate::accounts::diagnostics::read_accounts_startup_status;
+use crate::accounts::observability_types::DiagnosticsIssueView;
+use crate::accounts::observability_types::DiagnosticsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
 use crate::accounts::observability_types::PoolQuotaView;
@@ -84,21 +91,7 @@ pub(crate) async fn read_pool_show(
         resolve_strict_target_pool(runtime, config, command.pool.as_deref(), top_level_override)
             .await?;
 
-    let configured_pool_exists = config.accounts.as_ref().is_some_and(|accounts| {
-        accounts.default_pool.as_deref() == Some(target.pool_id.as_str())
-            || accounts
-                .pools
-                .as_ref()
-                .is_some_and(|pools| pools.contains_key(target.pool_id.as_str()))
-    });
-    let registered_pool_exists = runtime
-        .list_account_pool_memberships(None)
-        .await?
-        .into_iter()
-        .any(|membership| membership.pool_id == target.pool_id);
-    if !configured_pool_exists && !registered_pool_exists {
-        bail!("account pool `{}` was not found", target.pool_id);
-    }
+    ensure_pool_exists(runtime, config, &target.pool_id).await?;
 
     let reader = local_observability_reader(runtime, config);
     let snapshot = reader
@@ -116,6 +109,25 @@ pub(crate) async fn read_pool_show(
         .await?;
 
     Ok(map_pool_show(snapshot, page))
+}
+
+pub(crate) async fn read_pool_diagnostics(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    top_level_override: Option<&str>,
+    command_pool: Option<&str>,
+) -> Result<DiagnosticsView> {
+    let target =
+        resolve_strict_target_pool(runtime, config, command_pool, top_level_override).await?;
+    ensure_pool_exists(runtime, config, &target.pool_id).await?;
+
+    let diagnostics = local_observability_reader(runtime, config)
+        .read_diagnostics(AccountPoolDiagnosticsReadRequest {
+            pool_id: target.pool_id,
+        })
+        .await?;
+
+    Ok(map_diagnostics(diagnostics))
 }
 
 async fn resolve_strict_target_pool(
@@ -149,6 +161,26 @@ fn local_observability_reader(
     }
     .lease_ttl_duration();
     LocalAccountPoolBackend::new(Arc::clone(runtime), lease_ttl)
+}
+
+async fn ensure_pool_exists(runtime: &StateRuntime, config: &Config, pool_id: &str) -> Result<()> {
+    let configured_pool_exists = config.accounts.as_ref().is_some_and(|accounts| {
+        accounts.default_pool.as_deref() == Some(pool_id)
+            || accounts
+                .pools
+                .as_ref()
+                .is_some_and(|pools| pools.contains_key(pool_id))
+    });
+    let registered_pool_exists = runtime
+        .list_account_pool_memberships(None)
+        .await?
+        .into_iter()
+        .any(|membership| membership.pool_id == pool_id);
+    if !configured_pool_exists && !registered_pool_exists {
+        bail!("account pool `{pool_id}` was not found");
+    }
+
+    Ok(())
 }
 
 fn map_pool_show(snapshot: AccountPoolSnapshot, page: AccountPoolAccountsPage) -> PoolShowView {
@@ -227,6 +259,28 @@ fn map_selection(selection: AccountPoolSelection) -> PoolSelectionView {
     }
 }
 
+fn map_diagnostics(diagnostics: AccountPoolDiagnostics) -> DiagnosticsView {
+    DiagnosticsView {
+        pool_id: diagnostics.pool_id,
+        generated_at: Some(diagnostics.generated_at.to_rfc3339()),
+        status: account_pool_diagnostics_status_to_string(diagnostics.status),
+        issues: diagnostics.issues.into_iter().map(map_issue).collect(),
+    }
+}
+
+fn map_issue(issue: AccountPoolIssue) -> DiagnosticsIssueView {
+    DiagnosticsIssueView {
+        severity: account_pool_diagnostics_severity_to_string(issue.severity),
+        reason_code: account_pool_reason_code_to_string(issue.reason_code),
+        message: issue.message,
+        account_id: issue.account_id,
+        holder_instance_id: issue.holder_instance_id,
+        next_relevant_at: issue
+            .next_relevant_at
+            .map(|next_relevant_at| next_relevant_at.to_rfc3339()),
+    }
+}
+
 fn account_operational_state_to_string(state: AccountOperationalState) -> String {
     state.as_str().to_string()
 }
@@ -253,6 +307,24 @@ fn account_pool_reason_code_to_string(reason_code: AccountPoolReasonCode) -> Str
         AccountPoolReasonCode::LeaseHeldByAnotherInstance => "leaseHeldByAnotherInstance",
         AccountPoolReasonCode::NonReplayableTurn => "nonReplayableTurn",
         AccountPoolReasonCode::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+fn account_pool_diagnostics_status_to_string(status: AccountPoolDiagnosticsStatus) -> String {
+    match status {
+        AccountPoolDiagnosticsStatus::Healthy => "healthy",
+        AccountPoolDiagnosticsStatus::Degraded => "degraded",
+        AccountPoolDiagnosticsStatus::Blocked => "blocked",
+    }
+    .to_string()
+}
+
+fn account_pool_diagnostics_severity_to_string(severity: AccountPoolDiagnosticsSeverity) -> String {
+    match severity {
+        AccountPoolDiagnosticsSeverity::Info => "info",
+        AccountPoolDiagnosticsSeverity::Warning => "warning",
+        AccountPoolDiagnosticsSeverity::Error => "error",
     }
     .to_string()
 }

@@ -173,49 +173,13 @@ async fn accounts_events_rejects_conflicting_pool_flags() -> Result<()> {
 }
 
 #[tokio::test]
-async fn accounts_diagnostics_without_explicit_pool_keeps_placeholder_behavior() -> Result<()> {
-    let codex_home = prepared_empty_home()?;
+async fn accounts_diagnostics_text_reports_issues_none_for_healthy_pool() -> Result<()> {
+    let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "diagnostics"]).await?;
 
-    assert!(!output.success, "stdout: {}", output.stdout);
-    assert!(
-        output
-            .stderr
-            .contains("Error managing accounts: accounts diagnostics is not implemented yet")
-    );
-    assert!(
-        !output
-            .stderr
-            .contains("no account pool is configured; pass --pool <POOL_ID> or configure a pool")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn accounts_diagnostics_placeholder_does_not_require_runtime_init() -> Result<()> {
-    let codex_home = prepared_empty_home()?;
-    let output = run_codex(
-        &codex_home,
-        &[
-            "-c",
-            "sqlite_home=\"/dev/null/nope\"",
-            "accounts",
-            "diagnostics",
-        ],
-    )
-    .await?;
-
-    assert!(!output.success, "stdout: {}", output.stdout);
-    assert!(
-        output
-            .stderr
-            .contains("Error managing accounts: accounts diagnostics is not implemented yet")
-    );
-    assert!(
-        !output
-            .stderr
-            .contains("initialize account startup selection state")
-    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("status: healthy"));
+    assert!(output.stdout.contains("issues: none"));
     Ok(())
 }
 
@@ -224,6 +188,36 @@ async fn prepared_home() -> Result<TempDir> {
     seed_accounts_config(codex_home.path())?;
     seed_state(codex_home.path()).await?;
     Ok(codex_home)
+}
+
+#[tokio::test]
+async fn accounts_diagnostics_json_reports_degraded_issue_details() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "diagnostics", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["poolId"], "team-main");
+    assert_eq!(json["status"], "degraded");
+    assert!(json["generatedAt"].as_str().is_some());
+    let issues = json["issues"].as_array().expect("issues");
+    assert_eq!(issues.len(), 1);
+    assert!(issues[0]["severity"].as_str().is_some());
+    assert!(issues[0]["reasonCode"].as_str().is_some());
+    assert!(issues[0]["message"].as_str().is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_diagnostics_requires_pool_when_no_effective_pool_resolves() -> Result<()> {
+    let codex_home = prepared_empty_home()?;
+    let output = run_codex(&codex_home, &["accounts", "diagnostics"]).await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("pass --pool <POOL_ID>"));
+    Ok(())
 }
 
 fn prepared_empty_home() -> Result<TempDir> {
@@ -268,6 +262,81 @@ async fn seed_state(codex_home: &Path) -> Result<()> {
     seed_account(&pool, "acct-1", "team-main", 0).await?;
     seed_account(&pool, "acct-2", "team-main", 1).await?;
     seed_account(&pool, "acct-other", "team-other", 0).await?;
+    Ok(())
+}
+
+async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let expires_at = now + 300;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_leases (
+    lease_id,
+    pool_id,
+    account_id,
+    holder_instance_id,
+    lease_epoch,
+    acquired_at,
+    renewed_at,
+    expires_at,
+    released_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("lease-1")
+    .bind("team-main")
+    .bind("acct-1")
+    .bind("holder-1")
+    .bind(0_i64)
+    .bind(now)
+    .bind(now)
+    .bind(expires_at)
+    .bind(Option::<i64>::None)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_runtime_state (
+    account_id,
+    pool_id,
+    health_state,
+    last_health_event_sequence,
+    last_health_event_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("acct-2")
+    .bind("team-main")
+    .bind("rate_limited")
+    .bind(1_i64)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+UPDATE account_registry
+SET healthy = 0,
+    updated_at = ?
+WHERE account_id = ?
+        "#,
+    )
+    .bind(now)
+    .bind("acct-2")
+    .execute(&pool)
+    .await?;
+
     Ok(())
 }
 
