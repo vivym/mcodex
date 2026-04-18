@@ -258,6 +258,12 @@ The engine should accept a `SelectionIntent` such as:
 - `HardFailover`
 - `ProbeRecovery`
 
+`SelectionIntent` must remain orthogonal to switch damping. The runtime-local
+minimum-hold behavior for proactive switching continues to live in the separate
+`2026-04-16-account-pool-switch-damping-design.md` design. This quota-aware
+selector should consume the intent it is given and must not silently duplicate
+or reinterpret `accounts.min_switch_interval_secs` inside quota ranking.
+
 The engine input should include:
 
 - registry facts
@@ -309,8 +315,28 @@ An account is `PredictedBlocked` when:
 An account is `ProbeEligibleBlocked` when:
 
 - it is currently predicted blocked
-- but the reprobe throttle has opened or the cached knowledge is stale enough
-  that a revalidation attempt is justified
+- `now >= next_probe_after`
+- and the current selection attempt has exhausted ordinary `NotBlocked`
+  candidates or the intent is `HardFailover` or `ProbeRecovery`
+
+In the first slice, "stale enough to reprobe" is defined only through
+`next_probe_after`. Planners should not invent an additional implicit staleness
+timeout in the selector. Writers compute `next_probe_after` from the last
+`observed_at`, the exhausted-window shape, and the probe backoff level; readers
+simply compare `now` against that stored boundary.
+
+Missing or partial quota data must default deterministically:
+
+- if there is no quota row for the relevant limit family and no fallback row
+  for the default family, classify the account as `NotBlocked` with low
+  confidence
+- if a present row marks `exhausted_windows != none`, classify using that
+  exhausted state even if only one window snapshot is populated
+- if a row has partial window data but no exhausted signal, classify the
+  account as `NotBlocked` with low confidence and rank it below otherwise
+  comparable candidates that have fresher complete quota data
+- the selector must never hard-block an account solely because quota knowledge
+  is absent or partial
 
 Weekly or other long-window exhaustion must act as a veto before ordinary
 ranking begins. That is the safeguard that prevents a 5-hour reset alone from
@@ -327,7 +353,9 @@ Ranking rules:
 2. within that set, sort by descending primary safety margin
 3. break ties by descending secondary safety margin
 4. use reset proximity as a later tie-breaker, not the primary key
-5. use pool position and account id as stable final tie-breakers
+5. prefer candidates backed by complete, fresher quota rows over low-confidence
+   candidates that were admitted through missing or partial quota fallback
+6. use pool position and account id as stable final tie-breakers
 
 This makes short-window stability the primary optimization target while still
 ensuring long-window exhaustion acts as a veto condition earlier in the
