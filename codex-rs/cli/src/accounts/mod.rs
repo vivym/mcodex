@@ -13,7 +13,6 @@ use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
-use diagnostics::read_accounts_startup_status;
 use diagnostics::read_current_diagnostic;
 use diagnostics::read_status_diagnostic;
 use mutate::assign_account_pool;
@@ -21,7 +20,6 @@ use mutate::list_account_pools;
 use mutate::list_accounts;
 use mutate::remove_account;
 use mutate::set_account_enabled;
-use observability::ResolvedTargetPool;
 use observability::resolve_target_pool;
 use output::print_current_json;
 use output::print_current_text;
@@ -341,34 +339,25 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                 assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
             }
             PoolSubcommand::Show(command) => {
-                let _target = resolve_observability_target(
-                    &runtime,
-                    &config,
+                validate_explicit_observability_target(
                     command.pool.as_deref(),
                     account_pool.as_deref(),
-                )
-                .await?;
+                )?;
                 anyhow::bail!("accounts pool show is not implemented yet")
             }
         },
         AccountsSubcommand::Diagnostics(command) => {
-            let _target = resolve_observability_target(
-                &runtime,
-                &config,
+            validate_explicit_observability_target(
                 command.pool.as_deref(),
                 account_pool.as_deref(),
-            )
-            .await?;
+            )?;
             anyhow::bail!("accounts diagnostics is not implemented yet")
         }
         AccountsSubcommand::Events(command) => {
-            let _target = resolve_observability_target(
-                &runtime,
-                &config,
+            validate_explicit_observability_target(
                 command.pool.as_deref(),
                 account_pool.as_deref(),
-            )
-            .await?;
+            )?;
             anyhow::bail!("accounts events is not implemented yet")
         }
         AccountsSubcommand::Current(current_command) => {
@@ -449,26 +438,13 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
     }
 }
 
-async fn resolve_observability_target(
-    runtime: &Arc<StateRuntime>,
-    config: &Config,
+fn validate_explicit_observability_target(
     command_pool: Option<&str>,
     top_level_override: Option<&str>,
-) -> anyhow::Result<ResolvedTargetPool> {
-    let effective_pool_id = if command_pool.is_none() && top_level_override.is_none() {
-        read_accounts_startup_status(runtime, config, top_level_override)
-            .await
-            .context("read account startup status")?
-            .startup
-            .preview
-            .effective_pool_id
-    } else {
-        None
-    };
+) -> anyhow::Result<()> {
+    if command_pool.is_some() || top_level_override.is_some() {
+        let _ = resolve_target_pool(command_pool, top_level_override, None)?;
+    }
 
-    resolve_target_pool(
-        command_pool,
-        top_level_override,
-        effective_pool_id.as_deref(),
-    )
+    Ok(())
 }
