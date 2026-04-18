@@ -494,6 +494,8 @@ SELECT
     account_registry.healthy,
     account_runtime_state.health_state,
     quota_state.exhausted_windows AS quota_exhausted_windows,
+    quota_state.predicted_blocked_until AS quota_predicted_blocked_until,
+    quota_state.next_probe_after AS quota_next_probe_after,
     active_lease.lease_id,
     active_lease.holder_instance_id,
     active_lease.lease_epoch,
@@ -555,6 +557,14 @@ ORDER BY
             let quota_exhausted = row
                 .try_get::<Option<String>, _>("quota_exhausted_windows")?
                 .is_some_and(|exhausted_windows| exhausted_windows != "none");
+            let quota_next_eligible_at = if quota_exhausted {
+                row.try_get::<Option<i64>, _>("quota_predicted_blocked_until")?
+                    .or(row.try_get::<Option<i64>, _>("quota_next_probe_after")?)
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?
+            } else {
+                None
+            };
             let health_state = match legacy_health_state {
                 Some(AccountHealthState::Unauthorized) => Some(AccountHealthState::Unauthorized),
                 _ if quota_exhausted => Some(AccountHealthState::RateLimited),
@@ -584,7 +594,16 @@ ORDER BY
                 None => None,
             };
             let account_next_eligible_at = if enabled && selector_auth_eligible {
-                active_lease.as_ref().map(|lease| lease.expires_at)
+                match (
+                    active_lease.as_ref().map(|lease| lease.expires_at),
+                    quota_next_eligible_at,
+                ) {
+                    (Some(lease_expires_at), Some(quota_next_eligible_at)) => {
+                        Some(lease_expires_at.max(quota_next_eligible_at))
+                    }
+                    (Some(lease_expires_at), None) => Some(lease_expires_at),
+                    (None, quota_next_eligible_at) => quota_next_eligible_at,
+                }
             } else {
                 None
             };
@@ -596,6 +615,12 @@ ORDER BY
                 AccountStartupEligibility::PreferredAccountBusy
             } else if !selector_auth_eligible {
                 AccountStartupEligibility::PreferredAccountUnhealthy
+            } else if quota_exhausted {
+                if is_preferred {
+                    AccountStartupEligibility::PreferredAccountUnhealthy
+                } else {
+                    AccountStartupEligibility::NoEligibleAccount
+                }
             } else if !enabled {
                 AccountStartupEligibility::NoEligibleAccount
             } else if is_preferred {
@@ -2263,6 +2288,74 @@ WHERE holder_instance_id = ?
         assert_eq!(
             diagnostic.accounts[0].health_state,
             Some(AccountHealthState::RateLimited)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostic_blocks_exhausted_quota_accounts_until_quota_cooldown() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "team-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(120)),
+                next_probe_after: Some(test_timestamp(90)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-2".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: None,
+                next_probe_after: Some(test_timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", Some("acct-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostic.next_eligible_at, Some(test_timestamp(120)));
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::PreferredAccountUnhealthy
+        );
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
+        assert_eq!(
+            diagnostic.accounts[0].next_eligible_at,
+            Some(test_timestamp(120))
+        );
+        assert_eq!(
+            diagnostic.accounts[1].eligibility,
+            crate::AccountStartupEligibility::NoEligibleAccount
+        );
+        assert_eq!(
+            diagnostic.accounts[1].next_eligible_at,
+            Some(test_timestamp(150))
         );
     }
 
