@@ -88,6 +88,9 @@ pub(crate) async fn read_accounts_startup_status(
     .await
 }
 
+#[allow(unused_imports)]
+pub(crate) use read_accounts_startup_status as read_startup_status;
+
 fn configured_default_pool_id(config: &Config) -> Option<&str> {
     config
         .accounts

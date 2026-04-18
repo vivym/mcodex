@@ -1,5 +1,6 @@
 mod diagnostics;
 mod mutate;
+mod observability;
 mod output;
 mod registration;
 
@@ -19,6 +20,7 @@ use mutate::list_account_pools;
 use mutate::list_accounts;
 use mutate::remove_account;
 use mutate::set_account_enabled;
+use observability::resolve_target_pool;
 use output::print_current_json;
 use output::print_current_text;
 use output::print_status_json;
@@ -49,6 +51,8 @@ pub enum AccountsSubcommand {
     Remove(RemoveAccountCommand),
     List,
     Pool(PoolCommand),
+    Diagnostics(AccountsDiagnosticsCommand),
+    Events(AccountsEventsCommand),
     Current(CurrentAccountCommand),
     Status(StatusAccountCommand),
     Resume,
@@ -119,6 +123,7 @@ pub struct PoolCommand {
 pub enum PoolSubcommand {
     List,
     Assign(PoolAssignCommand),
+    Show(PoolShowCommand),
 }
 
 #[derive(Debug, Args)]
@@ -128,6 +133,45 @@ pub struct PoolAssignCommand {
 
     #[arg(value_name = "POOL_ID")]
     pub pool_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolShowCommand {
+    #[arg(long = "pool", value_name = "POOL_ID")]
+    pub pool: Option<String>,
+
+    #[arg(long = "limit")]
+    pub limit: Option<u32>,
+
+    #[arg(long = "cursor")]
+    pub cursor: Option<String>,
+
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsDiagnosticsCommand {
+    #[arg(long = "pool", value_name = "POOL_ID")]
+    pub pool: Option<String>,
+
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AccountsEventsCommand {
+    #[arg(long = "pool", value_name = "POOL_ID")]
+    pub pool: Option<String>,
+
+    #[arg(long = "limit")]
+    pub limit: Option<u32>,
+
+    #[arg(long = "cursor")]
+    pub cursor: Option<String>,
+
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 pub async fn run_accounts(command: AccountsCommand) -> ! {
@@ -294,7 +338,19 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             PoolSubcommand::Assign(command) => {
                 assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
             }
+            PoolSubcommand::Show(command) => {
+                validate_observability_target(command.pool.as_deref(), account_pool.as_deref())?;
+                anyhow::bail!("accounts pool show is not implemented yet")
+            }
         },
+        AccountsSubcommand::Diagnostics(command) => {
+            validate_observability_target(command.pool.as_deref(), account_pool.as_deref())?;
+            anyhow::bail!("accounts diagnostics is not implemented yet")
+        }
+        AccountsSubcommand::Events(command) => {
+            validate_observability_target(command.pool.as_deref(), account_pool.as_deref())?;
+            anyhow::bail!("accounts events is not implemented yet")
+        }
         AccountsSubcommand::Current(current_command) => {
             let diagnostic = read_current_diagnostic(&runtime, &config, account_pool.as_deref())
                 .await
@@ -371,4 +427,15 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn validate_observability_target(
+    command_pool: Option<&str>,
+    top_level_override: Option<&str>,
+) -> anyhow::Result<()> {
+    if command_pool.is_some() || top_level_override.is_some() {
+        let _ = resolve_target_pool(command_pool, top_level_override, None)?;
+    }
+
+    Ok(())
 }
