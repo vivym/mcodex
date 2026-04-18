@@ -1,5 +1,7 @@
 use crate::accounts::diagnostics::AccountsCurrentDiagnostic;
 use crate::accounts::diagnostics::AccountsStatusDiagnostic;
+use crate::accounts::observability_output::render_status_pool_observability_text;
+use crate::accounts::observability_output::status_pool_observability_json_value;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountDiagnostic;
 use codex_state::AccountPoolDiagnostic;
@@ -105,6 +107,13 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
             );
         }
     }
+
+    if let Some(pool_observability) = diagnostic.pool_observability.as_ref() {
+        print!(
+            "{}",
+            render_status_pool_observability_text(pool_observability)
+        );
+    }
 }
 
 pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow::Result<()> {
@@ -159,6 +168,9 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        "poolObservability": status_pool_observability_json_value(
+            diagnostic.pool_observability.as_ref()
+        ),
     }))?;
     println!("{output}");
     Ok(())

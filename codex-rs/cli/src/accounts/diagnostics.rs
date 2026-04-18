@@ -8,6 +8,9 @@ use codex_state::StateRuntime;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::accounts::observability::read_status_pool_observability;
+use crate::accounts::observability_types::StatusPoolObservabilityView;
+
 pub(crate) struct AccountsCurrentDiagnostic {
     pub account_pool_override_id: Option<String>,
     pub startup: SharedStartupStatus,
@@ -19,6 +22,7 @@ pub(crate) struct AccountsStatusDiagnostic {
     pub registered_pool_count: usize,
     pub startup: SharedStartupStatus,
     pub pool: Option<AccountPoolDiagnostic>,
+    pub pool_observability: Option<StatusPoolObservabilityView>,
 }
 
 pub(crate) async fn read_current_diagnostic(
@@ -54,6 +58,12 @@ pub(crate) async fn read_status_diagnostic(
         ),
         None => None,
     };
+    let pool_observability = read_status_pool_observability(
+        runtime,
+        config,
+        current.startup.startup.preview.effective_pool_id.as_deref(),
+    )
+    .await;
 
     Ok(AccountsStatusDiagnostic {
         account_pool_override_id: current.account_pool_override_id,
@@ -61,6 +71,7 @@ pub(crate) async fn read_status_diagnostic(
         registered_pool_count: registered_pool_count(runtime).await?,
         startup: current.startup,
         pool,
+        pool_observability,
     })
 }
 

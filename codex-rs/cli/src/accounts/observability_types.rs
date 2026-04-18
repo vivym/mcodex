@@ -100,3 +100,96 @@ pub(crate) struct EventView {
     pub message: String,
     pub details: serde_json::Value,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusPoolObservabilityView {
+    pub pool_id: String,
+    pub summary: Option<PoolSummaryView>,
+    pub diagnostics: Option<DiagnosticsView>,
+    pub warning: Option<String>,
+}
+
+impl StatusPoolObservabilityView {
+    pub(crate) fn from_results(
+        pool_id: String,
+        summary: anyhow::Result<PoolSummaryView>,
+        diagnostics: anyhow::Result<DiagnosticsView>,
+    ) -> Self {
+        let mut warnings = Vec::new();
+        let summary = match summary {
+            Ok(summary) => Some(summary),
+            Err(err) => {
+                warnings.push(err.to_string());
+                None
+            }
+        };
+        let diagnostics = match diagnostics {
+            Ok(diagnostics) => Some(diagnostics),
+            Err(err) => {
+                warnings.push(err.to_string());
+                None
+            }
+        };
+
+        Self {
+            pool_id,
+            summary,
+            diagnostics,
+            warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiagnosticsView;
+    use super::StatusPoolObservabilityView;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn status_pool_observability_from_results_keeps_diagnostics_when_summary_fails() {
+        let view = StatusPoolObservabilityView::from_results(
+            "team-main".to_string(),
+            Err(anyhow::anyhow!("summary unavailable")),
+            Ok(sample_diagnostics()),
+        );
+
+        assert_eq!(
+            view,
+            StatusPoolObservabilityView {
+                pool_id: "team-main".to_string(),
+                summary: None,
+                diagnostics: Some(sample_diagnostics()),
+                warning: Some("summary unavailable".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn status_pool_observability_from_results_combines_warnings_when_both_fail() {
+        let view = StatusPoolObservabilityView::from_results(
+            "team-main".to_string(),
+            Err(anyhow::anyhow!("summary unavailable")),
+            Err(anyhow::anyhow!("diagnostics unavailable")),
+        );
+
+        assert_eq!(
+            view,
+            StatusPoolObservabilityView {
+                pool_id: "team-main".to_string(),
+                summary: None,
+                diagnostics: None,
+                warning: Some("summary unavailable; diagnostics unavailable".to_string()),
+            }
+        );
+    }
+
+    fn sample_diagnostics() -> DiagnosticsView {
+        DiagnosticsView {
+            pool_id: "team-main".to_string(),
+            generated_at: None,
+            status: "degraded".to_string(),
+            issues: Vec::new(),
+        }
+    }
+}

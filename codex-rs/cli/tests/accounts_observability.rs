@@ -281,6 +281,108 @@ async fn accounts_diagnostics_text_reports_issues_none_for_healthy_pool() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn accounts_status_json_adds_pool_observability_on_success() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["poolObservability"]["poolId"], "team-main");
+    assert_eq!(json["poolObservability"]["summary"]["totalAccounts"], 2);
+    assert!(json["poolObservability"]["diagnostics"]["status"].is_string());
+    assert!(json["poolObservability"]["warning"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_keeps_startup_fields_when_observability_read_fails() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "missing-pool",
+            "status",
+            "--json",
+        ],
+    )
+    .await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "missing-pool");
+    assert_eq!(json["poolObservability"]["poolId"], "missing-pool");
+    assert!(json["poolObservability"]["summary"].is_null());
+    assert!(json["poolObservability"]["diagnostics"].is_null());
+    assert!(json["poolObservability"]["warning"].is_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_sets_pool_observability_null_when_no_effective_pool_resolves()
+-> Result<()> {
+    let codex_home = prepared_empty_home()?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert!(json["effectivePoolId"].is_null());
+    assert!(json["poolObservability"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_keeps_summary_when_diagnostics_read_fails() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_invalid_account_pool_event_details(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["poolObservability"]["poolId"], "team-main");
+    assert_eq!(json["poolObservability"]["summary"]["totalAccounts"], 2);
+    assert!(json["poolObservability"]["diagnostics"].is_null());
+    assert!(json["poolObservability"]["warning"].is_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_text_reports_degraded_issue_summary() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    assert!(
+        output
+            .stdout
+            .contains("pooled diagnostics status: degraded")
+    );
+    assert!(output.stdout.contains("issue:"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_text_reports_warning_when_diagnostics_read_fails() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_invalid_account_pool_event_details(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    assert!(output.stdout.contains("pooled accounts total: 2"));
+    assert!(output.stdout.contains("warning:"));
+    Ok(())
+}
+
 async fn prepared_home() -> Result<TempDir> {
     let codex_home = TempDir::new()?;
     seed_accounts_config(codex_home.path())?;
@@ -476,6 +578,44 @@ async fn seed_account_pool_events(codex_home: &TempDir) -> Result<()> {
             details_json: Some(serde_json::json!({"remainingPercent": 12.5})),
         },
     )
+    .await?;
+    Ok(())
+}
+
+async fn seed_invalid_account_pool_event_details(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+
+    sqlx::query(
+        r#"
+INSERT INTO account_pool_events (
+    event_id,
+    occurred_at,
+    pool_id,
+    account_id,
+    lease_id,
+    holder_instance_id,
+    event_type,
+    reason_code,
+    message,
+    details_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("event-invalid-json")
+    .bind(30_i64)
+    .bind("team-main")
+    .bind(Option::<&str>::None)
+    .bind(Option::<&str>::None)
+    .bind(Option::<&str>::None)
+    .bind("leaseAcquireFailed")
+    .bind(Some("noEligibleAccount"))
+    .bind("invalid event details")
+    .bind("{not json")
+    .execute(&pool)
     .await?;
     Ok(())
 }

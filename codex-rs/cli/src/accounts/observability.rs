@@ -40,6 +40,7 @@ use crate::accounts::observability_types::PoolQuotaView;
 use crate::accounts::observability_types::PoolSelectionView;
 use crate::accounts::observability_types::PoolShowView;
 use crate::accounts::observability_types::PoolSummaryView;
+use crate::accounts::observability_types::StatusPoolObservabilityView;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TargetPoolSource {
@@ -138,6 +139,19 @@ pub(crate) async fn read_pool_diagnostics(
     Ok(map_diagnostics(diagnostics))
 }
 
+pub(crate) async fn read_status_pool_observability(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    effective_pool_id: Option<&str>,
+) -> Option<StatusPoolObservabilityView> {
+    let pool_id = effective_pool_id?;
+    Some(
+        status_pool_observability_access(runtime, config)
+            .read(pool_id)
+            .await,
+    )
+}
+
 pub(crate) async fn read_pool_events(
     runtime: &Arc<StateRuntime>,
     config: &Config,
@@ -196,7 +210,92 @@ fn local_observability_reader(
     LocalAccountPoolBackend::new(Arc::clone(runtime), lease_ttl)
 }
 
+trait PoolExistenceResolver {
+    async fn pool_exists(&self, pool_id: &str) -> Result<bool>;
+}
+
+struct LocalPoolExistenceResolver<'a> {
+    runtime: &'a Arc<StateRuntime>,
+    config: &'a Config,
+}
+
+impl PoolExistenceResolver for LocalPoolExistenceResolver<'_> {
+    async fn pool_exists(&self, pool_id: &str) -> Result<bool> {
+        pool_exists(self.runtime, self.config, pool_id).await
+    }
+}
+
+struct StatusPoolObservabilityAccess<R, E> {
+    reader: R,
+    existence_resolver: E,
+}
+
+fn status_pool_observability_access<'a>(
+    runtime: &'a Arc<StateRuntime>,
+    config: &'a Config,
+) -> StatusPoolObservabilityAccess<LocalAccountPoolBackend, LocalPoolExistenceResolver<'a>> {
+    StatusPoolObservabilityAccess {
+        reader: local_observability_reader(runtime, config),
+        existence_resolver: LocalPoolExistenceResolver { runtime, config },
+    }
+}
+
+impl<R, E> StatusPoolObservabilityAccess<R, E>
+where
+    R: AccountPoolObservabilityReader,
+    E: PoolExistenceResolver,
+{
+    async fn read(&self, pool_id: &str) -> StatusPoolObservabilityView {
+        match self.existence_resolver.pool_exists(pool_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return StatusPoolObservabilityView {
+                    pool_id: pool_id.to_string(),
+                    summary: None,
+                    diagnostics: None,
+                    warning: Some(format!("account pool `{pool_id}` was not found")),
+                };
+            }
+            Err(err) => {
+                return StatusPoolObservabilityView {
+                    pool_id: pool_id.to_string(),
+                    summary: None,
+                    diagnostics: None,
+                    warning: Some(err.to_string()),
+                };
+            }
+        }
+
+        let summary = self
+            .reader
+            .read_pool(AccountPoolReadRequest {
+                pool_id: pool_id.to_string(),
+            })
+            .await
+            .map(|snapshot| map_summary(snapshot.summary))
+            .map_err(|err| anyhow::anyhow!("read pooled summary: {err}"));
+        let diagnostics = self
+            .reader
+            .read_diagnostics(AccountPoolDiagnosticsReadRequest {
+                pool_id: pool_id.to_string(),
+            })
+            .await
+            .map(map_diagnostics)
+            .map_err(|err| anyhow::anyhow!("read pooled diagnostics: {err}"));
+
+        StatusPoolObservabilityView::from_results(pool_id.to_string(), summary, diagnostics)
+    }
+}
+
 async fn ensure_pool_exists(runtime: &StateRuntime, config: &Config, pool_id: &str) -> Result<()> {
+    if !pool_exists(runtime, config, pool_id).await? {
+        bail!("account pool `{pool_id}` was not found");
+    }
+
+    Ok(())
+}
+
+async fn pool_exists(runtime: &StateRuntime, config: &Config, pool_id: &str) -> Result<bool> {
     let configured_pool_exists = config.accounts.as_ref().is_some_and(|accounts| {
         accounts.default_pool.as_deref() == Some(pool_id)
             || accounts
@@ -209,11 +308,8 @@ async fn ensure_pool_exists(runtime: &StateRuntime, config: &Config, pool_id: &s
         .await?
         .into_iter()
         .any(|membership| membership.pool_id == pool_id);
-    if !configured_pool_exists && !registered_pool_exists {
-        bail!("account pool `{pool_id}` was not found");
-    }
 
-    Ok(())
+    Ok(configured_pool_exists || registered_pool_exists)
 }
 
 fn map_pool_show(snapshot: AccountPoolSnapshot, page: AccountPoolAccountsPage) -> PoolShowView {
