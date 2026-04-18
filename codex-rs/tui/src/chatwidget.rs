@@ -42,6 +42,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_product_identity::MCODEX;
 use url::Url;
 
 use self::realtime::PendingSteerCompareKey;
@@ -9831,7 +9832,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let resume_cmd = crate::legacy_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codex resume {name}"));
+            .unwrap_or_else(|| format!("{} resume {name}", MCODEX.binary_name));
         let name = name.to_string();
         let line = vec![
             "• ".into(),
