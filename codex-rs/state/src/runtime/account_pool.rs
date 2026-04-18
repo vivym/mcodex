@@ -493,6 +493,7 @@ SELECT
     account_registry.enabled,
     account_registry.healthy,
     account_runtime_state.health_state,
+    quota_state.exhausted_windows AS quota_exhausted_windows,
     active_lease.lease_id,
     active_lease.holder_instance_id,
     active_lease.lease_epoch,
@@ -505,6 +506,9 @@ JOIN account_registry
   ON account_registry.account_id = membership.account_id
 LEFT JOIN account_runtime_state
   ON account_runtime_state.account_id = membership.account_id
+LEFT JOIN account_quota_state AS quota_state
+  ON quota_state.account_id = membership.account_id
+ AND quota_state.limit_id = 'codex'
 LEFT JOIN account_leases AS active_lease
   ON active_lease.account_id = membership.account_id
  AND active_lease.pool_id = membership.pool_id
@@ -543,12 +547,21 @@ ORDER BY
                 .transpose()?;
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
-            let health_state = row
+            let legacy_health_state = row
                 .try_get::<Option<String>, _>("health_state")?
                 .as_deref()
                 .map(AccountHealthState::try_from)
                 .transpose()?;
-            let selector_auth_eligible = match health_state {
+            let quota_exhausted = row
+                .try_get::<Option<String>, _>("quota_exhausted_windows")?
+                .is_some_and(|exhausted_windows| exhausted_windows != "none");
+            let health_state = match legacy_health_state {
+                Some(AccountHealthState::Unauthorized) => Some(AccountHealthState::Unauthorized),
+                _ if quota_exhausted => Some(AccountHealthState::RateLimited),
+                Some(AccountHealthState::Healthy) => Some(AccountHealthState::Healthy),
+                Some(AccountHealthState::RateLimited) | None => None,
+            };
+            let selector_auth_eligible = match legacy_health_state {
                 Some(AccountHealthState::Unauthorized) => false,
                 Some(AccountHealthState::Healthy | AccountHealthState::RateLimited) => true,
                 None => healthy,
@@ -2212,15 +2225,45 @@ WHERE holder_instance_id = ?
         assert_eq!(diagnostic.accounts[1].pool_id, "team-main");
         assert_eq!(diagnostic.accounts[1].healthy, false);
         assert_eq!(diagnostic.accounts[1].active_lease, None);
-        assert_eq!(
-            diagnostic.accounts[1].health_state,
-            Some(AccountHealthState::RateLimited)
-        );
+        assert_eq!(diagnostic.accounts[1].health_state, None);
         assert_eq!(
             diagnostic.accounts[1].eligibility,
             crate::AccountStartupEligibility::AutomaticAccountSelected
         );
         assert_eq!(diagnostic.accounts[1].next_eligible_at, None);
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostic_derives_rate_limited_health_from_quota_state() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(120)),
+                next_probe_after: Some(test_timestamp(90)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
     }
 
     #[tokio::test]
