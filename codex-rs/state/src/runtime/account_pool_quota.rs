@@ -1,0 +1,339 @@
+use super::*;
+use crate::AccountHealthState;
+use crate::AccountQuotaStateRecord;
+use crate::QuotaExhaustedWindows;
+use crate::QuotaProbeResult;
+use crate::model::account_datetime_to_epoch_seconds;
+use crate::model::account_epoch_seconds_to_datetime;
+use sqlx::Row;
+
+impl StateRuntime {
+    pub async fn upsert_account_quota_state(
+        &self,
+        record: AccountQuotaStateRecord,
+    ) -> anyhow::Result<()> {
+        let observed_at = account_datetime_to_epoch_seconds(record.observed_at);
+        let primary_resets_at = record
+            .primary_resets_at
+            .map(account_datetime_to_epoch_seconds);
+        let secondary_resets_at = record
+            .secondary_resets_at
+            .map(account_datetime_to_epoch_seconds);
+        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
+        let predicted_blocked_until = if record.exhausted_windows.is_exhausted() {
+            record
+                .predicted_blocked_until
+                .map(account_datetime_to_epoch_seconds)
+        } else {
+            None
+        };
+        let next_probe_after = if record.exhausted_windows.is_exhausted() {
+            record
+                .next_probe_after
+                .map(account_datetime_to_epoch_seconds)
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+INSERT INTO account_quota_state (
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, limit_id) DO UPDATE SET
+    primary_used_percent = excluded.primary_used_percent,
+    primary_resets_at = excluded.primary_resets_at,
+    secondary_used_percent = excluded.secondary_used_percent,
+    secondary_resets_at = excluded.secondary_resets_at,
+    observed_at = excluded.observed_at,
+    exhausted_windows = excluded.exhausted_windows,
+    predicted_blocked_until = excluded.predicted_blocked_until,
+    next_probe_after = excluded.next_probe_after,
+    probe_backoff_level = excluded.probe_backoff_level,
+    last_probe_result = excluded.last_probe_result,
+    updated_at = excluded.updated_at
+WHERE excluded.observed_at >= account_quota_state.observed_at
+            "#,
+        )
+        .bind(&record.account_id)
+        .bind(&record.limit_id)
+        .bind(record.primary_used_percent)
+        .bind(primary_resets_at)
+        .bind(record.secondary_used_percent)
+        .bind(secondary_resets_at)
+        .bind(observed_at)
+        .bind(record.exhausted_windows.as_str())
+        .bind(predicted_blocked_until)
+        .bind(next_probe_after)
+        .bind(0_i64)
+        .bind(Option::<String>::None)
+        .bind(updated_at)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn read_account_quota_state(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+    ) -> anyhow::Result<Option<AccountQuotaStateRecord>> {
+        read_account_quota_state(self.pool.as_ref(), account_id, limit_id).await
+    }
+
+    pub async fn read_selection_quota_state(
+        &self,
+        account_id: &str,
+        selection_family: &str,
+    ) -> anyhow::Result<Option<AccountQuotaStateRecord>> {
+        let selected =
+            read_account_quota_state(self.pool.as_ref(), account_id, selection_family).await?;
+        if selected.is_some() || selection_family == "codex" {
+            return Ok(selected);
+        }
+
+        read_account_quota_state(self.pool.as_ref(), account_id, "codex").await
+    }
+
+    pub async fn read_selection_quota_compat_health_state(
+        &self,
+        account_id: &str,
+        selection_family: &str,
+    ) -> anyhow::Result<Option<AccountHealthState>> {
+        Ok(self
+            .read_selection_quota_state(account_id, selection_family)
+            .await?
+            .map(|record| record.compatibility_health_state()))
+    }
+
+    pub async fn reserve_account_quota_probe(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        now: DateTime<Utc>,
+        reserved_until: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let updated_at = account_datetime_to_epoch_seconds(Utc::now());
+        let result = sqlx::query(
+            r#"
+UPDATE account_quota_state
+SET next_probe_after = ?,
+    updated_at = ?
+WHERE account_id = ?
+  AND limit_id = ?
+  AND exhausted_windows != ?
+  AND COALESCE(next_probe_after, 0) <= ?
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(reserved_until))
+        .bind(updated_at)
+        .bind(account_id)
+        .bind(limit_id)
+        .bind(QuotaExhaustedWindows::None.as_str())
+        .bind(account_datetime_to_epoch_seconds(now))
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_account_quota_probe_success(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        observed_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE account_quota_state
+SET observed_at = ?,
+    exhausted_windows = ?,
+    predicted_blocked_until = NULL,
+    next_probe_after = NULL,
+    probe_backoff_level = 0,
+    last_probe_result = ?,
+    updated_at = ?
+WHERE account_id = ?
+  AND limit_id = ?
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(QuotaExhaustedWindows::None.as_str())
+        .bind(QuotaProbeResult::Success.as_str())
+        .bind(account_datetime_to_epoch_seconds(Utc::now()))
+        .bind(account_id)
+        .bind(limit_id)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_account_quota_probe_still_blocked(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        observed_at: DateTime<Utc>,
+        exhausted_windows: QuotaExhaustedWindows,
+        predicted_blocked_until: Option<DateTime<Utc>>,
+        next_probe_after: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let exhausted_windows = if exhausted_windows.is_exhausted() {
+            exhausted_windows
+        } else {
+            QuotaExhaustedWindows::Unknown
+        };
+        let result = sqlx::query(
+            r#"
+UPDATE account_quota_state
+SET observed_at = ?,
+    exhausted_windows = ?,
+    predicted_blocked_until = ?,
+    next_probe_after = ?,
+    probe_backoff_level = 0,
+    last_probe_result = ?,
+    updated_at = ?
+WHERE account_id = ?
+  AND limit_id = ?
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(exhausted_windows.as_str())
+        .bind(predicted_blocked_until.map(account_datetime_to_epoch_seconds))
+        .bind(account_datetime_to_epoch_seconds(next_probe_after))
+        .bind(QuotaProbeResult::StillBlocked.as_str())
+        .bind(account_datetime_to_epoch_seconds(Utc::now()))
+        .bind(account_id)
+        .bind(limit_id)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_account_quota_probe_ambiguous(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        observed_at: DateTime<Utc>,
+        predicted_blocked_until: DateTime<Utc>,
+        next_probe_after: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+UPDATE account_quota_state
+SET observed_at = ?,
+    exhausted_windows = CASE
+        WHEN exhausted_windows = 'none' THEN ?
+        ELSE exhausted_windows
+    END,
+    predicted_blocked_until = ?,
+    next_probe_after = ?,
+    probe_backoff_level = probe_backoff_level + 1,
+    last_probe_result = ?,
+    updated_at = ?
+WHERE account_id = ?
+  AND limit_id = ?
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(QuotaExhaustedWindows::Unknown.as_str())
+        .bind(account_datetime_to_epoch_seconds(predicted_blocked_until))
+        .bind(account_datetime_to_epoch_seconds(next_probe_after))
+        .bind(QuotaProbeResult::Ambiguous.as_str())
+        .bind(account_datetime_to_epoch_seconds(Utc::now()))
+        .bind(account_id)
+        .bind(limit_id)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+}
+
+async fn read_account_quota_state<'e, E>(
+    executor: E,
+    account_id: &str,
+    limit_id: &str,
+) -> anyhow::Result<Option<AccountQuotaStateRecord>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query(
+        r#"
+SELECT
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result
+FROM account_quota_state
+WHERE account_id = ?
+  AND limit_id = ?
+            "#,
+    )
+    .bind(account_id)
+    .bind(limit_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(account_quota_state_record_from_row).transpose()
+}
+
+fn account_quota_state_record_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<AccountQuotaStateRecord> {
+    let last_probe_result: Option<String> = row.try_get("last_probe_result")?;
+
+    Ok(AccountQuotaStateRecord {
+        account_id: row.try_get("account_id")?,
+        limit_id: row.try_get("limit_id")?,
+        primary_used_percent: row.try_get("primary_used_percent")?,
+        primary_resets_at: row
+            .try_get::<Option<i64>, _>("primary_resets_at")?
+            .map(account_epoch_seconds_to_datetime)
+            .transpose()?,
+        secondary_used_percent: row.try_get("secondary_used_percent")?,
+        secondary_resets_at: row
+            .try_get::<Option<i64>, _>("secondary_resets_at")?
+            .map(account_epoch_seconds_to_datetime)
+            .transpose()?,
+        observed_at: account_epoch_seconds_to_datetime(row.try_get("observed_at")?)?,
+        exhausted_windows: QuotaExhaustedWindows::try_from(
+            row.try_get::<String, _>("exhausted_windows")?.as_str(),
+        )?,
+        predicted_blocked_until: row
+            .try_get::<Option<i64>, _>("predicted_blocked_until")?
+            .map(account_epoch_seconds_to_datetime)
+            .transpose()?,
+        next_probe_after: row
+            .try_get::<Option<i64>, _>("next_probe_after")?
+            .map(account_epoch_seconds_to_datetime)
+            .transpose()?,
+        probe_backoff_level: row.try_get("probe_backoff_level")?,
+        last_probe_result: last_probe_result
+            .as_deref()
+            .map(QuotaProbeResult::try_from)
+            .transpose()?,
+    })
+}

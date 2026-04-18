@@ -1,5 +1,6 @@
 mod account_pool;
 mod account_pool_observability;
+mod account_pool_quota;
 mod agent_job;
 mod backfill_state;
 mod graph;
@@ -47,6 +48,9 @@ pub use account_pool_observability::AccountPoolQuotaRecord;
 pub use account_pool_observability::AccountPoolSelectionRecord;
 pub use account_pool_observability::AccountPoolSnapshotRecord;
 pub use account_pool_observability::AccountPoolSummaryRecord;
+pub use account_pool_quota::AccountQuotaStateRecord;
+pub use account_pool_quota::QuotaExhaustedWindows;
+pub use account_pool_quota::QuotaProbeResult;
 pub use agent_job::AgentJob;
 pub use agent_job::AgentJobCreateParams;
 pub use agent_job::AgentJobItem;
