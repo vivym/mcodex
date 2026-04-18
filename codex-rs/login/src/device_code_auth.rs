@@ -10,6 +10,7 @@ use crate::pkce::PkceCodes;
 use crate::pooled_registration::ChatgptManagedRegistrationTokens;
 use crate::server::ServerOptions;
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_product_identity::MCODEX;
 use std::io;
 
 const ANSI_BLUE: &str = "\x1b[94m";
@@ -83,7 +84,10 @@ async fn request_user_code(
         if status == StatusCode::NOT_FOUND {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "device code login is not enabled for this Codex server. Use the browser login or verify the server URL.",
+                format!(
+                    "device code login is not enabled for this {} server. Use the browser login or verify the server URL.",
+                    MCODEX.display_name
+                ),
             ));
         }
 
@@ -147,14 +151,20 @@ async fn poll_for_token(
 }
 
 fn print_device_code_prompt(verification_url: &str, code: &str) {
+    println!("{}", device_code_prompt_text(verification_url, code));
+}
+
+fn device_code_prompt_text(verification_url: &str, code: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    println!(
-        "\nWelcome to Codex [v{ANSI_GRAY}{version}{ANSI_RESET}]\n{ANSI_GRAY}OpenAI's command-line coding agent{ANSI_RESET}\n\
+    let display_name = MCODEX.display_name;
+    let runtime_tagline = MCODEX.runtime_tagline;
+    format!(
+        "\nWelcome to {display_name} [v{ANSI_GRAY}{version}{ANSI_RESET}]\n{ANSI_GRAY}{runtime_tagline}{ANSI_RESET}\n\
 \nFollow these steps to sign in with ChatGPT using device code authorization:\n\
 \n1. Open this link in your browser and sign in to your account\n   {ANSI_BLUE}{verification_url}{ANSI_RESET}\n\
 \n2. Enter this one-time code {ANSI_GRAY}(expires in 15 minutes){ANSI_RESET}\n   {ANSI_BLUE}{code}{ANSI_RESET}\n\
 \n{ANSI_GRAY}Device codes are a common phishing target. Never share this code.{ANSI_RESET}\n",
-    );
+    )
 }
 
 pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<DeviceCode> {
@@ -253,4 +263,19 @@ pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {
     let device_code = request_device_code(&opts).await?;
     print_device_code_prompt(&device_code.verification_url, &device_code.user_code);
     complete_device_code_login(opts, device_code).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_code_prompt_text;
+
+    #[test]
+    fn device_code_prompt_uses_runtime_identity() {
+        let prompt = device_code_prompt_text("https://example.test/device", "CODE-123");
+
+        assert!(prompt.contains("Welcome to mcodex"));
+        assert!(prompt.contains("an OpenAI Codex-derived command-line coding agent"));
+        assert!(prompt.contains("https://example.test/device"));
+        assert!(prompt.contains("CODE-123"));
+    }
 }

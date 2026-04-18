@@ -37,6 +37,7 @@ use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
 use codex_client::build_reqwest_client_with_custom_ca;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_product_identity::MCODEX;
 use codex_utils_template::Template;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
@@ -61,6 +62,10 @@ const DEFAULT_PORT: u16 = 1455;
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
+});
+static LOGIN_SUCCESS_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    Template::parse(include_str!("assets/success.html"))
+        .unwrap_or_else(|err| panic!("login success page template must parse: {err}"))
 });
 
 /// Options for launching the local login callback server.
@@ -408,7 +413,6 @@ async fn process_request(
                             let _ = sender.send(Ok(registration_tokens));
                         }
 
-                        let body = include_str!("assets/success.html");
                         HandledRequest::ResponseAndExit {
                             headers: match Header::from_bytes(
                                 &b"Content-Type"[..],
@@ -417,7 +421,7 @@ async fn process_request(
                                 Ok(header) => vec![header],
                                 Err(_) => Vec::new(),
                             },
-                            body: body.as_bytes().to_vec(),
+                            body: render_login_success_page(),
                             result: Ok(()),
                         }
                     } else {
@@ -457,7 +461,10 @@ async fn process_request(
                         ) {
                             Ok(header) => HandledRequest::RedirectWithHeader(header),
                             Err(_) => login_error_response(
-                                "Sign-in completed but redirecting back to Codex failed.",
+                                &format!(
+                                    "Sign-in completed but redirecting back to {} failed.",
+                                    MCODEX.display_name
+                                ),
                                 io::ErrorKind::Other,
                                 Some("redirect_failed"),
                                 /*error_description*/ None,
@@ -477,20 +484,17 @@ async fn process_request(
                 }
             }
         }
-        "/success" => {
-            let body = include_str!("assets/success.html");
-            HandledRequest::ResponseAndExit {
-                headers: match Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"text/html; charset=utf-8"[..],
-                ) {
-                    Ok(header) => vec![header],
-                    Err(_) => Vec::new(),
-                },
-                body: body.as_bytes().to_vec(),
-                result: Ok(()),
-            }
-        }
+        "/success" => HandledRequest::ResponseAndExit {
+            headers: match Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/html; charset=utf-8"[..],
+            ) {
+                Ok(header) => vec![header],
+                Err(_) => Vec::new(),
+            },
+            body: render_login_success_page(),
+            result: Ok(()),
+        },
         "/cancel" => HandledRequest::ResponseAndExit {
             headers: Vec::new(),
             body: b"Login cancelled".to_vec(),
@@ -1021,7 +1025,10 @@ fn is_missing_codex_entitlement_error(error_code: &str, error_description: Optio
 /// Converts OAuth callback errors into a user-facing message.
 fn oauth_callback_error_message(error_code: &str, error_description: Option<&str>) -> String {
     if is_missing_codex_entitlement_error(error_code, error_description) {
-        return "Codex is not enabled for your workspace. Contact your workspace administrator to request access to Codex.".to_string();
+        let display_name = MCODEX.display_name;
+        return format!(
+            "{display_name} is not enabled for your workspace. Contact your workspace administrator to request access to {display_name}."
+        );
     }
 
     if let Some(description) = error_description
@@ -1102,6 +1109,20 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     }
 }
 
+/// Renders the branded success page used by completed browser login.
+fn render_login_success_page() -> Vec<u8> {
+    LOGIN_SUCCESS_PAGE_TEMPLATE
+        .render([
+            ("product_display_name", html_escape(MCODEX.display_name)),
+            (
+                "product_runtime_tagline",
+                html_escape(MCODEX.runtime_tagline),
+            ),
+        ])
+        .unwrap_or_else(|err| panic!("login success page template must render: {err}"))
+        .into_bytes()
+}
+
 /// Renders the branded error page used by callback failures.
 fn render_login_error_page(
     message: &str,
@@ -1109,27 +1130,38 @@ fn render_login_error_page(
     error_description: Option<&str>,
 ) -> Vec<u8> {
     let code = error_code.unwrap_or("unknown_error");
+    let display_name = MCODEX.display_name;
     let (title, display_message, display_description, help_text) =
         if is_missing_codex_entitlement_error(code, error_description) {
             (
-                "You do not have access to Codex".to_string(),
-                "This account is not currently authorized to use Codex in this workspace."
-                    .to_string(),
-                "Contact your workspace administrator to request access to Codex.".to_string(),
-                "Contact your workspace administrator to get access to Codex, then return to Codex and try again."
-                    .to_string(),
+                format!("You do not have access to {display_name}"),
+                format!(
+                    "This account is not currently authorized to use {display_name} in this workspace."
+                ),
+                format!(
+                    "Contact your workspace administrator to request access to {display_name}."
+                ),
+                format!(
+                    "Contact your workspace administrator to get access to {display_name}, then return to {display_name} and try again."
+                ),
             )
         } else {
             (
                 "Sign-in could not be completed".to_string(),
                 message.to_string(),
                 error_description.unwrap_or(message).to_string(),
-                "Return to Codex to retry, switch accounts, or contact your workspace admin if access is restricted."
-                    .to_string(),
+                format!(
+                    "Return to {display_name} to retry, switch accounts, or contact your workspace admin if access is restricted."
+                ),
             )
         };
     LOGIN_ERROR_PAGE_TEMPLATE
         .render([
+            ("product_display_name", html_escape(display_name)),
+            (
+                "product_runtime_tagline",
+                html_escape(MCODEX.runtime_tagline),
+            ),
             ("error_title", html_escape(&title)),
             ("error_message", html_escape(&display_message)),
             ("error_code", html_escape(code)),
@@ -1332,7 +1364,7 @@ mod tests {
         ))
         .expect("login error page should be utf-8");
 
-        assert!(body.contains("You do not have access to Codex"));
+        assert!(body.contains("You do not have access to mcodex"));
         assert!(body.contains("Contact your workspace administrator"));
         assert!(!body.contains("missing_codex_entitlement"));
     }

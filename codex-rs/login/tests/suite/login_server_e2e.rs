@@ -135,6 +135,15 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     let url = format!("http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123");
     let resp = client.get(&url).send().await?;
     assert!(resp.status().is_success());
+    let body = resp.text().await?;
+    assert!(
+        body.contains("Signed in to mcodex"),
+        "success body should identify the active product"
+    );
+    assert!(
+        !body.contains("Signed in to Codex"),
+        "success body should not use legacy product identity"
+    );
 
     // Wait for server shutdown
     server.block_until_done().await?;
@@ -287,8 +296,8 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
     assert!(resp.status().is_success());
     let body = resp.text().await?;
     assert!(
-        body.contains("You do not have access to Codex"),
-        "error body should clearly explain the Codex access denial"
+        body.contains("You do not have access to mcodex"),
+        "error body should clearly explain the mcodex access denial"
     );
     assert!(
         body.contains("Contact your workspace administrator"),
@@ -302,11 +311,19 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
         !body.contains("missing_codex_entitlement"),
         "known entitlement errors should be mapped to user-facing copy"
     );
+    assert!(
+        !body.contains("You do not have access to Codex"),
+        "error body should not use legacy product identity"
+    );
 
     let result = server.block_until_done().await;
     assert!(result.is_err(), "login should fail for access_denied");
     let err = result.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string().contains("mcodex"),
+        "terminal error should identify the active product"
+    );
     assert!(
         err.to_string()
             .contains("Contact your workspace administrator"),
@@ -362,8 +379,12 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
         "generic oauth denial should preserve the oauth error details"
     );
     assert!(
-        body.contains("Return to Codex to retry"),
+        body.contains("Return to mcodex to retry"),
         "generic oauth denial should keep the generic help text"
+    );
+    assert!(
+        !body.contains("Return to Codex to retry"),
+        "generic oauth denial should not use legacy product identity"
     );
     assert!(
         body.contains("access_denied"),
@@ -374,11 +395,11 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
         "generic oauth denial should include the oauth error description"
     );
     assert!(
-        !body.contains("You do not have access to Codex"),
+        !body.contains("You do not have access to mcodex"),
         "generic oauth denial should not show the entitlement-specific title"
     );
     assert!(
-        !body.contains("get access to Codex"),
+        !body.contains("get access to mcodex"),
         "generic oauth denial should not show the entitlement-specific admin guidance"
     );
 

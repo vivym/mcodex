@@ -2340,6 +2340,7 @@ dependencies = [
  "codex-keyring-store",
  "codex-model-provider-info",
  "codex-otel",
+ "codex-product-identity",
  "codex-protocol",
  "codex-terminal-detection",
  "codex-utils-template",
