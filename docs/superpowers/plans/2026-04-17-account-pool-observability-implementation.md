@@ -8,6 +8,64 @@
 
 **Tech Stack:** Rust workspace crates (`codex-app-server-protocol`, `codex-app-server`, `codex-account-pool`, `codex-state`, `codex-core`), SQLite via `sqlx`, app-server v2 JSON-RPC schema fixtures, `pretty_assertions`, targeted crate tests, and `just write-app-server-schema` for generated protocol fixtures.
 
+## Execution Status
+
+Status as of 2026-04-18: implemented and verified. The checkbox tracker below was
+not maintained during execution; use this section as the authoritative summary
+of what landed.
+
+Completed implementation slices:
+
+- protocol contract: `06c24ae58 feat(protocol): add account pool observability rpc types`
+- protocol fixture follow-up: `1090c306d fix(protocol): require nullable account pool response fields in schema`
+- local state storage/reads: `30aa15fa3 feat(state): add pooled observability storage and reads`
+- state follow-ups:
+  - `fefbca9fc fix(state): align pooled diagnostics and selection events`
+  - `bdabb5bab fix(state): emit cleared startup selection events`
+  - `913e1089b fix(state): treat auth-failed leases as non-viable`
+  - `a05fb60a4 fix(state): tighten pooled observability semantics`
+  - `dd0346cc8 fix(state): preserve account list pagination`
+  - `4d2b39067 fix(state): keep healthy single-lease pools healthy`
+- runtime-only event emission: `099fa3b20 feat(core): emit pooled observability decision events`
+- backend-neutral seam:
+  - `c7fdb3f48 feat(account-pool): add observability reader seam`
+  - `268112a79 fix(account-pool): decouple observability seam models`
+- app-server exposure: `13a57ebe9 feat(app-server): expose account pool observability rpc`
+
+Acceptance criteria in the paired design doc are met:
+
+- app-server v2 exposes `accountPool/read`, `accountPool/accounts/list`,
+  `accountPool/events/list`, and `accountPool/diagnostics/read`
+- the local backend returns pool summary, account list, event history, and
+  derived diagnostics through the backend-neutral observability seam
+- event history is durably recorded in `state/migrations/0030_account_pool_events.sql`
+- diagnostics remain derived at read time rather than persisted separately
+
+Targeted verification completed during implementation:
+
+```bash
+cd codex-rs
+cargo test -p codex-app-server-protocol account_pool_observability -- --nocapture
+cargo test -p codex-app-server-protocol schema_fixtures -- --nocapture
+cargo test -p codex-state account_pool_observability -- --nocapture
+cargo test -p codex-core observability_event -- --nocapture
+cargo test -p codex-account-pool observability -- --nocapture
+cargo test -p codex-app-server account_pool_ -- --nocapture
+just fmt
+just fix -p codex-app-server
+just fix -p codex-state
+git diff --check
+```
+
+Still intentionally deferred for follow-on work:
+
+- remote backend support against the same observability contract
+- CLI/TUI consumers of the new RPCs
+- write-side control-plane operations such as pause/resume/drain
+- richer local quota/pause/drain summary facts where no backend-authoritative
+  local source exists yet; the contract is in place and local v1 returns `null`
+  for those fields instead of inventing shadow state
+
 ---
 
 ## Scope
