@@ -27,8 +27,8 @@ The recommended direction is:
   acquisition
 - make `usage_limit_reached` close the current lease to future new requests
   without killing in-flight siblings
-- make `401 unauthorized` invalidate the current lease generation and trigger
-  tree-scoped cancellation
+- make terminal `401 unauthorized` invalidate the current lease generation and
+  trigger tree-scoped cancellation
 - use explicit lease generations so late results from an old lease cannot
   corrupt the current lease state
 - converge `spawn_agent`, `review`, `guardian`, and other child-thread paths on
@@ -57,15 +57,23 @@ The recommended direction is:
 - Do not introduce per-request account load balancing or round-robin
   distribution.
 - Do not broaden pooled mode to multi-client WebSocket app-server processes.
+- Do not broaden pooled mode to stdio app-server shapes that load or run more
+  than one top-level thread context at a time.
 - Do not redesign manual account switching semantics for fresh runtime
   instances.
 - Do not introduce a background lease-rotation worker or a new operator UI.
+- Do not change the existing authenticated no-commit replay guard or
+  transport-reset model from the 2026-04-10 pooled account design.
 
 ## Constraints
 
 - The original multi-account pool design already defines pooled allocation as
   runtime-scoped, not request-scoped, and explicitly says threads in the same
   CLI or TUI runtime share one pooled lease context.
+- The original pooled-runtime applicability boundary also remains in force:
+  pooled mode is valid for CLI/TUI runtimes and for stdio app-server only while
+  at most one top-level thread context is loaded or running. This design does
+  not broaden that boundary.
 - The current implementation does not fully honor that contract:
   - `ThreadSpawn` child threads create fresh session-local account-pool
     managers instead of inheriting shared pooled lease ownership.
@@ -199,6 +207,17 @@ Responsibilities:
 This moves switching state such as `pending_rotation` and proactive-switch
 state out of per-session control and back into one runtime-owned control plane.
 
+Placement:
+
+- `RuntimeLeaseAuthority` lives in a runtime-scoped host above individual
+  `Codex` session services.
+- For CLI and TUI runtimes, that host is process-scoped.
+- For stdio app-server runtimes, that host is scoped to the one pooled
+  selection context already permitted by the earlier design; it must not become
+  a process-global authority spanning multiple loaded top-level threads.
+- Sessions receive shared handles to this authority, but no child session owns
+  its lifetime.
+
 ### 2. Introduce explicit request-scoped lease snapshots
 
 Every new remote model request must first acquire a `LeaseSnapshot` from
@@ -209,6 +228,7 @@ The snapshot should contain at least:
 - `account_id`
 - `lease_epoch` or equivalent generation token
 - `auth_handle`
+- `admission_id` or equivalent request-completion token
 - whether the generation currently accepts new requests
 - optional switch metadata useful for observability and debugging
 
@@ -220,6 +240,27 @@ The key rule is:
 - new requests acquire a fresh snapshot
 - in-flight requests may continue using the snapshot they started with
 - late reports from an old snapshot may only affect that same generation
+
+The acquisition step also records one admitted request against the current
+generation. The caller must release that admission when the request finishes,
+whether it succeeds, fails, or is cancelled. The authority uses that count to
+decide when a closed generation has fully drained.
+
+Lease liveness model:
+
+- this slice keeps one leased generation active for a pooled runtime at a time
+- a generation may be in one of three relevant states:
+  - `accepting`
+  - `draining`
+  - `released`
+- when the authority acquires a generation, it starts a runtime-owned
+  heartbeat for that generation
+- when the generation is closed to new work or invalidated, it becomes
+  `draining`; the heartbeat continues while admitted work remains
+- when the admitted-request count reaches zero, the authority releases that
+  generation and may acquire the next one
+- future new requests are blocked during `draining`; this slice does not
+  require overlapping dual leases for one runtime
 
 ### 3. Make remote-context continuity session-scoped
 
@@ -233,6 +274,8 @@ session-local `SessionLeaseView`.
 - decide whether this session must reset remote conversation or session state
   before the next request
 - expose the auth view the `ModelClient` should use for the current request
+- drive the existing transport-reset generation and remote-session reset
+  mechanics rather than introducing a second reset state machine
 
 This preserves the important distinction between:
 
@@ -243,6 +286,20 @@ This preserves the important distinction between:
 The runtime chooses the account. The session decides whether its own remote
 context can continue across that account boundary.
 
+The reset boundary remains the same as the 2026-04-10 pooled design:
+
+- when a cross-account change requires remote-context reset,
+  `SessionLeaseView` must drive the existing `transport_reset_generation`
+  boundary used by `ModelClient`
+- when remote-context reset is required, the session must mint a fresh outbound
+  remote session identity instead of reusing the old remote conversation or
+  thread id
+- when pool policy disallows cross-account context reuse, remote conversation
+  ids, thread ids, and equivalent transport handles must not be carried across
+  the account boundary
+- this design does not add a second independent generation mechanism for
+  transport reset
+
 ### 4. Make cancellation and fault scope collaboration-tree-scoped
 
 Introduce a `CollaborationTreeRegistry` that tracks parent-child relationships
@@ -250,10 +307,22 @@ for active sessions and exposes tree-scoped cancellation targets.
 
 Responsibilities:
 
+- extend the existing collaboration tree model rather than creating a second
+  unrelated tree subsystem
 - register collaboration trees and active members
 - identify which sessions belong to the same parent task tree
 - broadcast cancellation to cancellable members of one tree when required
 - keep this scope separate from runtime-wide lease ownership
+
+Tree-membership model:
+
+- `ThreadSpawn` relationships should continue to use the existing live and
+  persisted spawn-edge tree as their canonical source
+- non-`ThreadSpawn` delegated sessions such as `review` and guardian reviewer
+  flows should be attached to that same logical collaboration tree through
+  runtime-scoped membership edges rooted at their parent thread or turn
+- the registry is therefore a logical extension of the existing tree, not a
+  second independent hierarchy with different semantics
 
 This separation is intentional:
 
@@ -299,9 +368,15 @@ The pooled request lifecycle should be:
    snapshot.
 7. On `usage_limit_reached` or `401`, the caller reports the fault using the
    same snapshot.
+8. The caller releases the snapshot's admission when the request ends.
 
 This makes lease admission, execution, and reporting consistent across parent
 threads, spawned agents, and internal worker sessions.
+
+Any reused child `Codex` instance, including guardian or review sessions that
+survive across multiple requests or turns, must reacquire a fresh lease
+snapshot for each new request boundary. Reuse of a child session must not pin
+that session to creation-time pooled auth.
 
 ### 7. Define fault semantics explicitly
 
@@ -326,6 +401,35 @@ When any session reports `usage_limit_reached` for the current generation:
 
 This preserves the agreed behavior: block later work, not in-flight siblings.
 
+The rotation sequence is:
+
+- close the current generation to new work
+- let already admitted work drain under the same generation heartbeat
+- once the generation finishes draining, release it
+- only then acquire the replacement generation for future new requests
+
+This preserves single-generation lease ownership for one runtime in this slice.
+
+#### Unauthorized reporting boundary
+
+A raw wire-level `401` does not immediately invalidate the pooled generation on
+its own.
+
+Before reporting unauthorized to `RuntimeLeaseAuthority`, the caller must first
+exhaust the existing auth-recovery or backend revalidation path for that
+request:
+
+- for local managed auth, attempt the normal auth recovery path once
+- for remote leased auth, let the backend renew or revalidate the leased
+  credential and treat backend-confirmed revocation or unrecoverable failure as
+  authoritative
+- only terminal unauthorized or unrecoverable auth failure reports invalidate
+  the generation
+
+This spec changes lease ownership and cancellation scope. It does not change
+the earlier replay-guard or authenticated no-commit policy for current-turn
+retry.
+
 #### `401 unauthorized`
 
 When any session reports `401 unauthorized` for the current generation:
@@ -333,6 +437,10 @@ When any session reports `401 unauthorized` for the current generation:
 - the runtime immediately invalidates that generation for future new requests
 - the collaboration tree containing the reporting session should receive
   best-effort cancellation for all cancellable members
+- already admitted work outside the reporting tree enters drain-only behavior:
+  no further requests may be admitted on that generation, but unrelated work is
+  allowed to complete or fail naturally unless a future slice chooses broader
+  interruption semantics
 - new requests must reacquire against the next valid generation
 - late responses from the invalidated generation must be treated as stale and
   may not damage later generations
@@ -352,6 +460,8 @@ Required rules:
 - callers may not start a new request from a stale snapshot after the runtime
   has closed or invalidated that generation
 - auth access without lease admission is not allowed for pooled requests
+- a draining generation may continue to receive completion and telemetry
+  reports, but may not admit new requests
 
 These rules are what make dynamic following safe:
 
@@ -368,16 +478,26 @@ ownership boundary must move.
 
 Migration direction:
 
-1. Introduce `RuntimeLeaseAuthority` backed by the current account-pool
-   machinery instead of inventing a second selection engine.
-2. Introduce `LeaseSnapshot` and route pooled request admission through it.
-3. Replace the primary role of `SessionLeaseAuth` with `SessionLeaseView`.
-4. Route `ThreadSpawn`, `Review`, guardian, and other child-thread creation
+1. Introduce a runtime-scoped host/container above per-session `Codex`
+   services. Move pooled lease lifetime, heartbeat, and request-admission
+   ownership to that host before rerouting child-thread call sites.
+2. Introduce `RuntimeLeaseAuthority` inside that host, backed by the current
+   account-pool machinery instead of inventing a second selection engine.
+3. Introduce `LeaseSnapshot` plus request-completion release semantics at the
+   request boundary, and stop relying on session-construction-time pooled-auth
+   snapshots as the primary control seam.
+4. Replace the primary role of `SessionLeaseAuth` with `SessionLeaseView`,
+   explicitly reusing the existing transport-reset generation and remote
+   identity reset mechanics.
+5. Extend the existing collaboration tree into `CollaborationTreeRegistry` for
+   delegated non-`ThreadSpawn` child sessions instead of creating a second tree
+   system.
+6. Route `ThreadSpawn`, `Review`, guardian, and other child-thread creation
    through the runtime authority instead of separate per-session ownership.
-5. Convert fault reporting APIs to require explicit lease snapshot or
-   generation context.
-6. Add `CollaborationTreeRegistry` and route `401` cancellation through it.
-7. Retire `inherited_lease_auth_session` as the main pooled-runtime path,
+7. Convert fault reporting APIs to require explicit lease snapshot or
+   generation context, and only emit terminal unauthorized after existing
+   recovery or revalidation paths fail.
+8. Retire `inherited_lease_auth_session` as the main pooled-runtime path,
    keeping only a narrow compatibility shim during migration if needed.
 
 This lets the implementation change the ownership boundary without rewriting
@@ -392,10 +512,16 @@ At minimum, add coverage for:
 
 - parent session plus multiple child sessions concurrently sharing the same
   `account_id` and `lease_epoch`
+- runtime-owned heartbeat continuing while a closed or invalidated generation
+  drains already admitted work
+- new requests being blocked while a generation is draining
 - `usage_limit_reached` from one child closing the current generation to later
   new requests without cancelling already admitted siblings
-- `401` from one child invalidating the generation and triggering tree-scoped
-  cancellation
+- terminal `401` only invalidating the generation after existing recovery or
+  backend revalidation paths fail
+- `401` from one child invalidating the generation, triggering tree-scoped
+  cancellation for the reporting tree, and leaving unrelated already admitted
+  work in drain-only behavior
 - late `401` or quota-failure reports from an old generation not affecting the
   next generation
 - a child session following a later runtime rotation automatically on its next
@@ -404,6 +530,8 @@ At minimum, add coverage for:
   even though lease ownership is runtime-shared
 - `spawn_agent`, `review`, guardian, and other child-thread sources all
   exercising the same request-admission and fault-reporting path
+- pooled-mode applicability remaining unchanged for stdio app-server: one
+  loaded top-level thread context only
 
 ## Risks And Mitigations
 
