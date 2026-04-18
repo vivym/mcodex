@@ -48,10 +48,6 @@ SELECT
     COALESCE(SUM(CASE
         WHEN account_registry.enabled = 1
           AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
-          AND (
-              account_registry.healthy = 1
-              OR account_runtime_state.health_state IN ('healthy', 'rate_limited')
-          )
           AND COALESCE(quota_state.exhausted_windows, 'none') = 'none'
           AND active_lease.lease_id IS NULL
             THEN 1
@@ -621,11 +617,11 @@ fn derive_account_compat_health_state(
     }
 }
 
-fn selector_auth_eligible(healthy: bool, health_state: Option<&str>) -> bool {
+fn selector_auth_eligible(_healthy: bool, health_state: Option<&str>) -> bool {
     match health_state {
         Some("unauthorized") => false,
         Some("healthy" | "rate_limited") => true,
-        _ => healthy,
+        _ => true,
     }
 }
 
