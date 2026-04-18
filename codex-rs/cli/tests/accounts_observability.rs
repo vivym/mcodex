@@ -138,6 +138,12 @@ fn accounts_events_parse_flags() {
         "events",
         "--pool",
         "team-main",
+        "--account",
+        "acct-1",
+        "--type",
+        "leaseAcquired",
+        "--type",
+        "quotaObserved",
         "--limit",
         "25",
         "--cursor",
@@ -147,7 +153,7 @@ fn accounts_events_parse_flags() {
     .expect("events parses");
     assert_eq!(
         format!("{:?}", events.subcommand),
-        "Events(AccountsEventsCommand { pool: Some(\"team-main\"), limit: Some(25), cursor: Some(\"cursor-1\"), json: true })"
+        "Events(AccountsEventsCommand { pool: Some(\"team-main\"), account: Some(\"acct-1\"), types: [LeaseAcquired, QuotaObserved], limit: Some(25), cursor: Some(\"cursor-1\"), json: true })"
     );
 }
 
@@ -169,6 +175,98 @@ async fn accounts_events_rejects_conflicting_pool_flags() -> Result<()> {
 
     assert!(!output.success, "stdout: {}", output.stdout);
     assert!(output.stderr.contains("conflicts with --account-pool"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_events_json_preserves_cursor_and_details_payload() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_account_pool_events(&codex_home).await?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "events",
+            "--type",
+            "leaseAcquired",
+            "--type",
+            "quotaObserved",
+            "--limit",
+            "1",
+            "--json",
+        ],
+    )
+    .await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["poolId"], "team-main");
+    let data = json["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["eventType"], "leaseAcquired");
+    assert_eq!(data[0]["details"], serde_json::json!(["soft-limit", 42]));
+    let next_cursor = json["nextCursor"].as_str().expect("next cursor");
+
+    let next_output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "events",
+            "--type",
+            "leaseAcquired",
+            "--type",
+            "quotaObserved",
+            "--limit",
+            "1",
+            "--cursor",
+            next_cursor,
+            "--json",
+        ],
+    )
+    .await?;
+
+    assert!(next_output.success, "stderr: {}", next_output.stderr);
+    let next_json: serde_json::Value = serde_json::from_str(&next_output.stdout)?;
+    let next_data = next_json["data"].as_array().expect("data");
+    assert_eq!(next_data.len(), 1);
+    assert_eq!(next_data[0]["eventType"], "quotaObserved");
+    assert_eq!(
+        next_data[0]["details"],
+        serde_json::json!({"remainingPercent": 12.5})
+    );
+    assert!(next_json["nextCursor"].is_null());
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_events_text_reports_events_none_when_filter_matches_nothing() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_account_pool_events(&codex_home).await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "events", "--account", "missing-account"],
+    )
+    .await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("events: none"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_events_rejects_invalid_cursor() -> Result<()> {
+    let codex_home = prepared_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "events", "--cursor", "not-a-valid-cursor"],
+    )
+    .await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("invalid"));
     Ok(())
 }
 
@@ -337,6 +435,93 @@ WHERE account_id = ?
     .execute(&pool)
     .await?;
 
+    Ok(())
+}
+
+async fn seed_account_pool_events(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+
+    insert_account_pool_event(
+        &pool,
+        SeedEvent {
+            event_id: "event-array",
+            occurred_at: 20,
+            pool_id: "team-main",
+            account_id: Some("acct-1"),
+            lease_id: Some("lease-1"),
+            holder_instance_id: Some("holder-1"),
+            event_type: "leaseAcquired",
+            reason_code: Some("automaticAccountSelected"),
+            message: "lease acquired",
+            details_json: Some(serde_json::json!(["soft-limit", 42])),
+        },
+    )
+    .await?;
+    insert_account_pool_event(
+        &pool,
+        SeedEvent {
+            event_id: "event-object",
+            occurred_at: 10,
+            pool_id: "team-main",
+            account_id: Some("acct-2"),
+            lease_id: None,
+            holder_instance_id: None,
+            event_type: "quotaObserved",
+            reason_code: Some("quotaNearExhausted"),
+            message: "quota observed",
+            details_json: Some(serde_json::json!({"remainingPercent": 12.5})),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+struct SeedEvent {
+    event_id: &'static str,
+    occurred_at: i64,
+    pool_id: &'static str,
+    account_id: Option<&'static str>,
+    lease_id: Option<&'static str>,
+    holder_instance_id: Option<&'static str>,
+    event_type: &'static str,
+    reason_code: Option<&'static str>,
+    message: &'static str,
+    details_json: Option<serde_json::Value>,
+}
+
+async fn insert_account_pool_event(pool: &SqlitePool, event: SeedEvent) -> Result<()> {
+    sqlx::query(
+        r#"
+INSERT INTO account_pool_events (
+    event_id,
+    occurred_at,
+    pool_id,
+    account_id,
+    lease_id,
+    holder_instance_id,
+    event_type,
+    reason_code,
+    message,
+    details_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(event.event_id)
+    .bind(event.occurred_at)
+    .bind(event.pool_id)
+    .bind(event.account_id)
+    .bind(event.lease_id)
+    .bind(event.holder_instance_id)
+    .bind(event.event_type)
+    .bind(event.reason_code)
+    .bind(event.message)
+    .bind(event.details_json.map(|details| details.to_string()))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

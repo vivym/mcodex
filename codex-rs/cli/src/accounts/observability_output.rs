@@ -1,5 +1,7 @@
 use crate::accounts::observability_types::DiagnosticsIssueView;
 use crate::accounts::observability_types::DiagnosticsView;
+use crate::accounts::observability_types::EventView;
+use crate::accounts::observability_types::EventsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
 use crate::accounts::observability_types::PoolQuotaView;
@@ -26,6 +28,18 @@ pub(crate) fn print_diagnostics_json(view: &DiagnosticsView) -> anyhow::Result<(
     println!(
         "{}",
         serde_json::to_string_pretty(&diagnostics_json_value(view))?
+    );
+    Ok(())
+}
+
+pub(crate) fn print_events_text(view: &EventsView) {
+    print!("{}", render_events_text(view));
+}
+
+pub(crate) fn print_events_json(view: &EventsView) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&events_json_value(view))?
     );
     Ok(())
 }
@@ -229,13 +243,69 @@ fn diagnostics_issue_json_value(issue: &DiagnosticsIssueView) -> serde_json::Val
     })
 }
 
+fn render_events_text(view: &EventsView) -> String {
+    let mut lines = vec![format!("pool id: {}", view.pool_id)];
+
+    if view.data.is_empty() {
+        lines.push("events: none".to_string());
+    } else {
+        lines.push(
+            "eventId | occurredAt | type | accountId | reasonCode | message | details".to_string(),
+        );
+        for event in &view.data {
+            lines.push(format!(
+                "{} | {} | {} | {} | {} | {} | {}",
+                event.event_id,
+                event.occurred_at,
+                event.event_type,
+                event.account_id.as_deref().unwrap_or("none"),
+                event.reason_code.as_deref().unwrap_or("none"),
+                event.message,
+                event.details,
+            ));
+        }
+    }
+
+    if let Some(next_cursor) = view.next_cursor.as_deref() {
+        lines.push(format!("next cursor: {next_cursor}"));
+    }
+
+    format!("{}\n", lines.join("\n"))
+}
+
+fn events_json_value(view: &EventsView) -> serde_json::Value {
+    serde_json::json!({
+        "poolId": view.pool_id,
+        "data": view.data.iter().map(event_json_value).collect::<Vec<_>>(),
+        "nextCursor": view.next_cursor,
+    })
+}
+
+fn event_json_value(event: &EventView) -> serde_json::Value {
+    serde_json::json!({
+        "eventId": event.event_id,
+        "occurredAt": event.occurred_at,
+        "poolId": event.pool_id,
+        "accountId": event.account_id,
+        "leaseId": event.lease_id,
+        "holderInstanceId": event.holder_instance_id,
+        "eventType": event.event_type,
+        "reasonCode": event.reason_code,
+        "message": event.message,
+        "details": event.details,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::EventView;
+    use super::EventsView;
     use super::PoolAccountView;
     use super::PoolLeaseView;
     use super::PoolShowView;
     use super::lease_text;
     use super::render_diagnostics_text;
+    use super::render_events_text;
     use super::render_pool_show_text;
     use crate::accounts::observability_types::DiagnosticsIssueView;
     use crate::accounts::observability_types::DiagnosticsView;
@@ -301,6 +371,21 @@ mod tests {
         assert!(text.contains("warning | leaseHeldByAnotherInstance | account is leased | acct-1 | holder-1 | 2026-04-18T00:05:00Z"));
     }
 
+    #[test]
+    fn events_text_reports_events_none() {
+        let text = render_events_text(&sample_events(Vec::new(), None));
+
+        assert!(text.contains("pool id: team-main"));
+        assert!(text.contains("events: none"));
+    }
+
+    #[test]
+    fn events_text_reports_next_cursor() {
+        let text = render_events_text(&sample_events(vec![sample_event()], Some("cursor-1")));
+
+        assert!(text.contains("next cursor: cursor-1"));
+    }
+
     fn sample_view(data: Vec<PoolAccountView>, next_cursor: Option<&str>) -> PoolShowView {
         PoolShowView {
             pool_id: "team-main".to_string(),
@@ -354,6 +439,29 @@ mod tests {
                 "degraded".to_string()
             },
             issues,
+        }
+    }
+
+    fn sample_events(data: Vec<EventView>, next_cursor: Option<&str>) -> EventsView {
+        EventsView {
+            pool_id: "team-main".to_string(),
+            data,
+            next_cursor: next_cursor.map(ToOwned::to_owned),
+        }
+    }
+
+    fn sample_event() -> EventView {
+        EventView {
+            event_id: "event-1".to_string(),
+            occurred_at: "2026-04-18T00:00:00Z".to_string(),
+            pool_id: "team-main".to_string(),
+            account_id: Some("acct-1".to_string()),
+            lease_id: Some("lease-1".to_string()),
+            holder_instance_id: Some("holder-1".to_string()),
+            event_type: "leaseAcquired".to_string(),
+            reason_code: Some("automaticAccountSelected".to_string()),
+            message: "lease acquired".to_string(),
+            details: serde_json::json!(["soft-limit", 42]),
         }
     }
 }

@@ -79,3 +79,24 @@ pub(crate) struct DiagnosticsIssueView {
     pub holder_instance_id: Option<String>,
     pub next_relevant_at: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EventsView {
+    pub pool_id: String,
+    pub data: Vec<EventView>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EventView {
+    pub event_id: String,
+    pub occurred_at: String,
+    pub pool_id: String,
+    pub account_id: Option<String>,
+    pub lease_id: Option<String>,
+    pub holder_instance_id: Option<String>,
+    pub event_type: String,
+    pub reason_code: Option<String>,
+    pub message: String,
+    pub details: serde_json::Value,
+}

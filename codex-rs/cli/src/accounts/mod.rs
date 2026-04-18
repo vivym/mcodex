@@ -9,6 +9,7 @@ mod registration;
 use anyhow::Context;
 use clap::Args;
 use clap::Parser;
+use clap::ValueEnum;
 use codex_core::config::Config;
 use codex_product_identity::MCODEX;
 use codex_state::AccountStartupSelectionUpdate;
@@ -23,10 +24,13 @@ use mutate::list_accounts;
 use mutate::remove_account;
 use mutate::set_account_enabled;
 use observability::read_pool_diagnostics;
+use observability::read_pool_events;
 use observability::read_pool_show;
 use observability::resolve_target_pool;
 use observability_output::print_diagnostics_json;
 use observability_output::print_diagnostics_text;
+use observability_output::print_events_json;
+use observability_output::print_events_text;
 use observability_output::print_pool_show_json;
 use observability_output::print_pool_show_text;
 use output::print_current_json;
@@ -172,6 +176,12 @@ pub struct AccountsEventsCommand {
     #[arg(long = "pool", value_name = "POOL_ID")]
     pub pool: Option<String>,
 
+    #[arg(long = "account", value_name = "ACCOUNT_ID")]
+    pub account: Option<String>,
+
+    #[arg(long = "type", value_enum)]
+    pub types: Vec<AccountsEventTypeFilter>,
+
     #[arg(long = "limit")]
     pub limit: Option<u32>,
 
@@ -180,6 +190,27 @@ pub struct AccountsEventsCommand {
 
     #[arg(long = "json", default_value_t = false)]
     pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "camelCase")]
+pub enum AccountsEventTypeFilter {
+    LeaseAcquired,
+    LeaseRenewed,
+    LeaseReleased,
+    LeaseAcquireFailed,
+    ProactiveSwitchSelected,
+    ProactiveSwitchSuppressed,
+    QuotaObserved,
+    QuotaNearExhausted,
+    QuotaExhausted,
+    AccountPaused,
+    AccountResumed,
+    AccountDrainingStarted,
+    AccountDrainingCleared,
+    AuthFailed,
+    CooldownStarted,
+    CooldownCleared,
 }
 
 pub async fn run_accounts(command: AccountsCommand) -> ! {
@@ -334,7 +365,19 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                 command.pool.as_deref(),
                 account_pool.as_deref(),
             )?;
-            anyhow::bail!("accounts events is not implemented yet")
+            let runtime = Arc::new(
+                StateRuntime::init(config.sqlite_home.clone(), config.model_provider_id.clone())
+                    .await
+                    .context("initialize account startup selection state")?,
+            );
+            let view =
+                read_pool_events(&runtime, &config, account_pool.as_deref(), &command).await?;
+            if command.json {
+                print_events_json(&view)?;
+            } else {
+                print_events_text(&view);
+            }
+            Ok(())
         }
         subcommand => {
             let runtime = Arc::new(

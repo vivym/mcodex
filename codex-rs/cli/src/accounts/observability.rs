@@ -8,6 +8,10 @@ use codex_account_pool::AccountPoolDiagnostics;
 use codex_account_pool::AccountPoolDiagnosticsReadRequest;
 use codex_account_pool::AccountPoolDiagnosticsSeverity;
 use codex_account_pool::AccountPoolDiagnosticsStatus;
+use codex_account_pool::AccountPoolEvent;
+use codex_account_pool::AccountPoolEventType;
+use codex_account_pool::AccountPoolEventsListRequest;
+use codex_account_pool::AccountPoolEventsPage;
 use codex_account_pool::AccountPoolIssue;
 use codex_account_pool::AccountPoolLease;
 use codex_account_pool::AccountPoolObservabilityReader;
@@ -20,12 +24,16 @@ use codex_account_pool::AccountPoolSummary;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_core::config::Config;
 use codex_state::StateRuntime;
+use serde_json::Value;
 use std::sync::Arc;
 
+use crate::accounts::AccountsEventsCommand;
 use crate::accounts::PoolShowCommand;
 use crate::accounts::diagnostics::read_accounts_startup_status;
 use crate::accounts::observability_types::DiagnosticsIssueView;
 use crate::accounts::observability_types::DiagnosticsView;
+use crate::accounts::observability_types::EventView;
+use crate::accounts::observability_types::EventsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
 use crate::accounts::observability_types::PoolQuotaView;
@@ -128,6 +136,31 @@ pub(crate) async fn read_pool_diagnostics(
         .await?;
 
     Ok(map_diagnostics(diagnostics))
+}
+
+pub(crate) async fn read_pool_events(
+    runtime: &Arc<StateRuntime>,
+    config: &Config,
+    top_level_override: Option<&str>,
+    command: &AccountsEventsCommand,
+) -> Result<EventsView> {
+    let target =
+        resolve_strict_target_pool(runtime, config, command.pool.as_deref(), top_level_override)
+            .await?;
+    ensure_pool_exists(runtime, config, &target.pool_id).await?;
+
+    let page = local_observability_reader(runtime, config)
+        .list_events(AccountPoolEventsListRequest {
+            pool_id: target.pool_id.clone(),
+            account_id: command.account.clone(),
+            types: (!command.types.is_empty())
+                .then(|| command.types.iter().copied().map(Into::into).collect()),
+            cursor: command.cursor.clone(),
+            limit: command.limit,
+        })
+        .await?;
+
+    Ok(map_events(target.pool_id, page))
 }
 
 async fn resolve_strict_target_pool(
@@ -281,8 +314,66 @@ fn map_issue(issue: AccountPoolIssue) -> DiagnosticsIssueView {
     }
 }
 
+fn map_events(pool_id: String, page: AccountPoolEventsPage) -> EventsView {
+    EventsView {
+        pool_id,
+        data: page.data.into_iter().map(map_event).collect(),
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn map_event(event: AccountPoolEvent) -> EventView {
+    EventView {
+        event_id: event.event_id,
+        occurred_at: event.occurred_at.to_rfc3339(),
+        pool_id: event.pool_id,
+        account_id: event.account_id,
+        lease_id: event.lease_id,
+        holder_instance_id: event.holder_instance_id,
+        event_type: event.event_type.as_str().to_string(),
+        reason_code: event.reason_code.map(account_pool_reason_code_to_string),
+        message: event.message,
+        details: event.details_json.unwrap_or(Value::Null),
+    }
+}
+
 fn account_operational_state_to_string(state: AccountOperationalState) -> String {
     state.as_str().to_string()
+}
+
+impl From<crate::accounts::AccountsEventTypeFilter> for AccountPoolEventType {
+    fn from(value: crate::accounts::AccountsEventTypeFilter) -> Self {
+        match value {
+            crate::accounts::AccountsEventTypeFilter::LeaseAcquired => Self::LeaseAcquired,
+            crate::accounts::AccountsEventTypeFilter::LeaseRenewed => Self::LeaseRenewed,
+            crate::accounts::AccountsEventTypeFilter::LeaseReleased => Self::LeaseReleased,
+            crate::accounts::AccountsEventTypeFilter::LeaseAcquireFailed => {
+                Self::LeaseAcquireFailed
+            }
+            crate::accounts::AccountsEventTypeFilter::ProactiveSwitchSelected => {
+                Self::ProactiveSwitchSelected
+            }
+            crate::accounts::AccountsEventTypeFilter::ProactiveSwitchSuppressed => {
+                Self::ProactiveSwitchSuppressed
+            }
+            crate::accounts::AccountsEventTypeFilter::QuotaObserved => Self::QuotaObserved,
+            crate::accounts::AccountsEventTypeFilter::QuotaNearExhausted => {
+                Self::QuotaNearExhausted
+            }
+            crate::accounts::AccountsEventTypeFilter::QuotaExhausted => Self::QuotaExhausted,
+            crate::accounts::AccountsEventTypeFilter::AccountPaused => Self::AccountPaused,
+            crate::accounts::AccountsEventTypeFilter::AccountResumed => Self::AccountResumed,
+            crate::accounts::AccountsEventTypeFilter::AccountDrainingStarted => {
+                Self::AccountDrainingStarted
+            }
+            crate::accounts::AccountsEventTypeFilter::AccountDrainingCleared => {
+                Self::AccountDrainingCleared
+            }
+            crate::accounts::AccountsEventTypeFilter::AuthFailed => Self::AuthFailed,
+            crate::accounts::AccountsEventTypeFilter::CooldownStarted => Self::CooldownStarted,
+            crate::accounts::AccountsEventTypeFilter::CooldownCleared => Self::CooldownCleared,
+        }
+    }
 }
 
 fn account_pool_reason_code_to_string(reason_code: AccountPoolReasonCode) -> String {
