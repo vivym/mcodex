@@ -525,14 +525,18 @@ impl AuthModeWidget {
             "".into(),
             "  Before you start:".into(),
             "".into(),
-            "  Decide how much autonomy you want to grant Codex".into(),
+            format!(
+                "  Decide how much autonomy you want to grant {}",
+                MCODEX.display_name
+            )
+            .into(),
             Line::from(vec![
                 "  For more details see the ".into(),
                 "\u{1b}]8;;https://developers.openai.com/codex/security\u{7}Codex docs\u{1b}]8;;\u{7}".underlined(),
             ])
             .dim(),
             "".into(),
-            "  Codex can make mistakes".into(),
+            format!("  {} can make mistakes", MCODEX.display_name).into(),
             "  Review the code it writes and commands it runs".dim().into(),
             "".into(),
             "  Powered by your ChatGPT account".into(),
@@ -566,7 +570,11 @@ impl AuthModeWidget {
         let lines = vec![
             "✓ API key configured".fg(Color::Green).into(),
             "".into(),
-            "  Codex will use usage-based billing with your API key.".into(),
+            format!(
+                "  {} will use usage-based billing with your API key.",
+                MCODEX.display_name
+            )
+            .into(),
         ];
 
         Paragraph::new(lines)

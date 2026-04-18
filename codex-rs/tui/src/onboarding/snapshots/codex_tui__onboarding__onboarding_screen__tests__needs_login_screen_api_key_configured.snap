@@ -1,0 +1,9 @@
+---
+source: tui/src/onboarding/onboarding_screen.rs
+expression: rendered
+---
+  Welcome to mcodex, an OpenAI Codex-derived command-line coding agent
+
+✓ API key configured
+
+  mcodex will use usage-based billing with your API key.

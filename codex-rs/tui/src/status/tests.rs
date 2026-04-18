@@ -218,6 +218,8 @@ async fn status_snapshot_includes_reasoning_details() {
         }
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert!(sanitized.contains(">_ mcodex (v"));
+    assert!(!sanitized.contains("OpenAI Codex"));
     assert_snapshot!(sanitized);
 }
 

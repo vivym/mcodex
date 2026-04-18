@@ -753,6 +753,8 @@ async fn handle_startup_notice_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::onboarding::auth::AuthModeWidget;
+    use crate::onboarding::auth::SignInState;
     use crate::onboarding::pooled_access_notice::PooledAccessNoticeWidget;
     use crate::onboarding::welcome::WelcomeWidget;
     use crate::startup_access::StartupPromptDecision;
@@ -798,6 +800,20 @@ mod tests {
             })
             .expect("draw");
         format!("{}", terminal.backend())
+    }
+
+    fn auth_widget_mut(screen: &mut OnboardingScreen) -> &mut AuthModeWidget {
+        screen
+            .steps
+            .iter_mut()
+            .find_map(|step| match step {
+                Step::Auth(widget) => Some(widget),
+                Step::Welcome(_)
+                | Step::PooledOnlyNotice(_)
+                | Step::PooledPausedNotice(_)
+                | Step::TrustDirectory(_) => None,
+            })
+            .expect("auth step")
     }
 
     #[tokio::test]
@@ -865,6 +881,62 @@ mod tests {
 
         assert_eq!(step_names(&screen), vec!["welcome", "trust"]);
         assert!(!reload_config);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_success_message_uses_mcodex_runtime_identity() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let request_frame = FrameRequester::test_dummy();
+        let args = OnboardingScreenArgs {
+            show_trust_screen: false,
+            show_login_screen: true,
+            startup_prompt_decision: StartupPromptDecision::NeedsLogin,
+            login_status: LoginStatus::NotAuthenticated,
+            app_server_request_handle: Some(app_server.request_handle()),
+            config,
+        };
+
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        *auth_widget_mut(&mut screen).sign_in_state.write().unwrap() =
+            SignInState::ChatGptSuccessMessage;
+
+        let rendered = render_to_string(&screen);
+        assert!(rendered.contains("grant mcodex"));
+        assert!(rendered.contains("mcodex can make mistakes"));
+        assert!(!rendered.contains("grant Codex"));
+        assert!(!rendered.contains("Codex can make mistakes"));
+        assert_snapshot!("needs_login_screen_chatgpt_success_message", rendered);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_success_message_uses_mcodex_runtime_identity() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let request_frame = FrameRequester::test_dummy();
+        let args = OnboardingScreenArgs {
+            show_trust_screen: false,
+            show_login_screen: true,
+            startup_prompt_decision: StartupPromptDecision::NeedsLogin,
+            login_status: LoginStatus::NotAuthenticated,
+            app_server_request_handle: Some(app_server.request_handle()),
+            config,
+        };
+
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        *auth_widget_mut(&mut screen).sign_in_state.write().unwrap() =
+            SignInState::ApiKeyConfigured;
+
+        let rendered = render_to_string(&screen);
+        assert!(rendered.contains("mcodex will use usage-based billing with your API key."));
+        assert!(!rendered.contains("Codex will use usage-based billing with your API key."));
+        assert_snapshot!("needs_login_screen_api_key_configured", rendered);
 
         Ok(())
     }

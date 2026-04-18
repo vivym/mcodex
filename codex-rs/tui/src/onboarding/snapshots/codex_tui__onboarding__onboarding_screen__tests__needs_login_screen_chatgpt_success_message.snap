@@ -1,0 +1,22 @@
+---
+source: tui/src/onboarding/onboarding_screen.rs
+expression: rendered
+---
+  Welcome to mcodex, an OpenAI Codex-derived command-line coding agent
+
+✓ Signed in with your ChatGPT account
+
+  Before you start:
+
+  Decide how much autonomy you want to grant mcodex
+  For more details see the
+Codex docs
+
+  mcodex can make mistakes
+  Review the code it writes and commands it runs
+
+  Powered by your ChatGPT account
+  Uses your plan's rate limits and
+training data preferences
+
+  Press Enter to continue

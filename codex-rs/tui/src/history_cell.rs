@@ -1363,10 +1363,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
 
         let make_row = |spans: Vec<Span<'static>>| Line::from(spans);
 
-        // Title line rendered inside the box: ">_ OpenAI Codex (vX)"
+        // Title line rendered inside the box: ">_ mcodex (vX)"
         let title_spans: Vec<Span<'static>> = vec![
             Span::from(">_ ").dim(),
-            Span::from("OpenAI Codex").bold(),
+            Span::from(MCODEX.display_name).bold(),
             Span::from(" ").dim(),
             Span::from(format!("(v{})", self.version)).dim(),
         ];
@@ -3953,6 +3953,23 @@ mod tests {
 
         assert!(model_line.contains("gpt-4o high"));
         assert!(!model_line.contains("fast"));
+    }
+
+    #[test]
+    fn session_header_uses_mcodex_title() {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-4o".to_string(),
+            Some(ReasoningEffortConfig::High),
+            /*show_fast_status*/ true,
+            std::env::temp_dir(),
+            "test",
+        );
+
+        let lines = render_lines(&cell.display_lines(/*width*/ 80));
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains(">_ mcodex (vtest)"));
+        assert!(!rendered.contains("OpenAI Codex"));
     }
 
     #[test]
