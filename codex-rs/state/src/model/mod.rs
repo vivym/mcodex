@@ -79,7 +79,9 @@ pub use thread_metadata::ThreadMetadata;
 pub use thread_metadata::ThreadMetadataBuilder;
 pub use thread_metadata::ThreadsPage;
 
+pub(crate) use account_pool::datetime_to_epoch_nanos as account_datetime_to_epoch_nanos;
 pub(crate) use account_pool::datetime_to_epoch_seconds as account_datetime_to_epoch_seconds;
+pub(crate) use account_pool::epoch_nanos_to_datetime as account_epoch_nanos_to_datetime;
 pub(crate) use account_pool::epoch_seconds_to_datetime as account_epoch_seconds_to_datetime;
 pub(crate) use agent_job::AgentJobItemRow;
 pub(crate) use agent_job::AgentJobRow;

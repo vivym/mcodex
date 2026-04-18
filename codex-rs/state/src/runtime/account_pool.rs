@@ -2524,6 +2524,62 @@ WHERE holder_instance_id = ?
     }
 
     #[tokio::test]
+    async fn read_pool_diagnostic_does_not_splice_codex_timing_into_family_row() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(180)),
+                next_probe_after: Some(test_timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "chatgpt".to_string(),
+                primary_used_percent: Some(97.0),
+                primary_resets_at: Some(test_timestamp(240)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(120),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::NoEligibleAccount
+        );
+        assert_eq!(diagnostic.accounts[0].next_eligible_at, None);
+        assert_eq!(diagnostic.next_eligible_at, None);
+    }
+
+    #[tokio::test]
     async fn legacy_rate_limited_state_does_not_block_startup_preview_or_lease_acquisition() {
         let runtime = test_runtime().await;
         seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;

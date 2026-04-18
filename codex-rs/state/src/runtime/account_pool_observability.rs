@@ -1109,6 +1109,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_account_pool_accounts_does_not_splice_codex_timing_into_family_row() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(98.0),
+                primary_resets_at: Some(timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(timestamp(180)),
+                next_probe_after: Some(timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "chatgpt".to_string(),
+                primary_used_percent: Some(96.0),
+                primary_resets_at: Some(timestamp(240)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: timestamp(120),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                cursor: None,
+                limit: Some(10),
+                states: Some(vec!["coolingDown".to_string()]),
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 1);
+        assert_eq!(accounts.data[0].account_id, "acct-1");
+        assert_eq!(
+            accounts.data[0]
+                .selection
+                .as_ref()
+                .and_then(|selection| selection.next_eligible_at),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn diagnostics_and_snapshot_project_cooldown_from_quota_rows() {
         let runtime = test_runtime().await;
         seed_account(&runtime, "acct-1", "team-main", 0).await;

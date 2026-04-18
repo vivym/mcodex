@@ -276,6 +276,93 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
     }
 }
 
+#[tokio::test]
+async fn account_pool_quota_same_second_fresher_live_observation_beats_stale_probe() {
+    let harness = AccountPoolQuotaHarness::new().await;
+    let same_second = timestamp_with_nanos(6_000, 0);
+    let stale_probe_observed_at = timestamp_with_nanos(6_000, 100_000_000);
+    let fresh_observed_at = timestamp_with_nanos(6_000, 900_000_000);
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(same_second)
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(same_second + Duration::hours(1))
+                .with_next_probe_after(same_second + Duration::minutes(15)),
+        )
+        .await
+        .expect("write initial blocked quota");
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(fresh_observed_at)
+                .with_primary_used(5.0)
+                .with_exhausted_windows(QuotaExhaustedWindows::None),
+        )
+        .await
+        .expect("write fresher same-second observation");
+
+    assert!(
+        !harness
+            .record_probe_still_blocked(
+                "acct-a",
+                "codex",
+                stale_probe_observed_at,
+                QuotaExhaustedWindows::Secondary,
+                Some(stale_probe_observed_at + Duration::hours(1)),
+                stale_probe_observed_at + Duration::minutes(15),
+            )
+            .await
+            .expect("record stale same-second probe")
+    );
+
+    let refreshed = harness
+        .read_quota_state("acct-a", "codex")
+        .await
+        .expect("read refreshed quota")
+        .expect("missing refreshed quota");
+    assert_eq!(refreshed.observed_at, fresh_observed_at);
+    assert_eq!(refreshed.exhausted_windows, QuotaExhaustedWindows::None);
+    assert_eq!(refreshed.predicted_blocked_until, None);
+    assert_eq!(refreshed.next_probe_after, None);
+    assert_eq!(refreshed.last_probe_result, None);
+}
+
+#[tokio::test]
+async fn account_pool_quota_selection_family_does_not_splice_nullable_codex_fields() {
+    let harness = AccountPoolQuotaHarness::new().await;
+    let family_observed_at = timestamp(7_000);
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(timestamp_with_nanos(7_000, 100_000_000))
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(timestamp(7_600))
+                .with_next_probe_after(timestamp(7_300)),
+        )
+        .await
+        .expect("write codex quota");
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "chatgpt")
+                .with_observed_at(family_observed_at)
+                .with_primary_used(91.0)
+                .with_exhausted_windows(QuotaExhaustedWindows::Unknown),
+        )
+        .await
+        .expect("write family quota with null timings");
+
+    let selected = harness
+        .read_selection_quota_facts("acct-a", "chatgpt")
+        .await
+        .expect("read selected family quota")
+        .expect("missing family quota");
+    assert_eq!(selected.limit_id, "chatgpt");
+    assert_eq!(selected.observed_at, family_observed_at);
+    assert_eq!(selected.predicted_blocked_until, None);
+    assert_eq!(selected.next_probe_after, None);
+}
+
 struct AccountPoolQuotaHarness {
     runtime: Arc<StateRuntime>,
 }
@@ -460,6 +547,11 @@ impl AccountQuotaStateRecordExt for AccountQuotaStateRecord {
 
 fn timestamp(seconds: i64) -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(|| panic!("timestamp {seconds}"))
+}
+
+fn timestamp_with_nanos(seconds: i64, nanos: u32) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(seconds, nanos)
+        .unwrap_or_else(|| panic!("timestamp {seconds}.{nanos}"))
 }
 
 fn unique_temp_dir() -> PathBuf {

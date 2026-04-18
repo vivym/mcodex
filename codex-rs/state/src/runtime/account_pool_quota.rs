@@ -3,7 +3,9 @@ use crate::AccountHealthState;
 use crate::AccountQuotaStateRecord;
 use crate::QuotaExhaustedWindows;
 use crate::QuotaProbeResult;
+use crate::model::account_datetime_to_epoch_nanos;
 use crate::model::account_datetime_to_epoch_seconds;
+use crate::model::account_epoch_nanos_to_datetime;
 use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
 use sqlx::Row;
@@ -30,6 +32,7 @@ LEFT JOIN account_quota_state AS {selection_quota_alias}
 LEFT JOIN account_quota_state AS {fallback_quota_alias}
   ON {fallback_quota_alias}.account_id = {account_id_expr}
  AND {fallback_quota_alias}.limit_id = '{COMPAT_QUOTA_LIMIT_ID}'
+ AND {selection_quota_alias}.account_id IS NULL
         "#,
     )
 }
@@ -69,6 +72,7 @@ impl StateRuntime {
         record: AccountQuotaStateRecord,
     ) -> anyhow::Result<()> {
         let observed_at = account_datetime_to_epoch_seconds(record.observed_at);
+        let observed_at_nanos = account_datetime_to_epoch_nanos(record.observed_at);
         let primary_resets_at = record
             .primary_resets_at
             .map(account_datetime_to_epoch_seconds);
@@ -101,26 +105,28 @@ INSERT INTO account_quota_state (
     secondary_used_percent,
     secondary_resets_at,
     observed_at,
+    observed_at_nanos,
     exhausted_windows,
     predicted_blocked_until,
     next_probe_after,
     probe_backoff_level,
     last_probe_result,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, limit_id) DO UPDATE SET
     primary_used_percent = excluded.primary_used_percent,
     primary_resets_at = excluded.primary_resets_at,
     secondary_used_percent = excluded.secondary_used_percent,
     secondary_resets_at = excluded.secondary_resets_at,
     observed_at = excluded.observed_at,
+    observed_at_nanos = excluded.observed_at_nanos,
     exhausted_windows = excluded.exhausted_windows,
     predicted_blocked_until = excluded.predicted_blocked_until,
     next_probe_after = excluded.next_probe_after,
     probe_backoff_level = excluded.probe_backoff_level,
     last_probe_result = excluded.last_probe_result,
     updated_at = excluded.updated_at
-WHERE excluded.observed_at >= account_quota_state.observed_at
+WHERE excluded.observed_at_nanos >= COALESCE(account_quota_state.observed_at_nanos, account_quota_state.observed_at * 1000000000)
             "#,
         )
         .bind(&record.account_id)
@@ -130,6 +136,7 @@ WHERE excluded.observed_at >= account_quota_state.observed_at
         .bind(record.secondary_used_percent)
         .bind(secondary_resets_at)
         .bind(observed_at)
+        .bind(observed_at_nanos)
         .bind(record.exhausted_windows.as_str())
         .bind(predicted_blocked_until)
         .bind(next_probe_after)
@@ -222,10 +229,12 @@ WHERE account_id = ?
         limit_id: &str,
         observed_at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
+        let observed_at_nanos = account_datetime_to_epoch_nanos(observed_at);
         let result = sqlx::query(
             r#"
 UPDATE account_quota_state
 SET observed_at = ?,
+    observed_at_nanos = ?,
     exhausted_windows = ?,
     predicted_blocked_until = NULL,
     next_probe_after = NULL,
@@ -234,16 +243,17 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
-  AND observed_at <= ?
+  AND COALESCE(observed_at_nanos, observed_at * 1000000000) <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .bind(QuotaExhaustedWindows::None.as_str())
         .bind(QuotaProbeResult::Success.as_str())
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
-        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .execute(self.pool.as_ref())
         .await?;
 
@@ -264,10 +274,12 @@ WHERE account_id = ?
         } else {
             QuotaExhaustedWindows::Unknown
         };
+        let observed_at_nanos = account_datetime_to_epoch_nanos(observed_at);
         let result = sqlx::query(
             r#"
 UPDATE account_quota_state
 SET observed_at = ?,
+    observed_at_nanos = ?,
     exhausted_windows = ?,
     predicted_blocked_until = ?,
     next_probe_after = ?,
@@ -276,10 +288,11 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
-  AND observed_at <= ?
+  AND COALESCE(observed_at_nanos, observed_at * 1000000000) <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .bind(exhausted_windows.as_str())
         .bind(predicted_blocked_until.map(account_datetime_to_epoch_seconds))
         .bind(account_datetime_to_epoch_seconds(next_probe_after))
@@ -287,7 +300,7 @@ WHERE account_id = ?
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
-        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .execute(self.pool.as_ref())
         .await?;
 
@@ -302,10 +315,12 @@ WHERE account_id = ?
         predicted_blocked_until: DateTime<Utc>,
         next_probe_after: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
+        let observed_at_nanos = account_datetime_to_epoch_nanos(observed_at);
         let result = sqlx::query(
             r#"
 UPDATE account_quota_state
 SET observed_at = ?,
+    observed_at_nanos = ?,
     exhausted_windows = CASE
         WHEN exhausted_windows = 'none' THEN ?
         ELSE exhausted_windows
@@ -317,10 +332,11 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
-  AND observed_at <= ?
+  AND COALESCE(observed_at_nanos, observed_at * 1000000000) <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .bind(QuotaExhaustedWindows::Unknown.as_str())
         .bind(account_datetime_to_epoch_seconds(predicted_blocked_until))
         .bind(account_datetime_to_epoch_seconds(next_probe_after))
@@ -328,7 +344,7 @@ WHERE account_id = ?
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
-        .bind(account_datetime_to_epoch_seconds(observed_at))
+        .bind(observed_at_nanos)
         .execute(self.pool.as_ref())
         .await?;
 
@@ -354,6 +370,7 @@ SELECT
     secondary_used_percent,
     secondary_resets_at,
     observed_at,
+    COALESCE(observed_at_nanos, observed_at * 1000000000) AS observed_at_nanos,
     exhausted_windows,
     predicted_blocked_until,
     next_probe_after,
@@ -390,7 +407,7 @@ fn account_quota_state_record_from_row(
             .try_get::<Option<i64>, _>("secondary_resets_at")?
             .map(account_epoch_seconds_to_datetime)
             .transpose()?,
-        observed_at: account_epoch_seconds_to_datetime(row.try_get("observed_at")?)?,
+        observed_at: account_epoch_nanos_to_datetime(row.try_get("observed_at_nanos")?)?,
         exhausted_windows: QuotaExhaustedWindows::try_from(
             row.try_get::<String, _>("exhausted_windows")?.as_str(),
         )?,
