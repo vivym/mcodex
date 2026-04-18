@@ -6,12 +6,12 @@ use rand::Rng;
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
-const APP_TOOLTIP: &str = "Try the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const APP_TOOLTIP: &str = "Try the **mcodex desktop app**. Run 'mcodex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const FAST_TOOLTIP: &str = "*New* Use **/fast** to enable our fastest inference at 2X plan usage.";
-const OTHER_TOOLTIP: &str = "*New* Build faster with the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
-const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
+const OTHER_TOOLTIP: &str = "*New* Build faster with the **mcodex desktop app**. Run 'mcodex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with mcodex.";
 const FREE_GO_TOOLTIP: &str =
-    "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
+    "*New* For a limited time, mcodex is included in your plan for free - let's build together.";
 
 const RAW_TOOLTIPS: &str = include_str!("../tooltips.txt");
 
@@ -371,6 +371,60 @@ mod tests {
         let expected = std::collections::BTreeSet::from([paid_app_tooltip()]);
         assert_eq!(seen, expected);
         assert!(!seen.contains(&Some(FAST_TOOLTIP)));
+    }
+
+    #[test]
+    fn runtime_identity_tooltips_use_mcodex_commands_and_naming() {
+        assert!(RAW_TOOLTIPS.contains("when mcodex asks for confirmation."));
+        assert!(RAW_TOOLTIPS.contains("ask mcodex to use one."));
+        assert!(RAW_TOOLTIPS.contains("Run `mcodex app` to open the mcodex desktop app"));
+        assert!(RAW_TOOLTIPS.contains("customize how mcodex communicates."));
+        assert!(RAW_TOOLTIPS.contains(
+            "enable it with `mcodex mcp add openaiDeveloperDocs --url https://developers.openai.com/mcp`."
+        ));
+        assert!(RAW_TOOLTIPS.contains("run any shell command from mcodex using `!`"));
+        assert!(
+            RAW_TOOLTIPS
+                .contains("You can resume a previous conversation by running `mcodex resume`")
+        );
+        assert!(!RAW_TOOLTIPS.contains("`codex app`"));
+        assert!(!RAW_TOOLTIPS.contains("`codex mcp add"));
+        assert!(!RAW_TOOLTIPS.contains("`codex resume`"));
+        assert!(!RAW_TOOLTIPS.contains("Codex asks for confirmation."));
+        assert!(!RAW_TOOLTIPS.contains("Codex communicates."));
+        assert!(!RAW_TOOLTIPS.contains("from Codex"));
+
+        let promo_tooltips = [
+            APP_TOOLTIP,
+            OTHER_TOOLTIP,
+            OTHER_TOOLTIP_NON_MAC,
+            FREE_GO_TOOLTIP,
+        ];
+        assert!(
+            promo_tooltips
+                .iter()
+                .all(|tooltip| !tooltip.contains("'codex app'"))
+        );
+        assert!(
+            promo_tooltips
+                .iter()
+                .any(|tooltip| tooltip.contains("mcodex app"))
+        );
+        assert!(
+            promo_tooltips
+                .iter()
+                .all(|tooltip| !tooltip.contains("**Codex App**"))
+        );
+        assert!(
+            promo_tooltips
+                .iter()
+                .all(|tooltip| !tooltip.contains("Build faster with Codex."))
+        );
+        assert!(
+            promo_tooltips
+                .iter()
+                .all(|tooltip| !tooltip.contains("Codex is included in your plan"))
+        );
     }
 
     #[test]
