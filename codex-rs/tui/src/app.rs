@@ -107,6 +107,7 @@ use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
 use codex_otel::SessionTelemetry;
+use codex_product_identity::MCODEX;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::ExecApprovalRequestEvent;
 use codex_protocol::config_types::Personality;
@@ -173,6 +174,13 @@ use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+
+fn missing_external_editor_message() -> String {
+    format!(
+        "Cannot open external editor: set $VISUAL or $EDITOR before starting {}.",
+        MCODEX.display_name
+    )
+}
 
 enum ThreadInteractiveRequest {
     Approval(ApprovalRequest),
@@ -4979,8 +4987,11 @@ impl App {
                                     Line::from(vec!["• ".dim(), "Sandbox ready".into()]),
                                     Line::from(vec![
                                         "  ".into(),
-                                        "Codex can now safely edit files and execute commands in your computer"
-                                            .dark_gray(),
+                                        format!(
+                                            "{} can now safely edit files and execute commands in your computer",
+                                            MCODEX.display_name
+                                        )
+                                        .dark_gray(),
                                     ]),
                                 ]);
                             }
@@ -5941,9 +5952,8 @@ impl App {
             Err(external_editor::EditorError::MissingEditor) => {
                 self.chat_widget
                     .add_to_history(history_cell::new_error_event(
-                    "Cannot open external editor: set $VISUAL or $EDITOR before starting Codex."
-                        .to_string(),
-                ));
+                        missing_external_editor_message(),
+                    ));
                 self.reset_external_editor_state(tui);
                 return;
             }
@@ -6470,6 +6480,13 @@ mod tests {
 
     fn test_absolute_path(path: &str) -> AbsolutePathBuf {
         AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
+    }
+
+    #[test]
+    fn missing_external_editor_message_uses_mcodex_runtime_identity() {
+        let message = missing_external_editor_message();
+        assert!(message.contains("starting mcodex."));
+        assert!(!message.contains("starting Codex."));
     }
 
     #[test]
@@ -10232,12 +10249,12 @@ guardian_approval = true
             target_description,
             can_opt_out,
         );
+        let rendered = model_migration_copy_to_plain_text(&copy);
+        assert!(rendered.contains("mcodex just got an upgrade."));
+        assert!(!rendered.contains("Codex just got an upgrade."));
 
         // Snapshot the copy we would show; rendering is covered by model_migration snapshots.
-        assert_snapshot!(
-            "model_migration_prompt_shows_for_hidden_model",
-            model_migration_copy_to_plain_text(&copy)
-        );
+        assert_snapshot!("model_migration_prompt_shows_for_hidden_model", rendered);
     }
 
     #[tokio::test]

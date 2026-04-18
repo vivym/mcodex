@@ -7,6 +7,7 @@
 //! - Reorder items
 //! - Preview the rendered title
 
+use codex_product_identity::MCODEX;
 use itertools::Itertools;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -32,7 +33,7 @@ use crate::render::renderable::Renderable;
 #[derive(EnumIter, EnumString, Display, Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[strum(serialize_all = "kebab-case")]
 pub(crate) enum TerminalTitleItem {
-    /// Codex app name.
+    /// mcodex app name.
     AppName,
     /// Project root name, or a compact cwd fallback.
     Project,
@@ -53,7 +54,7 @@ pub(crate) enum TerminalTitleItem {
 impl TerminalTitleItem {
     pub(crate) fn description(self) -> &'static str {
         match self {
-            TerminalTitleItem::AppName => "Codex app name",
+            TerminalTitleItem::AppName => "mcodex app name",
             TerminalTitleItem::Project => "Project name (falls back to current directory name)",
             TerminalTitleItem::Spinner => {
                 "Animated task spinner (omitted while idle or when animations are off)"
@@ -74,7 +75,7 @@ impl TerminalTitleItem {
     /// session.
     pub(crate) fn preview_example(self) -> &'static str {
         match self {
-            TerminalTitleItem::AppName => "codex",
+            TerminalTitleItem::AppName => MCODEX.display_name,
             TerminalTitleItem::Project => "my-project",
             TerminalTitleItem::Spinner => "⠋",
             TerminalTitleItem::Status => "Working",
@@ -281,10 +282,10 @@ mod tests {
             "thread".to_string(),
         ];
         let view = TerminalTitleSetupView::new(Some(&selected), tx);
-        assert_snapshot!(
-            "terminal_title_setup_basic",
-            render_lines(&view, /*width*/ 84)
-        );
+        let rendered = render_lines(&view, /*width*/ 84);
+        assert!(rendered.contains("mcodex app name"));
+        assert!(!rendered.contains("Codex app name"));
+        assert_snapshot!("terminal_title_setup_basic", rendered);
     }
 
     #[test]

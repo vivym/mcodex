@@ -81,6 +81,8 @@ async fn full_access_confirmation_popup_snapshot() {
     chat.open_full_access_confirmation(preset, /*return_to_permissions*/ false);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("When mcodex runs with full access"));
+    assert!(!popup.contains("When Codex runs with full access"));
     assert_chatwidget_snapshot!("full_access_confirmation_popup", popup);
 }
 
@@ -99,6 +101,10 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
     assert!(
         popup.contains("requires Administrator permissions"),
         "expected auto mode prompt to mention Administrator permissions, popup: {popup}"
+    );
+    assert!(
+        popup.contains("Set up the mcodex agent sandbox"),
+        "expected auto mode prompt to use mcodex product naming, popup: {popup}"
     );
     assert!(
         popup.contains("Use non-admin sandbox"),

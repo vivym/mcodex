@@ -78,7 +78,7 @@ pub(crate) enum StatusLineItem {
     /// Remaining usage on the weekly rate limit.
     WeeklyLimit,
 
-    /// Codex application version.
+    /// mcodex application version.
     CodexVersion,
 
     /// Total context window size in tokens.
@@ -124,7 +124,7 @@ impl StatusLineItem {
             StatusLineItem::WeeklyLimit => {
                 "Remaining usage on weekly usage limit (omitted when unavailable)"
             }
-            StatusLineItem::CodexVersion => "Codex application version",
+            StatusLineItem::CodexVersion => "mcodex application version",
             StatusLineItem::ContextWindowSize => {
                 "Total context window size in tokens (omitted when unknown)"
             }
@@ -405,6 +405,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_version_description_uses_runtime_identity() {
+        let description = StatusLineItem::CodexVersion.description();
+
+        assert_eq!("mcodex application version", description);
+        assert!(!description.contains("Codex"));
+    }
+
+    #[test]
     fn setup_view_snapshot_uses_runtime_preview_values() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let view = StatusLineSetupView::new(
@@ -425,7 +433,8 @@ mod tests {
             AppEventSender::new(tx_raw),
         );
 
-        assert_snapshot!(render_lines(&view, /*width*/ 72));
+        let rendered = render_lines(&view, /*width*/ 72);
+        assert_snapshot!(rendered);
     }
 
     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {

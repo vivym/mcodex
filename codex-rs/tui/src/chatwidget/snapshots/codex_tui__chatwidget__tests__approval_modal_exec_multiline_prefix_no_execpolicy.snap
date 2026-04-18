@@ -1,5 +1,5 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
 expression: contents
 ---
 
@@ -11,6 +11,6 @@ expression: contents
   PY
 
 › 1. Yes, proceed (y)
-  2. No, and tell Codex what to do differently (esc)
+  2. No, and tell mcodex what to do differently (esc)
 
   Press enter to confirm or esc to cancel

@@ -1,5 +1,6 @@
 use codex_feedback::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 use codex_feedback::FeedbackDiagnostics;
+use codex_product_identity::MCODEX;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -533,10 +534,10 @@ pub(crate) fn feedback_upload_consent_params(
         items: vec![
             super::SelectionItem {
                 name: "Yes".to_string(),
-                description: Some(
-                    "Share the current Codex session logs with the team for troubleshooting."
-                        .to_string(),
-                ),
+                description: Some(format!(
+                    "Share the current {} session logs with the team for troubleshooting.",
+                    MCODEX.display_name
+                )),
                 actions: vec![yes_action],
                 dismiss_on_select: true,
                 ..Default::default()

@@ -1314,7 +1314,7 @@ async fn apps_refresh_preserves_toggled_enabled_state() {
 
 #[tokio::test]
 async fn apps_popup_for_not_installed_app_uses_install_only_selected_description() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);
     chat.config
         .features
@@ -1352,6 +1352,13 @@ async fn apps_popup_for_not_installed_app_uses_install_only_selected_description
     assert!(
         !popup.contains("enable/disable this app."),
         "did not expect enable/disable text for not-installed apps, got:\n{popup}"
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::OpenAppLink { instructions, .. })
+            if instructions == "Install this app in your browser, then reload mcodex."
     );
 }
 
@@ -1519,6 +1526,8 @@ async fn personality_selection_popup_snapshot() {
     chat.open_personality_popup();
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Choose a communication style for mcodex."));
+    assert!(!popup.contains("Choose a communication style for Codex."));
     assert_chatwidget_snapshot!("personality_selection_popup", popup);
 }
 
@@ -1529,6 +1538,8 @@ async fn realtime_audio_selection_popup_snapshot() {
     chat.open_realtime_audio_popup();
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Configure settings for mcodex."));
+    assert!(!popup.contains("Configure settings for Codex."));
     assert_chatwidget_snapshot!("realtime_audio_selection_popup", popup);
 }
 
@@ -1650,6 +1661,32 @@ async fn server_overloaded_error_does_not_switch_models() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn empty_server_overloaded_error_uses_mcodex_runtime_identity() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.on_server_overloaded_error(String::new());
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert_eq!(
+        lines_to_single_string(&cells[0]),
+        "⚠ mcodex is currently experiencing high load.\n"
+    );
+}
+
+#[test]
+fn edit_approval_notification_uses_mcodex_runtime_identity() {
+    let notification = Notification::EditApprovalRequested {
+        cwd: test_path_buf("/tmp/project"),
+        changes: vec![PathBuf::from("/tmp/project/src/main.rs")],
+    };
+
+    let rendered = notification.display();
+    assert!(rendered.contains("mcodex wants to edit"));
+    assert!(!rendered.contains("Codex wants to edit"));
 }
 
 #[tokio::test]

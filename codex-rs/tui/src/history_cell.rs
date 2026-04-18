@@ -819,7 +819,7 @@ pub fn new_approval_decision_cell(
                 vec![
                     actor.subject().into(),
                     "approved".bold(),
-                    " codex to run ".into(),
+                    format!(" {} to run ", MCODEX.display_name).into(),
                     snippet,
                     " this time".bold(),
                 ],
@@ -834,7 +834,11 @@ pub fn new_approval_decision_cell(
                 vec![
                     actor.subject().into(),
                     "approved".bold(),
-                    " codex to always run commands that start with ".into(),
+                    format!(
+                        " {} to always run commands that start with ",
+                        MCODEX.display_name
+                    )
+                    .into(),
                     snippet,
                 ],
             )
@@ -846,7 +850,7 @@ pub fn new_approval_decision_cell(
                 vec![
                     actor.subject().into(),
                     "approved".bold(),
-                    " codex to run ".into(),
+                    format!(" {} to run ", MCODEX.display_name).into(),
                     snippet,
                     " every time this session".bold(),
                 ],
@@ -860,7 +864,7 @@ pub fn new_approval_decision_cell(
                 vec![
                     actor.subject().into(),
                     "persisted".bold(),
-                    " Codex network access to ".into(),
+                    format!(" {} network access to ", MCODEX.display_name).into(),
                     Span::from(network_policy_amendment.host).dim(),
                 ],
             ),
@@ -869,7 +873,7 @@ pub fn new_approval_decision_cell(
                 vec![
                     actor.subject().into(),
                     "denied".bold(),
-                    " codex network access to ".into(),
+                    format!(" {} network access to ", MCODEX.display_name).into(),
                     Span::from(network_policy_amendment.host).dim(),
                     " and saved that rule".into(),
                 ],
@@ -881,13 +885,13 @@ pub fn new_approval_decision_cell(
                 ApprovalDecisionActor::User => vec![
                     actor.subject().into(),
                     "did not approve".bold(),
-                    " codex to run ".into(),
+                    format!(" {} to run ", MCODEX.display_name).into(),
                     snippet,
                 ],
                 ApprovalDecisionActor::Guardian => vec![
                     "Request ".into(),
                     "denied".bold(),
-                    " for codex to run ".into(),
+                    format!(" for {} to run ", MCODEX.display_name).into(),
                     snippet,
                 ],
             };
@@ -900,7 +904,7 @@ pub fn new_approval_decision_cell(
                 vec![
                     "Review ".into(),
                     "timed out".bold(),
-                    " before codex could run ".into(),
+                    format!(" before {} could run ", MCODEX.display_name).into(),
                     snippet,
                 ],
             )
@@ -1205,7 +1209,11 @@ pub(crate) fn new_session_info(
             Line::from(vec![
                 "  ".into(),
                 "/init".into(),
-                " - create an AGENTS.md file with instructions for Codex".dim(),
+                format!(
+                    " - create an AGENTS.md file with instructions for {}",
+                    MCODEX.display_name
+                )
+                .dim(),
             ]),
             Line::from(vec![
                 "  ".into(),
@@ -1215,7 +1223,7 @@ pub(crate) fn new_session_info(
             Line::from(vec![
                 "  ".into(),
                 "/permissions".into(),
-                " - choose what Codex is allowed to do".dim(),
+                format!(" - choose what {} is allowed to do", MCODEX.display_name).dim(),
             ]),
             Line::from(vec![
                 "  ".into(),
@@ -3175,6 +3183,10 @@ mod tests {
         let rendered = render_transcript(&cell).join("\n");
         assert!(!rendered.contains("Model just became available"));
         assert!(rendered.contains("To get started"));
+        assert!(rendered.contains("instructions for mcodex"));
+        assert!(rendered.contains("what mcodex is allowed to do"));
+        assert!(!rendered.contains("instructions for Codex"));
+        assert!(!rendered.contains("what Codex is allowed to do"));
     }
 
     #[tokio::test]
@@ -3970,6 +3982,32 @@ mod tests {
 
         assert!(rendered.contains(">_ mcodex (vtest)"));
         assert!(!rendered.contains("OpenAI Codex"));
+    }
+
+    #[test]
+    fn approval_decision_cells_use_mcodex_runtime_identity() {
+        let approved = new_approval_decision_cell(
+            vec!["git".to_string(), "status".to_string()],
+            codex_protocol::protocol::ReviewDecision::ApprovedForSession,
+            ApprovalDecisionActor::User,
+        );
+        let approved_rendered = render_lines(&approved.display_lines(/*width*/ 120)).join("\n");
+        assert!(approved_rendered.contains("approved mcodex to run"));
+        assert!(!approved_rendered.contains("approved codex to run"));
+
+        let network = new_approval_decision_cell(
+            Vec::new(),
+            codex_protocol::protocol::ReviewDecision::NetworkPolicyAmendment {
+                network_policy_amendment: codex_protocol::protocol::NetworkPolicyAmendment {
+                    host: "example.test".to_string(),
+                    action: codex_protocol::protocol::NetworkPolicyRuleAction::Allow,
+                },
+            },
+            ApprovalDecisionActor::User,
+        );
+        let network_rendered = render_lines(&network.display_lines(/*width*/ 120)).join("\n");
+        assert!(network_rendered.contains("mcodex network access to"));
+        assert!(!network_rendered.contains("Codex network access to"));
     }
 
     #[test]

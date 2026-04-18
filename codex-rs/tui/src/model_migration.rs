@@ -8,6 +8,9 @@ use crate::selection_list::selection_option_row;
 use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
+use crate::wrapping::RtOptions;
+use crate::wrapping::word_wrap_lines;
+use codex_product_identity::MCODEX;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -82,7 +85,8 @@ pub(crate) fn migration_copy_for_models(
     }
 
     let heading_text = Span::from(format!(
-        "Codex just got an upgrade. Introducing {target_display_name}."
+        "{} just got an upgrade. Introducing {target_display_name}.",
+        MCODEX.display_name
     ))
     .bold();
     let description_line: Line<'static>;
@@ -258,7 +262,12 @@ impl WidgetRef for &ModelMigrationScreen {
         if let Some(markdown) = self.copy.markdown.as_ref() {
             self.render_markdown_content(markdown, area.width, &mut column);
         } else {
-            column.push(self.heading_line());
+            let heading_options = RtOptions::new(area.width as usize)
+                .subsequent_indent(Line::from("  "))
+                .word_splitter(textwrap::WordSplitter::NoHyphenation);
+            for line in word_wrap_lines([self.heading_line()], heading_options) {
+                column.push(line);
+            }
             column.push(Line::from(""));
             self.render_content(&mut column);
         }
@@ -341,11 +350,14 @@ impl ModelMigrationScreen {
     fn render_menu(&self, column: &mut ColumnRenderable) {
         column.push(Line::from(""));
         column.push(
-            Paragraph::new("Choose how you'd like Codex to proceed.")
-                .wrap(Wrap { trim: false })
-                .inset(Insets::tlbr(
-                    /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
-                )),
+            Paragraph::new(format!(
+                "Choose how you'd like {} to proceed.",
+                MCODEX.display_name
+            ))
+            .wrap(Wrap { trim: false })
+            .inset(Insets::tlbr(
+                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+            )),
         );
         column.push(Line::from(""));
 
@@ -401,7 +413,13 @@ fn is_ctrl_exit_combo(key_event: KeyEvent) -> bool {
 }
 
 fn fill_migration_markdown(template: &str, current_model: &str, target_model: &str) -> String {
+    let display_name = MCODEX.display_name;
+    let upgrade_phrase = format!("{display_name} just got an upgrade");
+    let powered_phrase = format!("{display_name} is now powered");
+
     template
+        .replace("Codex just got an upgrade", &upgrade_phrase)
+        .replace("Codex is now powered", &powered_phrase)
         .replace("{model_from}", current_model)
         .replace("{model_to}", target_model)
 }
@@ -410,6 +428,7 @@ fn fill_migration_markdown(template: &str, current_model: &str, target_model: &s
 mod tests {
     use super::ModelMigrationCopy;
     use super::ModelMigrationScreen;
+    use super::fill_migration_markdown;
     use super::migration_copy_for_models;
     use crate::custom_terminal::Terminal;
     use crate::test_backend::VT100Backend;
@@ -532,6 +551,21 @@ mod tests {
         }
         terminal.flush().expect("flush");
         assert_snapshot!("model_migration_prompt_gpt5_codex_mini", terminal.backend());
+    }
+
+    #[test]
+    fn markdown_template_uses_runtime_identity_without_rewriting_model_names() {
+        let filled = fill_migration_markdown(
+            "**Codex just got an upgrade. Introducing {model_to}.**\n\nCodex is now powered by {model_to}.\n\nYou can always keep using GPT-5.3-Codex if you prefer.",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+        );
+
+        assert!(filled.contains("**mcodex just got an upgrade. Introducing gpt-5.4.**"));
+        assert!(filled.contains("mcodex is now powered by gpt-5.4."));
+        assert!(filled.contains("GPT-5.3-Codex"));
+        assert!(!filled.contains("Codex just got an upgrade"));
+        assert!(!filled.contains("Codex is now powered"));
     }
 
     #[test]
