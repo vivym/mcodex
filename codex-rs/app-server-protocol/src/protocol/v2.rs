@@ -1769,12 +1769,20 @@ pub struct AccountLeaseReadResponse {
     pub lease_id: Option<String>,
     #[ts(type = "number | null")]
     pub lease_epoch: Option<u64>,
+    #[ts(type = "number | null")]
+    pub lease_acquired_at: Option<i64>,
     pub health_state: Option<String>,
     pub switch_reason: Option<String>,
     pub suppression_reason: Option<String>,
     #[ts(type = "number | null")]
     pub transport_reset_generation: Option<u64>,
     pub last_remote_context_reset_turn_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub min_switch_interval_secs: Option<u64>,
+    pub proactive_switch_pending: Option<bool>,
+    pub proactive_switch_suppressed: Option<bool>,
+    #[ts(type = "number | null")]
+    pub proactive_switch_allowed_at: Option<i64>,
     #[ts(type = "number | null")]
     pub next_eligible_at: Option<i64>,
     pub effective_pool_resolution_source: Option<String>,
@@ -1786,6 +1794,336 @@ pub struct AccountLeaseReadResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountLeaseResumeResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolReadParams {
+    pub pool_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolAccountsListParams {
+    pub pool_id: String,
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+    #[ts(optional = nullable)]
+    pub states: Option<Vec<AccountOperationalState>>,
+    #[ts(optional = nullable)]
+    pub account_kinds: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolEventsListParams {
+    pub pool_id: String,
+    #[ts(optional = nullable)]
+    pub account_id: Option<String>,
+    #[ts(optional = nullable)]
+    pub types: Option<Vec<AccountPoolEventType>>,
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDiagnosticsReadParams {
+    pub pool_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolReadResponse {
+    pub pool_id: String,
+    pub backend: AccountPoolBackendKind,
+    pub summary: AccountPoolSummaryResponse,
+    pub policy: AccountPoolPolicyResponse,
+    pub refreshed_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolAccountsListResponse {
+    pub data: Vec<AccountPoolAccountResponse>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolEventsListResponse {
+    pub data: Vec<AccountPoolEventResponse>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDiagnosticsReadResponse {
+    pub pool_id: String,
+    pub generated_at: i64,
+    pub status: AccountPoolDiagnosticsStatus,
+    pub issues: Vec<AccountPoolDiagnosticsIssueResponse>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSummaryResponse {
+    pub total_accounts: u32,
+    pub active_leases: u32,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub available_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub leased_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub paused_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub draining_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub near_exhausted_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub exhausted_accounts: Option<u32>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub error_accounts: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolPolicyResponse {
+    pub allocation_mode: String,
+    pub allow_context_reuse: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<u8>")]
+    pub proactive_switch_threshold_percent: Option<u8>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u64>")]
+    pub min_switch_interval_secs: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolAccountResponse {
+    pub account_id: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub backend_account_ref: Option<String>,
+    pub account_kind: String,
+    pub enabled: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub health_state: Option<String>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountOperationalState>"
+    )]
+    pub operational_state: Option<AccountOperationalState>,
+    #[schemars(required, schema_with = "nullable_field_schema::<bool>")]
+    pub allocatable: Option<bool>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolReasonCode>"
+    )]
+    pub status_reason_code: Option<AccountPoolReasonCode>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub status_message: Option<String>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolLeaseResponse>"
+    )]
+    pub current_lease: Option<AccountPoolLeaseResponse>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolQuotaResponse>"
+    )]
+    pub quota: Option<AccountPoolQuotaResponse>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolSelectionResponse>"
+    )]
+    pub selection: Option<AccountPoolSelectionResponse>,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolLeaseResponse {
+    pub lease_id: String,
+    pub lease_epoch: u64,
+    pub holder_instance_id: String,
+    pub acquired_at: i64,
+    pub renewed_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolQuotaResponse {
+    #[schemars(required, schema_with = "nullable_field_schema::<f64>")]
+    pub remaining_percent: Option<f64>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub resets_at: Option<i64>,
+    pub observed_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolSelectionResponse {
+    pub eligible: bool,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub next_eligible_at: Option<i64>,
+    pub preferred: bool,
+    pub suppressed: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolEventResponse {
+    pub event_id: String,
+    pub occurred_at: i64,
+    pub pool_id: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub account_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub lease_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub holder_instance_id: Option<String>,
+    pub event_type: AccountPoolEventType,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountPoolReasonCode>"
+    )]
+    pub reason_code: Option<AccountPoolReasonCode>,
+    pub message: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<serde_json::Value>")]
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDiagnosticsIssueResponse {
+    pub severity: AccountPoolDiagnosticsSeverity,
+    pub reason_code: AccountPoolReasonCode,
+    pub message: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub account_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub holder_instance_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub next_relevant_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountPoolBackendKind {
+    Local,
+    Remote,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountOperationalState {
+    Available,
+    Leased,
+    Paused,
+    Draining,
+    CoolingDown,
+    NearExhausted,
+    Exhausted,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountPoolEventType {
+    LeaseAcquired,
+    LeaseRenewed,
+    LeaseReleased,
+    LeaseAcquireFailed,
+    ProactiveSwitchSelected,
+    ProactiveSwitchSuppressed,
+    QuotaObserved,
+    QuotaNearExhausted,
+    QuotaExhausted,
+    AccountPaused,
+    AccountResumed,
+    AccountDrainingStarted,
+    AccountDrainingCleared,
+    AuthFailed,
+    CooldownStarted,
+    CooldownCleared,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountPoolReasonCode {
+    DurablySuppressed,
+    MissingPool,
+    PreferredAccountSelected,
+    AutomaticAccountSelected,
+    PreferredAccountMissing,
+    PreferredAccountInOtherPool,
+    PreferredAccountDisabled,
+    PreferredAccountUnhealthy,
+    PreferredAccountBusy,
+    ManualPause,
+    ManualDrain,
+    QuotaNearExhausted,
+    QuotaExhausted,
+    AuthFailure,
+    CooldownActive,
+    MinimumSwitchInterval,
+    NoEligibleAccount,
+    LeaseHeldByAnotherInstance,
+    NonReplayableTurn,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountPoolDiagnosticsStatus {
+    Healthy,
+    Degraded,
+    Blocked,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountPoolDiagnosticsSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+fn nullable_field_schema<T>(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema
+where
+    Option<T>: JsonSchema,
+{
+    <Option<T> as JsonSchema>::json_schema(generator)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -3820,6 +4158,14 @@ pub struct AccountLeaseUpdatedNotification {
     pub account_id: Option<String>,
     pub pool_id: Option<String>,
     pub suppressed: bool,
+    #[ts(type = "number | null")]
+    pub lease_acquired_at: Option<i64>,
+    #[ts(type = "number | null")]
+    pub min_switch_interval_secs: Option<u64>,
+    pub proactive_switch_pending: Option<bool>,
+    pub proactive_switch_suppressed: Option<bool>,
+    #[ts(type = "number | null")]
+    pub proactive_switch_allowed_at: Option<i64>,
 }
 
 impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
@@ -3828,6 +4174,11 @@ impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
             account_id: value.account_id,
             pool_id: value.pool_id,
             suppressed: value.suppressed,
+            lease_acquired_at: value.lease_acquired_at,
+            min_switch_interval_secs: value.min_switch_interval_secs,
+            proactive_switch_pending: value.proactive_switch_pending,
+            proactive_switch_suppressed: value.proactive_switch_suppressed,
+            proactive_switch_allowed_at: value.proactive_switch_allowed_at,
         }
     }
 }

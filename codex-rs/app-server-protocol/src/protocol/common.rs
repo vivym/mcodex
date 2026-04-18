@@ -517,6 +517,22 @@ client_request_definitions! {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::AccountLeaseResumeResponse,
     },
+    AccountPoolRead => "accountPool/read" {
+        params: v2::AccountPoolReadParams,
+        response: v2::AccountPoolReadResponse,
+    },
+    AccountPoolAccountsList => "accountPool/accounts/list" {
+        params: v2::AccountPoolAccountsListParams,
+        response: v2::AccountPoolAccountsListResponse,
+    },
+    AccountPoolEventsList => "accountPool/events/list" {
+        params: v2::AccountPoolEventsListParams,
+        response: v2::AccountPoolEventsListResponse,
+    },
+    AccountPoolDiagnosticsRead => "accountPool/diagnostics/read" {
+        params: v2::AccountPoolDiagnosticsReadParams,
+        response: v2::AccountPoolDiagnosticsReadResponse,
+    },
 
     GetAccountRateLimits => "account/rateLimits/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
@@ -1982,6 +1998,11 @@ mod tests {
                 account_id: Some("acct-1".to_string()),
                 pool_id: Some("pool-main".to_string()),
                 suppressed: false,
+                lease_acquired_at: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
             });
         assert_eq!(
             json!({
@@ -1989,7 +2010,12 @@ mod tests {
                 "params": {
                     "accountId": "acct-1",
                     "poolId": "pool-main",
-                    "suppressed": false
+                    "suppressed": false,
+                    "leaseAcquiredAt": null,
+                    "minSwitchIntervalSecs": null,
+                    "proactiveSwitchPending": null,
+                    "proactiveSwitchSuppressed": null,
+                    "proactiveSwitchAllowedAt": null
                 }
             }),
             serde_json::to_value(&notification)?,

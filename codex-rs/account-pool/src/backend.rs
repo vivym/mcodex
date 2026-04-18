@@ -14,6 +14,27 @@ use codex_state::RegisteredAccountRecord;
 use codex_state::RegisteredAccountUpsert;
 
 pub mod local;
+pub use crate::observability::AccountOperationalState;
+pub use crate::observability::AccountPoolAccount;
+pub use crate::observability::AccountPoolAccountsListRequest;
+pub use crate::observability::AccountPoolAccountsPage;
+pub use crate::observability::AccountPoolDiagnostics;
+pub use crate::observability::AccountPoolDiagnosticsReadRequest;
+pub use crate::observability::AccountPoolDiagnosticsSeverity;
+pub use crate::observability::AccountPoolDiagnosticsStatus;
+pub use crate::observability::AccountPoolEvent;
+pub use crate::observability::AccountPoolEventType;
+pub use crate::observability::AccountPoolEventsListRequest;
+pub use crate::observability::AccountPoolEventsPage;
+pub use crate::observability::AccountPoolIssue;
+pub use crate::observability::AccountPoolLease;
+pub use crate::observability::AccountPoolObservabilityReader;
+pub use crate::observability::AccountPoolQuota;
+pub use crate::observability::AccountPoolReadRequest;
+pub use crate::observability::AccountPoolReasonCode;
+pub use crate::observability::AccountPoolSelection;
+pub use crate::observability::AccountPoolSnapshot;
+pub use crate::observability::AccountPoolSummary;
 
 /// Read-only account source used by the startup selection policy.
 ///
@@ -33,6 +54,17 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         pool_id: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError>;
+
+    /// Acquire a pool lease while temporarily excluding specific account ids.
+    async fn acquire_lease_excluding(
+        &self,
+        pool_id: &str,
+        holder_instance_id: &str,
+        excluded_account_ids: &[String],
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = excluded_account_ids;
+        self.acquire_lease(pool_id, holder_instance_id).await
+    }
 
     /// Renew the lease if it is still active.
     async fn renew_lease(

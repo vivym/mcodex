@@ -20,11 +20,11 @@ chrono = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-login = { workspace = true }
 codex-state = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 pretty_assertions = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

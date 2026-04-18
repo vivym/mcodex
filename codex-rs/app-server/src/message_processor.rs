@@ -870,6 +870,50 @@ impl MessageProcessor {
                     )
                     .await;
             }
+            ClientRequest::AccountPoolRead { request_id, params } => {
+                self.codex_message_processor
+                    .account_pool_read(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        params,
+                    )
+                    .await;
+            }
+            ClientRequest::AccountPoolAccountsList { request_id, params } => {
+                self.codex_message_processor
+                    .account_pool_accounts_list(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        params,
+                    )
+                    .await;
+            }
+            ClientRequest::AccountPoolEventsList { request_id, params } => {
+                self.codex_message_processor
+                    .account_pool_events_list(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        params,
+                    )
+                    .await;
+            }
+            ClientRequest::AccountPoolDiagnosticsRead { request_id, params } => {
+                self.codex_message_processor
+                    .account_pool_diagnostics_read(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        params,
+                    )
+                    .await;
+            }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
                 // inline the full `CodexMessageProcessor::process_request` future, which

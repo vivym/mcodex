@@ -1,0 +1,154 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolBackendKind": {
+      "enum": [
+        "local",
+        "remote"
+      ],
+      "type": "string"
+    },
+    "AccountPoolPolicyResponse": {
+      "properties": {
+        "allocationMode": {
+          "type": "string"
+        },
+        "allowContextReuse": {
+          "type": "boolean"
+        },
+        "minSwitchIntervalSecs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "proactiveSwitchThresholdPercent": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "allocationMode",
+        "allowContextReuse",
+        "minSwitchIntervalSecs",
+        "proactiveSwitchThresholdPercent"
+      ],
+      "type": "object"
+    },
+    "AccountPoolSummaryResponse": {
+      "properties": {
+        "activeLeases": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "availableAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "drainingAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "errorAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exhaustedAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "leasedAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "nearExhaustedAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pausedAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "totalAccounts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activeLeases",
+        "availableAccounts",
+        "drainingAccounts",
+        "errorAccounts",
+        "exhaustedAccounts",
+        "leasedAccounts",
+        "nearExhaustedAccounts",
+        "pausedAccounts",
+        "totalAccounts"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "backend": {
+      "$ref": "#/definitions/AccountPoolBackendKind"
+    },
+    "policy": {
+      "$ref": "#/definitions/AccountPoolPolicyResponse"
+    },
+    "poolId": {
+      "type": "string"
+    },
+    "refreshedAt": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "summary": {
+      "$ref": "#/definitions/AccountPoolSummaryResponse"
+    }
+  },
+  "required": [
+    "backend",
+    "policy",
+    "poolId",
+    "refreshedAt",
+    "summary"
+  ],
+  "title": "AccountPoolReadResponse",
+  "type": "object"
+}

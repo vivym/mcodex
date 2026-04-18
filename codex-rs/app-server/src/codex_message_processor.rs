@@ -1,4 +1,5 @@
 use crate::account_lease_api;
+use crate::account_pool_api;
 use crate::bespoke_event_handling::apply_bespoke_event_handling;
 use crate::bespoke_event_handling::maybe_emit_hook_prompt_item_completed;
 use crate::command_exec::CommandExecManager;
@@ -30,6 +31,10 @@ use codex_analytics::TurnSteerRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLeaseResumeResponse;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
+use codex_app_server_protocol::AccountPoolAccountsListParams;
+use codex_app_server_protocol::AccountPoolDiagnosticsReadParams;
+use codex_app_server_protocol::AccountPoolEventsListParams;
+use codex_app_server_protocol::AccountPoolReadParams;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::AppsListParams;
@@ -1117,6 +1122,22 @@ impl CodexMessageProcessor {
                 )
                 .await;
             }
+            ClientRequest::AccountPoolRead { request_id, params } => {
+                self.account_pool_read(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolAccountsList { request_id, params } => {
+                self.account_pool_accounts_list(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolEventsList { request_id, params } => {
+                self.account_pool_events_list(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolDiagnosticsRead { request_id, params } => {
+                self.account_pool_diagnostics_read(to_connection_request_id(request_id), params)
+                    .await;
+            }
             ClientRequest::CancelLoginAccount { request_id, params } => {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
                     .await;
@@ -1795,6 +1816,50 @@ impl CodexMessageProcessor {
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
             }
+        }
+    }
+
+    pub(crate) async fn account_pool_read(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolReadParams,
+    ) {
+        match account_pool_api::read_account_pool(self.config.as_ref(), params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn account_pool_accounts_list(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolAccountsListParams,
+    ) {
+        match account_pool_api::list_account_pool_accounts(self.config.as_ref(), params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn account_pool_events_list(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolEventsListParams,
+    ) {
+        match account_pool_api::list_account_pool_events(self.config.as_ref(), params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn account_pool_diagnostics_read(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolDiagnosticsReadParams,
+    ) {
+        match account_pool_api::read_account_pool_diagnostics(self.config.as_ref(), params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
         }
     }
 

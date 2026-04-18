@@ -1446,6 +1446,102 @@
             },
             "method": {
               "enum": [
+                "accountPool/read"
+              ],
+              "title": "AccountPool/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AccountPoolReadParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/accounts/list"
+              ],
+              "title": "AccountPool/accounts/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AccountPoolAccountsListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/accounts/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/events/list"
+              ],
+              "title": "AccountPool/events/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AccountPoolEventsListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/events/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/diagnostics/read"
+              ],
+              "title": "AccountPool/diagnostics/readRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/AccountPoolDiagnosticsReadParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/diagnostics/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "account/rateLimits/read"
               ],
               "title": "Account/rateLimits/readRequestMethod",
@@ -5072,6 +5168,13 @@
               "null"
             ]
           },
+          "leaseAcquiredAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "leaseEpoch": {
             "format": "uint64",
             "minimum": 0.0,
@@ -5083,6 +5186,14 @@
           "leaseId": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "minSwitchIntervalSecs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -5102,6 +5213,25 @@
           "poolId": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "proactiveSwitchAllowedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "proactiveSwitchPending": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "proactiveSwitchSuppressed": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -5150,9 +5280,43 @@
               "null"
             ]
           },
+          "leaseAcquiredAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "minSwitchIntervalSecs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "poolId": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "proactiveSwitchAllowedAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "proactiveSwitchPending": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "proactiveSwitchSuppressed": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -5189,6 +5353,722 @@
           "success"
         ],
         "title": "AccountLoginCompletedNotification",
+        "type": "object"
+      },
+      "AccountOperationalState": {
+        "enum": [
+          "available",
+          "leased",
+          "paused",
+          "draining",
+          "coolingDown",
+          "nearExhausted",
+          "exhausted",
+          "error"
+        ],
+        "type": "string"
+      },
+      "AccountPoolAccountResponse": {
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "accountKind": {
+            "type": "string"
+          },
+          "allocatable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "backendAccountRef": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currentLease": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountPoolLeaseResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "healthState": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operationalState": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountOperationalState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quota": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountPoolQuotaResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selection": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountPoolSelectionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "statusMessage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "statusReasonCode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountPoolReasonCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updatedAt": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accountId",
+          "accountKind",
+          "allocatable",
+          "backendAccountRef",
+          "currentLease",
+          "enabled",
+          "healthState",
+          "operationalState",
+          "quota",
+          "selection",
+          "statusMessage",
+          "statusReasonCode",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "AccountPoolAccountsListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accountKinds": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "poolId": {
+            "type": "string"
+          },
+          "states": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountOperationalState"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "poolId"
+        ],
+        "title": "AccountPoolAccountsListParams",
+        "type": "object"
+      },
+      "AccountPoolAccountsListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountPoolAccountResponse"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "title": "AccountPoolAccountsListResponse",
+        "type": "object"
+      },
+      "AccountPoolBackendKind": {
+        "enum": [
+          "local",
+          "remote"
+        ],
+        "type": "string"
+      },
+      "AccountPoolDiagnosticsIssueResponse": {
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "holderInstanceId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "nextRelevantAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reasonCode": {
+            "$ref": "#/definitions/v2/AccountPoolReasonCode"
+          },
+          "severity": {
+            "$ref": "#/definitions/v2/AccountPoolDiagnosticsSeverity"
+          }
+        },
+        "required": [
+          "accountId",
+          "holderInstanceId",
+          "message",
+          "nextRelevantAt",
+          "reasonCode",
+          "severity"
+        ],
+        "type": "object"
+      },
+      "AccountPoolDiagnosticsReadParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "poolId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "poolId"
+        ],
+        "title": "AccountPoolDiagnosticsReadParams",
+        "type": "object"
+      },
+      "AccountPoolDiagnosticsReadResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "generatedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountPoolDiagnosticsIssueResponse"
+            },
+            "type": "array"
+          },
+          "poolId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/definitions/v2/AccountPoolDiagnosticsStatus"
+          }
+        },
+        "required": [
+          "generatedAt",
+          "issues",
+          "poolId",
+          "status"
+        ],
+        "title": "AccountPoolDiagnosticsReadResponse",
+        "type": "object"
+      },
+      "AccountPoolDiagnosticsSeverity": {
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "AccountPoolDiagnosticsStatus": {
+        "enum": [
+          "healthy",
+          "degraded",
+          "blocked"
+        ],
+        "type": "string"
+      },
+      "AccountPoolEventResponse": {
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "details": true,
+          "eventId": {
+            "type": "string"
+          },
+          "eventType": {
+            "$ref": "#/definitions/v2/AccountPoolEventType"
+          },
+          "holderInstanceId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "leaseId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "occurredAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "poolId": {
+            "type": "string"
+          },
+          "reasonCode": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountPoolReasonCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "accountId",
+          "details",
+          "eventId",
+          "eventType",
+          "holderInstanceId",
+          "leaseId",
+          "message",
+          "occurredAt",
+          "poolId",
+          "reasonCode"
+        ],
+        "type": "object"
+      },
+      "AccountPoolEventType": {
+        "enum": [
+          "leaseAcquired",
+          "leaseRenewed",
+          "leaseReleased",
+          "leaseAcquireFailed",
+          "proactiveSwitchSelected",
+          "proactiveSwitchSuppressed",
+          "quotaObserved",
+          "quotaNearExhausted",
+          "quotaExhausted",
+          "accountPaused",
+          "accountResumed",
+          "accountDrainingStarted",
+          "accountDrainingCleared",
+          "authFailed",
+          "cooldownStarted",
+          "cooldownCleared"
+        ],
+        "type": "string"
+      },
+      "AccountPoolEventsListParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "poolId": {
+            "type": "string"
+          },
+          "types": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountPoolEventType"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "poolId"
+        ],
+        "title": "AccountPoolEventsListParams",
+        "type": "object"
+      },
+      "AccountPoolEventsListResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountPoolEventResponse"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "title": "AccountPoolEventsListResponse",
+        "type": "object"
+      },
+      "AccountPoolLeaseResponse": {
+        "properties": {
+          "acquiredAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "expiresAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "holderInstanceId": {
+            "type": "string"
+          },
+          "leaseEpoch": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "leaseId": {
+            "type": "string"
+          },
+          "renewedAt": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "acquiredAt",
+          "expiresAt",
+          "holderInstanceId",
+          "leaseEpoch",
+          "leaseId",
+          "renewedAt"
+        ],
+        "type": "object"
+      },
+      "AccountPoolPolicyResponse": {
+        "properties": {
+          "allocationMode": {
+            "type": "string"
+          },
+          "allowContextReuse": {
+            "type": "boolean"
+          },
+          "minSwitchIntervalSecs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "proactiveSwitchThresholdPercent": {
+            "format": "uint8",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "allocationMode",
+          "allowContextReuse",
+          "minSwitchIntervalSecs",
+          "proactiveSwitchThresholdPercent"
+        ],
+        "type": "object"
+      },
+      "AccountPoolQuotaResponse": {
+        "properties": {
+          "observedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "remainingPercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "resetsAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "observedAt",
+          "remainingPercent",
+          "resetsAt"
+        ],
+        "type": "object"
+      },
+      "AccountPoolReadParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "poolId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "poolId"
+        ],
+        "title": "AccountPoolReadParams",
+        "type": "object"
+      },
+      "AccountPoolReadResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "backend": {
+            "$ref": "#/definitions/v2/AccountPoolBackendKind"
+          },
+          "policy": {
+            "$ref": "#/definitions/v2/AccountPoolPolicyResponse"
+          },
+          "poolId": {
+            "type": "string"
+          },
+          "refreshedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "summary": {
+            "$ref": "#/definitions/v2/AccountPoolSummaryResponse"
+          }
+        },
+        "required": [
+          "backend",
+          "policy",
+          "poolId",
+          "refreshedAt",
+          "summary"
+        ],
+        "title": "AccountPoolReadResponse",
+        "type": "object"
+      },
+      "AccountPoolReasonCode": {
+        "enum": [
+          "durablySuppressed",
+          "missingPool",
+          "preferredAccountSelected",
+          "automaticAccountSelected",
+          "preferredAccountMissing",
+          "preferredAccountInOtherPool",
+          "preferredAccountDisabled",
+          "preferredAccountUnhealthy",
+          "preferredAccountBusy",
+          "manualPause",
+          "manualDrain",
+          "quotaNearExhausted",
+          "quotaExhausted",
+          "authFailure",
+          "cooldownActive",
+          "minimumSwitchInterval",
+          "noEligibleAccount",
+          "leaseHeldByAnotherInstance",
+          "nonReplayableTurn",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "AccountPoolSelectionResponse": {
+        "properties": {
+          "eligible": {
+            "type": "boolean"
+          },
+          "nextEligibleAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "preferred": {
+            "type": "boolean"
+          },
+          "suppressed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "eligible",
+          "nextEligibleAt",
+          "preferred",
+          "suppressed"
+        ],
+        "type": "object"
+      },
+      "AccountPoolSummaryResponse": {
+        "properties": {
+          "activeLeases": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "availableAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "drainingAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "errorAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exhaustedAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "leasedAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "nearExhaustedAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pausedAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "totalAccounts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "activeLeases",
+          "availableAccounts",
+          "drainingAccounts",
+          "errorAccounts",
+          "exhaustedAccounts",
+          "leasedAccounts",
+          "nearExhaustedAccounts",
+          "pausedAccounts",
+          "totalAccounts"
+        ],
         "type": "object"
       },
       "AccountRateLimitsUpdatedNotification": {

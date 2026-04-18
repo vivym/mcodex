@@ -1456,16 +1456,6 @@ impl Config {
             }
         }
 
-        if let Some(accounts) = &cfg.accounts
-            && let (Some(lease_ttl_secs), Some(min_switch_interval_secs)) =
-                (accounts.lease_ttl_secs, accounts.min_switch_interval_secs)
-            && min_switch_interval_secs >= lease_ttl_secs
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "accounts.min_switch_interval_secs must be less than accounts.lease_ttl_secs",
-            ));
-        }
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
         let ConfigRequirements {

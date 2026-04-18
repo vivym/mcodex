@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolEventType": {
+      "enum": [
+        "leaseAcquired",
+        "leaseRenewed",
+        "leaseReleased",
+        "leaseAcquireFailed",
+        "proactiveSwitchSelected",
+        "proactiveSwitchSuppressed",
+        "quotaObserved",
+        "quotaNearExhausted",
+        "quotaExhausted",
+        "accountPaused",
+        "accountResumed",
+        "accountDrainingStarted",
+        "accountDrainingCleared",
+        "authFailed",
+        "cooldownStarted",
+        "cooldownCleared"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "accountId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limit": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "poolId": {
+      "type": "string"
+    },
+    "types": {
+      "items": {
+        "$ref": "#/definitions/AccountPoolEventType"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "poolId"
+  ],
+  "title": "AccountPoolEventsListParams",
+  "type": "object"
+}

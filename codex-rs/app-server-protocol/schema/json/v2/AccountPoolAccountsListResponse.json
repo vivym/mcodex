@@ -1,0 +1,261 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountOperationalState": {
+      "enum": [
+        "available",
+        "leased",
+        "paused",
+        "draining",
+        "coolingDown",
+        "nearExhausted",
+        "exhausted",
+        "error"
+      ],
+      "type": "string"
+    },
+    "AccountPoolAccountResponse": {
+      "properties": {
+        "accountId": {
+          "type": "string"
+        },
+        "accountKind": {
+          "type": "string"
+        },
+        "allocatable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "backendAccountRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currentLease": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountPoolLeaseResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "healthState": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationalState": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountOperationalState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quota": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountPoolQuotaResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountPoolSelectionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "statusMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "statusReasonCode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountPoolReasonCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "updatedAt": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accountId",
+        "accountKind",
+        "allocatable",
+        "backendAccountRef",
+        "currentLease",
+        "enabled",
+        "healthState",
+        "operationalState",
+        "quota",
+        "selection",
+        "statusMessage",
+        "statusReasonCode",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "AccountPoolLeaseResponse": {
+      "properties": {
+        "acquiredAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "expiresAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "holderInstanceId": {
+          "type": "string"
+        },
+        "leaseEpoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "leaseId": {
+          "type": "string"
+        },
+        "renewedAt": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acquiredAt",
+        "expiresAt",
+        "holderInstanceId",
+        "leaseEpoch",
+        "leaseId",
+        "renewedAt"
+      ],
+      "type": "object"
+    },
+    "AccountPoolQuotaResponse": {
+      "properties": {
+        "observedAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "remainingPercent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "resetsAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "observedAt",
+        "remainingPercent",
+        "resetsAt"
+      ],
+      "type": "object"
+    },
+    "AccountPoolReasonCode": {
+      "enum": [
+        "durablySuppressed",
+        "missingPool",
+        "preferredAccountSelected",
+        "automaticAccountSelected",
+        "preferredAccountMissing",
+        "preferredAccountInOtherPool",
+        "preferredAccountDisabled",
+        "preferredAccountUnhealthy",
+        "preferredAccountBusy",
+        "manualPause",
+        "manualDrain",
+        "quotaNearExhausted",
+        "quotaExhausted",
+        "authFailure",
+        "cooldownActive",
+        "minimumSwitchInterval",
+        "noEligibleAccount",
+        "leaseHeldByAnotherInstance",
+        "nonReplayableTurn",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "AccountPoolSelectionResponse": {
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "nextEligibleAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "preferred": {
+          "type": "boolean"
+        },
+        "suppressed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "eligible",
+        "nextEligibleAt",
+        "preferred",
+        "suppressed"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "data": {
+      "items": {
+        "$ref": "#/definitions/AccountPoolAccountResponse"
+      },
+      "type": "array"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "data",
+    "nextCursor"
+  ],
+  "title": "AccountPoolAccountsListResponse",
+  "type": "object"
+}

@@ -1,0 +1,133 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountPoolEventResponse": {
+      "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "details": true,
+        "eventId": {
+          "type": "string"
+        },
+        "eventType": {
+          "$ref": "#/definitions/AccountPoolEventType"
+        },
+        "holderInstanceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "leaseId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "occurredAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "poolId": {
+          "type": "string"
+        },
+        "reasonCode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountPoolReasonCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "accountId",
+        "details",
+        "eventId",
+        "eventType",
+        "holderInstanceId",
+        "leaseId",
+        "message",
+        "occurredAt",
+        "poolId",
+        "reasonCode"
+      ],
+      "type": "object"
+    },
+    "AccountPoolEventType": {
+      "enum": [
+        "leaseAcquired",
+        "leaseRenewed",
+        "leaseReleased",
+        "leaseAcquireFailed",
+        "proactiveSwitchSelected",
+        "proactiveSwitchSuppressed",
+        "quotaObserved",
+        "quotaNearExhausted",
+        "quotaExhausted",
+        "accountPaused",
+        "accountResumed",
+        "accountDrainingStarted",
+        "accountDrainingCleared",
+        "authFailed",
+        "cooldownStarted",
+        "cooldownCleared"
+      ],
+      "type": "string"
+    },
+    "AccountPoolReasonCode": {
+      "enum": [
+        "durablySuppressed",
+        "missingPool",
+        "preferredAccountSelected",
+        "automaticAccountSelected",
+        "preferredAccountMissing",
+        "preferredAccountInOtherPool",
+        "preferredAccountDisabled",
+        "preferredAccountUnhealthy",
+        "preferredAccountBusy",
+        "manualPause",
+        "manualDrain",
+        "quotaNearExhausted",
+        "quotaExhausted",
+        "authFailure",
+        "cooldownActive",
+        "minimumSwitchInterval",
+        "noEligibleAccount",
+        "leaseHeldByAnotherInstance",
+        "nonReplayableTurn",
+        "unknown"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "data": {
+      "items": {
+        "$ref": "#/definitions/AccountPoolEventResponse"
+      },
+      "type": "array"
+    },
+    "nextCursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "data",
+    "nextCursor"
+  ],
+  "title": "AccountPoolEventsListResponse",
+  "type": "object"
+}

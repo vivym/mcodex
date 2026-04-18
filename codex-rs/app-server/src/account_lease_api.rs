@@ -182,11 +182,16 @@ fn empty_account_lease_response() -> AccountLeaseReadResponse {
         pool_id: None,
         lease_id: None,
         lease_epoch: None,
+        lease_acquired_at: None,
         health_state: None,
         switch_reason: None,
         suppression_reason: None,
         transport_reset_generation: None,
         last_remote_context_reset_turn_id: None,
+        min_switch_interval_secs: None,
+        proactive_switch_pending: None,
+        proactive_switch_suppressed: None,
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         effective_pool_resolution_source: None,
         configured_default_pool_id: None,
@@ -208,11 +213,16 @@ fn account_lease_response_from_startup_status(
         pool_id: preview.effective_pool_id,
         lease_id: None,
         lease_epoch: None,
+        lease_acquired_at: None,
         health_state: health_state_for_preview(&preview.eligibility, preview.predicted_account_id),
         switch_reason,
         suppression_reason,
         transport_reset_generation: None,
         last_remote_context_reset_turn_id: None,
+        min_switch_interval_secs: None,
+        proactive_switch_pending: None,
+        proactive_switch_suppressed: None,
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         effective_pool_resolution_source: Some(
             effective_pool_resolution_source_to_wire_string(
@@ -238,6 +248,9 @@ fn account_lease_response_from_runtime_snapshot(
         lease_epoch: live_snapshot
             .lease_epoch
             .and_then(|epoch| u64::try_from(epoch).ok()),
+        lease_acquired_at: live_snapshot
+            .lease_acquired_at
+            .map(|timestamp| timestamp.timestamp()),
         health_state: live_snapshot_health_state(live_snapshot.health_state),
         switch_reason: live_snapshot
             .switch_reason
@@ -247,6 +260,12 @@ fn account_lease_response_from_runtime_snapshot(
             .map(runtime_reason_to_wire_string),
         transport_reset_generation: live_snapshot.transport_reset_generation,
         last_remote_context_reset_turn_id: live_snapshot.last_remote_context_reset_turn_id.clone(),
+        min_switch_interval_secs: live_snapshot.min_switch_interval_secs,
+        proactive_switch_pending: live_snapshot.proactive_switch_pending,
+        proactive_switch_suppressed: live_snapshot.proactive_switch_suppressed,
+        proactive_switch_allowed_at: live_snapshot
+            .proactive_switch_allowed_at
+            .map(|timestamp| timestamp.timestamp()),
         next_eligible_at: live_snapshot
             .next_eligible_at
             .map(|timestamp| timestamp.timestamp()),
@@ -276,11 +295,16 @@ fn account_lease_response_from_preview(
         pool_id: preview.effective_pool_id,
         lease_id: None,
         lease_epoch: None,
+        lease_acquired_at: None,
         health_state: health_state_for_preview(&preview.eligibility, preview.predicted_account_id),
         switch_reason,
         suppression_reason,
         transport_reset_generation: None,
         last_remote_context_reset_turn_id: None,
+        min_switch_interval_secs: None,
+        proactive_switch_pending: None,
+        proactive_switch_suppressed: None,
+        proactive_switch_allowed_at: None,
         next_eligible_at: None,
         effective_pool_resolution_source: None,
         configured_default_pool_id: None,

@@ -34,6 +34,13 @@
         "null"
       ]
     },
+    "leaseAcquiredAt": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "leaseEpoch": {
       "format": "uint64",
       "minimum": 0.0,
@@ -45,6 +52,14 @@
     "leaseId": {
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "minSwitchIntervalSecs": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
         "null"
       ]
     },
@@ -64,6 +79,25 @@
     "poolId": {
       "type": [
         "string",
+        "null"
+      ]
+    },
+    "proactiveSwitchAllowedAt": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "proactiveSwitchPending": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "proactiveSwitchSuppressed": {
+      "type": [
+        "boolean",
         "null"
       ]
     },

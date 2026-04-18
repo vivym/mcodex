@@ -1,6 +1,8 @@
 use anyhow::Result;
 use base64::Engine;
 use chrono::Utc;
+use codex_app_server_protocol::AccountPoolEventType;
+use codex_app_server_protocol::AccountPoolReasonCode;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_core::AccountLeaseRuntimeReason;
@@ -18,6 +20,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
+use codex_state::AccountPoolEventRecord;
+use codex_state::AccountPoolEventsListQuery;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use core_test_support::responses::ResponseMock;
@@ -111,6 +115,349 @@ async fn account_lease_snapshot_reports_active_lease_and_next_eligible_time() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_lease_snapshot_reports_proactive_switch_suppression_without_rate_limited_health()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    mount_response_sequence(
+        &server,
+        vec![sse_with_primary_usage_percent("resp-1", 92.0)],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(5);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+
+    let turn_error = submit_turn_and_wait(&test, "soft pressure turn").await?;
+    assert!(turn_error.is_none());
+
+    let snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(snapshot.active, true);
+    assert_eq!(snapshot.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(snapshot.health_state, Some(AccountHealthState::Healthy));
+    assert_eq!(snapshot.proactive_switch_pending, Some(true));
+    assert_eq!(snapshot.proactive_switch_suppressed, Some(true));
+    assert_eq!(snapshot.min_switch_interval_secs, Some(5));
+    assert!(snapshot.lease_acquired_at.is_some());
+    assert!(snapshot.proactive_switch_allowed_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_soft_pressure_clears_after_window_without_forcing_rotation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_with_primary_usage_percent("resp-1", 92.0),
+            sse_with_primary_usage_percent("resp-2", 12.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(3);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "suppressed pressure turn").await?;
+    assert!(first_turn_error.is_none());
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let second_turn_error = submit_turn_and_wait(&test, "after stale pressure").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected one request per turn");
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID]);
+
+    let snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(snapshot.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(snapshot.proactive_switch_pending, Some(false));
+    assert_eq!(snapshot.proactive_switch_suppressed, Some(false));
+    assert_eq!(snapshot.proactive_switch_allowed_at, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proactive_rotation_does_not_immediately_switch_back_to_just_replaced_account() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_with_primary_usage_percent("resp-1", 92.0),
+            sse_with_primary_usage_percent("resp-2", 91.0),
+            sse_with_primary_usage_percent("resp-3", 18.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(0);
+    });
+    let test = builder.build(&server).await?;
+    seed_three_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "turn a").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "turn b").await?;
+    assert!(second_turn_error.is_none());
+
+    let third_turn_error = submit_turn_and_wait(&test, "turn c").await?;
+    assert!(third_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3, "expected one request per turn");
+    assert_account_ids_in_order(
+        &requests,
+        &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID, "account_id_c"],
+    );
+
+    Ok(())
+}
+
+mod observability_event {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_suppressed_records_minimum_switch_interval_event() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        mount_response_sequence(
+            &server,
+            vec![sse_with_primary_usage_percent("resp-1", 92.0)],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(5);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let suppressed_event_type =
+            event_type_name(AccountPoolEventType::ProactiveSwitchSuppressed);
+        let minimum_switch_interval =
+            reason_code_name(AccountPoolReasonCode::MinimumSwitchInterval);
+
+        let turn_error = submit_turn_and_wait(&test, "soft pressure observability turn").await?;
+        assert!(turn_error.is_none());
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == suppressed_event_type
+                    && event.reason_code.as_deref() == Some(minimum_switch_interval.as_str())
+            }),
+            "expected proactive-switch suppression event in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_selected_records_rotation_event() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        let response_mock = mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 18.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(0);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+
+        let first_turn_error = submit_turn_and_wait(&test, "rotation observability turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error =
+            submit_turn_and_wait(&test, "rotation observability turn 2").await?;
+        assert!(second_turn_error.is_none());
+        assert_account_ids_in_order(
+            &response_mock.requests(),
+            &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+        );
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == selected_event_type
+                    && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+            }),
+            "expected proactive-switch selection event in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_suppressed_records_only_one_event_while_pending() -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 91.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(300);
+        });
+        let test = builder.build(&server).await?;
+        seed_two_accounts(&test).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let suppressed_event_type =
+            event_type_name(AccountPoolEventType::ProactiveSwitchSuppressed);
+        let minimum_switch_interval =
+            reason_code_name(AccountPoolReasonCode::MinimumSwitchInterval);
+
+        let first_turn_error = submit_turn_and_wait(&test, "suppression dedupe turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error = submit_turn_and_wait(&test, "suppression dedupe turn 2").await?;
+        assert!(second_turn_error.is_none());
+
+        let events = list_account_pool_events(&test).await?;
+        let suppressed_events = events
+            .iter()
+            .filter(|event| {
+                event.event_type == suppressed_event_type
+                    && event.reason_code.as_deref() == Some(minimum_switch_interval.as_str())
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            suppressed_events,
+            1,
+            "expected exactly one proactive-switch suppression event while pending in {events:#?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proactive_switch_without_alternate_account_records_runtime_classified_acquire_failure()
+    -> Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = start_mock_server().await;
+        let response_mock = mount_response_sequence(
+            &server,
+            vec![
+                sse_with_primary_usage_percent("resp-1", 92.0),
+                sse_with_primary_usage_percent("resp-2", 18.0),
+            ],
+        )
+        .await;
+
+        let mut builder = pooled_accounts_builder().with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(0);
+        });
+        let test = builder.build(&server).await?;
+        seed_account(&test, PRIMARY_ACCOUNT_ID).await?;
+        seed_account_health_state(&test, PRIMARY_ACCOUNT_ID, AccountHealthState::Healthy).await?;
+        let failure_event_type = event_type_name(AccountPoolEventType::LeaseAcquireFailed);
+        let no_eligible_account = reason_code_name(AccountPoolReasonCode::NoEligibleAccount);
+        let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+
+        let first_turn_error =
+            submit_turn_and_wait(&test, "single-account rotation turn 1").await?;
+        assert!(first_turn_error.is_none());
+
+        let second_turn_error =
+            submit_turn_and_wait(&test, "single-account rotation turn 2").await?;
+        assert!(second_turn_error.is_none());
+        assert_account_ids_in_order(
+            &response_mock.requests(),
+            &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID],
+        );
+
+        let events = list_account_pool_events(&test).await?;
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == failure_event_type
+                    && event.reason_code.as_deref() == Some(no_eligible_account.as_str())
+            }),
+            "expected runtime-classified lease acquisition failure in {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != selected_event_type),
+            "did not expect proactive-switch selection event in {events:#?}"
+        );
+
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_lease_snapshot_records_remote_reset_generation_when_account_changes() -> Result<()>
 {
     skip_if_no_network!(Ok(()));
@@ -134,7 +481,13 @@ async fn account_lease_snapshot_records_remote_reset_generation_when_account_cha
     )
     .await;
 
-    let mut builder = pooled_accounts_builder();
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(600);
+    });
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
 
@@ -322,18 +675,35 @@ async fn nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion() -> Res
     )
     .await;
 
-    let mut builder = pooled_accounts_builder();
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(0);
+    });
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
 
     let first_turn_error = submit_turn_and_wait(&test, "near-limit turn").await?;
     assert!(first_turn_error.is_none());
-    wait_for_account_health_transition(
-        &test,
-        AccountHealthState::RateLimited,
-        AccountLeaseRuntimeReason::NonReplayableTurn,
-    )
-    .await?;
+    let first_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(
+        first_snapshot.account_id.as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+    assert_ne!(
+        first_snapshot.health_state,
+        Some(AccountHealthState::RateLimited)
+    );
+    assert_ne!(
+        first_snapshot.switch_reason,
+        Some(AccountLeaseRuntimeReason::NonReplayableTurn)
+    );
 
     let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
     assert!(second_turn_error.is_none());
@@ -1135,7 +1505,14 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
 
     let mut builder = pooled_accounts_builder()
         .with_home(Arc::clone(&shared_home))
-        .with_auth(shared_auth);
+        .with_auth(shared_auth)
+        .with_config(|config| {
+            config
+                .accounts
+                .as_mut()
+                .expect("pooled accounts config")
+                .min_switch_interval_secs = Some(0);
+        });
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
     write_pooled_auth(
@@ -1153,12 +1530,23 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
 
     let first_turn_error = submit_turn_and_wait(&test, "near-limit turn").await?;
     assert!(first_turn_error.is_none());
-    wait_for_account_health_transition(
-        &test,
-        AccountHealthState::RateLimited,
-        AccountLeaseRuntimeReason::NonReplayableTurn,
-    )
-    .await?;
+    let first_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
+    assert_eq!(
+        first_snapshot.account_id.as_deref(),
+        Some(PRIMARY_ACCOUNT_ID)
+    );
+    assert_ne!(
+        first_snapshot.health_state,
+        Some(AccountHealthState::RateLimited)
+    );
+    assert_ne!(
+        first_snapshot.switch_reason,
+        Some(AccountLeaseRuntimeReason::NonReplayableTurn)
+    );
     assert_eq!(
         test.codex
             .current_lease_bridge_account_id()
@@ -1461,6 +1849,12 @@ async fn seed_two_accounts(test: &TestCodex) -> Result<()> {
     Ok(())
 }
 
+async fn seed_three_accounts(test: &TestCodex) -> Result<()> {
+    seed_two_accounts(test).await?;
+    seed_account(test, "account_id_c").await?;
+    Ok(())
+}
+
 async fn seed_account(test: &TestCodex, account_id: &str) -> Result<()> {
     let Some(state_db) = test.codex.state_db() else {
         return Err(anyhow::anyhow!(
@@ -1479,6 +1873,62 @@ async fn seed_account(test: &TestCodex, account_id: &str) -> Result<()> {
         &format!("pooled-access-{account_id}"),
     )?;
     Ok(())
+}
+
+async fn seed_account_health_state(
+    test: &TestCodex,
+    account_id: &str,
+    health_state: AccountHealthState,
+) -> Result<()> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db
+        .record_account_health_event(AccountHealthEvent {
+            account_id: account_id.to_string(),
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            health_state,
+            sequence_number: 1,
+            observed_at: Utc::now(),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn list_account_pool_events(test: &TestCodex) -> Result<Vec<AccountPoolEventRecord>> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    let events = state_db
+        .list_account_pool_events(AccountPoolEventsListQuery {
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            account_id: None,
+            types: None,
+            cursor: None,
+            limit: Some(20),
+        })
+        .await?;
+    Ok(events.data)
+}
+
+fn event_type_name(value: AccountPoolEventType) -> String {
+    serialized_protocol_enum_name(&value)
+}
+
+fn reason_code_name(value: AccountPoolReasonCode) -> String {
+    serialized_protocol_enum_name(&value)
+}
+
+fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(other) => panic!("protocol enum serialized to a non-string value: {other:?}"),
+        Err(err) => panic!("protocol enum should serialize to a string: {err}"),
+    }
 }
 
 async fn wait_for_compact_request(mock_response: &ResponseMock) {
@@ -1713,11 +2163,11 @@ async fn wait_for_account_health_transition(
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let Some(snapshot) = test.codex.account_lease_snapshot().await else {
-            return Err(anyhow::anyhow!(
-                "pooled session should expose lease snapshot"
-            ));
-        };
+        let snapshot = test
+            .codex
+            .account_lease_snapshot()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("pooled session should expose lease snapshot"))?;
         if snapshot.health_state == Some(expected_health_state)
             && snapshot.switch_reason == Some(expected_switch_reason)
         {
