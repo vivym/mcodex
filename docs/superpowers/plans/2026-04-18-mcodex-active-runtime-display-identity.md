@@ -377,7 +377,7 @@
 **Files:**
 - Modify: any files touched by formatting/lint follow-up only
 
-- [ ] **Step 1: Run crate-targeted automated tests**
+- [x] **Step 1: Run crate-targeted automated tests**
 
   Run:
 
@@ -390,7 +390,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 2: Run formatter after Rust changes**
+- [x] **Step 2: Run formatter after Rust changes**
 
   Run:
 
@@ -400,7 +400,7 @@
 
   Expected: no formatting drift remains.
 
-- [ ] **Step 3: Run scoped clippy autofix passes**
+- [x] **Step 3: Run scoped clippy autofix passes**
 
   Run:
 
@@ -413,7 +413,7 @@
 
   Expected: PASS or only unrelated pre-existing warnings that are documented before continuing.
 
-- [ ] **Step 4: Build and smoke the release binary**
+- [x] **Step 4: Build and smoke the release binary**
 
   Run:
 
@@ -428,6 +428,12 @@
   - `--version` shows `mcodex`
   - `--help` uses `mcodex` across public help output
 
+  Recorded on April 18, 2026:
+
+  - `cargo build --release --bin mcodex` passed while reusing local artifacts via `LK_CUSTOM_WEBRTC=/Users/viv/Downloads/mac-arm64-release` and `RUSTY_V8_ARCHIVE=/Users/viv/Downloads/librusty_v8_release_aarch64-apple-darwin.a.gz`
+  - `./target/release/mcodex --version` printed `mcodex 0.0.0`
+  - `./target/release/mcodex --help` printed `mcodex CLI` and `mcodex`-named public commands/help text
+
 - [ ] **Step 5: Re-run the first-run login smoke**
 
   Use an isolated `HOME` / `MCODEX_HOME` and verify:
@@ -437,7 +443,13 @@
   - device-code prompt says `Welcome to mcodex`
   - browser success/error pages no longer identify the active product as `Codex`
 
-- [ ] **Step 6: Commit any verification-only follow-up**
+  Partial manual verification recorded on April 18, 2026:
+
+  - isolated release `mcodex login` printed `Starting local login server ...` and the browser-auth guidance with `mcodex`
+  - isolated release `mcodex login --device-auth` printed `Welcome to mcodex`
+  - success/error page identity remained covered by the rerun `cargo test -p codex-login` suite and targeted entitlement/error-page tests
+
+- [x] **Step 6: Commit any verification-only follow-up**
 
   If formatter, snapshot acceptance, or small verification fixes changed tracked files, run:
 

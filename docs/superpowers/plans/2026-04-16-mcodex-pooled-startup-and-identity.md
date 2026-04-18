@@ -1106,12 +1106,12 @@ git commit -m "docs: switch install and update surfaces to mcodex"
 
 ### Task 8: Final Validation And Handoff
 
-> Status: One full targeted validation pass already landed while Tasks 1 through 7 were implemented. Until `main` stabilizes, use this section as the final identity-only revalidation and handoff checklist rather than as a prompt to keep changing the shared pooled-startup integration.
+> Status: `main` was merged back into this branch via `d6adc7349` on April 18, 2026. The identity-only targeted revalidation in this section has been rerun after the merge. Workspace-wide `cargo test` remains intentionally out of scope pending explicit user approval.
 
 **Files:**
 - Review only; no new source files expected unless a previous task exposed a gap
 
-- [ ] **Step 1: Run the targeted crate suites one final time**
+- [x] **Step 1: Run the targeted crate suites one final time**
 
 Run:
 
@@ -1134,7 +1134,7 @@ cargo test -p codex-tui startup_access -- --nocapture
 
 Expected: PASS across all targeted suites.
 
-- [ ] **Step 2: Run required generators/checkers if touched**
+- [x] **Step 2: Run required generators/checkers if touched**
 
 Run only if applicable:
 
@@ -1149,7 +1149,7 @@ just bazel-lock-check
 
 If shared-core risk still justifies broader coverage, stop here and ask the user before running `cargo test` for the whole workspace.
 
-- [ ] **Step 4: Summarize manual smoke checks**
+- [x] **Step 4: Summarize manual smoke checks**
 
 Verify manually:
 
@@ -1159,7 +1159,15 @@ Verify manually:
 4. TUI no longer shows the login wall for valid pooled-only startup access
 5. normal runtime and debug config point at `mcodex` system/admin roots and managed-preferences domain, while `/etc/codex/...`, `%ProgramData%\OpenAI\Codex\...`, and `com.openai.codex` appear only in explicit legacy migration or managed-config compatibility paths
 
-- [ ] **Step 5: Final commit or fixup commit**
+Recorded on April 18, 2026:
+
+1. `cargo test -p codex-tui` and `cargo test -p codex-tui startup_access -- --nocapture` both passed after the `main` merge, covering the pooled-only startup path and the removed login wall behavior.
+2. An isolated `HOME` / `MCODEX_HOME` release-binary smoke verified that `mcodex accounts status --json` exposes both the legacy compatibility fields (`effectivePoolId`, `effectivePoolSource`) and the newer resolution fields (`effectivePoolResolutionSource`, `configuredDefaultPoolId`, `persistedDefaultPoolId`).
+3. An isolated release `mcodex login` smoke verified the active binary/login surface uses `mcodex`, and `mcodex login --device-auth` rendered `Welcome to mcodex`.
+4. Config/root-path compatibility remains covered by the rerun `cargo test -p codex-core config_loader -- --nocapture` suite plus the full `cargo test -p codex-cli` / `cargo test -p codex-tui` validation.
+5. A full manual migration walk from legacy `CODEX_HOME` / `~/.codex` was not rerun in this pass; existing migration coverage remained test-backed.
+
+- [x] **Step 5: Final commit or fixup commit**
 
 ```bash
 git status --short

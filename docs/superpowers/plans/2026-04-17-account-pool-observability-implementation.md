@@ -936,7 +936,7 @@ git commit -m "feat(app-server): expose account pool observability rpc"
 **Files:**
 - Verify only; no planned code changes
 
-- [ ] **Step 1: Re-run crate-level targeted verification in dependency order**
+- [x] **Step 1: Re-run crate-level targeted verification in dependency order**
 
 Run:
 
@@ -952,7 +952,7 @@ cargo test -p codex-app-server account_pool_ -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 2: Verify generated schema is clean**
+- [x] **Step 2: Verify generated schema is clean**
 
 Run:
 
@@ -966,10 +966,16 @@ Expected:
 - no whitespace errors
 - only the intended observability files are modified
 
-- [ ] **Step 3: Hand off for execution**
+- [x] **Step 3: Hand off for execution**
 
 Record:
 
 - new migration version `0030_account_pool_events.sql`
 - generated schema fixture updates
 - the fact that CLI/TUI remain out of scope for this plan
+
+Recorded on April 18, 2026:
+
+- reran the targeted post-merge verification commands, including `codex-app-server-protocol` schema fixtures, `codex-state account_pool_observability`, `codex-core` observability-event tests, `codex-account-pool observability`, and `codex-app-server account_pool_`
+- reran `just write-app-server-schema`, `just write-config-schema`, `git diff --check`, and `just bazel-lock-check`; no generated-file drift or whitespace issues remained afterward
+- CLI/TUI identity validation also passed in the broader branch validation pass, but those surfaces remained outside the scope of this observability implementation plan itself
