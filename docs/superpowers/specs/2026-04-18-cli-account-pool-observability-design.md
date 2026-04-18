@@ -26,8 +26,9 @@ The recommended direction is:
 - preserve the existing `codex accounts pool list|assign` command family and
   add `show` under that subtree rather than introducing a conflicting top-level
   `pool` read command
-- keep the first text output concise and operator-oriented while preserving the
-  complete response shape in `--json`
+- keep the first text output concise and operator-oriented while defining
+  explicit per-command JSON output instead of reusing an implicit app-server
+  response shape
 
 This gives the fork an immediately useful local operator/debug surface without
 expanding the pooled runtime contract or increasing merge risk in state/core.
@@ -220,19 +221,63 @@ The first text output should include:
 `status` should not become a full dump of accounts, issues, and events. It
 should point users to `diagnostics`, `events`, and `pool show` for detail.
 
+`status` uses two additive observability reads:
+
+- pool summary read
+- diagnostics read
+
 Failure behavior:
 
 - if no effective pool can be resolved, `status` should still succeed and omit
   the pooled observability section
-- if an effective pool is resolved but the additive observability read fails or
-  returns not found, `status` should still succeed, preserve the existing
-  startup diagnostic output, and render a warning that pooled observability
-  could not be loaded
-- `status --json` should preserve the startup diagnostic payload and add
-  nullable pooled-observability fields plus an additive
-  `poolObservabilityError` string when the read fails
-- observability-read failure should therefore be partial degradation for
-  `status`, not a process-level command failure
+- if an effective pool is resolved, `status` should attempt both reads
+- any observability-read failure, including not found, should be partial
+  degradation for `status`, not a process-level command failure
+
+`status` outcome matrix:
+
+| Pool resolved? | Summary read | Diagnostics read | `status` behavior |
+|----------------|--------------|------------------|-------------------|
+| no | not attempted | not attempted | succeed; no pooled observability section |
+| yes | success | success | show counts, diagnostics status, and issue summary |
+| yes | success | failure | show counts, omit diagnostics details, add warning |
+| yes | failure | success | show diagnostics status and issue summary, omit counts, add warning |
+| yes | failure | failure | show warning only; preserve existing startup diagnostic output |
+
+`status --json` should preserve the existing startup-diagnostic top-level fields
+and add one new additive field:
+
+- `poolObservability`
+
+`poolObservability` shape:
+
+- `null` when no effective pool is resolved
+- otherwise an object with:
+  - `poolId: string`
+  - `summary: object | null`
+  - `diagnostics: object | null`
+  - `warning: string | null`
+
+`summary` shape:
+
+- `totalAccounts`
+- `activeLeases`
+- `availableAccounts`
+- `leasedAccounts`
+- `pausedAccounts`
+- `drainingAccounts`
+- `nearExhaustedAccounts`
+- `exhaustedAccounts`
+- `errorAccounts`
+
+`diagnostics` shape:
+
+- `generatedAt`
+- `status`
+- `issues`
+
+The new JSON contract should keep keys present with `null` values where the
+corresponding read failed, rather than omitting the field dynamically.
 
 ### 3. Add `pool show` as the operational detail view
 
@@ -261,7 +306,6 @@ First-pass parameters:
 Text output should show:
 
 - pool id
-- backend kind
 - refreshed timestamp
 - summary counts
 - account rows with these columns:
@@ -284,7 +328,7 @@ Other nullable text fields should render conservatively:
 
 - missing `health` or `state`: `unknown`
 - missing `eligible`: `unknown`
-- missing `preferred`: `no`
+- missing `preferred`: `unknown`
 - missing quota/selection detail not shown in the default text table: omit rather
   than invent placeholders
 
@@ -295,11 +339,14 @@ in the first text implementation.
 `pool show --json` should expose:
 
 - `poolId`
-- `backend`
 - `refreshedAt`
 - `summary`
 - `data`
 - `nextCursor`
+
+`backend` and `policy` are intentionally out of scope for CLI v1 because the
+current backend-neutral observability seam does not expose them and this slice
+should not widen that seam or duplicate app-server-only assembly logic.
 
 ### 4. Add `diagnostics` as the current-state explanation view
 
