@@ -168,6 +168,7 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
+  AND observed_at <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
@@ -176,6 +177,7 @@ WHERE account_id = ?
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
+        .bind(account_datetime_to_epoch_seconds(observed_at))
         .execute(self.pool.as_ref())
         .await?;
 
@@ -208,6 +210,7 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
+  AND observed_at <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
@@ -218,6 +221,7 @@ WHERE account_id = ?
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
+        .bind(account_datetime_to_epoch_seconds(observed_at))
         .execute(self.pool.as_ref())
         .await?;
 
@@ -247,6 +251,7 @@ SET observed_at = ?,
     updated_at = ?
 WHERE account_id = ?
   AND limit_id = ?
+  AND observed_at <= ?
             "#,
         )
         .bind(account_datetime_to_epoch_seconds(observed_at))
@@ -257,6 +262,7 @@ WHERE account_id = ?
         .bind(account_datetime_to_epoch_seconds(Utc::now()))
         .bind(account_id)
         .bind(limit_id)
+        .bind(account_datetime_to_epoch_seconds(observed_at))
         .execute(self.pool.as_ref())
         .await?;
 

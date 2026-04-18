@@ -201,6 +201,81 @@ async fn account_pool_quota_fresh_non_exhausted_observation_immediately_clears_e
     assert_eq!(refreshed.next_probe_after, None);
 }
 
+#[tokio::test]
+async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observations() {
+    let harness = AccountPoolQuotaHarness::new().await;
+    let stale_probe_observed_at = timestamp(5_000);
+    let fresh_observed_at = stale_probe_observed_at + Duration::minutes(5);
+    for account_id in ["acct-success", "acct-still-blocked", "acct-ambiguous"] {
+        harness
+            .write_quota_observation(
+                quota_row(account_id, "codex")
+                    .with_observed_at(stale_probe_observed_at)
+                    .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                    .with_predicted_blocked_until(stale_probe_observed_at + Duration::hours(1))
+                    .with_next_probe_after(stale_probe_observed_at + Duration::minutes(15)),
+            )
+            .await
+            .expect("write initial blocked quota");
+        harness
+            .write_quota_observation(
+                quota_row(account_id, "codex")
+                    .with_observed_at(fresh_observed_at)
+                    .with_primary_used(3.0)
+                    .with_exhausted_windows(QuotaExhaustedWindows::None),
+            )
+            .await
+            .expect("write fresher recovered quota");
+    }
+
+    assert!(
+        !harness
+            .record_probe_success("acct-success", "codex", stale_probe_observed_at)
+            .await
+            .expect("record stale probe success")
+    );
+    assert!(
+        !harness
+            .record_probe_still_blocked(
+                "acct-still-blocked",
+                "codex",
+                stale_probe_observed_at,
+                QuotaExhaustedWindows::Secondary,
+                Some(stale_probe_observed_at + Duration::hours(1)),
+                stale_probe_observed_at + Duration::minutes(15),
+            )
+            .await
+            .expect("record stale still-blocked probe")
+    );
+    assert!(
+        !harness
+            .record_probe_ambiguous(
+                "acct-ambiguous",
+                "codex",
+                stale_probe_observed_at,
+                stale_probe_observed_at + Duration::hours(1),
+                stale_probe_observed_at + Duration::minutes(15),
+            )
+            .await
+            .expect("record stale ambiguous probe")
+    );
+
+    for account_id in ["acct-success", "acct-still-blocked", "acct-ambiguous"] {
+        let refreshed = harness
+            .read_quota_state(account_id, "codex")
+            .await
+            .expect("read refreshed quota")
+            .expect("missing refreshed quota");
+
+        assert_eq!(refreshed.observed_at, fresh_observed_at);
+        assert_eq!(refreshed.exhausted_windows, QuotaExhaustedWindows::None);
+        assert_eq!(refreshed.predicted_blocked_until, None);
+        assert_eq!(refreshed.next_probe_after, None);
+        assert_eq!(refreshed.probe_backoff_level, 0);
+        assert_eq!(refreshed.last_probe_result, None);
+    }
+}
+
 struct AccountPoolQuotaHarness {
     runtime: Arc<StateRuntime>,
 }
@@ -258,7 +333,7 @@ impl AccountPoolQuotaHarness {
         observed_at: DateTime<Utc>,
         predicted_blocked_until: DateTime<Utc>,
         next_probe_after: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.runtime
             .record_account_quota_probe_ambiguous(
                 account_id,
@@ -268,7 +343,38 @@ impl AccountPoolQuotaHarness {
                 next_probe_after,
             )
             .await
-            .map(|_| ())
+    }
+
+    async fn record_probe_success(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        observed_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        self.runtime
+            .record_account_quota_probe_success(account_id, limit_id, observed_at)
+            .await
+    }
+
+    async fn record_probe_still_blocked(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        observed_at: DateTime<Utc>,
+        exhausted_windows: QuotaExhaustedWindows,
+        predicted_blocked_until: Option<DateTime<Utc>>,
+        next_probe_after: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        self.runtime
+            .record_account_quota_probe_still_blocked(
+                account_id,
+                limit_id,
+                observed_at,
+                exhausted_windows,
+                predicted_blocked_until,
+                next_probe_after,
+            )
+            .await
     }
 
     async fn seed_legacy_rate_limited_health(&self, account_id: &str) -> anyhow::Result<()> {
