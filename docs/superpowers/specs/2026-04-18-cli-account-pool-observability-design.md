@@ -1,0 +1,752 @@
+# CLI Account Pool Observability Design
+
+This document defines the first CLI consumer slice for the pooled-account
+observability contract that already exists behind the local backend and
+app-server v2.
+
+It is intentionally scoped to a read-only operator-facing CLI surface. It does
+not add new pooled state, it does not add app-server protocol changes, it does
+not implement a remote backend, and it does not add write-side operator
+commands such as pause, resume, or drain.
+
+## Summary
+
+The recommended direction is:
+
+- add a small read-only operator CLI surface under `codex accounts`
+- keep `codex accounts status` as the top-level overview command
+- add focused drill-down commands:
+  - `codex accounts pool show`
+  - `codex accounts diagnostics`
+  - `codex accounts events`
+- make CLI consume the backend-neutral observability seam in
+  `codex-account-pool`, rather than:
+  - querying `StateRuntime` directly
+  - calling app-server RPCs through a transport loop
+- preserve the existing `codex accounts pool list|assign` command family and
+  add `show` under that subtree rather than introducing a conflicting top-level
+  `pool` read command
+- keep the first text output concise and operator-oriented while defining
+  explicit per-command JSON output instead of reusing an implicit app-server
+  response shape
+
+This gives the fork an immediately useful local operator/debug surface without
+expanding the pooled runtime contract or increasing merge risk in state/core.
+
+JSON timestamp rule for this CLI slice:
+
+- all new CLI JSON timestamps should be RFC 3339 UTC strings
+- absent timestamps remain `null`
+- this applies to top-level and nested fields such as:
+  - `refreshedAt`
+  - `generatedAt`
+  - `occurredAt`
+  - `updatedAt`
+  - lease timestamps
+  - quota timestamps
+  - selection timestamps
+  - diagnostics issue timestamps
+
+This keeps CLI JSON aligned with the existing CLI preference for human-readable
+timestamps while staying explicit and deterministic.
+
+## Goals
+
+- Improve day-to-day operator UX for pooled accounts.
+- Make it easy to answer:
+  - "what pool is active right now?"
+  - "why is the pool degraded or blocked?"
+  - "what happened recently?"
+  - "which accounts are currently in the pool and what state are they in?"
+- Reuse the existing pooled observability contract instead of growing another
+  CLI-only read path.
+- Keep the design compatible with a future remote backend by making CLI depend
+  on the same backend-neutral seam that future consumers will use.
+- Keep the command surface small enough that users can discover it from
+  `codex accounts --help` without learning a separate tool.
+
+## Non-Goals
+
+- Do not change pooled allocation, lease, or proactive switch semantics.
+- Do not add remote backend implementation or remote transport logic in this
+  slice.
+- Do not add new app-server RPCs or change the current observability wire
+  contract.
+- Do not add write-side control-plane commands such as pause, resume, drain, or
+  pool-level mutation.
+- Do not redesign `codex accounts current`; it may remain startup-selection
+  focused in this slice.
+- Do not add a TUI consumer in the same change.
+- Do not invent synthetic quota, pause, or drain facts when the local backend
+  still has no authoritative source for them.
+
+## Constraints
+
+- Upstream mergeability matters, so the implementation should stay in the CLI
+  crate plus existing backend-neutral seams instead of changing pooled state or
+  runtime ownership again.
+- The current CLI already has a `codex accounts pool` subtree for control-plane
+  operations (`list` and `assign`), so any new read view must fit without
+  breaking that grammar.
+- The existing observability contract intentionally returns `null` for fields
+  that the local backend cannot fill authoritatively yet. The CLI must preserve
+  that realism rule instead of papering over it with guessed values.
+- The first operator slice should prioritize high-signal debugging and
+  operational visibility rather than a large command matrix.
+
+## Problem Statement
+
+The pooled observability slice is now implemented below the CLI, but the local
+operator experience still stops at startup-selection diagnostics and coarse
+account management:
+
+- `codex accounts status` explains startup selection and eligibility, but it
+  does not show pooled observability summary, diagnostics status, or event
+  history
+- there is no CLI command that shows the current pool summary through the new
+  observability seam
+- there is no CLI command that lists the current diagnostics issues for a pool
+- there is no CLI command that lists recent append-only pool events
+
+That creates two practical problems:
+
+1. users can operate the local pool, but they still have to infer why it is
+   degraded or blocked
+2. future CLI work would be tempted to re-query local state tables directly,
+   which would duplicate semantics and make remote support harder later
+
+The missing piece is not another ad hoc status string. It is a CLI surface that
+consumes the already-shipped observability contract with stable command
+boundaries and operator-oriented output.
+
+## Approaches Considered
+
+### Approach A: Query `StateRuntime` directly from CLI
+
+Under this approach, CLI would read pooled observability facts straight from the
+state layer and format them locally.
+
+Pros:
+
+- fastest implementation path
+- avoids introducing new CLI wiring over existing seams
+
+Cons:
+
+- duplicates observability semantics outside the backend-neutral layer
+- encourages more local-only branching when remote support arrives
+- makes CLI a second owner of cursor/filter mapping and nullability behavior
+
+This approach is rejected.
+
+### Approach B: Consume the backend-neutral observability seam from CLI
+
+Under this approach:
+
+- CLI resolves the target pool
+- CLI constructs a local `codex-account-pool` backend
+- CLI reads summary/accounts/events/diagnostics through the observability seam
+- CLI formats text and JSON output on top of those seam types
+
+Pros:
+
+- keeps one shared read contract below the CLI
+- future remote support can plug in behind the same seam
+- avoids pulling app-server transport into the local CLI path
+
+Cons:
+
+- requires a small new CLI read adapter layer
+- still needs CLI-specific output view models and formatting
+
+This is the recommended approach.
+
+### Approach C: Call app-server `accountPool/*` RPCs from CLI
+
+Under this approach, CLI would boot an app-server-style transport path and
+consume the pooled observability RPCs directly.
+
+Pros:
+
+- strongest reuse of the app-server wire contract
+
+Cons:
+
+- adds unnecessary transport/process complexity to the local CLI path
+- makes local command startup and testing heavier
+- increases coupling between CLI and app-server runtime behavior
+
+This approach is rejected.
+
+## Recommended Design
+
+### 1. Add one overview command and three drill-down commands
+
+The first CLI observability slice should expose:
+
+- `codex accounts status`
+- `codex accounts pool show`
+- `codex accounts diagnostics`
+- `codex accounts events`
+
+Command roles:
+
+- `status`: concise overview and best first command
+- `pool show`: operator view of current pool summary and current account rows
+- `diagnostics`: focused explanation of current degraded/blocked state
+- `events`: recent append-only history for time-ordered debugging
+
+`codex accounts pool list|assign` remain unchanged. `show` is additive under the
+existing subtree, avoiding a grammar conflict with the current `pool`
+management commands.
+
+Per-command scope and pagination rules:
+
+| Command | Default pool resolution | Pagination | Text cursor behavior |
+|---------|-------------------------|------------|----------------------|
+| `accounts status` | honor top-level `--account-pool` first; otherwise use the command's resolved effective pool; otherwise omit pooled observability summary instead of failing | none | none |
+| `accounts pool show` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over account rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+| `accounts diagnostics` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | none | none |
+| `accounts events` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over event rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+
+The precedence rule is therefore:
+
+1. command-specific `--pool`
+2. top-level `--account-pool`
+3. existing effective-pool resolution from startup diagnostics/config/state
+
+If command-specific `--pool` and top-level `--account-pool` are both present and
+their values differ, the command should fail with an explicit conflict error
+instead of silently applying precedence.
+
+### 2. Keep `status` concise and additive
+
+`codex accounts status` already owns startup-selection and effective-pool
+explanation. This slice should preserve that role and append a pooled
+observability summary rather than replacing the existing diagnostic path.
+
+For `status`, top-level `--account-pool` applies to the entire command. It
+changes the startup-resolution/effective-pool interpretation and therefore also
+changes the pooled observability target. `status` must not show startup
+diagnostics for one pool while showing pooled observability for another.
+
+The first text output should include:
+
+- effective pool id and source
+- preferred/predicted account ids when present
+- suppression state
+- startup eligibility summary
+- pooled diagnostics status: `healthy`, `degraded`, or `blocked`
+- compact summary counts:
+  - total accounts
+  - active leases
+  - available accounts
+  - leased accounts
+- one high-signal issue summary when diagnostics are not healthy
+
+`status` should not become a full dump of accounts, issues, and events. It
+should point users to `diagnostics`, `events`, and `pool show` for detail.
+
+The high-signal issue summary should be chosen deterministically as the first
+issue returned by the diagnostics read. `status` should not add a separate
+sorting or ranking pass in this slice.
+
+`status` uses two additive observability reads:
+
+- pool summary read
+- diagnostics read
+
+Failure behavior:
+
+- if no effective pool can be resolved, `status` should still succeed and omit
+  the pooled observability section
+- if an effective pool is resolved, `status` should attempt both reads
+- any observability-read failure, including not found, should be partial
+  degradation for `status`, not a process-level command failure
+
+`status` outcome matrix:
+
+| Pool resolved? | Summary read | Diagnostics read | `status` behavior |
+|----------------|--------------|------------------|-------------------|
+| no | not attempted | not attempted | succeed; no pooled observability section |
+| yes | success | success | show counts, diagnostics status, and issue summary |
+| yes | success | failure | show counts, omit diagnostics details, add warning |
+| yes | failure | success | show diagnostics status and issue summary, omit counts, add warning |
+| yes | failure | failure | show warning only; preserve existing startup diagnostic output |
+
+`status --json` should preserve the existing startup-diagnostic top-level fields
+and add one new additive field:
+
+- `poolObservability`
+
+`poolObservability` shape:
+
+- `null` when no effective pool is resolved
+- otherwise an object with:
+  - `poolId: string`
+  - `summary: object | null`
+  - `diagnostics: object | null`
+  - `warning: string | null`
+
+`summary` shape:
+
+- `totalAccounts`
+- `activeLeases`
+- `availableAccounts`
+- `leasedAccounts`
+- `pausedAccounts`
+- `drainingAccounts`
+- `nearExhaustedAccounts`
+- `exhaustedAccounts`
+- `errorAccounts`
+
+`diagnostics` shape:
+
+- `generatedAt`
+- `status`
+- `issues`
+
+The new JSON contract should keep keys present with `null` values where the
+corresponding read failed, rather than omitting the field dynamically.
+
+Unless stated otherwise, nested CLI JSON should mirror seam nullability and
+value semantics, with the timestamp normalization rule above applied at the
+output boundary.
+
+### 3. Add `pool show` as the operational detail view
+
+`codex accounts pool show` should present the current summary and account rows
+for one pool.
+
+Pool selection rules:
+
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
+- otherwise, resolve the current effective pool from the existing startup
+  diagnostic path
+- if neither exists, fail with an explicit message telling the user to pass
+  `--pool <POOL_ID>`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
+- `--limit` and `--cursor` page account rows, not summary metadata
+- omitting `--limit` should use the backend/default reader page size; the CLI
+  must not treat it as unbounded output
+- when another account page exists, text mode should print the returned next
+  cursor after the rows; JSON mode should preserve the raw `nextCursor` field
+- account rows must preserve backend order exactly; the CLI must not add a
+  client-side sorting pass over paged results
+
+Failure behavior:
+
+- `pool show` is a strict drill-down command
+- it requires both the pool summary read and the account-row read
+- if either read fails, the command fails; no partial summary-only or rows-only
+  output is allowed in this slice
+
+First-pass parameters:
+
+- `--pool <POOL_ID>`
+- `--limit <N>`
+- `--cursor <CURSOR>`
+- `--json`
+
+Text output should show:
+
+- pool id
+- refreshed timestamp
+- summary counts
+- account rows with these columns:
+  - `accountId`
+  - `kind`
+  - `enabled`
+  - `health`
+  - `state`
+  - `lease`
+  - `eligible`
+  - `preferred`
+
+The `lease` column should render:
+
+- `-` when no active lease exists
+- `leaseId@holderInstanceId` when an active lease exists
+
+Other nullable text fields should render conservatively:
+
+- missing `health` or `state`: `unknown`
+- missing `eligible`: `unknown`
+- missing `preferred`: `unknown`
+- missing quota/selection detail not shown in the default text table: omit rather
+  than invent placeholders
+
+Less critical fields such as `backendAccountRef`, `statusReasonCode`,
+`statusMessage`, and the full `selection` object may remain primarily JSON-only
+in the first text implementation.
+
+`pool show --json` should expose:
+
+- `poolId`
+- `refreshedAt`
+- `summary`
+- `data`
+- `nextCursor`
+
+`summary` should use the same shape described for `status.poolObservability.summary`.
+
+`data` item shape:
+
+- `accountId`
+- `backendAccountRef`
+- `accountKind`
+- `enabled`
+- `healthState`
+- `operationalState`
+- `allocatable`
+- `statusReasonCode`
+- `statusMessage`
+- `currentLease`
+- `quota`
+- `selection`
+- `updatedAt`
+
+`currentLease` shape:
+
+- `leaseId`
+- `leaseEpoch`
+- `holderInstanceId`
+- `acquiredAt`
+- `renewedAt`
+- `expiresAt`
+
+`quota` shape:
+
+- `remainingPercent`
+- `resetsAt`
+- `observedAt`
+
+`selection` shape:
+
+- `eligible`
+- `nextEligibleAt`
+- `preferred`
+- `suppressed`
+
+JSON contract rules:
+
+- `data` is always present as an array; use `[]` when no rows match
+- `nextCursor` is always present; use `null` when no further page exists
+- nullable row fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- if no account rows match the request, still print the pool header/summary and
+  then print `accounts: none`
+
+`backend` and `policy` are intentionally out of scope for CLI v1 because the
+current backend-neutral observability seam does not expose them and this slice
+should not widen that seam or duplicate app-server-only assembly logic.
+
+### 4. Add `diagnostics` as the current-state explanation view
+
+`codex accounts diagnostics` should show why a pool is currently healthy,
+degraded, or blocked.
+
+Pool selection rules:
+
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
+- otherwise, resolve the current effective pool from the existing startup
+  diagnostic path
+- if neither exists, fail with the same explicit `--pool` guidance used by
+  `pool show`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
+
+First-pass parameters:
+
+- `--pool <POOL_ID>`
+- `--json`
+
+Text output should include:
+
+- top-level diagnostics status
+- generated timestamp
+- one row per issue with:
+  - severity
+  - reason code
+  - message
+  - account id when present
+  - holder instance id when present
+  - next relevant timestamp when present
+
+Issue ordering should preserve backend order. The CLI should not add a separate
+sorting pass over diagnostics rows in this slice.
+
+This command is intentionally about current issues, not historical order. Users
+who want chronology should move to `events`.
+
+`diagnostics --json` should expose:
+
+- `poolId`
+- `generatedAt`
+- `status`
+- `issues`
+
+`issues` item shape:
+
+- `severity`
+- `reasonCode`
+- `message`
+- `accountId`
+- `holderInstanceId`
+- `nextRelevantAt`
+
+JSON contract rules:
+
+- `issues` is always present as an array; use `[]` when there are no current issues
+- nullable issue fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- when diagnostics are healthy and `issues` is empty, print `issues: none`
+
+### 5. Add `events` as the chronological debugging view
+
+`codex accounts events` should expose recent append-only pooled history with the
+existing cursor model.
+
+Pool selection rules:
+
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
+- otherwise, resolve the current effective pool from the existing startup
+  diagnostic path
+- if neither exists, fail with the same explicit `--pool` guidance used by
+  `pool show`
+- if both command `--pool` and top-level `--account-pool` are present and
+  differ, fail with an explicit conflict error
+
+First-pass parameters:
+
+- `--pool <POOL_ID>`
+- `--account <ACCOUNT_ID>`
+- `--type <EVENT_TYPE>` (repeatable)
+- `--limit <N>`
+- `--cursor <CURSOR>`
+- `--json`
+
+Repeatable `--type` flags compose as OR semantics:
+
+- an event matches when its type is any of the requested values
+- this should map directly to the backend filter list rather than a CLI-side
+  intersection rule
+
+Text output should include:
+
+- occurred timestamp
+- event type
+- account id when present
+- reason code when present
+- message
+
+Event order should match the backend contract exactly:
+
+- newest first
+- descending by `occurredAt`
+- tie-broken by descending event id/cursor order
+
+Pagination rules:
+
+- `--limit` and `--cursor` page event rows only
+- omitting `--limit` should use the backend/default reader page size; the CLI
+  must not treat it as unbounded output
+- text mode should print the returned next cursor when another page exists
+- JSON mode should preserve the raw `nextCursor` field unchanged
+
+When another page exists, text output should print the next cursor explicitly so
+the operator can request the next page without a separate pagination protocol.
+
+`events --follow` and live streaming behavior are intentionally deferred.
+
+`events --json` should expose:
+
+- `poolId`
+- `data`
+- `nextCursor`
+
+`data` item shape:
+
+- `eventId`
+- `occurredAt`
+- `poolId`
+- `accountId`
+- `leaseId`
+- `holderInstanceId`
+- `eventType`
+- `reasonCode`
+- `message`
+- `details`
+
+`details` should be an opaque raw JSON passthrough:
+
+- preserve any JSON value shape emitted by the seam/backend
+- do not stringify JSON into a text blob
+- do not narrow it to object-only payloads
+
+JSON contract rules:
+
+- `data` is always present as an array; use `[]` when no rows match
+- `nextCursor` is always present; use `null` when no further page exists
+- nullable event fields remain present with `null` values rather than being omitted
+
+Text empty-state rule:
+
+- when no event rows match the request, print `events: none`
+
+### 6. Keep CLI dependent on the backend-neutral observability seam
+
+The CLI should load config and construct a backend reader through
+`codex-account-pool`, then consume:
+
+- `read_pool`
+- `list_accounts`
+- `read_diagnostics`
+- `list_events`
+
+The CLI should not:
+
+- duplicate SQL queries
+- read observability tables directly
+- call app-server methods through a transport client just to read local state
+
+This keeps the local CLI aligned with the same seam a future remote backend can
+implement.
+
+### 7. Isolate read helpers and output formatting
+
+The first implementation should avoid growing the existing accounts modules into
+one large mixed control-plane/read-formatting file.
+
+Recommended CLI additions under `codex-rs/cli/src/accounts/`:
+
+- `observability.rs`
+  - target pool resolution
+  - local backend reader construction
+  - command-level read helpers
+- `observability_types.rs`
+  - optional CLI-facing view models that decouple formatting from backend types
+- `observability_output.rs`
+  - text/json formatting for `status`, `pool show`, `diagnostics`, and `events`
+
+If the implementation can stay clear without `observability_types.rs`, it may
+be omitted, but the formatter should still remain separate from command parsing
+and reader construction.
+
+### 8. Preserve the contract realism rule in CLI output
+
+The CLI must not turn nullable local observability fields into invented facts.
+
+For local v1 specifically:
+
+- `quota` may still be `null`
+- paused/draining/near-exhausted/exhausted bucket counts may still be `null`
+- some per-account operational details may remain unknown
+
+Text mode may render these as `unknown` or omit them, but JSON output must
+preserve the real nullable values and the CLI must not pretend the local
+backend knows more than it does.
+
+### 9. Sequence the implementation from pure drill-down to mixed overview
+
+The recommended implementation order is:
+
+1. `codex accounts pool show`
+2. `codex accounts diagnostics`
+3. `codex accounts events`
+4. pooled observability summary integration into `codex accounts status`
+
+This order keeps the first tasks focused on new read-only commands with clear
+boundaries. `status` is intentionally last because it mixes existing startup
+diagnostics with the new observability summary.
+
+## Error Handling
+
+The first slice should keep a small, explicit error model:
+
+- no effective pool resolved and no `--pool` passed:
+  - fail with: `no effective pool is configured; pass --pool <POOL_ID>`
+- target pool not found:
+  - for `pool show`, `diagnostics`, and `events`, propagate a clear
+    pool-not-found error
+  - for additive `status` observability reads, do not fail the command; treat
+    pool-not-found the same as any other observability-read failure and surface
+    it as `poolObservability.warning`
+- invalid cursor:
+  - fail with an explicit cursor error
+- empty event page:
+  - return success with no rows
+- diagnostics with no issues:
+  - render `healthy` and no issue rows
+
+Text rendering should prefer omission or `unknown` for nullable fields over
+guessed operator conclusions.
+
+## Testing Strategy
+
+The first CLI slice should use three layers of tests.
+
+### 1. Command parsing and output tests
+
+Cover:
+
+- `accounts pool show`
+- `accounts diagnostics`
+- `accounts events`
+- additive `accounts status` pooled summary output
+- coexistence with existing `accounts pool list|assign`
+
+### 2. Read-path integration tests with seeded local state
+
+Use temporary homes and seeded pooled state to verify:
+
+- healthy pool summary
+- degraded diagnostics with at least one issue
+- blocked diagnostics
+- stale/missing resolved pool causing `status` to degrade with
+  `poolObservability.warning` instead of failing
+- event pagination through cursors
+- `--pool` overriding the current effective pool
+- explicit pool requirement when no effective pool can be resolved
+
+### 3. Formatter-focused unit tests
+
+Cover:
+
+- nullable fields remain nullable in JSON
+- text output does not invent synthetic facts
+- event and diagnostics rows remain stable and readable
+- next cursor rendering in `events` text output
+
+## Acceptance Criteria
+
+This design is complete when:
+
+- `codex accounts status` shows additive pooled observability summary for the
+  status-resolved target pool when one is available
+- `codex accounts pool show` returns current summary plus account rows for one
+  pool
+- `codex accounts diagnostics` explains current pool issues through the
+  observability seam
+- `codex accounts events` exposes recent append-only history with cursor
+  pagination
+- CLI consumes the backend-neutral observability seam instead of direct local
+  state queries
+- existing `codex accounts pool list|assign` behavior remains intact
+
+## Follow-On Work
+
+- TUI consumption of the same observability seam
+- richer doctor-style or summary-first operator surfaces
+- remote backend implementation behind the same seam
+- write-side control-plane commands such as pause, resume, and drain
+- richer local quota/pause/drain facts once the backend has authoritative
+  sources for them
