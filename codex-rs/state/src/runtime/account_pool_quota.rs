@@ -5,7 +5,63 @@ use crate::QuotaExhaustedWindows;
 use crate::QuotaProbeResult;
 use crate::model::account_datetime_to_epoch_seconds;
 use crate::model::account_epoch_seconds_to_datetime;
+use sqlx::Executor;
 use sqlx::Row;
+use sqlx::Sqlite;
+
+pub(super) const COMPAT_QUOTA_LIMIT_ID: &str = "codex";
+
+fn normalized_selection_family_sql(selection_family_expr: &str) -> String {
+    format!("COALESCE(NULLIF({selection_family_expr}, ''), '{COMPAT_QUOTA_LIMIT_ID}')")
+}
+
+pub(super) fn selection_quota_state_joins_sql(
+    selection_quota_alias: &str,
+    fallback_quota_alias: &str,
+    account_id_expr: &str,
+    selection_family_expr: &str,
+) -> String {
+    let normalized_selection_family_expr = normalized_selection_family_sql(selection_family_expr);
+    format!(
+        r#"
+LEFT JOIN account_quota_state AS {selection_quota_alias}
+  ON {selection_quota_alias}.account_id = {account_id_expr}
+ AND {selection_quota_alias}.limit_id = {normalized_selection_family_expr}
+LEFT JOIN account_quota_state AS {fallback_quota_alias}
+  ON {fallback_quota_alias}.account_id = {account_id_expr}
+ AND {fallback_quota_alias}.limit_id = '{COMPAT_QUOTA_LIMIT_ID}'
+        "#,
+    )
+}
+
+pub(super) fn selection_quota_state_field_sql(
+    selection_quota_alias: &str,
+    fallback_quota_alias: &str,
+    field_name: &str,
+) -> String {
+    format!("COALESCE({selection_quota_alias}.{field_name}, {fallback_quota_alias}.{field_name})")
+}
+
+pub(super) async fn read_account_selection_family<'e, E>(
+    executor: E,
+    account_id: &str,
+) -> anyhow::Result<String>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        r#"
+SELECT NULLIF(backend_family, '')
+FROM account_registry
+WHERE account_id = ?
+        "#,
+    )
+    .bind(account_id)
+    .fetch_optional(executor)
+    .await?
+    .flatten()
+    .unwrap_or_else(|| COMPAT_QUOTA_LIMIT_ID.to_string()))
+}
 
 impl StateRuntime {
     pub async fn upsert_account_quota_state(
@@ -101,11 +157,21 @@ WHERE excluded.observed_at >= account_quota_state.observed_at
     ) -> anyhow::Result<Option<AccountQuotaStateRecord>> {
         let selected =
             read_account_quota_state(self.pool.as_ref(), account_id, selection_family).await?;
-        if selected.is_some() || selection_family == "codex" {
+        if selected.is_some() || selection_family == COMPAT_QUOTA_LIMIT_ID {
             return Ok(selected);
         }
 
-        read_account_quota_state(self.pool.as_ref(), account_id, "codex").await
+        read_account_quota_state(self.pool.as_ref(), account_id, COMPAT_QUOTA_LIMIT_ID).await
+    }
+
+    pub async fn read_registered_account_selection_quota_state(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountQuotaStateRecord>> {
+        let selection_family =
+            read_account_selection_family(self.pool.as_ref(), account_id).await?;
+        self.read_selection_quota_state(account_id, &selection_family)
+            .await
     }
 
     pub async fn read_selection_quota_compat_health_state(
