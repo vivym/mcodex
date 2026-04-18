@@ -831,6 +831,10 @@ mod tests {
 
         assert_eq!(step_names(&screen), vec!["welcome", "pooled-only", "auth"]);
         assert!(!reload_config);
+        assert_snapshot!(
+            "pooled_only_notice_screen_auth_revealed",
+            render_to_string(&screen)
+        );
 
         Ok(())
     }

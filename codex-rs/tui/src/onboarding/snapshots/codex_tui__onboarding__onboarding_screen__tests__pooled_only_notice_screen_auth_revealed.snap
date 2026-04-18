@@ -1,0 +1,25 @@
+---
+source: tui/src/onboarding/onboarding_screen.rs
+expression: render_to_string(&screen)
+---
+  Welcome to mcodex, an OpenAI Codex-derived command-line coding agent
+
+  Pooled access is available
+
+  You can continue with pooled access or hand off to login.
+
+  Press enter to continue, press l to log in, or press n to hide and con
+
+  Sign in with ChatGPT to use mcodex as part of your paid plan
+  or connect an API key for usage-based billing
+
+> 1. Sign in with ChatGPT
+     Usage included with Plus, Pro, Business, and Enterprise plans
+
+  2. Sign in with Device Code
+     Sign in from another device with a one-time code
+
+  3. Provide your own API key
+     Pay for what you use
+
+  Press Enter to continue

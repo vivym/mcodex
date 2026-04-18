@@ -1,3 +1,4 @@
+use codex_product_identity::MCODEX;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -93,8 +94,8 @@ impl WidgetRef for &WelcomeWidget {
         lines.push(Line::from(vec![
             "  ".into(),
             "Welcome to ".into(),
-            "Codex".bold(),
-            ", OpenAI's command-line coding agent".into(),
+            MCODEX.display_name.bold(),
+            format!(", {}", MCODEX.runtime_tagline).into(),
         ]));
 
         Paragraph::new(lines)
