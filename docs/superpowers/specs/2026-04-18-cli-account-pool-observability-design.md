@@ -186,10 +186,16 @@ Per-command scope and pagination rules:
 
 | Command | Default pool resolution | Pagination | Text cursor behavior |
 |---------|-------------------------|------------|----------------------|
-| `accounts status` | use current effective pool when one exists; otherwise omit pooled observability summary instead of failing | none | none |
-| `accounts pool show` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | yes, over account rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
-| `accounts diagnostics` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | none | none |
-| `accounts events` | use `--pool` if present; otherwise fall back to current effective pool; fail if neither exists | yes, over event rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+| `accounts status` | honor top-level `--account-pool` first; otherwise use current effective pool when one exists; otherwise omit pooled observability summary instead of failing | none | none |
+| `accounts pool show` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over account rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+| `accounts diagnostics` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | none | none |
+| `accounts events` | use command `--pool` first; otherwise honor top-level `--account-pool`; otherwise fall back to current effective pool; fail if none exists | yes, over event rows via `--limit` and `--cursor` | print `next cursor: ...` when another page exists |
+
+The precedence rule is therefore:
+
+1. command-specific `--pool`
+2. top-level `--account-pool`
+3. existing effective-pool resolution from startup diagnostics/config/state
 
 ### 2. Keep `status` concise and additive
 
@@ -214,6 +220,20 @@ The first text output should include:
 `status` should not become a full dump of accounts, issues, and events. It
 should point users to `diagnostics`, `events`, and `pool show` for detail.
 
+Failure behavior:
+
+- if no effective pool can be resolved, `status` should still succeed and omit
+  the pooled observability section
+- if an effective pool is resolved but the additive observability read fails or
+  returns not found, `status` should still succeed, preserve the existing
+  startup diagnostic output, and render a warning that pooled observability
+  could not be loaded
+- `status --json` should preserve the startup diagnostic payload and add
+  nullable pooled-observability fields plus an additive
+  `poolObservabilityError` string when the read fails
+- observability-read failure should therefore be partial degradation for
+  `status`, not a process-level command failure
+
 ### 3. Add `pool show` as the operational detail view
 
 `codex accounts pool show` should present the current summary and account rows
@@ -221,7 +241,8 @@ for one pool.
 
 Pool selection rules:
 
-- if `--pool <POOL_ID>` is present, use it
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
 - otherwise, resolve the current effective pool from the existing startup
   diagnostic path
 - if neither exists, fail with an explicit message telling the user to pass
@@ -253,6 +274,12 @@ Text output should show:
   - `eligible`
   - `preferred`
 
+The `lease` column should render:
+
+- `-` when no active lease exists
+- `leaseId` when a lease exists but no holder is present
+- `leaseId@holderInstanceId` when both values are present
+
 Less critical fields such as `backendAccountRef`, `statusReasonCode`,
 `statusMessage`, and the full `selection` object may remain primarily JSON-only
 in the first text implementation.
@@ -264,7 +291,8 @@ degraded, or blocked.
 
 Pool selection rules:
 
-- if `--pool <POOL_ID>` is present, use it
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
 - otherwise, resolve the current effective pool from the existing startup
   diagnostic path
 - if neither exists, fail with the same explicit `--pool` guidance used by
@@ -287,6 +315,9 @@ Text output should include:
   - holder instance id when present
   - next relevant timestamp when present
 
+Issue ordering should preserve backend order. The CLI should not add a separate
+sorting pass over diagnostics rows in this slice.
+
 This command is intentionally about current issues, not historical order. Users
 who want chronology should move to `events`.
 
@@ -297,7 +328,8 @@ existing cursor model.
 
 Pool selection rules:
 
-- if `--pool <POOL_ID>` is present, use it
+- if command `--pool <POOL_ID>` is present, use it
+- otherwise, if top-level `--account-pool <POOL_ID>` is present, use it
 - otherwise, resolve the current effective pool from the existing startup
   diagnostic path
 - if neither exists, fail with the same explicit `--pool` guidance used by
