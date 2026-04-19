@@ -81,7 +81,7 @@ pub fn evaluate_selection(
     }
 
     if request.intent.is_probe_recovery() {
-        return finalize_probe_recovery(admitted, rejected_candidates, selection_family, now);
+        return finalize_probe_recovery(admitted, rejected_candidates);
     }
 
     let mut eligible_candidates = admitted
@@ -142,8 +142,6 @@ pub fn evaluate_selection(
 fn finalize_probe_recovery(
     admitted: Vec<RankedCandidate>,
     mut rejected_candidates: Vec<RejectedCandidate>,
-    selection_family: &str,
-    now: DateTime<Utc>,
 ) -> SelectionPlan {
     let probe_candidate = admitted
         .iter()
@@ -154,6 +152,12 @@ fn finalize_probe_recovery(
         for candidate in admitted.iter().filter(|candidate| {
             !matches!(candidate.block_class, QuotaBlockClass::ProbeEligibleBlocked)
         }) {
+            if rejected_candidates
+                .iter()
+                .any(|rejected| rejected.account_id == candidate.record.account_id)
+            {
+                continue;
+            }
             let reason = if matches!(candidate.block_class, QuotaBlockClass::PredictedBlocked) {
                 SelectionRejectReason::PredictedBlocked
             } else {
@@ -171,7 +175,6 @@ fn finalize_probe_recovery(
         .map(|account_id| SelectionAction::Probe(account_id.clone()))
         .unwrap_or(SelectionAction::NoCandidate);
 
-    let _ = (selection_family, now);
     SelectionPlan {
         eligible_candidates: Vec::new(),
         probe_candidate,
@@ -198,6 +201,14 @@ fn hard_reject_reason(
     if candidate.leased_to_other_holder {
         return Some(SelectionRejectReason::LeasedToOtherHolder);
     }
+    if request.intent.is_probe_recovery() {
+        if request.reserved_probe_target_account_id.as_deref()
+            != Some(candidate.account_id.as_str())
+        {
+            return Some(SelectionRejectReason::ProbeTargetOnly);
+        }
+        return None;
+    }
     if request.current_account_id.as_deref() == Some(candidate.account_id.as_str()) {
         return Some(SelectionRejectReason::CurrentAccount);
     }
@@ -205,12 +216,6 @@ fn hard_reject_reason(
         && request.just_replaced_account_id.as_deref() == Some(candidate.account_id.as_str())
     {
         return Some(SelectionRejectReason::JustReplacedAccount);
-    }
-    if request.intent.is_probe_recovery()
-        && request.reserved_probe_target_account_id.as_deref()
-            != Some(candidate.account_id.as_str())
-    {
-        return Some(SelectionRejectReason::ProbeTargetOnly);
     }
     None
 }
@@ -310,10 +315,14 @@ fn probe_priority(row: &AccountQuotaStateRecord, now: DateTime<Utc>) -> (i8, i64
         .unwrap_or(i64::MAX);
     let predicted_recovery_secs = row
         .predicted_blocked_until
-        .map(|predicted_blocked_until| (predicted_blocked_until - now).num_seconds())
+        .map(|predicted_blocked_until| {
+            (predicted_blocked_until - now)
+                .num_seconds()
+                .saturating_neg()
+        })
         .unwrap_or(i64::MIN);
 
-    (kind_rank, probe_staleness_secs, -predicted_recovery_secs)
+    (kind_rank, probe_staleness_secs, predicted_recovery_secs)
 }
 
 fn is_low_confidence(row: &AccountQuotaStateRecord) -> bool {

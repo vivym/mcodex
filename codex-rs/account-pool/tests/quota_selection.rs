@@ -133,6 +133,40 @@ fn quota_selection_probe_recovery_only_rechecks_reserved_target_and_returns_prob
 }
 
 #[test]
+fn quota_selection_probe_recovery_reserved_target_overrides_current_account_veto() {
+    let plan = build_selection_plan(
+        selection_request(SelectionIntent::ProbeRecovery)
+            .with_current_account("acct-probe")
+            .with_reserved_probe_target("acct-probe"),
+    )
+    .with_candidate(candidate("acct-probe").with_primary_block(now_minus_minutes(30)))
+    .run();
+
+    assert_eq!(plan.probe_candidate.as_deref(), Some("acct-probe"));
+    assert_eq!(
+        plan.terminal_action,
+        SelectionAction::Probe("acct-probe".to_string())
+    );
+}
+
+#[test]
+fn quota_selection_probe_recovery_reserved_target_overrides_just_replaced_veto() {
+    let plan = build_selection_plan(
+        selection_request(SelectionIntent::ProbeRecovery)
+            .with_just_replaced_account("acct-probe")
+            .with_reserved_probe_target("acct-probe"),
+    )
+    .with_candidate(candidate("acct-probe").with_primary_block(now_minus_minutes(30)))
+    .run();
+
+    assert_eq!(plan.probe_candidate.as_deref(), Some("acct-probe"));
+    assert_eq!(
+        plan.terminal_action,
+        SelectionAction::Probe("acct-probe".to_string())
+    );
+}
+
+#[test]
 fn quota_selection_probe_recovery_returns_no_candidate_until_reserved_target_becomes_probe_eligible()
  {
     let plan = build_selection_plan(
@@ -145,7 +179,11 @@ fn quota_selection_probe_recovery_returns_no_candidate_until_reserved_target_bec
     assert_eq!(plan.probe_candidate, None);
     assert_eq!(plan.decision_reason, SelectionDecisionReason::NoCandidate);
     assert_eq!(plan.terminal_action, SelectionAction::NoCandidate);
-    assert_rejected_reason(&plan, "acct-probe", SelectionRejectReason::PredictedBlocked);
+    assert_rejected_reasons(
+        &plan,
+        "acct-probe",
+        &[SelectionRejectReason::PredictedBlocked],
+    );
 }
 
 #[test]
@@ -266,6 +304,23 @@ fn quota_selection_reprobe_prefers_stale_primary_block_over_fresher_secondary_bl
 }
 
 #[test]
+fn quota_selection_reprobe_handles_missing_predicted_blocked_until() {
+    let plan = build_selection_plan(selection_request(SelectionIntent::HardFailover))
+        .with_candidate(
+            candidate("acct-partial")
+                .with_primary_block(now_minus_minutes(40))
+                .with_predicted_blocked_until_none(),
+        )
+        .with_candidate(candidate("acct-complete").with_secondary_block(now_minus_minutes(20)))
+        .run();
+
+    assert_eq!(
+        plan.terminal_action,
+        SelectionAction::Probe("acct-partial".to_string())
+    );
+}
+
+#[test]
 fn quota_selection_exhausted_row_stays_blocked_after_predicted_blocked_until_until_cleared_by_new_fact()
  {
     let plan = build_selection_plan(
@@ -298,6 +353,20 @@ fn assert_rejected_reason(
         panic!("candidate should be rejected");
     };
     assert_eq!(rejected.reason, expected_reason);
+}
+
+fn assert_rejected_reasons(
+    plan: &SelectionPlan,
+    account_id: &str,
+    expected_reasons: &[SelectionRejectReason],
+) {
+    let actual_reasons = plan
+        .rejected_candidates
+        .iter()
+        .filter(|candidate| candidate.account_id == account_id)
+        .map(|candidate| candidate.reason)
+        .collect::<Vec<_>>();
+    assert_eq!(actual_reasons, expected_reasons);
 }
 
 fn selection_request(intent: SelectionIntent) -> SelectionRequest {
@@ -496,6 +565,20 @@ impl CandidateBuilder {
             .unwrap_or_else(|| quota_row().build());
         self.record.quota.selection = Some(AccountQuotaStateRecord {
             predicted_blocked_until: Some(predicted_blocked_until),
+            ..row
+        });
+        self
+    }
+
+    fn with_predicted_blocked_until_none(mut self) -> Self {
+        let row = self
+            .record
+            .quota
+            .selection
+            .take()
+            .unwrap_or_else(|| quota_row().build());
+        self.record.quota.selection = Some(AccountQuotaStateRecord {
+            predicted_blocked_until: None,
             ..row
         });
         self
