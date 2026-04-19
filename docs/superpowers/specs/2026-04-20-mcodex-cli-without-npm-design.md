@@ -301,6 +301,10 @@ Recommended PATH entries:
 This slice supports PowerShell as the Windows command surface. `mcodex.cmd` is
 explicitly out of scope.
 
+Windows users should still invoke the command as `mcodex` from PowerShell. The
+visible PATH entry is implemented as `mcodex.ps1`, but the user-facing command
+name is `mcodex`.
+
 Wrapper responsibilities:
 
 - resolve `current/bin/mcodex` (or `mcodex.exe`)
@@ -355,12 +359,40 @@ Responsibilities:
 - download the archive plus `SHA256SUMS`
 - verify checksums before switching live state
 - treat `SHA256SUMS.sig` as release-record-only in this slice
-- extract into `install/<version>`
+- extract into a staging directory under `versionsDir`
+- publish complete version directories only after extraction and validation
 - atomically move the stable `current` pointer
 - write/update installation metadata
-- create the wrapper if missing
+- create or atomically replace the wrapper on every successful installer run
 - update user PATH setup on first install using the platform's native
   profile/PATH mechanism
+
+Reinstall/update semantics:
+
+- installers must never mutate an existing `versionDir` in place
+- installers should download and extract into a temporary staging directory,
+  then write a completion marker after archive layout validation succeeds
+- a matching existing `versionDir` with a valid completion marker may be reused
+  without re-extraction
+- a missing, incomplete, or marker-mismatched `versionDir` should be replaced
+  from a freshly validated staging directory
+- the existing `currentLink` must not change until the target `versionDir` is
+  complete
+- reinstalling the currently active version should verify and reuse a valid
+  existing `versionDir`, or repair an invalid one from staging, then leave
+  `currentLink` pointing at that version
+- failed installs must leave the previous `currentLink` and wrapper usable
+
+The completion marker should live at
+`<versionDir>/.mcodex-install-complete.json` and include at least:
+
+- `version`
+- `archiveName`
+- `sha256`
+- `installedAt`
+
+A marker is valid only when `version` matches the requested normalized version
+and `sha256` matches the selected archive entry in `SHA256SUMS`.
 
 Selected PATH strategy:
 
@@ -513,6 +545,18 @@ to:
 - create/update a lightweight GitHub Release containing release notes and
   checksum artifacts only
 
+`SHA256SUMS.sig` signing contract:
+
+- use `minisign` to create a detached signature for `SHA256SUMS`
+- do not use GPG, cosign, or GitHub attestation output for this file in this
+  slice
+- keep the minisign public key in the repository and repeat it in release notes
+  or linked release documentation
+- store the encrypted minisign private key and password as GitHub Actions
+  repository secrets owned by the release maintainers
+- the release workflow should fail if signing is unavailable, rather than
+  publishing unsigned checksum artifacts
+
 The OSS publish order must be atomic from the client's perspective:
 
 1. upload versioned release artifacts
@@ -538,9 +582,13 @@ Coverage should include:
   `v0.96.0`, and `rust-v0.96.0`
 - installer tests proving invalid version syntax fails before download or disk
   mutation
+- installer tests for matching, missing, incomplete, and marker-mismatched
+  `versionDir` handling
 - wrapper smoke tests proving PATH injection and exit-code forwarding
+- wrapper smoke tests proving installer reruns replace stale wrappers
 - release-workflow tests or scripted validations for archive layout and
   checksum generation
+- release-workflow validation that `SHA256SUMS.sig` is generated with minisign
 
 Manual smoke should confirm:
 
@@ -549,7 +597,10 @@ Manual smoke should confirm:
 - explicit version install works on both platforms
 - upgrade from one script-installed version to another updates `current`
   without leaving PATH broken
+- reinstalling the active version repairs an incomplete version directory
+  without breaking the previous working command if the repair fails
 - `mcodex` launched through the wrapper sees script-managed install metadata
+- Windows PowerShell users can invoke the wrapper as `mcodex`
 - TUI update prompt points to the script-managed update path, not npm, bun, or
   Homebrew
 - lightweight GitHub Release still provides notes and checksum artifacts
@@ -605,13 +656,17 @@ Mitigation:
 - install scripts fetch native platform archives from OSS/CDN
 - install scripts support both `latest` and explicit versions
 - install scripts validate `SHA256SUMS` before switching the active version
+- install scripts use staging plus completion markers so failed installs do not
+  break the previous active version
 - PATH points to a thin wrapper, not directly to the versioned binary
-- wrappers inject script-managed install metadata and otherwise stay minimal
+- wrappers are replaced on installer reruns, inject script-managed install
+  metadata, and otherwise stay minimal
 - TUI update prompts recognize script-managed installs and no longer direct the
   CLI user to npm, bun, or Homebrew
 - runtime update checks read the OSS stable manifest instead of GitHub latest
   API
 - GitHub Releases remain lightweight publication records with notes and checksum
   artifacts, not the primary binary distribution channel
+- `SHA256SUMS.sig` is generated by the selected minisign release-key workflow
 - docs and release notes describe the clean npm-to-script CLI cutover
 - TypeScript SDK npm publishing remains unaffected by the CLI cutover
