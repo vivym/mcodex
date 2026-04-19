@@ -160,6 +160,8 @@ state into `effective_pool_id`:
   blocked by a selection problem
 - `startup_resolution_issue`: an optional structured reason for blocked or
   degraded resolution
+- `selection_eligibility`: the existing fresh-runtime account-selection result
+  inside the resolved pool, projected from `AccountStartupEligibility`
 
 The availability values should be:
 
@@ -171,8 +173,6 @@ The availability values should be:
   are visible and no explicit default was selected
 - `invalidExplicitDefault`: an explicit default source names a pool that is not
   visible in the startup pool inventory
-- `noEligibleAccount`: a valid effective pool exists, but no account in that
-  pool can be selected for a fresh lease
 - `unavailable`: no pooled startup surface is visible
 
 TUI and app-server startup decisions should use `startup_availability`, not a
@@ -181,6 +181,22 @@ multi-pool/no-default case from falling back to the generic login screen.
 Any compatibility helper that still exposes `pooled_applicable` should derive
 it from availability: all values except `unavailable` represent a pooled
 startup surface, even when that surface is blocked and cannot acquire a lease.
+
+`startup_availability` is intentionally about pool-resolution and startup
+surface state. It does not replace the existing account-level selection model.
+Preferred-account blockers and exhausted-pool outcomes such as:
+
+- `preferredAccountMissing`
+- `preferredAccountInOtherPool`
+- `preferredAccountDisabled`
+- `preferredAccountUnhealthy`
+- `preferredAccountBusy`
+- `noEligibleAccount`
+
+remain represented by `selection_eligibility` and its compatibility
+projections, such as existing `switchReason` and `healthState` fields. When a
+valid effective pool exists, those outcomes do not change
+`startup_availability`; it remains `available` or `suppressed`.
 
 ### 2. Effective-pool precedence
 
@@ -203,6 +219,15 @@ still giving users a productized local preference mechanism.
 
 The resolver must not hard-code local SQLite membership as the abstract source
 of pool existence. It should consume a backend-neutral startup pool inventory.
+
+This slice chooses one authoritative split:
+
+- backend-to-server seam: inventory-driven
+- server-to-client seam: resolved-snapshot-driven
+
+Backends expose startup inventory and selection facts to the shared resolver.
+Clients consume a resolved startup snapshot and do not recompute resolution
+from inventory.
 
 Implementation should introduce a small backend-facing shape, for example
 `StartupPoolInventory`, containing `StartupPoolCandidate` rows with:
@@ -229,13 +254,14 @@ plane or startup catalog:
 
 - a remote pool can be visible even when individual account membership is not
   stored locally
-- if a remote backend cannot expose a pool inventory yet, it must not invent a
-  local-only single-pool fallback; it should report `unavailable` or the
-  server-provided startup state until the catalog exists
+- every backend used by this slice must expose the inventory needed by the
+  shared resolver; a remote backend that cannot do so is not compatible with
+  this slice yet
 
 Pool-count decisions use visible pools, not eligible accounts. A disabled-only
 or temporarily exhausted pool can still be a valid pool, but it should surface
-`noEligibleAccount` instead of being treated as an invalid default.
+an account-level `selection_eligibility` such as `noEligibleAccount` instead
+of being treated as an invalid default.
 
 ### 4. Single visible pool fallback
 
@@ -317,16 +343,16 @@ default, startup can then show the existing paused notice until the user runs
 
 | Override | Config default | Persisted default | Visible pools | Suppressed | Result |
 | --- | --- | --- | --- | --- | --- |
-| valid | any | any | any | false | `effective_pool_id = override`, source `override`, availability `available` or `noEligibleAccount` |
+| valid | any | any | any | false | `effective_pool_id = override`, source `override`, availability `available` |
 | valid | any | any | any | true | `effective_pool_id = override`, source `override`, availability `suppressed` |
 | invalid | any | any | any | any | no effective pool, source `override`, availability `invalidExplicitDefault`, issue `overridePoolUnavailable` |
-| none | valid | any | any | false | `effective_pool_id = config`, source `configDefault`, availability `available` or `noEligibleAccount` |
+| none | valid | any | any | false | `effective_pool_id = config`, source `configDefault`, availability `available` |
 | none | valid | any | any | true | `effective_pool_id = config`, source `configDefault`, availability `suppressed` |
 | none | invalid | any | any | any | no effective pool, source `configDefault`, availability `invalidExplicitDefault`, issue `configDefaultPoolUnavailable` |
-| none | none | valid | any | false | `effective_pool_id = persisted`, source `persistedSelection`, availability `available` or `noEligibleAccount` |
+| none | none | valid | any | false | `effective_pool_id = persisted`, source `persistedSelection`, availability `available` |
 | none | none | valid | any | true | `effective_pool_id = persisted`, source `persistedSelection`, availability `suppressed` |
 | none | none | invalid | any | any | no effective pool, source `persistedSelection`, availability `invalidExplicitDefault`, issue `persistedDefaultPoolUnavailable` |
-| none | none | none | 1 | false | `effective_pool_id = only pool`, source `singleVisiblePool`, availability `available` or `noEligibleAccount` |
+| none | none | none | 1 | false | `effective_pool_id = only pool`, source `singleVisiblePool`, availability `available` |
 | none | none | none | 1 | true | `effective_pool_id = only pool`, source `singleVisiblePool`, availability `suppressed` |
 | none | none | none | 2+ | any | no effective pool, source `none`, availability `multiplePoolsRequireDefault`, issue `multiplePoolsRequireDefault` |
 | none | none | none | 0 | any | no effective pool, source `none`, availability `unavailable` |
@@ -456,6 +482,8 @@ registration into an otherwise empty pool inventory:
   command is empty
 - `import-legacy --pool <POOL_ID>` follows the same post-success persistence
   rule
+- when that first-default bootstrap occurs, registration/import also writes
+  `preferred_account_id = None` and `suppressed = false`
 - registering into a second or later visible pool does not auto-persist or
   auto-switch the default; the user should run
   `mcodex accounts pool default set <POOL_ID>` when they want a durable
@@ -463,6 +491,39 @@ registration into an otherwise empty pool inventory:
 
 This preserves the first-account UX while preventing single-pool fallback from
 silently becoming durable state or switching to a newly added second pool.
+
+#### Resume and switch mutation matrix
+
+`accounts resume` and the app-server `accountLease/resume` RPC must remain
+behaviorally identical.
+
+Resume semantics:
+
+- preserve `default_pool_id`
+- clear `preferred_account_id`
+- set `suppressed = false`
+- succeed even when startup is still blocked by
+  `multiplePoolsRequireDefault` or `invalidExplicitDefault`
+- return or emit the updated startup snapshot after the mutation
+
+This means `resume` can clear latent suppression while startup remains blocked
+for some other reason. The user may still need to choose a default pool or fix
+an invalid explicit source before pooled startup becomes usable.
+
+`accounts switch <ACCOUNT_ID>` remains a valid-pool operation only.
+
+Switch semantics:
+
+- require a valid `effective_pool_id`
+- allow the current startup state to be either `available` or `suppressed`
+- fail before mutation when startup is `multiplePoolsRequireDefault`,
+  `invalidExplicitDefault`, or `unavailable`
+- preserve `default_pool_id`
+- set `preferred_account_id = <ACCOUNT_ID>`
+- set `suppressed = false`
+
+`switch` therefore continues to act as both a preferred-account selection and
+an implicit resume when a valid effective pool already exists.
 
 ### 9. Keep startup-selection concerns separate
 
@@ -519,6 +580,11 @@ The notice should print the exact CLI command shape and enough pool context for
 the user to pick the right pool. That context must come from the backend
 startup inventory and, for remote clients, from protocol fields described
 below. It does not need to implement an interactive pool picker in this slice.
+
+In remote mode, this slice does not require the TUI itself to implement an
+inline pool picker. The blocker must still be actionable through app-server
+mutation methods defined below, but the first slice may surface guidance
+instead of in-TUI selection.
 
 Invalid explicit defaults should use the same blocking notice shell with
 source-specific copy:
@@ -590,14 +656,30 @@ not introduce partial pagination or list truncation for this field.
 
 #### App-server v2 fields
 
-Add the following fields to `AccountLeaseReadResponse`:
+Define a new additive v2 type:
 
-- `startupAvailability: AccountStartupAvailability | null`
+- `AccountStartupSnapshot`
+
+`AccountStartupSnapshot` is the authoritative client-facing startup contract in
+this slice. It must be present on both:
+
+- `AccountLeaseReadResponse`
+- `AccountLeaseUpdatedNotification`
+
+That read/notification parity is required so remote clients can cache startup
+state without immediately rereading after every notification. Since
+notification dedupe currently compares whole notification objects, any startup
+snapshot change must also be observable in the notification payload.
+
+`AccountStartupSnapshot` fields:
+
+- `effectivePoolId: string | null`
+- `effectivePoolResolutionSource: string`
+- `configuredDefaultPoolId: string | null`
+- `persistedDefaultPoolId: string | null`
+- `startupAvailability: AccountStartupAvailability`
 - `startupResolutionIssue: AccountStartupResolutionIssue | null`
-
-Add the same fields to `AccountLeaseUpdatedNotification` so remote clients can
-update visible startup state without issuing an immediate read after every
-notification.
+- `selectionEligibility: string`
 
 Define `AccountStartupAvailability` as a closed v2 enum/string union with
 these camelCase values:
@@ -606,13 +688,12 @@ these camelCase values:
 - `suppressed`
 - `multiplePoolsRequireDefault`
 - `invalidExplicitDefault`
-- `noEligibleAccount`
 - `unavailable`
 
 Define `AccountStartupResolutionIssue` as a v2 exported type with
 `#[serde(rename_all = "camelCase")]` and `#[ts(export_to = "v2/")]`. The
-fields above should not use `skip_serializing_if`; they should follow v2
-response/notification conventions.
+startup snapshot and issue fields should not use `skip_serializing_if`; they
+should follow v2 response/notification conventions.
 
 Define `AccountStartupCandidatePool` as a v2 exported type with:
 
@@ -620,10 +701,59 @@ Define `AccountStartupCandidatePool` as a v2 exported type with:
 - `displayName: string | null`
 - `status: string | null`
 
+`AccountStartupResolutionIssue` wire rules:
+
+- `type`: required
+- `source`: required
+- `poolId`: required-nullable
+- `candidatePoolCount`: required-nullable
+- `candidatePools`: required-nullable
+- `message`: required-nullable
+
 For `multiplePoolsRequireDefault`, `startupResolutionIssue.candidatePools`
 must include enough candidate pool rows for the TUI notice to show concrete
 pool ids instead of a placeholder. For invalid explicit defaults,
-`candidatePools` may be present to show alternatives but is not required.
+`candidatePools` should be included when the backend knows visible alternatives
+and may otherwise be `null`.
+
+`selectionEligibility` should use the existing fresh-runtime selection codes,
+including:
+
+- `suppressed`
+- `missingPool`
+- `preferredAccountSelected`
+- `automaticAccountSelected`
+- `preferredAccountMissing`
+- `preferredAccountInOtherPool`
+- `preferredAccountDisabled`
+- `preferredAccountUnhealthy`
+- `preferredAccountBusy`
+- `noEligibleAccount`
+
+Legacy top-level `AccountLeaseReadResponse` fields such as `poolId`,
+`accountId`, `switchReason`, and `healthState` remain for compatibility, but
+new clients should treat `startup` as the authoritative startup-resolution
+object. `AccountLeaseUpdatedNotification` should carry the same `startup`
+snapshot, not a partial subset.
+
+#### App-server v2 mutation methods
+
+Add narrow app-server mutation methods for local startup intent:
+
+- `accountPool/default/set`
+- `accountPool/default/clear`
+
+These methods mutate only local startup-selection state. They do not write to a
+remote control plane and therefore do not conflict with the earlier
+read-oriented remote control-plane contract.
+
+Recommended RPC shapes:
+
+- `accountPool/default/set` params: `{ poolId: string }`
+- `accountPool/default/clear` params: `undefined`
+- both responses: empty response objects
+- both methods emit `accountLease/updated` with the full updated
+  `AccountStartupSnapshot`
 
 #### `accounts status`
 
@@ -640,6 +770,21 @@ particular it should distinguish:
 - startup is suppressed despite a resolved effective pool
 - resolved pool has no eligible account
 
+`accounts status --json` should add a top-level `startup` object that mirrors
+`AccountStartupSnapshot` exactly:
+
+- `effectivePoolId`
+- `effectivePoolResolutionSource`
+- `configuredDefaultPoolId`
+- `persistedDefaultPoolId`
+- `startupAvailability`
+- `startupResolutionIssue`
+- `selectionEligibility`
+
+Existing top-level JSON fields remain additive and unchanged for compatibility,
+including `switchReason`, `healthState`, `preferredAccountId`,
+`predictedAccountId`, and `suppressed`.
+
 The existing `poolObservability` addition remains useful, but it is not a
 replacement for startup-resolution diagnostics because there may be no
 effective pool to observe yet.
@@ -651,14 +796,19 @@ instead of re-deriving pool-selection semantics in the TUI.
 
 That means:
 
-- the shared startup model owns resolution source, availability, and issue
-  shape
-- app-server protocol surfaces should expose the additive fields needed by
-  remote clients
+- the shared startup model owns resolution source, availability, issue shape,
+  and account-level selection eligibility
+- every backend participating in this slice exposes the inventory required by
+  the shared resolver on the authority side
+- app-server protocol surfaces expose a fully resolved `AccountStartupSnapshot`
+  to clients
 - the TUI should treat remote startup as a consumer of those fields, not the
   place where multi-pool/no-default policy is invented
 - single-pool fallback depends on backend-visible pool inventory, not local
   SQLite membership
+- remote clients may mutate local startup intent through
+  `accountPool/default/set|clear` and `accountLease/resume`; remote
+  lease/control-plane authority remains unchanged
 
 This keeps the local and remote models aligned and avoids later rework when a
 remote pool authority becomes primary.
@@ -680,6 +830,24 @@ Add focused tests for:
 - suppression overlays a valid effective pool as `suppressed`
 - suppression does not hide `multiplePoolsRequireDefault` or
   `invalidExplicitDefault`
+- preferred-account blocker states preserve `startupAvailability = available`
+  while changing `selectionEligibility`
+
+### Backend contract tests
+
+Add a backend-contract suite with a fake inventory provider so the shared
+resolver semantics are tested independently of any one backend implementation.
+
+That suite should prove:
+
+- single-pool fallback
+- multi-pool default-required
+- invalid explicit default handling
+- suppression overlay
+- deterministic candidate ordering
+- candidate list completeness
+- preferred-account blocker mapping into `selectionEligibility` without
+  changing `startupAvailability`
 
 ### CLI tests
 
@@ -702,6 +870,7 @@ Add focused tests for:
   preferred startup selection instead of reporting a pure no-op
 - `accounts status` text output for each new resolution state
 - `accounts status --json` additive fields for new resolution and warning
+- `accounts status --json` `startup` object matching `AccountStartupSnapshot`
 - observability commands when there is one visible pool, multiple visible
   pools, an invalid explicit target, and explicit `--pool` target selection
 
@@ -715,6 +884,8 @@ Add focused tests proving actual turn-time behavior, not only status output:
   structured blocker
 - invalid explicit defaults do not fall back to another visible pool
 - suppressed single-pool fallback does not acquire a lease until resumed
+- preferred-account blocker states remain account-level eligibility outcomes,
+  not startup-availability blockers
 
 ### TUI tests
 
@@ -733,14 +904,21 @@ Add snapshot and behavior coverage for:
 Add protocol and server coverage for:
 
 - new resolution source serialization
+- `AccountStartupSnapshot` serialization on both read responses and updated
+  notifications
 - `startupAvailability`
+- `selectionEligibility`
 - `startupResolutionIssue`
 - `AccountStartupCandidatePool` serialization for
   `multiplePoolsRequireDefault`
 - `candidatePools` completeness and deterministic `poolId` ordering
 - remote startup responses that represent single-pool fallback and
   multi-pool-without-default distinctly
-- notification conversion preserving availability and issue fields
+- notification conversion preserving full startup snapshot parity with reads
+- `accountPool/default/set|clear` mutation methods emitting updated
+  `accountLease/updated` notifications
+- `accountLease/resume` remaining behaviorally identical to CLI
+  `accounts resume`
 - schema regeneration with `just write-app-server-schema`, plus
   `just write-app-server-schema --experimental` if experimental fixtures are
   affected
