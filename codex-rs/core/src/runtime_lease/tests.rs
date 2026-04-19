@@ -33,6 +33,7 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn pooled_host_id_is_stable_for_one_runtime() {
@@ -259,6 +260,209 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
 
     child.shutdown_and_wait().await?;
     root.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pooled_host_child_keeps_bridge_manager_until_last_session_shutdown() -> anyhow::Result<()>
+{
+    let codex_home = tempfile::tempdir()?;
+    let config = build_test_config_with_pool(codex_home.path()).await;
+    let config_codex_home = config.codex_home.clone();
+    let auth_manager =
+        codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager.clone(),
+        /*model_catalog*/ None,
+        CollaborationModesConfig::default(),
+    ));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ true,
+    ));
+    let skills_watcher = Arc::new(SkillsWatcher::noop());
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-b".to_string()));
+
+    let root = Codex::spawn(CodexSpawnArgs {
+        config: config.clone(),
+        auth_manager: auth_manager.clone(),
+        models_manager: Arc::clone(&models_manager),
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        skills_manager: Arc::clone(&skills_manager),
+        plugins_manager: Arc::clone(&plugins_manager),
+        mcp_manager: Arc::clone(&mcp_manager),
+        skills_watcher: Arc::clone(&skills_watcher),
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::Exec,
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
+        inherited_lease_auth_session: None,
+        runtime_lease_host: Some(runtime_lease_host.clone()),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await?
+    .codex;
+    let child = Codex::spawn(CodexSpawnArgs {
+        config: config.clone(),
+        auth_manager: auth_manager.clone(),
+        models_manager: Arc::clone(&models_manager),
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        skills_manager: Arc::clone(&skills_manager),
+        plugins_manager: Arc::clone(&plugins_manager),
+        mcp_manager: Arc::clone(&mcp_manager),
+        skills_watcher: Arc::clone(&skills_watcher),
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::default(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
+        inherited_lease_auth_session: None,
+        runtime_lease_host: Some(runtime_lease_host),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await?
+    .codex;
+
+    let account_id = "acct-pooled-lifecycle";
+    let state_db = root
+        .session
+        .services
+        .state_db
+        .as_ref()
+        .expect("root state db");
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(config_codex_home.as_path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let child_turn_manager = child
+        .session
+        .services
+        .account_pool_manager_for_turn()
+        .expect("pooled child should resolve the bridge manager");
+    {
+        let mut manager = child_turn_manager.lock().await;
+        let selection = manager
+            .prepare_turn()
+            .await?
+            .expect("pooled child should acquire a bridge-backed lease");
+        assert_eq!(selection.account_id, account_id);
+    }
+
+    let turn_cancellation = CancellationToken::new();
+    let _child_heartbeat = crate::codex::start_account_pool_lease_heartbeat(
+        &child.session,
+        /*lease_selected_for_turn*/ true,
+        &turn_cancellation,
+    )
+    .await
+    .expect("pooled child should start a heartbeat from the bridge manager");
+
+    let snapshot_before_parent_shutdown = child
+        .account_lease_snapshot()
+        .await
+        .expect("child should expose bridge-backed lease snapshot before parent shutdown");
+    assert!(snapshot_before_parent_shutdown.active);
+    assert_eq!(
+        snapshot_before_parent_shutdown.account_id.as_deref(),
+        Some(account_id)
+    );
+
+    root.shutdown_and_wait().await?;
+
+    let snapshot_after_parent_shutdown = child
+        .account_lease_snapshot()
+        .await
+        .expect("child should keep the bridge-backed lease after parent shutdown");
+    assert!(snapshot_after_parent_shutdown.active);
+    assert_eq!(
+        snapshot_after_parent_shutdown.account_id.as_deref(),
+        Some(account_id)
+    );
+
+    child.shutdown_and_wait().await?;
+
+    let contender = Codex::spawn(CodexSpawnArgs {
+        config,
+        auth_manager,
+        models_manager,
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        skills_watcher,
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::Exec,
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
+        inherited_lease_auth_session: None,
+        runtime_lease_host: Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+            "runtime-c".to_string(),
+        ))),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await?
+    .codex;
+    let contender_turn_manager = contender
+        .session
+        .services
+        .account_pool_manager_for_turn()
+        .expect("contender root should build a local pooled manager");
+    let contender_selection = {
+        let mut manager = contender_turn_manager.lock().await;
+        manager.prepare_turn().await?
+    }
+    .expect("last pooled child shutdown should release the bridge lease for immediate reuse");
+    assert_eq!(contender_selection.account_id, account_id);
+
+    contender.shutdown_and_wait().await?;
     Ok(())
 }
 

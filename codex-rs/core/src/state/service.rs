@@ -111,6 +111,33 @@ impl SessionServices {
         })
     }
 
+    pub(crate) async fn attach_runtime_lease_session(&self, session_id: &str) {
+        if let Some(runtime_lease_host) = self.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+        {
+            runtime_lease_host.attach_session(session_id).await;
+        }
+    }
+
+    pub(crate) async fn release_runtime_lease_session_for_shutdown(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(runtime_lease_host) = self.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+        {
+            runtime_lease_host.detach_session(session_id).await?;
+            self.lease_auth.clear();
+            return Ok(());
+        }
+        if let Some(account_pool_manager) = self.account_pool_manager.as_ref() {
+            let mut account_pool_manager = account_pool_manager.lock().await;
+            account_pool_manager.release_for_shutdown().await?;
+            self.lease_auth.clear();
+        }
+        Ok(())
+    }
+
     pub(crate) async fn build_root_runtime_lease_host(
         state_db: Option<StateDbHandle>,
         accounts: Option<AccountsConfigToml>,

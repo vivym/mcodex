@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -30,12 +31,18 @@ pub(crate) enum RuntimeLeaseHostMode {
 #[derive(Debug)]
 pub(crate) struct RuntimeLeaseAuthorityMarker;
 
+#[derive(Default)]
+struct RuntimeLeaseHostLifecycle {
+    attached_sessions: HashSet<String>,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
     legacy_manager_bridge: OnceLock<Arc<Mutex<crate::state::AccountPoolManager>>>,
+    lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
 }
 
 impl fmt::Debug for RuntimeLeaseHostInner {
@@ -63,6 +70,7 @@ impl RuntimeLeaseHost {
             mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
             legacy_manager_bridge: OnceLock::new(),
+            lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
 
@@ -72,6 +80,7 @@ impl RuntimeLeaseHost {
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
             legacy_manager_bridge: OnceLock::new(),
+            lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
 
@@ -110,6 +119,31 @@ impl RuntimeLeaseHost {
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
         self.0.legacy_manager_bridge.get().cloned()
+    }
+
+    pub(crate) async fn attach_session(&self, session_id: &str) {
+        if !self.is_pooled() {
+            return;
+        }
+        let mut lifecycle = self.0.lifecycle.lock().await;
+        lifecycle.attached_sessions.insert(session_id.to_string());
+    }
+
+    pub(crate) async fn detach_session(&self, session_id: &str) -> anyhow::Result<()> {
+        if !self.is_pooled() {
+            return Ok(());
+        }
+        let mut lifecycle = self.0.lifecycle.lock().await;
+        if !lifecycle.attached_sessions.remove(session_id)
+            || !lifecycle.attached_sessions.is_empty()
+        {
+            return Ok(());
+        }
+        if let Some(manager) = self.legacy_manager_bridge() {
+            let mut manager = manager.lock().await;
+            manager.release_for_shutdown().await?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]

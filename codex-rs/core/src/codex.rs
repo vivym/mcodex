@@ -2203,6 +2203,9 @@ impl Session {
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
         });
+        sess.services
+            .attach_runtime_lease_session(&sess.conversation_id.to_string())
+            .await;
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
             *guard = Arc::downgrade(&sess);
@@ -4974,12 +4977,12 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     // Also drain cached guardian state if the submission loop exits because
     // the channel closed without receiving an explicit shutdown op.
     sess.guardian_review_session.shutdown().await;
-    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-        let mut account_pool_manager = account_pool_manager.lock().await;
-        if let Err(err) = account_pool_manager.release_for_shutdown().await {
-            warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
-        }
-        sess.services.lease_auth.clear();
+    if let Err(err) = sess
+        .services
+        .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+        .await
+    {
+        warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
     }
     debug!("Agent loop exited");
 }
@@ -5925,12 +5928,12 @@ mod handlers {
             .unified_exec_manager
             .terminate_all_processes()
             .await;
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            if let Err(err) = account_pool_manager.release_for_shutdown().await {
-                warn!("failed to release account-pool lease during shutdown: {err:#}");
-            }
-            sess.services.lease_auth.clear();
+        if let Err(err) = sess
+            .services
+            .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+            .await
+        {
+            warn!("failed to release account-pool lease during shutdown: {err:#}");
         }
         sess.guardian_review_session.shutdown().await;
         info!("Shutting down Codex instance");
@@ -6244,12 +6247,11 @@ pub(crate) async fn start_account_pool_lease_heartbeat(
     if !lease_selected_for_turn {
         return None;
     }
-    let account_pool_manager = sess.services.account_pool_manager.as_ref()?;
+    let account_pool_manager = sess.services.account_pool_manager_for_turn()?;
     let heartbeat_interval = {
         let account_pool_manager = account_pool_manager.lock().await;
         account_pool_manager.heartbeat_interval()
     };
-    let account_pool_manager = Arc::clone(account_pool_manager);
     let heartbeat_cancellation_token = cancellation_token.child_token();
     let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
     let task = tokio::spawn(async move {
