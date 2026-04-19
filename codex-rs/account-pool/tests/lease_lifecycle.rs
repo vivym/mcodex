@@ -13,6 +13,7 @@ use codex_account_pool::LegacyAuthBootstrap;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::NoLegacyAuthBootstrap;
 use codex_account_pool::ProbeOutcome;
+use codex_account_pool::ProbeReservation;
 use codex_account_pool::RateLimitSnapshot;
 use codex_account_pool::RegisteredAccountRegistration;
 use codex_account_pool::SelectionAction;
@@ -560,6 +561,51 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
+    async fn preferred_lease_acquisition_uses_requested_family_instead_of_backend_family_fallback()
+    {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("write blocked codex fallback quota");
+        harness
+            .write_quota("acct-a", "chatgpt", healthy_primary(5.0))
+            .await
+            .expect("write requested-family healthy quota");
+        harness
+            .write_quota("acct-b", "chatgpt", healthy_primary(42.0))
+            .await
+            .expect("write worse requested-family quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let request = runtime_selection_request().with_selection_family("chatgpt");
+        let (selection_family, plan) = backend
+            .plan_runtime_selection(&request, "test-holder")
+            .await
+            .expect("plan requested-family selection");
+
+        assert_eq!(selection_family, "chatgpt");
+        assert_eq!(
+            plan.terminal_action,
+            SelectionAction::Select("acct-a".to_string())
+        );
+
+        let lease = backend
+            .acquire_preferred_lease(
+                "legacy-default",
+                "acct-a",
+                selection_family.as_str(),
+                "test-holder",
+            )
+            .await
+            .expect("acquire preferred lease for requested-family winner");
+
+        assert_eq!(lease.account_id(), "acct-a");
+    }
+
+    #[tokio::test]
     async fn runtime_selection_ignores_legacy_registry_health_flag() {
         let harness = quota_fixture_with_three_accounts().await;
         harness
@@ -600,10 +646,11 @@ mod lease_lifecycle {
         );
         let now = Utc::now();
 
-        let reserved = backend
+        let reservation = backend
             .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
             .await
-            .expect("reserve fallback probe");
+            .expect("reserve fallback probe")
+            .expect("probe reservation should succeed");
 
         let codex_quota = harness
             .runtime
@@ -611,7 +658,8 @@ mod lease_lifecycle {
             .await
             .expect("read codex quota")
             .expect("codex quota should exist");
-        assert_eq!(reserved, true);
+        assert_eq!(reservation.limit_id, "codex");
+        assert_eq!(reservation.reserved_until, now + Duration::seconds(30));
         assert_eq!(
             harness
                 .runtime
@@ -629,20 +677,60 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
-    async fn probe_refresh_ambiguous_updates_codex_fallback_when_requested_family_row_is_absent() {
+    async fn probe_acquire_uses_reserved_codex_fallback_when_requested_family_row_appears_later() {
         let harness = quota_fixture_with_three_accounts().await;
-        let backend = LocalAccountPoolBackend::new(
-            harness.runtime.clone(),
-            default_config().lease_ttl_duration(),
-        );
-        let lease = backend
-            .acquire_preferred_lease("legacy-default", "acct-a", "probe-holder")
-            .await
-            .expect("acquire probe lease");
         harness
             .write_quota("acct-a", "codex", exhausted_primary())
             .await
             .expect("write codex fallback quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let now = Utc::now();
+        let reservation = backend
+            .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
+            .await
+            .expect("reserve fallback probe")
+            .expect("probe reservation should succeed");
+        harness
+            .write_quota("acct-a", "chatgpt", exhausted_primary())
+            .await
+            .expect("write requested-family quota after reservation");
+
+        let lease = backend
+            .acquire_probe_lease("legacy-default", "acct-a", &reservation, "probe-holder")
+            .await
+            .expect("acquire probe lease through reserved fallback row");
+
+        assert_eq!(lease.account_id(), "acct-a");
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_uses_reserved_codex_fallback_when_requested_family_row_appears_later() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("write codex fallback quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let now = Utc::now();
+        let reservation = backend
+            .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
+            .await
+            .expect("reserve fallback probe")
+            .expect("probe reservation should succeed");
+        harness
+            .write_quota("acct-a", "chatgpt", exhausted_primary())
+            .await
+            .expect("write requested-family quota after reservation");
+        let lease = backend
+            .acquire_probe_lease("legacy-default", "acct-a", &reservation, "probe-holder")
+            .await
+            .expect("acquire probe lease through reserved fallback row");
         let auth_home = harness
             .runtime
             .codex_home()
@@ -651,7 +739,107 @@ mod lease_lifecycle {
         fs::remove_file(auth_home.join("lease_epoch")).expect("remove lease epoch marker");
 
         let outcome = backend
-            .refresh_quota_probe(&lease, "chatgpt")
+            .refresh_quota_probe(&lease, &reservation)
+            .await
+            .expect("refresh reserved fallback quota probe");
+
+        let codex_quota = harness
+            .runtime
+            .read_account_quota_state("acct-a", "codex")
+            .await
+            .expect("read codex quota")
+            .expect("codex quota should exist");
+        let chatgpt_quota = harness
+            .runtime
+            .read_account_quota_state("acct-a", "chatgpt")
+            .await
+            .expect("read requested-family quota")
+            .expect("requested-family quota should exist");
+        assert_eq!(outcome, Some(ProbeOutcome::Ambiguous));
+        assert_eq!(
+            codex_quota.last_probe_result,
+            Some(QuotaProbeResult::Ambiguous)
+        );
+        assert_eq!(chatgpt_quota.last_probe_result, None);
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_ignores_reserved_codex_fallback_after_row_is_replaced() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("write codex fallback quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let now = Utc::now();
+        let reservation = backend
+            .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
+            .await
+            .expect("reserve fallback probe")
+            .expect("probe reservation should succeed");
+        let lease = backend
+            .acquire_probe_lease("legacy-default", "acct-a", &reservation, "probe-holder")
+            .await
+            .expect("acquire probe lease through reserved fallback row");
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("replace reserved codex quota");
+        let auth_home = harness
+            .runtime
+            .codex_home()
+            .join(".pooled-auth/backends/local/accounts")
+            .join(normalized_backend_account_handle("acct-a"));
+        fs::remove_file(auth_home.join("lease_epoch")).expect("remove lease epoch marker");
+
+        let outcome = backend
+            .refresh_quota_probe(&lease, &reservation)
+            .await
+            .expect("ignore stale fallback quota probe");
+
+        let codex_quota = harness
+            .runtime
+            .read_account_quota_state("acct-a", "codex")
+            .await
+            .expect("read codex quota")
+            .expect("codex quota should exist");
+        assert_eq!(outcome, None);
+        assert_eq!(codex_quota.last_probe_result, None);
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_ambiguous_updates_codex_fallback_when_requested_family_row_is_absent() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("write codex fallback quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let now = Utc::now();
+        let reservation = backend
+            .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
+            .await
+            .expect("reserve fallback probe")
+            .expect("probe reservation should succeed");
+        let lease = backend
+            .acquire_probe_lease("legacy-default", "acct-a", &reservation, "probe-holder")
+            .await
+            .expect("acquire probe lease");
+        let auth_home = harness
+            .runtime
+            .codex_home()
+            .join(".pooled-auth/backends/local/accounts")
+            .join(normalized_backend_account_handle("acct-a"));
+        fs::remove_file(auth_home.join("lease_epoch")).expect("remove lease epoch marker");
+
+        let outcome = backend
+            .refresh_quota_probe(&lease, &reservation)
             .await
             .expect("refresh fallback quota probe");
 
@@ -1971,6 +2159,7 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
         &self,
         pool_id: &str,
         account_id: &str,
+        _selection_family: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let _ = pool_id;
@@ -2007,11 +2196,10 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
         &self,
         pool_id: &str,
         account_id: &str,
-        selection_family: &str,
-        reserved_until: chrono::DateTime<Utc>,
+        reservation: &ProbeReservation,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
-        let _ = (account_id, selection_family, reserved_until);
+        let _ = (account_id, reservation);
         {
             let mut state = self.state.lock().expect("lock probe state");
             state.probe_acquire_called = true;
@@ -2022,16 +2210,20 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
     async fn reserve_quota_probe(
         &self,
         _account_id: &str,
-        _selection_family: &str,
+        selection_family: &str,
         now: chrono::DateTime<Utc>,
         reserved_for: Duration,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<ProbeReservation>> {
         let mut state = self.state.lock().expect("lock probe state");
         if state.probe_reserved_until.is_some() {
-            return Ok(false);
+            return Ok(None);
         }
-        state.probe_reserved_until = Some(now + reserved_for);
-        Ok(true)
+        let reserved_until = now + reserved_for;
+        state.probe_reserved_until = Some(reserved_until);
+        Ok(Some(ProbeReservation {
+            limit_id: selection_family.to_string(),
+            reserved_until,
+        }))
     }
 
     async fn renew_lease(
@@ -2115,7 +2307,7 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
     async fn refresh_quota_probe(
         &self,
         _lease: &LeaseGrant,
-        _selection_family: &str,
+        _reservation: &ProbeReservation,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         let mut state = self.state.lock().expect("lock probe state");
         state.refresh_called = true;

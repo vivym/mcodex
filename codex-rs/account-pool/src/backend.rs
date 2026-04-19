@@ -54,6 +54,18 @@ pub trait AccountPoolBackend {
     fn accounts(&self) -> &[AccountRecord];
 }
 
+/// Exact quota-row reservation granted for a verification probe.
+///
+/// The reservation captures the concrete `limit_id` row whose
+/// `next_probe_after` compare-and-set succeeded, so later probe lease
+/// acquisition can bind to that same row without re-resolving selection-family
+/// fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReservation {
+    pub limit_id: String,
+    pub reserved_until: DateTime<Utc>,
+}
+
 /// Runtime state backend for local lease lifecycle operations.
 #[async_trait]
 pub trait AccountPoolExecutionBackend: Send + Sync {
@@ -99,9 +111,11 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         &self,
         pool_id: &str,
         account_id: &str,
+        selection_family: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let _ = account_id;
+        let _ = selection_family;
         self.acquire_lease(pool_id, holder_instance_id).await
     }
 
@@ -115,14 +129,16 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         &self,
         pool_id: &str,
         account_id: &str,
-        selection_family: &str,
-        reserved_until: DateTime<Utc>,
+        reservation: &ProbeReservation,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
-        let _ = selection_family;
-        let _ = reserved_until;
-        self.acquire_preferred_lease(pool_id, account_id, holder_instance_id)
-            .await
+        self.acquire_preferred_lease(
+            pool_id,
+            account_id,
+            reservation.limit_id.as_str(),
+            holder_instance_id,
+        )
+        .await
     }
 
     /// Reserve the probe slot for a blocked candidate by advancing `next_probe_after`.
@@ -132,8 +148,8 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         _selection_family: &str,
         _now: DateTime<Utc>,
         _reserved_for: Duration,
-    ) -> anyhow::Result<bool> {
-        Ok(false)
+    ) -> anyhow::Result<Option<ProbeReservation>> {
+        Ok(None)
     }
 
     /// Renew the lease if it is still active.
@@ -168,7 +184,7 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
     async fn refresh_quota_probe(
         &self,
         _lease: &LeaseGrant,
-        _selection_family: &str,
+        _reservation: &ProbeReservation,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         Ok(None)
     }

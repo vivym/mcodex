@@ -29,6 +29,28 @@ impl AccountQuotaStateRecord {
     }
 }
 
+/// Probe write guard tying a quota probe observation to the reservation it verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountQuotaProbeObservation {
+    pub observed_at: DateTime<Utc>,
+    pub reserved_until: DateTime<Utc>,
+}
+
+/// Backoff fields recorded when a quota probe cannot prove recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountQuotaProbeBackoff {
+    pub predicted_blocked_until: DateTime<Utc>,
+    pub next_probe_after: DateTime<Utc>,
+}
+
+/// Probe result fields recorded when the quota window is still exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountQuotaProbeStillBlocked {
+    pub exhausted_windows: QuotaExhaustedWindows,
+    pub predicted_blocked_until: Option<DateTime<Utc>>,
+    pub next_probe_after: DateTime<Utc>,
+}
+
 /// Latest known exhausted quota windows for one family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaExhaustedWindows {

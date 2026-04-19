@@ -3,6 +3,9 @@ use chrono::Duration;
 use chrono::Utc;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
+use codex_state::AccountQuotaProbeBackoff;
+use codex_state::AccountQuotaProbeObservation;
+use codex_state::AccountQuotaProbeStillBlocked;
 use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountRegistryEntryUpdate;
 use codex_state::QuotaExhaustedWindows;
@@ -99,7 +102,8 @@ async fn account_pool_quota_selection_family_row_wins_before_codex_fallback_and_
         .write_quota_observation(
             quota_row("acct-a", "chatgpt")
                 .with_primary_used(88.0)
-                .with_exhausted_windows(QuotaExhaustedWindows::Unknown),
+                .with_exhausted_windows(QuotaExhaustedWindows::Unknown)
+                .with_next_probe_after(now),
         )
         .await
         .expect("write chatgpt quota");
@@ -122,9 +126,14 @@ async fn account_pool_quota_selection_family_row_wins_before_codex_fallback_and_
         .record_probe_ambiguous(
             "acct-a",
             "chatgpt",
-            now,
-            now + Duration::minutes(10),
-            now + Duration::minutes(10),
+            AccountQuotaProbeObservation {
+                observed_at: now,
+                reserved_until: now,
+            },
+            AccountQuotaProbeBackoff {
+                predicted_blocked_until: now + Duration::minutes(10),
+                next_probe_after: now + Duration::minutes(10),
+            },
         )
         .await
         .expect("record ambiguous probe");
@@ -206,6 +215,10 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
     let harness = AccountPoolQuotaHarness::new().await;
     let stale_probe_observed_at = timestamp(5_000);
     let fresh_observed_at = stale_probe_observed_at + Duration::minutes(5);
+    let stale_observation = AccountQuotaProbeObservation {
+        observed_at: stale_probe_observed_at,
+        reserved_until: stale_probe_observed_at + Duration::minutes(15),
+    };
     for account_id in ["acct-success", "acct-still-blocked", "acct-ambiguous"] {
         harness
             .write_quota_observation(
@@ -230,7 +243,7 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
 
     assert!(
         !harness
-            .record_probe_success("acct-success", "codex", stale_probe_observed_at)
+            .record_probe_success("acct-success", "codex", stale_observation,)
             .await
             .expect("record stale probe success")
     );
@@ -239,10 +252,12 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
             .record_probe_still_blocked(
                 "acct-still-blocked",
                 "codex",
-                stale_probe_observed_at,
-                QuotaExhaustedWindows::Secondary,
-                Some(stale_probe_observed_at + Duration::hours(1)),
-                stale_probe_observed_at + Duration::minutes(15),
+                stale_observation,
+                AccountQuotaProbeStillBlocked {
+                    exhausted_windows: QuotaExhaustedWindows::Secondary,
+                    predicted_blocked_until: Some(stale_probe_observed_at + Duration::hours(1)),
+                    next_probe_after: stale_probe_observed_at + Duration::minutes(15),
+                },
             )
             .await
             .expect("record stale still-blocked probe")
@@ -252,9 +267,11 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
             .record_probe_ambiguous(
                 "acct-ambiguous",
                 "codex",
-                stale_probe_observed_at,
-                stale_probe_observed_at + Duration::hours(1),
-                stale_probe_observed_at + Duration::minutes(15),
+                stale_observation,
+                AccountQuotaProbeBackoff {
+                    predicted_blocked_until: stale_probe_observed_at + Duration::hours(1),
+                    next_probe_after: stale_probe_observed_at + Duration::minutes(15),
+                },
             )
             .await
             .expect("record stale ambiguous probe")
@@ -277,11 +294,120 @@ async fn account_pool_quota_stale_probe_results_do_not_overwrite_fresher_observa
 }
 
 #[tokio::test]
+async fn account_pool_quota_stale_probe_success_is_rejected_after_same_row_is_rereserved() {
+    let harness = AccountPoolQuotaHarness::new().await;
+    let observed_at = timestamp(5_500);
+    let stale_observation = AccountQuotaProbeObservation {
+        observed_at,
+        reserved_until: observed_at + Duration::minutes(15),
+    };
+    let refreshed_reservation = observed_at + Duration::minutes(30);
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(observed_at)
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(observed_at + Duration::hours(1))
+                .with_next_probe_after(stale_observation.reserved_until),
+        )
+        .await
+        .expect("write initial blocked quota");
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(observed_at)
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(observed_at + Duration::hours(1))
+                .with_next_probe_after(refreshed_reservation),
+        )
+        .await
+        .expect("write reregistered reservation");
+
+    assert!(
+        !harness
+            .record_probe_success("acct-a", "codex", stale_observation)
+            .await
+            .expect("reject stale reregistered probe success")
+    );
+
+    let quota = harness
+        .read_quota_state("acct-a", "codex")
+        .await
+        .expect("read quota")
+        .expect("missing quota");
+    assert_eq!(quota.observed_at, observed_at);
+    assert_eq!(quota.exhausted_windows, QuotaExhaustedWindows::Secondary);
+    assert_eq!(quota.next_probe_after, Some(refreshed_reservation));
+    assert_eq!(quota.last_probe_result, None);
+}
+
+#[tokio::test]
+async fn account_pool_quota_stale_probe_still_blocked_is_rejected_after_same_row_is_rereserved() {
+    let harness = AccountPoolQuotaHarness::new().await;
+    let observed_at = timestamp(5_600);
+    let stale_observation = AccountQuotaProbeObservation {
+        observed_at,
+        reserved_until: observed_at + Duration::minutes(15),
+    };
+    let refreshed_reservation = observed_at + Duration::minutes(30);
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(observed_at)
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(observed_at + Duration::hours(1))
+                .with_next_probe_after(stale_observation.reserved_until),
+        )
+        .await
+        .expect("write initial blocked quota");
+    harness
+        .write_quota_observation(
+            quota_row("acct-a", "codex")
+                .with_observed_at(observed_at)
+                .with_exhausted_windows(QuotaExhaustedWindows::Secondary)
+                .with_predicted_blocked_until(observed_at + Duration::hours(1))
+                .with_next_probe_after(refreshed_reservation),
+        )
+        .await
+        .expect("write reregistered reservation");
+
+    assert!(
+        !harness
+            .record_probe_still_blocked(
+                "acct-a",
+                "codex",
+                stale_observation,
+                AccountQuotaProbeStillBlocked {
+                    exhausted_windows: QuotaExhaustedWindows::Secondary,
+                    predicted_blocked_until: Some(observed_at + Duration::hours(1)),
+                    next_probe_after: observed_at + Duration::minutes(45),
+                },
+            )
+            .await
+            .expect("reject stale reregistered still-blocked probe")
+    );
+
+    let quota = harness
+        .read_quota_state("acct-a", "codex")
+        .await
+        .expect("read quota")
+        .expect("missing quota");
+    assert_eq!(quota.observed_at, observed_at);
+    assert_eq!(quota.exhausted_windows, QuotaExhaustedWindows::Secondary);
+    assert_eq!(quota.next_probe_after, Some(refreshed_reservation));
+    assert_eq!(quota.last_probe_result, None);
+}
+
+#[tokio::test]
 async fn account_pool_quota_same_second_fresher_live_observation_beats_stale_probe() {
     let harness = AccountPoolQuotaHarness::new().await;
     let same_second = timestamp_with_nanos(6_000, 0);
     let stale_probe_observed_at = timestamp_with_nanos(6_000, 100_000_000);
     let fresh_observed_at = timestamp_with_nanos(6_000, 900_000_000);
+    let stale_observation = AccountQuotaProbeObservation {
+        observed_at: stale_probe_observed_at,
+        reserved_until: same_second + Duration::minutes(15),
+    };
     harness
         .write_quota_observation(
             quota_row("acct-a", "codex")
@@ -307,10 +433,12 @@ async fn account_pool_quota_same_second_fresher_live_observation_beats_stale_pro
             .record_probe_still_blocked(
                 "acct-a",
                 "codex",
-                stale_probe_observed_at,
-                QuotaExhaustedWindows::Secondary,
-                Some(stale_probe_observed_at + Duration::hours(1)),
-                stale_probe_observed_at + Duration::minutes(15),
+                stale_observation,
+                AccountQuotaProbeStillBlocked {
+                    exhausted_windows: QuotaExhaustedWindows::Secondary,
+                    predicted_blocked_until: Some(stale_probe_observed_at + Duration::hours(1)),
+                    next_probe_after: stale_probe_observed_at + Duration::minutes(15),
+                },
             )
             .await
             .expect("record stale same-second probe")
@@ -417,18 +545,11 @@ impl AccountPoolQuotaHarness {
         &self,
         account_id: &str,
         limit_id: &str,
-        observed_at: DateTime<Utc>,
-        predicted_blocked_until: DateTime<Utc>,
-        next_probe_after: DateTime<Utc>,
+        observation: AccountQuotaProbeObservation,
+        backoff: AccountQuotaProbeBackoff,
     ) -> anyhow::Result<bool> {
         self.runtime
-            .record_account_quota_probe_ambiguous(
-                account_id,
-                limit_id,
-                observed_at,
-                predicted_blocked_until,
-                next_probe_after,
-            )
+            .record_account_quota_probe_ambiguous(account_id, limit_id, observation, backoff)
             .await
     }
 
@@ -436,10 +557,10 @@ impl AccountPoolQuotaHarness {
         &self,
         account_id: &str,
         limit_id: &str,
-        observed_at: DateTime<Utc>,
+        observation: AccountQuotaProbeObservation,
     ) -> anyhow::Result<bool> {
         self.runtime
-            .record_account_quota_probe_success(account_id, limit_id, observed_at)
+            .record_account_quota_probe_success(account_id, limit_id, observation)
             .await
     }
 
@@ -447,20 +568,11 @@ impl AccountPoolQuotaHarness {
         &self,
         account_id: &str,
         limit_id: &str,
-        observed_at: DateTime<Utc>,
-        exhausted_windows: QuotaExhaustedWindows,
-        predicted_blocked_until: Option<DateTime<Utc>>,
-        next_probe_after: DateTime<Utc>,
+        observation: AccountQuotaProbeObservation,
+        update: AccountQuotaProbeStillBlocked,
     ) -> anyhow::Result<bool> {
         self.runtime
-            .record_account_quota_probe_still_blocked(
-                account_id,
-                limit_id,
-                observed_at,
-                exhausted_windows,
-                predicted_blocked_until,
-                next_probe_after,
-            )
+            .record_account_quota_probe_still_blocked(account_id, limit_id, observation, update)
             .await
     }
 

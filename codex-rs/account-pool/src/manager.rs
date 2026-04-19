@@ -440,6 +440,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         .acquire_preferred_lease(
                             pool_id,
                             account_id.as_str(),
+                            selection_family.as_str(),
                             &self.holder_instance_id,
                         )
                         .await
@@ -451,8 +452,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 }
                 SelectionAction::Probe(account_id) => {
                     let now = request.now.unwrap_or_else(Utc::now);
-                    let reserved_until = now + self.probe_reservation_duration();
-                    if !self
+                    let Some(reservation) = self
                         .backend
                         .reserve_quota_probe(
                             account_id.as_str(),
@@ -462,9 +462,9 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         )
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
-                    {
+                    else {
                         continue;
-                    }
+                    };
 
                     let probe_holder_instance_id = self.probe_holder_instance_id();
                     let verification_lease = match self
@@ -472,8 +472,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         .acquire_probe_lease(
                             pool_id,
                             account_id.as_str(),
-                            selection_family.as_str(),
-                            reserved_until,
+                            &reservation,
                             probe_holder_instance_id.as_str(),
                         )
                         .await
@@ -484,7 +483,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     };
                     let probe_result = self
                         .backend
-                        .refresh_quota_probe(&verification_lease, selection_family.as_str())
+                        .refresh_quota_probe(&verification_lease, &reservation)
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()));
                     let release_result = self
@@ -513,6 +512,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                             .acquire_preferred_lease(
                                 pool_id,
                                 current_account_id.as_str(),
+                                selection_family.as_str(),
                                 &self.holder_instance_id,
                             )
                             .await
@@ -551,7 +551,12 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
             match plan.terminal_action {
                 SelectionAction::Select(account_id) => match self
                     .backend
-                    .acquire_preferred_lease(pool_id, account_id.as_str(), &self.holder_instance_id)
+                    .acquire_preferred_lease(
+                        pool_id,
+                        account_id.as_str(),
+                        selection_family.as_str(),
+                        &self.holder_instance_id,
+                    )
                     .await
                 {
                     Ok(grant) => return self.adopt_active_grant(grant).await,
@@ -560,8 +565,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 },
                 SelectionAction::Probe(account_id) => {
                     let now = request.now.unwrap_or_else(Utc::now);
-                    let reserved_until = now + self.probe_reservation_duration();
-                    if !self
+                    let Some(reservation) = self
                         .backend
                         .reserve_quota_probe(
                             account_id.as_str(),
@@ -571,16 +575,15 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         )
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
-                    {
+                    else {
                         continue;
-                    }
+                    };
                     let verification_lease = match self
                         .backend
                         .acquire_probe_lease(
                             pool_id,
                             account_id.as_str(),
-                            selection_family.as_str(),
-                            reserved_until,
+                            &reservation,
                             self.probe_holder_instance_id().as_str(),
                         )
                         .await
@@ -591,7 +594,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     };
                     let probe_result = self
                         .backend
-                        .refresh_quota_probe(&verification_lease, selection_family.as_str())
+                        .refresh_quota_probe(&verification_lease, &reservation)
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()));
                     let release_result = self

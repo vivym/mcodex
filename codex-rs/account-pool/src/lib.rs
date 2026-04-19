@@ -35,6 +35,7 @@ pub use backend::AccountPoolReasonCode;
 pub use backend::AccountPoolSelection;
 pub use backend::AccountPoolSnapshot;
 pub use backend::AccountPoolSummary;
+pub use backend::ProbeReservation;
 pub use backend::RegisteredAccountRegistration;
 pub use backend::local::LocalAccountPoolBackend;
 pub use bootstrap::LegacyAuthBootstrap;

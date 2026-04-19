@@ -10,6 +10,9 @@ use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
+use codex_state::AccountQuotaProbeBackoff;
+use codex_state::AccountQuotaProbeObservation;
+use codex_state::AccountQuotaProbeStillBlocked;
 use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupSelectionState;
 use codex_state::AccountStartupStatus;
@@ -80,6 +83,7 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         &self,
         pool_id: &str,
         account_id: &str,
+        selection_family: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let lease = self
@@ -87,6 +91,7 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
             .acquire_preferred_account_lease(
                 pool_id,
                 account_id,
+                selection_family,
                 holder_instance_id,
                 self.lease_ttl,
             )
@@ -98,8 +103,7 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         &self,
         pool_id: &str,
         account_id: &str,
-        selection_family: &str,
-        reserved_until: DateTime<Utc>,
+        reservation: &crate::backend::ProbeReservation,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let lease = self
@@ -107,8 +111,8 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
             .acquire_quota_probe_account_lease(
                 pool_id,
                 account_id,
-                selection_family,
-                reserved_until,
+                reservation.limit_id.as_str(),
+                reservation.reserved_until,
                 holder_instance_id,
                 self.lease_ttl,
             )
@@ -122,49 +126,65 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         selection_family: &str,
         now: DateTime<Utc>,
         reserved_for: Duration,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<crate::backend::ProbeReservation>> {
         let Some(quota_state) = self
             .runtime
             .read_selection_quota_state(account_id, selection_family)
             .await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
+        let reserved_until = now + reserved_for;
+        let reserved_limit_id = quota_state.limit_id;
 
-        self.runtime
+        let reserved = self
+            .runtime
             .reserve_account_quota_probe(
                 account_id,
-                quota_state.limit_id.as_str(),
+                reserved_limit_id.as_str(),
                 now,
-                now + reserved_for,
+                reserved_until,
             )
-            .await
+            .await?;
+        if reserved {
+            Ok(Some(crate::backend::ProbeReservation {
+                limit_id: reserved_limit_id,
+                reserved_until,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn refresh_quota_probe(
         &self,
         lease: &LeaseGrant,
-        selection_family: &str,
+        reservation: &crate::backend::ProbeReservation,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         let observed_at = Utc::now();
         let quota_state = self
             .runtime
-            .read_selection_quota_state(lease.account_id(), selection_family)
+            .read_account_quota_state(lease.account_id(), reservation.limit_id.as_str())
             .await?;
         if lease.auth_session.ensure_current().is_err() {
             if let Some(quota_state) = quota_state {
                 let backoff_until = observed_at + Duration::seconds(30);
-                let _ = self
+                let recorded = self
                     .runtime
                     .record_account_quota_probe_ambiguous(
                         lease.account_id(),
                         quota_state.limit_id.as_str(),
-                        observed_at,
-                        backoff_until,
-                        backoff_until,
+                        AccountQuotaProbeObservation {
+                            observed_at,
+                            reserved_until: reservation.reserved_until,
+                        },
+                        AccountQuotaProbeBackoff {
+                            predicted_blocked_until: backoff_until,
+                            next_probe_after: backoff_until,
+                        },
                     )
                     .await?;
-                return Ok(Some(ProbeOutcome::Ambiguous));
+                return Ok(recorded.then_some(ProbeOutcome::Ambiguous));
             }
             return Ok(None);
         };
@@ -173,8 +193,13 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
             return Ok(None);
         };
 
-        self.record_probe_refresh(lease.account_id(), quota_state, observed_at)
-            .await
+        self.record_probe_refresh(
+            lease.account_id(),
+            quota_state,
+            observed_at,
+            reservation.reserved_until,
+        )
+        .await
     }
 
     async fn renew_lease(
@@ -280,32 +305,41 @@ impl LocalAccountPoolBackend {
         account_id: &str,
         quota_state: AccountQuotaStateRecord,
         observed_at: DateTime<Utc>,
+        reserved_until: DateTime<Utc>,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         if !quota_state.exhausted_windows.is_exhausted() {
-            let _ = self
+            let recorded = self
                 .runtime
                 .record_account_quota_probe_success(
                     account_id,
                     quota_state.limit_id.as_str(),
-                    observed_at,
+                    AccountQuotaProbeObservation {
+                        observed_at,
+                        reserved_until,
+                    },
                 )
                 .await?;
-            return Ok(Some(ProbeOutcome::Success));
+            return Ok(recorded.then_some(ProbeOutcome::Success));
         }
 
         let next_probe_after = observed_at + Duration::seconds(30);
-        let _ = self
+        let recorded = self
             .runtime
             .record_account_quota_probe_still_blocked(
                 account_id,
                 quota_state.limit_id.as_str(),
-                observed_at,
-                quota_state.exhausted_windows,
-                quota_state.predicted_blocked_until,
-                next_probe_after,
+                AccountQuotaProbeObservation {
+                    observed_at,
+                    reserved_until,
+                },
+                AccountQuotaProbeStillBlocked {
+                    exhausted_windows: quota_state.exhausted_windows,
+                    predicted_blocked_until: quota_state.predicted_blocked_until,
+                    next_probe_after,
+                },
             )
             .await?;
-        Ok(Some(ProbeOutcome::StillBlocked))
+        Ok(recorded.then_some(ProbeOutcome::StillBlocked))
     }
 }
 
