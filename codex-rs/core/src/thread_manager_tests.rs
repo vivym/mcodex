@@ -3,6 +3,8 @@ use crate::codex::make_session_and_context;
 use crate::config::test_config;
 use crate::rollout::RolloutRecorder;
 use crate::tasks::interrupted_turn_history_marker;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::models::ContentItem;
@@ -271,6 +273,98 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     assert!(report.submit_failed.is_empty());
     assert!(report.timed_out.is_empty());
     assert!(manager.list_thread_ids().await.is_empty());
+}
+
+#[tokio::test]
+async fn thread_spawn_child_inherits_parent_runtime_lease_host() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let root_runtime_lease_host = root
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host")
+        .clone();
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            manager.agent_control(),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn thread child");
+    let child_runtime_lease_host = child
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&root_runtime_lease_host));
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .account_pool_manager
+            .is_none()
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
 }
 
 #[tokio::test]
