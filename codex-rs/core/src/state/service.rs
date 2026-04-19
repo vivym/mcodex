@@ -146,7 +146,12 @@ impl SessionServices {
 mod tests {
     use super::*;
     use codex_config::types::AccountPoolDefinitionToml;
+    use codex_state::AccountQuotaStateRecord;
+    use codex_state::AccountRegistryEntryUpdate;
+    use codex_state::AccountStartupSelectionUpdate;
     use codex_state::LegacyAccountImport;
+    use codex_state::QuotaExhaustedWindows;
+    use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -209,6 +214,93 @@ mod tests {
         .await?;
 
         assert!(manager.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_reports_unhealthy_startup_preferred_account() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-preferred".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        state_db
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-preferred".to_string()),
+                suppressed: false,
+            })
+            .await?;
+        let now = Utc::now();
+        state_db
+            .upsert_account_quota_state(AccountQuotaStateRecord {
+                account_id: "acct-preferred".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(now + Duration::seconds(60)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: now,
+                exhausted_windows: QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(now + Duration::seconds(60)),
+                next_probe_after: Some(now + Duration::seconds(30)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await?;
+
+        let mut manager = AccountPoolManager::new(
+            state_db,
+            AccountsConfigToml {
+                backend: None,
+                default_pool: Some("pool-main".to_string()),
+                proactive_switch_threshold_percent: None,
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: None,
+            },
+            home.path().to_path_buf(),
+            "holder-startup-preferred".to_string(),
+        );
+
+        let selection = manager.prepare_turn().await?;
+
+        assert!(selection.is_none());
+        assert_eq!(
+            manager.snapshot_seed().snapshot().await,
+            AccountLeaseRuntimeSnapshot {
+                active: false,
+                suppressed: false,
+                account_id: None,
+                pool_id: None,
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: None,
+                health_state: None,
+                switch_reason: None,
+                suppression_reason: Some(AccountLeaseRuntimeReason::PreferredAccountUnhealthy),
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+            }
+        );
         Ok(())
     }
 }
@@ -432,6 +524,7 @@ impl AccountPoolManager {
                             .acquire_preferred_account_lease(
                                 &pool_id,
                                 account_id,
+                                "codex",
                                 &self.holder_instance_id,
                                 self.lease_ttl,
                             )
