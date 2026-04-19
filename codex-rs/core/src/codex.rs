@@ -2203,9 +2203,6 @@ impl Session {
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
         });
-        sess.services
-            .attach_runtime_lease_session(&sess.conversation_id.to_string())
-            .await;
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
             *guard = Arc::downgrade(&sess);
@@ -2341,6 +2338,9 @@ impl Session {
             Arc::clone(&config),
             &session_configuration.session_source,
         );
+        sess.services
+            .attach_runtime_lease_session(&sess.conversation_id.to_string())
+            .await;
 
         Ok(sess)
     }

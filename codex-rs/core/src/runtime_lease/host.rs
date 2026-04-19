@@ -177,4 +177,9 @@ impl RuntimeLeaseHost {
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
         self.legacy_manager_bridge()
     }
+
+    #[cfg(test)]
+    pub(crate) async fn attached_session_count_for_test(&self) -> usize {
+        self.0.lifecycle.lock().await.attached_sessions.len()
+    }
 }

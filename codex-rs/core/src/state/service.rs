@@ -162,7 +162,9 @@ impl SessionServices {
             None,
         )
         .await?;
-        if !shared_status.pooled_applicable {
+        // Mirror local manager ownership so top-level sessions keep one runtime
+        // control plane even when pooled mode can only activate after startup.
+        if accounts.is_none() && !shared_status.pooled_applicable {
             return Ok(None);
         }
         Ok(Some(crate::runtime_lease::RuntimeLeaseHost::pooled(
@@ -296,7 +298,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_root_runtime_lease_host_skips_config_only_pool() -> anyhow::Result<()> {
+    async fn build_root_runtime_lease_host_keeps_local_accounts_config_available_without_immediate_pool()
+    -> anyhow::Result<()> {
         let home = TempDir::new()?;
         let state_db =
             codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
@@ -326,7 +329,7 @@ mod tests {
         )
         .await?;
 
-        assert!(runtime_lease_host.is_none());
+        assert!(runtime_lease_host.is_some());
         Ok(())
     }
 
