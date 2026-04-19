@@ -9,5 +9,7 @@ mod host;
 mod tests;
 
 pub(crate) use host::RuntimeLeaseHost;
-#[cfg(test)]
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use host::RuntimeLeaseHostId;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use host::RuntimeLeaseHostMode;

@@ -1,6 +1,6 @@
-use super::host::RuntimeLeaseHost;
-use super::host::RuntimeLeaseHostId;
-use super::host::RuntimeLeaseHostMode;
+use super::RuntimeLeaseHost;
+use super::RuntimeLeaseHostId;
+use super::RuntimeLeaseHostMode;
 use pretty_assertions::assert_eq;
 
 #[test]
