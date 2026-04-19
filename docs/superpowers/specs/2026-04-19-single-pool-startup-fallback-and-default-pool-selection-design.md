@@ -198,6 +198,12 @@ projections, such as existing `switchReason` and `healthState` fields. When a
 valid effective pool exists, those outcomes do not change
 `startup_availability`; it remains `available` or `suppressed`.
 
+Suppression is an overlay on startup availability, not a replacement for
+account-level eligibility. When `startup_availability = suppressed` and a
+valid effective pool exists, the resolver should still publish the underlying
+account-selection outcome for that pool rather than replacing
+`selection_eligibility` with a synthetic `suppressed` value.
+
 ### 2. Effective-pool precedence
 
 The effective-pool precedence should become:
@@ -494,16 +500,26 @@ registration into an otherwise empty pool inventory:
   may also use that configured pool as a creation target even when it is not
   yet visible; this is a mutation-time convenience, not evidence that startup
   should treat the pool as valid before membership exists
-- plain `import-legacy` without `--pool` follows the same bootstrap rule using
-  `legacy-default` as the target pool id
+- plain `import-legacy` without `--pool` should resolve its target pool in
+  this order:
+  1. `accounts.default_pool`, if configured
+  2. persisted `default_pool_id`, if present
+  3. the currently resolved effective pool, if startup resolution already
+     yields one
+  4. `legacy-default`, but only when the visible pool inventory before the
+     command is empty
+  5. otherwise fail and require `--pool`
+- using configured or persisted defaults as implicit `import-legacy` targets
+  is a mutation-time repair path even when those pools are not yet visible in
+  startup inventory
 - `accounts add --account-pool <POOL_ID>` may persist `default_pool_id` only
   after successful registration, and only when no configured default exists,
   no persisted default exists, and the visible pool inventory before the
   command is empty
 - `import-legacy --pool <POOL_ID>` follows the same post-success persistence
   rule
-- plain `import-legacy` follows that same post-success persistence rule for
-  `legacy-default`
+- plain `import-legacy` follows that same post-success persistence rule only
+  in the empty-inventory bootstrap case where it selected `legacy-default`
 - when that first-default bootstrap occurs, registration/import also writes
   `preferred_account_id = None` and `suppressed = false`
 - registering into a second or later visible pool does not auto-persist or
@@ -603,15 +619,17 @@ the user to pick the right pool. That context must come from the backend
 startup inventory and, for remote clients, from protocol fields described
 below. It does not need to implement an interactive pool picker in this slice.
 
-In remote mode, this slice does not require the TUI itself to implement an
-inline pool picker. The blocker must still be actionable through app-server
-mutation methods defined below, but the first slice may surface guidance
-instead of in-TUI selection.
+In remote mode, this slice does not require the built-in TUI itself to
+implement an inline pool picker. The blocker remains actionable through the
+app-server mutation methods defined below, but wiring those actions into the
+first-party TUI is explicitly out of scope for this slice.
 
 For the built-in TUI specifically, the first slice is read-only for default
 blocker resolution. The notice may present pool ids and guidance, but it does
-not need to invoke `accountPool/default/set|clear` directly. Other app-server
-clients may use those RPCs immediately.
+not invoke `accountPool/default/set|clear` directly. First-party remote TUI
+users therefore still need an out-of-band CLI or another app-server client to
+resolve the blocker in this slice. The new RPCs are added now so later remote
+UX can become interactive without reopening the protocol contract.
 
 Invalid explicit defaults should use the same blocking notice shell with
 source-specific copy:
@@ -745,9 +763,10 @@ the backend inventory is non-empty; only truly empty inventory may project
 `candidatePools = null`.
 
 `selectionEligibility` should use the existing fresh-runtime selection codes,
-including:
+excluding the legacy synthetic `suppressed` placeholder, because suppression is
+represented separately by `startupAvailability` and `suppressionReason`. The
+selection-eligibility codes remain:
 
-- `suppressed`
 - `missingPool`
 - `preferredAccountSelected`
 - `automaticAccountSelected`
@@ -766,19 +785,20 @@ Compatibility projection rules for blocked startup states:
   `selectionEligibility = missingPool`
 - `startupAvailability = unavailable` maps to
   `selectionEligibility = missingPool`
-- `startupAvailability = suppressed` maps to
-  `selectionEligibility = suppressed`
+- `startupAvailability = suppressed` preserves the underlying resolved-pool
+  selection-eligibility code
 - all other eligibility codes are produced only when `effectivePoolId` is
   non-null
 
-Legacy compatibility projection from the startup snapshot should remain fixed:
+When no live lease is active, legacy compatibility projection from the startup
+snapshot should remain fixed:
 
 | Startup state | `poolId` | `accountId` | `switchReason` | `suppressionReason` | `healthState` |
 | --- | --- | --- | --- | --- | --- |
 | `multiplePoolsRequireDefault` | `null` | `null` | `missingPool` | `null` | `null` |
 | `invalidExplicitDefault` | `null` | `null` | `missingPool` | `null` | `null` |
 | `unavailable` | `null` | `null` | `missingPool` | `null` | `null` |
-| `suppressed` with valid pool | resolved pool id | `null` | `null` | `durablySuppressed` | `null` |
+| `suppressed` with valid pool | resolved pool id | `null` | existing selection code | `durablySuppressed` | existing projected health state |
 | `available` with non-null predicted account | resolved pool id | predicted account id | existing selection code | `null` | existing projected health state |
 | `available` with no predicted account | resolved pool id | `null` | existing selection code | `null` | existing projected health state |
 
@@ -787,6 +807,13 @@ Legacy top-level `AccountLeaseReadResponse` fields such as `poolId`,
 new clients should treat `startup` as the authoritative startup-resolution
 object. `AccountLeaseUpdatedNotification` should carry the same `startup`
 snapshot, not a partial subset.
+
+When a live lease is already active, those legacy top-level fields continue to
+describe the live lease and are not recomputed from the startup snapshot after
+`accountPool/default/set|clear`. In that state the nested `startup` object is
+authoritative for future startup/default resolution, while top-level
+`poolId`, `accountId`, `leaseId`, and related lease fields continue to follow
+existing runtime transitions until the live lease itself changes.
 
 #### App-server v2 mutation methods
 
@@ -804,13 +831,29 @@ Recommended RPC shapes:
 - `accountPool/default/set` params: `{ poolId: string }`
 - `accountPool/default/clear` params: `undefined`
 - both responses: empty response objects
-- both methods emit `accountLease/updated` with the full updated
+- state-changing calls emit `accountLease/updated` with the full updated
   `AccountStartupSnapshot`
+
+These RPCs are remote entry points for the exact same durable-default mutation
+semantics defined above for the CLI commands, except for CLI-only parsing
+constraints such as rejecting top-level `--account-pool`. In particular they
+must reuse the same validation and state-transition rules for:
+
+- visible-pool validation on `default set`
+- same-pool `set` clearing `preferred_account_id` when the state-backed
+  default source is active
+- config-controlled `set` preserving the active preferred account
+- idempotent `clear`
+- suppression preservation and post-mutation startup snapshots
 
 These methods update only durable startup-selection state. They must not
 retarget or interrupt an already active pooled lease. The nested `startup`
 snapshot may change immediately, while live top-level lease/account fields
 continue to follow existing runtime transitions.
+
+`accountLease/updated` notifications are required when the resulting
+observable `startup` snapshot or live lease fields change. Successful no-op
+mutations may return an empty response without emitting a notification.
 
 #### `accounts status`
 
@@ -889,6 +932,8 @@ Add focused tests for:
   `invalidExplicitDefault`
 - preferred-account blocker states preserve `startupAvailability = available`
   while changing `selectionEligibility`
+- suppressed startup preserves the underlying resolved-pool
+  `selectionEligibility` instead of replacing it with `suppressed`
 
 ### Backend contract tests
 
@@ -921,6 +966,10 @@ Add focused tests for:
   pre-command visible inventory is empty
 - registration bootstrap allowing a non-visible creation target for explicit
   `--account-pool` and implicit configured-default repair paths
+- plain `import-legacy` without `--pool` using configured default, persisted
+  default, resolved effective pool, or empty-inventory `legacy-default` in
+  that order, and requiring `--pool` once multiple visible pools exist with no
+  default
 - registration into a second visible pool not auto-persisting or auto-switching
   the default
 - same-pool `default set` with an existing preferred account clearing the
@@ -943,6 +992,8 @@ Add focused tests proving actual turn-time behavior, not only status output:
 - suppressed single-pool fallback does not acquire a lease until resumed
 - preferred-account blocker states remain account-level eligibility outcomes,
   not startup-availability blockers
+- active-lease `accountPool/default/set|clear` updating nested `startup`
+  without retargeting legacy top-level live lease fields
 
 ### TUI tests
 
@@ -972,8 +1023,10 @@ Add protocol and server coverage for:
 - remote startup responses that represent single-pool fallback and
   multi-pool-without-default distinctly
 - notification conversion preserving full startup snapshot parity with reads
-- `accountPool/default/set|clear` mutation methods emitting updated
-  `accountLease/updated` notifications
+- state-changing `accountPool/default/set|clear` mutation methods emitting
+  updated `accountLease/updated` notifications
+- `accountPool/default/set|clear` reusing the CLI default-mutation matrix and
+  skipping notifications for successful no-op mutations
 - `accountLease/resume` remaining behaviorally identical to CLI
   `accounts resume`
 - schema regeneration with `just write-app-server-schema`, plus
