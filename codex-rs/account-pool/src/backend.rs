@@ -35,6 +35,7 @@ pub use crate::observability::AccountPoolReasonCode;
 pub use crate::observability::AccountPoolSelection;
 pub use crate::observability::AccountPoolSnapshot;
 pub use crate::observability::AccountPoolSummary;
+use crate::quota::ProbeOutcome;
 
 /// Read-only account source used by the startup selection policy.
 ///
@@ -42,6 +43,11 @@ pub use crate::observability::AccountPoolSummary;
 /// selection so `select_startup_account` can make a deterministic choice.
 pub trait AccountPoolBackend {
     /// Returns the accounts available to the selector in stable priority order.
+    ///
+    /// Callers are expected to populate `AccountRecord::quota.selection` with the
+    /// requested selection-family row when present, and `quota.codex_fallback`
+    /// with the compatibility fallback row when that family differs from
+    /// `codex`.
     fn accounts(&self) -> &[AccountRecord];
 }
 
@@ -93,6 +99,15 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         &self,
         configured_default_pool_id: Option<&str>,
     ) -> anyhow::Result<AccountStartupStatus>;
+
+    /// Refresh quota state for a probe lease without consuming the next user turn.
+    async fn refresh_quota_probe(
+        &self,
+        _account_id: &str,
+        _selection_family: &str,
+    ) -> anyhow::Result<Option<ProbeOutcome>> {
+        Ok(None)
+    }
 }
 
 /// Control-plane backend for pooled account registration and deletion.

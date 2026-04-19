@@ -3,6 +3,7 @@ use codex_account_pool::AccountPoolBackend;
 use codex_account_pool::AccountRecord;
 use codex_account_pool::ContextReuseDecision;
 use codex_account_pool::ContextReuseRequest;
+use codex_account_pool::QuotaFamilyView;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::evaluate_context_reuse;
 use codex_account_pool::select_startup_account;
@@ -19,7 +20,7 @@ fn policy_default_selection_prefers_healthy_account_and_rejects_mixed_kind_auto_
 }
 
 #[test]
-fn context_reuse_requires_consent_and_portable_transport() {
+fn policy_context_reuse_requires_consent_and_portable_transport() {
     let decision = evaluate_context_reuse(ContextReuseRequest {
         allow_context_reuse: true,
         explicit_context_reuse_consent: false,
@@ -43,11 +44,21 @@ impl TestPool {
                     account_id: "acct-1".to_string(),
                     healthy: false,
                     kind: AccountKind::ChatGpt,
+                    enabled: true,
+                    selector_auth_eligible: false,
+                    pool_position: 0,
+                    leased_to_other_holder: false,
+                    quota: QuotaFamilyView::default(),
                 },
                 AccountRecord {
                     account_id: "acct-2".to_string(),
                     healthy: true,
                     kind: AccountKind::ChatGpt,
+                    enabled: true,
+                    selector_auth_eligible: true,
+                    pool_position: 1,
+                    leased_to_other_holder: false,
+                    quota: QuotaFamilyView::default(),
                 },
             ],
         }
@@ -60,11 +71,21 @@ impl TestPool {
                     account_id: "acct-1".to_string(),
                     healthy: true,
                     kind: AccountKind::ChatGpt,
+                    enabled: true,
+                    selector_auth_eligible: true,
+                    pool_position: 0,
+                    leased_to_other_holder: false,
+                    quota: QuotaFamilyView::default(),
                 },
                 AccountRecord {
                     account_id: "acct-2".to_string(),
                     healthy: true,
                     kind: AccountKind::ManualOnly,
+                    enabled: true,
+                    selector_auth_eligible: true,
+                    pool_position: 1,
+                    leased_to_other_holder: false,
+                    quota: QuotaFamilyView::default(),
                 },
             ],
         }

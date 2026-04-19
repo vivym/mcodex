@@ -162,6 +162,7 @@ async fn soft_pressure_before_min_interval_does_not_persist_rate_limited_health(
         .ensure_active_lease(SelectionRequest {
             now: Some(first.acquired_at() + Duration::seconds(60)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("reuse sticky lease");
@@ -203,6 +204,7 @@ async fn stale_soft_pressure_does_not_force_delayed_rotation_after_window_opens(
         .ensure_active_lease(SelectionRequest {
             now: Some(first.acquired_at() + Duration::seconds(121)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("stale soft pressure should not rotate");
@@ -241,6 +243,7 @@ async fn hard_usage_limit_bypasses_min_switch_interval() {
         .ensure_active_lease(SelectionRequest {
             now: Some(first.acquired_at() + Duration::seconds(31)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("hard failure should rotate immediately");
@@ -283,6 +286,7 @@ async fn proactive_rotation_avoids_just_replaced_account_when_another_candidate_
         .ensure_active_lease(SelectionRequest {
             now: Some(first.acquired_at() + Duration::seconds(122)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("rotate to second account");
@@ -303,6 +307,7 @@ async fn proactive_rotation_avoids_just_replaced_account_when_another_candidate_
         .ensure_active_lease(SelectionRequest {
             now: Some(second.acquired_at() + Duration::seconds(122)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("rotate to third account");
@@ -337,6 +342,7 @@ async fn non_proactive_replacement_clears_just_replaced_exclusion() {
         .ensure_active_lease(SelectionRequest {
             now: Some(first.acquired_at() + Duration::seconds(122)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("rotate to second account");
@@ -360,6 +366,7 @@ async fn non_proactive_replacement_clears_just_replaced_exclusion() {
         .ensure_active_lease(SelectionRequest {
             now: Some(second.acquired_at() + Duration::seconds(31)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("hard failure should rotate to next eligible account");
@@ -386,6 +393,7 @@ async fn non_proactive_replacement_clears_just_replaced_exclusion() {
         .ensure_active_lease(SelectionRequest {
             now: Some(third.acquired_at() + Duration::seconds(122)),
             pool_id: None,
+            ..SelectionRequest::default()
         })
         .await
         .expect("proactive rotation should not retain stale exclusion");
