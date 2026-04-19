@@ -1,7 +1,9 @@
 use crate::types::AccountRecord;
 use crate::types::LeaseGrant;
+use crate::types::SelectionRequest;
 use async_trait::async_trait;
 use chrono::DateTime;
+use chrono::Duration;
 use chrono::Utc;
 use codex_login::ChatgptManagedRegistrationTokens;
 use codex_state::AccountHealthEvent;
@@ -36,6 +38,7 @@ pub use crate::observability::AccountPoolSelection;
 pub use crate::observability::AccountPoolSnapshot;
 pub use crate::observability::AccountPoolSummary;
 use crate::quota::ProbeOutcome;
+use crate::quota::SelectionPlan;
 
 /// Read-only account source used by the startup selection policy.
 ///
@@ -54,12 +57,31 @@ pub trait AccountPoolBackend {
 /// Runtime state backend for local lease lifecycle operations.
 #[async_trait]
 pub trait AccountPoolExecutionBackend: Send + Sync {
+    /// Build the shared quota-aware selection plan for one runtime lease attempt.
+    async fn plan_runtime_selection(
+        &self,
+        request: &SelectionRequest,
+        holder_instance_id: &str,
+    ) -> anyhow::Result<(String, SelectionPlan)>;
+
     /// Acquire (or rehydrate) the current holder lease for a pool.
     async fn acquire_lease(
         &self,
         pool_id: &str,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError>;
+
+    /// Read the currently active lease for a holder without running selection.
+    ///
+    /// Implementations should return `Some` only when the lease is still active
+    /// and can be safely rehydrated by a new manager instance for the same
+    /// holder.
+    async fn read_active_holder_lease(
+        &self,
+        _holder_instance_id: &str,
+    ) -> anyhow::Result<Option<LeaseGrant>> {
+        Ok(None)
+    }
 
     /// Acquire a pool lease while temporarily excluding specific account ids.
     async fn acquire_lease_excluding(
@@ -70,6 +92,28 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let _ = excluded_account_ids;
         self.acquire_lease(pool_id, holder_instance_id).await
+    }
+
+    /// Acquire a lease for a specific account chosen by the selector.
+    async fn acquire_preferred_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = account_id;
+        self.acquire_lease(pool_id, holder_instance_id).await
+    }
+
+    /// Reserve the probe slot for a blocked candidate by advancing `next_probe_after`.
+    async fn reserve_quota_probe(
+        &self,
+        _account_id: &str,
+        _selection_family: &str,
+        _now: DateTime<Utc>,
+        _reserved_for: Duration,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Renew the lease if it is still active.
@@ -103,7 +147,7 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
     /// Refresh quota state for a probe lease without consuming the next user turn.
     async fn refresh_quota_probe(
         &self,
-        _account_id: &str,
+        _lease: &LeaseGrant,
         _selection_family: &str,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         Ok(None)

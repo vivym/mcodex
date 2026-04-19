@@ -11,8 +11,12 @@ use codex_account_pool::HealthEventDisposition;
 use codex_account_pool::LeaseGrant;
 use codex_account_pool::LegacyAuthBootstrap;
 use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::NoLegacyAuthBootstrap;
+use codex_account_pool::ProbeOutcome;
 use codex_account_pool::RateLimitSnapshot;
 use codex_account_pool::RegisteredAccountRegistration;
+use codex_account_pool::SelectionAction;
+use codex_account_pool::SelectionIntent;
 use codex_account_pool::SelectionRequest;
 use codex_account_pool::UsageLimitEvent;
 use codex_account_pool::read_shared_startup_status;
@@ -23,15 +27,23 @@ use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
+use codex_state::AccountHealthEvent;
+use codex_state::AccountLeaseError;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountRegistryEntryUpdate;
+use codex_state::AccountStartupSelectionState;
+use codex_state::AccountStartupStatus;
 use codex_state::EffectivePoolResolutionSource;
+use codex_state::LeaseRenewal;
 use codex_state::LegacyAccountImport;
+use codex_state::QuotaExhaustedWindows;
 use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use tempfile::TempDir;
@@ -498,6 +510,88 @@ mod lease_lifecycle {
         register_account_cleans_new_backend_private_auth_on_persistence_failure()
             .await
             .expect("failed registration should clean up new backend-private auth");
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_prefers_primary_safe_account_over_lower_position_blocked_account() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_secondary())
+            .await
+            .expect("write blocked quota");
+        harness
+            .write_quota("acct-b", "codex", healthy_primary(44.0))
+            .await
+            .expect("write healthy quota");
+
+        let lease = harness
+            .acquire_runtime_selected_lease(runtime_selection_request())
+            .await
+            .expect("acquire runtime-selected lease");
+
+        assert_eq!(lease.account_id(), "acct-b");
+    }
+
+    #[tokio::test]
+    async fn runtime_selection_uses_requested_family_before_consulting_codex_fallback() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", healthy_primary(5.0))
+            .await
+            .expect("write codex fallback quota");
+        harness
+            .write_quota("acct-a", "chatgpt", exhausted_primary())
+            .await
+            .expect("write requested-family blocked quota");
+        harness
+            .write_quota("acct-b", "chatgpt", healthy_primary(42.0))
+            .await
+            .expect("write requested-family healthy quota");
+
+        let lease = harness
+            .acquire_runtime_selected_lease(
+                runtime_selection_request().with_selection_family("chatgpt"),
+            )
+            .await
+            .expect("acquire requested-family lease");
+
+        assert_eq!(lease.account_id(), "acct-b");
+    }
+
+    #[tokio::test]
+    async fn probe_reservation_is_left_in_place_when_verification_lease_loses_a_race() {
+        let mut harness = ScriptedProbeHarness::new(ProbeScenario::Contention)
+            .await
+            .expect("create contention harness");
+
+        let result = harness
+            .force_probe_lease_contention()
+            .await
+            .expect("run contention scenario");
+
+        assert_eq!(result, ProbeExecutionOutcome::SelectionRestartRequired);
+        assert!(
+            harness.probe_state().probe_reserved_until.is_some(),
+            "probe reservation should remain in place after contention"
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_rotation_probe_keeps_active_lease_and_releases_verification_lease_before_reselection()
+     {
+        let mut harness = ScriptedProbeHarness::new(ProbeScenario::Success)
+            .await
+            .expect("create success harness");
+
+        let outcome = harness
+            .trigger_soft_rotation_probe_success()
+            .await
+            .expect("run probe success scenario");
+
+        assert_eq!(outcome.original_lease_account_id, "acct-current");
+        assert_eq!(outcome.active_lease_retained_during_probe, true);
+        assert_eq!(outcome.verification_lease_released, true);
+        assert_eq!(outcome.final_selected_account_id, "acct-recovered");
     }
 
     #[cfg(unix)]
@@ -1243,6 +1337,29 @@ impl TestHarness {
             holder_instance_id.to_string(),
         )
     }
+
+    async fn write_quota(
+        &self,
+        account_id: &str,
+        limit_id: &str,
+        template: AccountQuotaStateRecord,
+    ) -> anyhow::Result<()> {
+        self.runtime
+            .upsert_account_quota_state(AccountQuotaStateRecord {
+                account_id: account_id.to_string(),
+                limit_id: limit_id.to_string(),
+                ..template
+            })
+            .await
+    }
+
+    async fn acquire_runtime_selected_lease(
+        &self,
+        request: SelectionRequest,
+    ) -> anyhow::Result<codex_account_pool::LeasedAccount> {
+        let mut manager = self.manager("runtime-select-holder", default_config())?;
+        manager.ensure_active_lease(request).await
+    }
 }
 
 async fn fixture_with_legacy_auth(account_id: &str) -> TestHarness {
@@ -1295,6 +1412,10 @@ async fn fixture_with_registered_accounts(account_ids: &[&str]) -> TestHarness {
     harness
 }
 
+async fn quota_fixture_with_three_accounts() -> TestHarness {
+    fixture_with_registered_accounts(&["acct-a", "acct-b", "acct-c"]).await
+}
+
 #[derive(Clone)]
 struct TestLegacyBootstrap {
     account_id: Option<String>,
@@ -1325,6 +1446,363 @@ impl LegacyAuthBootstrap for TestLegacyBootstrap {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeScenario {
+    Contention,
+    Success,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeExecutionOutcome {
+    SelectionRestartRequired,
+    NoProbeAttempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SoftRotationProbeOutcome {
+    original_lease_account_id: String,
+    active_lease_retained_during_probe: bool,
+    verification_lease_released: bool,
+    final_selected_account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProbeBackendState {
+    probe_reserved_until: Option<chrono::DateTime<Utc>>,
+    refresh_called: bool,
+    active_released_before_refresh: bool,
+    verification_released: bool,
+}
+
+struct ScriptedProbeHarness {
+    manager: AccountPoolManager<ScriptedProbeBackend, NoLegacyAuthBootstrap>,
+    backend: ScriptedProbeBackend,
+}
+
+impl ScriptedProbeHarness {
+    async fn new(scenario: ProbeScenario) -> anyhow::Result<Self> {
+        let backend = ScriptedProbeBackend::new("test-holder", scenario).await?;
+        let manager = AccountPoolManager::new(
+            backend.clone(),
+            NoLegacyAuthBootstrap,
+            damping_config(),
+            "test-holder".to_string(),
+        )?;
+        Ok(Self { manager, backend })
+    }
+
+    async fn force_probe_lease_contention(&mut self) -> anyhow::Result<ProbeExecutionOutcome> {
+        let current = self
+            .manager
+            .ensure_active_lease(runtime_selection_request())
+            .await?;
+        self.manager
+            .report_rate_limits(
+                current.key(),
+                snapshot_at(95.0, current.acquired_at() + Duration::seconds(121)),
+            )
+            .await?;
+
+        let outcome = match self
+            .manager
+            .ensure_active_lease(SelectionRequest {
+                now: Some(current.acquired_at() + Duration::seconds(122)),
+                pool_id: Some(current.pool_id().to_string()),
+                intent: SelectionIntent::SoftRotation,
+                selection_family: None,
+                current_account_id: None,
+                just_replaced_account_id: None,
+                reserved_probe_target_account_id: None,
+                proactive_threshold_percent: 85,
+            })
+            .await
+        {
+            Ok(lease)
+                if lease.account_id() == current.account_id()
+                    && self.backend.state().probe_reserved_until.is_some() =>
+            {
+                ProbeExecutionOutcome::SelectionRestartRequired
+            }
+            Ok(_) | Err(_) => ProbeExecutionOutcome::NoProbeAttempt,
+        };
+
+        Ok(outcome)
+    }
+
+    async fn trigger_soft_rotation_probe_success(
+        &mut self,
+    ) -> anyhow::Result<SoftRotationProbeOutcome> {
+        let current = self
+            .manager
+            .ensure_active_lease(runtime_selection_request())
+            .await?;
+        self.manager
+            .report_rate_limits(
+                current.key(),
+                snapshot_at(95.0, current.acquired_at() + Duration::seconds(121)),
+            )
+            .await?;
+
+        let next = self
+            .manager
+            .ensure_active_lease(SelectionRequest {
+                now: Some(current.acquired_at() + Duration::seconds(122)),
+                pool_id: Some(current.pool_id().to_string()),
+                intent: SelectionIntent::SoftRotation,
+                selection_family: None,
+                current_account_id: None,
+                just_replaced_account_id: None,
+                reserved_probe_target_account_id: None,
+                proactive_threshold_percent: 85,
+            })
+            .await?;
+        let state = self.backend.state();
+
+        Ok(SoftRotationProbeOutcome {
+            original_lease_account_id: current.account_id().to_string(),
+            active_lease_retained_during_probe: state.refresh_called
+                && !state.active_released_before_refresh,
+            verification_lease_released: state.verification_released,
+            final_selected_account_id: next.account_id().to_string(),
+        })
+    }
+
+    fn probe_state(&self) -> ProbeBackendState {
+        self.backend.state()
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedProbeBackend {
+    main_holder_instance_id: String,
+    current_grant: LeaseGrant,
+    recovered_grant: LeaseGrant,
+    verification_grant: LeaseGrant,
+    scenario: ProbeScenario,
+    state: Arc<Mutex<ProbeBackendState>>,
+}
+
+impl ScriptedProbeBackend {
+    async fn new(main_holder_instance_id: &str, scenario: ProbeScenario) -> anyhow::Result<Self> {
+        Ok(Self {
+            main_holder_instance_id: main_holder_instance_id.to_string(),
+            current_grant: scripted_grant("acct-current", main_holder_instance_id).await?,
+            recovered_grant: scripted_grant("acct-recovered", main_holder_instance_id).await?,
+            verification_grant: scripted_grant("acct-recovered", "probe-holder").await?,
+            scenario,
+            state: Arc::new(Mutex::new(ProbeBackendState::default())),
+        })
+    }
+
+    fn is_probe_holder(&self, holder_instance_id: &str) -> bool {
+        holder_instance_id != self.main_holder_instance_id
+    }
+
+    fn state(&self) -> ProbeBackendState {
+        self.state.lock().expect("lock probe state").clone()
+    }
+
+    fn plan_for_request(
+        &self,
+        request: &SelectionRequest,
+    ) -> (String, codex_account_pool::SelectionPlan) {
+        let terminal_action = if request.current_account_id.is_none() {
+            SelectionAction::Select("acct-current".to_string())
+        } else if self.state().refresh_called {
+            SelectionAction::Select("acct-recovered".to_string())
+        } else if self.state().probe_reserved_until.is_some() {
+            SelectionAction::StayOnCurrent
+        } else {
+            SelectionAction::Probe("acct-recovered".to_string())
+        };
+
+        (
+            "codex".to_string(),
+            codex_account_pool::SelectionPlan {
+                eligible_candidates: Vec::new(),
+                probe_candidate: matches!(terminal_action, SelectionAction::Probe(_))
+                    .then(|| "acct-recovered".to_string()),
+                rejected_candidates: Vec::new(),
+                decision_reason: match terminal_action {
+                    SelectionAction::Select(_) => {
+                        codex_account_pool::SelectionDecisionReason::OrdinaryRanking
+                    }
+                    SelectionAction::Probe(_) => {
+                        codex_account_pool::SelectionDecisionReason::ProbeFallback
+                    }
+                    SelectionAction::StayOnCurrent => {
+                        codex_account_pool::SelectionDecisionReason::SoftRotationCurrentRetained
+                    }
+                    SelectionAction::NoCandidate => {
+                        codex_account_pool::SelectionDecisionReason::NoCandidate
+                    }
+                },
+                terminal_action,
+            },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl AccountPoolExecutionBackend for ScriptedProbeBackend {
+    async fn plan_runtime_selection(
+        &self,
+        request: &SelectionRequest,
+        _holder_instance_id: &str,
+    ) -> anyhow::Result<(String, codex_account_pool::SelectionPlan)> {
+        Ok(self.plan_for_request(request))
+    }
+
+    async fn acquire_lease(
+        &self,
+        _pool_id: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        if self.is_probe_holder(holder_instance_id) {
+            match self.scenario {
+                ProbeScenario::Contention => Err(AccountLeaseError::NoEligibleAccount),
+                ProbeScenario::Success => Ok(self.verification_grant.clone()),
+            }
+        } else if self.state().refresh_called {
+            Ok(self.recovered_grant.clone())
+        } else {
+            Ok(self.current_grant.clone())
+        }
+    }
+
+    async fn acquire_preferred_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = pool_id;
+        if self.is_probe_holder(holder_instance_id) {
+            return self.acquire_lease(pool_id, holder_instance_id).await;
+        }
+        if account_id == "acct-recovered" && self.state().refresh_called {
+            Ok(self.recovered_grant.clone())
+        } else {
+            Ok(self.current_grant.clone())
+        }
+    }
+
+    async fn reserve_quota_probe(
+        &self,
+        _account_id: &str,
+        _selection_family: &str,
+        now: chrono::DateTime<Utc>,
+        reserved_for: Duration,
+    ) -> anyhow::Result<bool> {
+        let mut state = self.state.lock().expect("lock probe state");
+        if state.probe_reserved_until.is_some() {
+            return Ok(false);
+        }
+        state.probe_reserved_until = Some(now + reserved_for);
+        Ok(true)
+    }
+
+    async fn renew_lease(
+        &self,
+        lease: &codex_state::LeaseKey,
+        _now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<LeaseRenewal> {
+        let grant = if lease.account_id == self.current_grant.account_id() {
+            self.current_grant.clone()
+        } else {
+            self.recovered_grant.clone()
+        };
+
+        Ok(LeaseRenewal::Renewed(codex_state::AccountLeaseRecord {
+            lease_id: grant.key().lease_id,
+            pool_id: grant.pool_id().to_string(),
+            account_id: grant.account_id().to_string(),
+            holder_instance_id: self.main_holder_instance_id.clone(),
+            lease_epoch: grant.lease_epoch(),
+            acquired_at: grant.acquired_at(),
+            renewed_at: grant.acquired_at(),
+            expires_at: grant.expires_at(),
+            released_at: None,
+        }))
+    }
+
+    async fn release_lease(
+        &self,
+        lease: &codex_state::LeaseKey,
+        _now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let mut state = self.state.lock().expect("lock probe state");
+        if !state.refresh_called && lease.account_id == self.current_grant.account_id() {
+            state.active_released_before_refresh = true;
+        }
+        if lease.account_id == self.verification_grant.account_id()
+            && lease.lease_id == self.verification_grant.key().lease_id
+        {
+            state.verification_released = true;
+        }
+        Ok(true)
+    }
+
+    async fn record_health_event(&self, _event: AccountHealthEvent) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn read_account_health_event_sequence(
+        &self,
+        _account_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(Some(0))
+    }
+
+    async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState> {
+        Ok(AccountStartupSelectionState {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        })
+    }
+
+    async fn read_account_startup_status(
+        &self,
+        _configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupStatus> {
+        Ok(AccountStartupStatus {
+            preview: codex_state::AccountStartupSelectionPreview {
+                effective_pool_id: Some("legacy-default".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some(self.current_grant.account_id().to_string()),
+                eligibility: codex_state::AccountStartupEligibility::AutomaticAccountSelected,
+            },
+            configured_default_pool_id: Some("legacy-default".to_string()),
+            persisted_default_pool_id: Some("legacy-default".to_string()),
+            effective_pool_resolution_source: EffectivePoolResolutionSource::ConfigDefault,
+        })
+    }
+
+    async fn refresh_quota_probe(
+        &self,
+        _lease: &LeaseGrant,
+        _selection_family: &str,
+    ) -> anyhow::Result<Option<ProbeOutcome>> {
+        let mut state = self.state.lock().expect("lock probe state");
+        state.refresh_called = true;
+        Ok(Some(ProbeOutcome::Success))
+    }
+}
+
+async fn scripted_grant(account_id: &str, holder_instance_id: &str) -> anyhow::Result<LeaseGrant> {
+    let harness = fixture_with_registered_account(account_id).await;
+    let backend = LocalAccountPoolBackend::new(
+        harness.runtime.clone(),
+        default_config().lease_ttl_duration(),
+    );
+    backend
+        .acquire_lease("legacy-default", holder_instance_id)
+        .await
+        .map_err(Into::into)
+}
+
 fn snapshot(used_percent: f64) -> RateLimitSnapshot {
     RateLimitSnapshot::new(used_percent, Utc::now())
 }
@@ -1339,6 +1817,13 @@ fn usage_limit_event() -> UsageLimitEvent {
 
 fn usage_limit_event_at(observed_at: chrono::DateTime<Utc>) -> UsageLimitEvent {
     UsageLimitEvent::new(observed_at)
+}
+
+fn runtime_selection_request() -> SelectionRequest {
+    SelectionRequest {
+        pool_id: Some("legacy-default".to_string()),
+        ..SelectionRequest::default()
+    }
 }
 
 fn default_config() -> AccountPoolConfig {
@@ -1365,6 +1850,43 @@ fn registry_entry_update(account_id: &str, enabled: bool) -> AccountRegistryEntr
         workspace_id: None,
         enabled,
         healthy: true,
+    }
+}
+
+fn healthy_primary(primary_used_percent: f64) -> AccountQuotaStateRecord {
+    quota_template(QuotaExhaustedWindows::None, Some(primary_used_percent))
+}
+
+fn exhausted_primary() -> AccountQuotaStateRecord {
+    quota_template(QuotaExhaustedWindows::Primary, Some(99.0))
+}
+
+fn exhausted_secondary() -> AccountQuotaStateRecord {
+    quota_template(QuotaExhaustedWindows::Secondary, Some(88.0))
+}
+
+fn quota_template(
+    exhausted_windows: QuotaExhaustedWindows,
+    primary_used_percent: Option<f64>,
+) -> AccountQuotaStateRecord {
+    let now = Utc::now();
+    AccountQuotaStateRecord {
+        account_id: String::new(),
+        limit_id: String::new(),
+        primary_used_percent,
+        primary_resets_at: None,
+        secondary_used_percent: None,
+        secondary_resets_at: None,
+        observed_at: now,
+        exhausted_windows,
+        predicted_blocked_until: exhausted_windows
+            .is_exhausted()
+            .then_some(now + Duration::minutes(30)),
+        next_probe_after: exhausted_windows
+            .is_exhausted()
+            .then_some(now - Duration::seconds(1)),
+        probe_backoff_level: 0,
+        last_probe_result: None,
     }
 }
 

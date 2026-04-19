@@ -1,3 +1,5 @@
+use crate::SelectionAction;
+use crate::SelectionIntent;
 use crate::backend::AccountPoolExecutionBackend;
 use crate::bootstrap::LegacyAuthBootstrap;
 use crate::lease_lifecycle::LeaseHealthEvent;
@@ -13,6 +15,7 @@ use crate::types::SelectionRequest;
 use crate::types::UsageLimitEvent;
 use anyhow::Context;
 use chrono::DateTime;
+use chrono::Duration;
 use chrono::Utc;
 use codex_state::AccountLeaseError;
 use codex_state::AccountStartupSelectionState;
@@ -101,14 +104,28 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 LeaseRenewalDisposition::NotNeeded(lease)
                 | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
-                    return self.acquire_fresh_lease(pool_id).await.map_err(Into::into);
+                    return self
+                        .acquire_selected_lease(SelectionRequest {
+                            now: Some(now),
+                            pool_id: Some(pool_id),
+                            ..request
+                        })
+                        .await
+                        .map_err(Into::into);
                 }
             }
         }
 
-        self.acquire_fresh_lease(self.resolve_pool_id(request.pool_id).await?)
-            .await
-            .map_err(Into::into)
+        if let Some(lease) = self.try_rehydrate_holder_lease().await? {
+            return Ok(lease);
+        }
+
+        self.acquire_selected_lease(SelectionRequest {
+            pool_id: Some(self.resolve_pool_id(request.pool_id.clone()).await?),
+            ..request
+        })
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn renew_active_lease_if_needed(
@@ -124,15 +141,30 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                 LeaseRenewalDisposition::NotNeeded(lease)
                 | LeaseRenewalDisposition::Renewed(lease) => return Ok(lease.leased_account()),
                 LeaseRenewalDisposition::Missing { pool_id } => {
-                    return self.acquire_fresh_lease(pool_id).await.map_err(Into::into);
+                    return self
+                        .acquire_selected_lease(SelectionRequest {
+                            now: Some(now),
+                            pool_id: Some(pool_id),
+                            ..SelectionRequest::default()
+                        })
+                        .await
+                        .map_err(Into::into);
                 }
             }
         }
 
-        self.acquire_fresh_lease(
-            self.resolve_pool_id(self.config.default_pool_id.clone())
-                .await?,
-        )
+        if let Some(lease) = self.try_rehydrate_holder_lease().await? {
+            return Ok(lease);
+        }
+
+        self.acquire_selected_lease(SelectionRequest {
+            now: Some(now),
+            pool_id: Some(
+                self.resolve_pool_id(self.config.default_pool_id.clone())
+                    .await?,
+            ),
+            ..SelectionRequest::default()
+        })
         .await
         .map_err(Into::into)
     }
@@ -333,18 +365,29 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         };
         let current_account_id = active_lease.account_id().to_string();
         let pool_id = active_lease.pool_id().to_string();
-        self.release_active_lease_at(now).await?;
+        let intent = match pending_rotation {
+            PendingRotation::HardFailure => SelectionIntent::HardFailover,
+            PendingRotation::SoftProactive => SelectionIntent::SoftRotation,
+        };
+        let leased_account = self
+            .acquire_selected_rotation_lease(
+                SelectionRequest {
+                    now: Some(now),
+                    pool_id: Some(pool_id),
+                    intent,
+                    selection_family: None,
+                    current_account_id: Some(current_account_id.clone()),
+                    just_replaced_account_id: self.last_proactively_replaced_account_id.clone(),
+                    reserved_probe_target_account_id: None,
+                    proactive_threshold_percent: self.config.proactive_switch_threshold_percent,
+                },
+                active_lease,
+            )
+            .await?;
+
         if pending_rotation == PendingRotation::HardFailure {
             self.last_proactively_replaced_account_id = None;
         }
-
-        let leased_account = match pending_rotation {
-            PendingRotation::HardFailure => self.acquire_fresh_lease(pool_id).await?,
-            PendingRotation::SoftProactive => {
-                self.acquire_proactively_rotated_lease(pool_id, current_account_id.as_str())
-                    .await?
-            }
-        };
         if pending_rotation == PendingRotation::SoftProactive
             && leased_account.account_id() != current_account_id
         {
@@ -364,62 +407,181 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         Ok(())
     }
 
-    async fn acquire_proactively_rotated_lease(
+    async fn acquire_selected_rotation_lease(
         &mut self,
-        pool_id: String,
-        current_account_id: &str,
+        request: SelectionRequest,
+        active_lease: LeaseGrant,
     ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
-        let current_only = vec![current_account_id.to_string()];
-        let mut excluded = current_only.clone();
-        if let Some(last_replaced_account_id) = self.last_proactively_replaced_account_id.as_ref()
-            && last_replaced_account_id != current_account_id
-        {
-            excluded.push(last_replaced_account_id.clone());
-        }
+        let keep_current_on_no_candidate = matches!(request.intent, SelectionIntent::SoftRotation);
+        let pool_id = request.pool_id.as_deref().ok_or_else(|| {
+            AccountLeaseError::Storage("runtime selection requires pool id".to_string())
+        })?;
+        loop {
+            let (selection_family, plan) = self
+                .backend
+                .plan_runtime_selection(&request, &self.holder_instance_id)
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
 
-        match self
-            .acquire_fresh_lease_excluding(pool_id.clone(), &excluded)
-            .await
-        {
-            Ok(lease) => Ok(lease),
-            Err(AccountLeaseError::NoEligibleAccount) if excluded.len() > 1 => {
-                match self
-                    .acquire_fresh_lease_excluding(pool_id.clone(), &current_only)
-                    .await
-                {
-                    Ok(lease) => Ok(lease),
-                    Err(AccountLeaseError::NoEligibleAccount) => {
-                        self.acquire_fresh_lease(pool_id).await
+            match plan.terminal_action {
+                SelectionAction::Select(account_id) => {
+                    self.release_active_lease_at(request.now.unwrap_or_else(Utc::now))
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                    match self
+                        .backend
+                        .acquire_preferred_lease(
+                            pool_id,
+                            account_id.as_str(),
+                            &self.holder_instance_id,
+                        )
+                        .await
+                    {
+                        Ok(grant) => return self.adopt_active_grant(grant).await,
+                        Err(AccountLeaseError::NoEligibleAccount) => continue,
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => Err(err),
+                }
+                SelectionAction::Probe(account_id) => {
+                    if !self
+                        .backend
+                        .reserve_quota_probe(
+                            account_id.as_str(),
+                            selection_family.as_str(),
+                            request.now.unwrap_or_else(Utc::now),
+                            self.probe_reservation_duration(),
+                        )
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+                    {
+                        continue;
+                    }
+
+                    let probe_holder_instance_id = self.probe_holder_instance_id();
+                    let verification_lease = match self
+                        .backend
+                        .acquire_preferred_lease(
+                            pool_id,
+                            account_id.as_str(),
+                            probe_holder_instance_id.as_str(),
+                        )
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(AccountLeaseError::NoEligibleAccount) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    let probe_result = self
+                        .backend
+                        .refresh_quota_probe(&verification_lease, selection_family.as_str())
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()));
+                    let release_result = self
+                        .backend
+                        .release_lease(
+                            &verification_lease.key(),
+                            request.now.unwrap_or_else(Utc::now),
+                        )
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()));
+                    probe_result?;
+                    let _ = release_result?;
+                    continue;
+                }
+                SelectionAction::StayOnCurrent if keep_current_on_no_candidate => {
+                    return Ok(active_lease.leased_account());
+                }
+                SelectionAction::StayOnCurrent | SelectionAction::NoCandidate => {
+                    if keep_current_on_no_candidate {
+                        return Ok(active_lease.leased_account());
+                    }
+                    self.release_active_lease_at(request.now.unwrap_or_else(Utc::now))
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                    return Err(AccountLeaseError::NoEligibleAccount);
                 }
             }
-            Err(AccountLeaseError::NoEligibleAccount) => self.acquire_fresh_lease(pool_id).await,
-            Err(err) => Err(err),
         }
     }
 
-    async fn acquire_fresh_lease(
+    async fn acquire_selected_lease(
         &mut self,
-        pool_id: String,
+        request: SelectionRequest,
     ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
-        self.acquire_fresh_lease_excluding(pool_id, &[]).await
+        let pool_id = request.pool_id.as_deref().ok_or_else(|| {
+            AccountLeaseError::Storage("runtime selection requires pool id".to_string())
+        })?;
+        loop {
+            let (selection_family, plan) = self
+                .backend
+                .plan_runtime_selection(&request, &self.holder_instance_id)
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+
+            match plan.terminal_action {
+                SelectionAction::Select(account_id) => match self
+                    .backend
+                    .acquire_preferred_lease(pool_id, account_id.as_str(), &self.holder_instance_id)
+                    .await
+                {
+                    Ok(grant) => return self.adopt_active_grant(grant).await,
+                    Err(AccountLeaseError::NoEligibleAccount) => continue,
+                    Err(err) => return Err(err),
+                },
+                SelectionAction::Probe(account_id) => {
+                    if !self
+                        .backend
+                        .reserve_quota_probe(
+                            account_id.as_str(),
+                            selection_family.as_str(),
+                            request.now.unwrap_or_else(Utc::now),
+                            self.probe_reservation_duration(),
+                        )
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+                    {
+                        continue;
+                    }
+                    let verification_lease = match self
+                        .backend
+                        .acquire_preferred_lease(
+                            pool_id,
+                            account_id.as_str(),
+                            self.probe_holder_instance_id().as_str(),
+                        )
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(AccountLeaseError::NoEligibleAccount) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    let probe_result = self
+                        .backend
+                        .refresh_quota_probe(&verification_lease, selection_family.as_str())
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()));
+                    let release_result = self
+                        .backend
+                        .release_lease(
+                            &verification_lease.key(),
+                            request.now.unwrap_or_else(Utc::now),
+                        )
+                        .await
+                        .map_err(|err| AccountLeaseError::Storage(err.to_string()));
+                    probe_result?;
+                    let _ = release_result?;
+                }
+                SelectionAction::StayOnCurrent | SelectionAction::NoCandidate => {
+                    return Err(AccountLeaseError::NoEligibleAccount);
+                }
+            }
+        }
     }
 
-    async fn acquire_fresh_lease_excluding(
+    async fn adopt_active_grant(
         &mut self,
-        pool_id: String,
-        excluded_account_ids: &[String],
+        grant: LeaseGrant,
     ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
-        let grant = if excluded_account_ids.is_empty() {
-            self.backend
-                .acquire_lease(&pool_id, &self.holder_instance_id)
-                .await?
-        } else {
-            self.backend
-                .acquire_lease_excluding(&pool_id, &self.holder_instance_id, excluded_account_ids)
-                .await?
-        };
         let leased_account = grant.leased_account();
         self.next_health_event_sequence = self
             .backend
@@ -430,5 +592,28 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         self.active_lease = Some(grant);
         self.proactive_switch_state.reset();
         Ok(leased_account)
+    }
+
+    async fn try_rehydrate_holder_lease(&mut self) -> anyhow::Result<Option<LeasedAccount>> {
+        let Some(grant) = self
+            .backend
+            .read_active_holder_lease(&self.holder_instance_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.adopt_active_grant(grant)
+            .await
+            .map(Some)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))
+    }
+
+    fn probe_holder_instance_id(&self) -> String {
+        format!("{}:probe", self.holder_instance_id)
+    }
+
+    fn probe_reservation_duration(&self) -> Duration {
+        Duration::seconds(30)
     }
 }

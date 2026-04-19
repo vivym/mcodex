@@ -18,6 +18,7 @@ use crate::model::EffectivePoolResolutionSource;
 use crate::model::LeaseKey;
 use crate::model::LeaseRenewal;
 use crate::model::LegacyAccountImport;
+use crate::model::RegisteredAccountRecord;
 use crate::model::account_datetime_to_epoch_seconds;
 use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
@@ -476,6 +477,116 @@ WHERE lease_id = ?
         holder_instance_id: &str,
     ) -> anyhow::Result<Option<AccountLeaseRecord>> {
         load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now()).await
+    }
+
+    pub async fn read_account_lease_selection_candidates(
+        &self,
+        pool_id: &str,
+    ) -> anyhow::Result<
+        Vec<(
+            RegisteredAccountRecord,
+            Option<AccountHealthState>,
+            Option<AccountLeaseRecord>,
+            i64,
+        )>,
+    > {
+        let now = Utc::now();
+        let rows = sqlx::query(
+            r#"
+SELECT
+    membership.position,
+    account_registry.account_id,
+    account_registry.backend_id,
+    account_registry.backend_family,
+    account_registry.workspace_id,
+    account_registry.backend_account_handle,
+    account_registry.account_kind,
+    account_registry.provider_fingerprint,
+    account_registry.display_name,
+    account_registry.source,
+    account_registry.enabled,
+    account_registry.healthy,
+    account_runtime_state.health_state,
+    active_lease.lease_id,
+    active_lease.holder_instance_id,
+    active_lease.lease_epoch,
+    active_lease.acquired_at,
+    active_lease.renewed_at,
+    active_lease.expires_at,
+    active_lease.released_at
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+LEFT JOIN account_leases AS active_lease
+  ON active_lease.account_id = membership.account_id
+ AND active_lease.pool_id = membership.pool_id
+ AND active_lease.released_at IS NULL
+ AND active_lease.expires_at > ?
+WHERE membership.pool_id = ?
+ORDER BY membership.position ASC, membership.account_id ASC
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(now))
+        .bind(pool_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let account_id: String = row.try_get("account_id")?;
+                let health_state = row
+                    .try_get::<Option<String>, _>("health_state")?
+                    .as_deref()
+                    .map(AccountHealthState::try_from)
+                    .transpose()?;
+                let active_lease = match row.try_get::<Option<String>, _>("lease_id")? {
+                    Some(lease_id) => Some(AccountLeaseRecord {
+                        lease_id,
+                        pool_id: pool_id.to_string(),
+                        account_id: account_id.clone(),
+                        holder_instance_id: row.try_get("holder_instance_id")?,
+                        lease_epoch: row.try_get("lease_epoch")?,
+                        acquired_at: account_epoch_seconds_to_datetime(
+                            row.try_get("acquired_at")?,
+                        )?,
+                        renewed_at: account_epoch_seconds_to_datetime(row.try_get("renewed_at")?)?,
+                        expires_at: account_epoch_seconds_to_datetime(row.try_get("expires_at")?)?,
+                        released_at: row
+                            .try_get::<Option<i64>, _>("released_at")?
+                            .map(account_epoch_seconds_to_datetime)
+                            .transpose()?,
+                    }),
+                    None => None,
+                };
+
+                let source = row
+                    .try_get::<Option<String>, _>("source")?
+                    .as_deref()
+                    .map(AccountSource::try_from)
+                    .transpose()?;
+
+                Ok((
+                    RegisteredAccountRecord {
+                        account_id,
+                        backend_id: row.try_get("backend_id")?,
+                        backend_family: row.try_get("backend_family")?,
+                        workspace_id: row.try_get("workspace_id")?,
+                        backend_account_handle: row.try_get("backend_account_handle")?,
+                        account_kind: row.try_get("account_kind")?,
+                        provider_fingerprint: row.try_get("provider_fingerprint")?,
+                        display_name: row.try_get("display_name")?,
+                        source,
+                        enabled: row.try_get::<i64, _>("enabled")? != 0,
+                        healthy: row.try_get::<i64, _>("healthy")? != 0,
+                    },
+                    health_state,
+                    active_lease,
+                    row.try_get("position")?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn read_account_pool_diagnostic(
