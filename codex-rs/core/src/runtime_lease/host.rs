@@ -4,14 +4,10 @@ use std::sync::Arc;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeLeaseHostId {
     pub(crate) fn new(value: String) -> Self {
         Self(value)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(value: &str) -> Self {
-        Self(value.to_string())
     }
 }
 
@@ -21,46 +17,52 @@ impl fmt::Display for RuntimeLeaseHostId {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeLeaseHostMode {
     Pooled,
     NonPooled,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct RuntimeLeaseAuthorityMarker;
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
-pub(crate) struct RuntimeLeaseHost {
+struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
+    mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeLeaseHost(Arc<RuntimeLeaseHostInner>);
+
+#[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeLeaseHost {
     pub(crate) fn pooled(id: RuntimeLeaseHostId) -> Self {
-        Self {
+        Self(Arc::new(RuntimeLeaseHostInner {
             id,
+            mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
-        }
+        }))
     }
 
     pub(crate) fn non_pooled(id: RuntimeLeaseHostId) -> Self {
-        Self {
+        Self(Arc::new(RuntimeLeaseHostInner {
             id,
+            mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
-        }
+        }))
     }
 
     pub(crate) fn id(&self) -> RuntimeLeaseHostId {
-        self.id.clone()
+        self.0.id.clone()
     }
 
     pub(crate) fn mode(&self) -> RuntimeLeaseHostMode {
-        if self.authority.is_some() {
-            RuntimeLeaseHostMode::Pooled
-        } else {
-            RuntimeLeaseHostMode::NonPooled
-        }
+        self.0.mode
     }
 
     #[cfg(test)]
@@ -75,6 +77,11 @@ impl RuntimeLeaseHost {
 
     #[cfg(test)]
     pub(crate) fn authority_for_test(&self) -> Option<Arc<RuntimeLeaseAuthorityMarker>> {
-        self.authority.clone()
+        self.0.authority.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
