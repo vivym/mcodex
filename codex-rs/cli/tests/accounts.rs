@@ -41,6 +41,20 @@ async fn prepared_home_with_two_pools_and_no_config() -> Result<TempDir> {
     Ok(codex_home)
 }
 
+async fn prepared_home_with_one_pool_and_no_default() -> Result<TempDir> {
+    let codex_home = TempDir::new()?;
+    seed_chatgpt_auth(codex_home.path())?;
+    let _runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    seed_account(&pool, "acct-existing", "team-main", 0).await?;
+    Ok(codex_home)
+}
+
 async fn prepared_legacy_auth_only_home() -> Result<TempDir> {
     let codex_home = TempDir::new()?;
     seed_chatgpt_auth(codex_home.path())?;
@@ -390,7 +404,7 @@ async fn accounts_import_legacy_registers_and_assigns_legacy_account_explicitly(
         read_startup_selection(&codex_home).await?,
         AccountStartupSelectionState {
             default_pool_id: Some("team-main".to_string()),
-            preferred_account_id: Some("acct-1".to_string()),
+            preferred_account_id: None,
             suppressed: false,
         }
     );
@@ -417,20 +431,49 @@ async fn accounts_import_legacy_registers_and_assigns_legacy_account_explicitly(
 }
 
 #[tokio::test]
-async fn accounts_import_legacy_without_explicit_pool_uses_legacy_default() -> Result<()> {
+async fn accounts_import_legacy_without_command_pool_uses_account_pool_override_for_bootstrap()
+-> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "--account-pool", "team-main", "import-legacy"],
+    )
+    .await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("team-main"));
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .pool_id,
+        "team-main"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_explicit_pool_uses_configured_default() -> Result<()> {
     let codex_home = prepared_legacy_auth_with_accounts_config_home().await?;
 
     let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
     assert!(output.stdout.contains("acct-1"));
+    assert!(output.stdout.contains("team-main"));
 
     assert_eq!(
         read_startup_selection(&codex_home).await?,
-        AccountStartupSelectionState {
-            default_pool_id: Some("legacy-default".to_string()),
-            preferred_account_id: Some("acct-1".to_string()),
-            suppressed: false,
-        }
+        AccountStartupSelectionState::default()
     );
     assert_eq!(
         read_pool_membership(&codex_home, "acct-1")
@@ -438,11 +481,130 @@ async fn accounts_import_legacy_without_explicit_pool_uses_legacy_default() -> R
             .expect("membership"),
         codex_state::AccountPoolMembership {
             account_id: "acct-1".to_string(),
-            pool_id: "legacy-default".to_string(),
+            pool_id: "team-main".to_string(),
             source: Some(codex_state::AccountSource::Migrated),
             enabled: true,
             healthy: true,
         }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_explicit_pool_uses_persisted_default() -> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("team-main"));
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .pool_id,
+        "team-main"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_explicit_pool_uses_single_visible_pool_without_persisting()
+-> Result<()> {
+    let codex_home = prepared_home_with_one_pool_and_no_default().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("team-main"));
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState::default()
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .pool_id,
+        "team-main"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_explicit_pool_uses_legacy_default_when_inventory_is_empty()
+-> Result<()> {
+    let codex_home = prepared_legacy_auth_only_home().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("legacy-default"));
+
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        }
+    );
+    assert_eq!(
+        read_pool_membership(&codex_home, "acct-1")
+            .await?
+            .expect("membership")
+            .pool_id,
+        "legacy-default"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_import_legacy_without_pool_requires_pool_when_multiple_visible_pools_have_no_default()
+-> Result<()> {
+    let codex_home = prepared_home_with_two_pools_and_no_config().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "import-legacy"]).await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("pass --pool <POOL_ID>"));
+    assert!(
+        output
+            .stderr
+            .contains("multiple account pools are registered")
+    );
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState::default()
     );
 
     Ok(())

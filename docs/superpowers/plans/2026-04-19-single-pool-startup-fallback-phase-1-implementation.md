@@ -823,7 +823,7 @@ git commit -m "feat(cli): add default pool commands"
 - Modify: `codex-rs/cli/tests/accounts.rs`
 - Test support: existing helpers in `accounts.rs`
 
-- [ ] **Step 1: Add failing import target-order tests**
+- [x] **Step 1: Add failing import target-order tests**
 
 Add tests for:
 
@@ -849,7 +849,7 @@ async fn import_legacy_without_pool_requires_pool_when_multiple_visible_pools_ha
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -860,7 +860,7 @@ cargo test -p codex-cli --test accounts import_legacy_without_pool -- --nocaptur
 
 Expected: FAIL because current code still uses legacy/default behavior.
 
-- [ ] **Step 3: Implement target order**
+- [x] **Step 3: Implement target order**
 
 In `registration.rs`, make plain `import-legacy` target resolution:
 
@@ -874,11 +874,11 @@ In `registration.rs`, make plain `import-legacy` target resolution:
 
 Keep explicit `--pool` and `--account-pool` behavior unchanged except for clearer diagnostics.
 
-- [ ] **Step 4: Preserve bootstrap persistence rule**
+- [x] **Step 4: Preserve bootstrap persistence rule**
 
 Only persist `default_pool_id` automatically when pre-command visible inventory was empty and no configured/persisted default existed.
 
-- [ ] **Step 5: Run import tests**
+- [x] **Step 5: Run import tests**
 
 Run:
 
@@ -889,7 +889,7 @@ cargo test -p codex-cli --test accounts import_legacy -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/registration.rs codex-rs/cli/tests/accounts.rs

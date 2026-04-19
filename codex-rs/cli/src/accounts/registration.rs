@@ -13,6 +13,7 @@ use codex_login::ServerOptions;
 use codex_login::run_pooled_browser_registration;
 use codex_login::run_pooled_device_code_registration;
 use codex_product_identity::MCODEX;
+use codex_state::AccountStartupSelectionState;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::NewPendingAccountRegistration;
@@ -20,7 +21,6 @@ use codex_state::RegisteredAccountMembership;
 use codex_state::RegisteredAccountRecord;
 use codex_state::RegisteredAccountUpsert;
 use codex_state::StateRuntime;
-use std::borrow::ToOwned;
 use std::sync::Arc;
 
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
@@ -482,10 +482,53 @@ pub(crate) async fn import_legacy_account(
         anyhow::bail!("no legacy compatibility account is available");
     };
 
-    let target_pool_id = pool
-        .or(account_pool_override)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| LEGACY_DEFAULT_POOL_ID.to_string());
+    let configured_default_pool_id = config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.default_pool.clone());
+    let startup_selection_before = runtime
+        .read_account_startup_selection()
+        .await
+        .context("read startup selection before legacy import")?;
+    let visible_pool_inventory = runtime
+        .read_account_startup_inventory()
+        .await
+        .context("read visible account pools before legacy import")?;
+    let inventory_was_empty = visible_pool_inventory.is_empty();
+    let explicit_target = pool.is_some() || account_pool_override.is_some();
+    let mut selected_empty_legacy_default = false;
+
+    let target_pool_id = if let Some(pool_id) = pool {
+        pool_id.to_string()
+    } else if let Some(pool_id) = account_pool_override {
+        pool_id.to_string()
+    } else if let Some(pool_id) = configured_default_pool_id.as_ref() {
+        pool_id.clone()
+    } else if let Some(pool_id) = startup_selection_before.default_pool_id.as_ref() {
+        pool_id.clone()
+    } else if let Some(pool_id) = runtime
+        .read_account_startup_status(None)
+        .await
+        .context("resolve current startup pool before legacy import")?
+        .preview
+        .effective_pool_id
+    {
+        pool_id
+    } else if inventory_was_empty {
+        selected_empty_legacy_default = true;
+        LEGACY_DEFAULT_POOL_ID.to_string()
+    } else {
+        anyhow::bail!(
+            "multiple account pools are registered; pass --pool <POOL_ID> to choose a target for `{} accounts import-legacy`",
+            MCODEX.binary_name
+        );
+    };
+    let should_persist_startup_default = inventory_was_empty
+        && configured_default_pool_id.is_none()
+        && startup_selection_before.default_pool_id.is_none()
+        && (explicit_target || selected_empty_legacy_default);
+    let should_restore_empty_startup_selection = !should_persist_startup_default
+        && startup_selection_before == AccountStartupSelectionState::default();
     let idempotency_key = format!("legacy-import:{account_id}:{target_pool_id}");
 
     runtime
@@ -515,14 +558,25 @@ pub(crate) async fn import_legacy_account(
                 .assign_account_pool(&account_id, &target_pool_id)
                 .await
                 .context("assign legacy account to target pool")?;
+        }
+        if should_persist_startup_default {
             runtime
                 .write_account_startup_selection(AccountStartupSelectionUpdate {
                     default_pool_id: Some(target_pool_id.clone()),
-                    preferred_account_id: Some(account_id.clone()),
+                    preferred_account_id: None,
                     suppressed: false,
                 })
                 .await
                 .context("record target pool selection")?;
+        } else if should_restore_empty_startup_selection {
+            runtime
+                .write_account_startup_selection(AccountStartupSelectionUpdate {
+                    default_pool_id: None,
+                    preferred_account_id: None,
+                    suppressed: false,
+                })
+                .await
+                .context("restore empty startup selection after legacy import")?;
         }
 
         runtime
