@@ -555,7 +555,7 @@ git commit -m "feat(accounts): resolve single visible startup pool"
 - Modify: `codex-rs/account-pool/src/lib.rs`
 - Test: `codex-rs/account-pool/src/startup_default.rs`
 
-- [ ] **Step 1: Write failing helper tests**
+- [x] **Step 1: Write failing helper tests**
 
 Create unit tests for the mutation matrix:
 
@@ -594,7 +594,7 @@ async fn set_default_clears_preferred_when_state_backed_source_is_active() {
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -605,7 +605,7 @@ cargo test -p codex-account-pool startup_default -- --nocapture
 
 Expected: FAIL because `startup_default` does not exist.
 
-- [ ] **Step 3: Implement helper types**
+- [x] **Step 3: Implement helper types**
 
 Add:
 
@@ -630,7 +630,7 @@ pub struct LocalDefaultPoolMutationOutcome {
 
 Use self-documenting constructors if the final API would otherwise require unclear booleans at call sites.
 
-- [ ] **Step 4: Implement `set_local_default_pool`**
+- [x] **Step 4: Implement `set_local_default_pool`**
 
 Required rules:
 
@@ -642,7 +642,7 @@ Required rules:
 - same-pool set with no preferred reset is no-op
 - same-pool set with preferred reset is state-changing
 
-- [ ] **Step 5: Implement `clear_local_default_pool`**
+- [x] **Step 5: Implement `clear_local_default_pool`**
 
 Required rules:
 
@@ -651,7 +651,7 @@ Required rules:
 - clear `preferred_account_id` only when a persisted default existed and no configured default exists
 - clearing absent persisted default succeeds as no-op
 
-- [ ] **Step 6: Run helper tests**
+- [x] **Step 6: Run helper tests**
 
 Run:
 
@@ -662,7 +662,7 @@ cargo test -p codex-account-pool startup_default -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/account-pool/src/startup_default.rs codex-rs/account-pool/src/lib.rs
