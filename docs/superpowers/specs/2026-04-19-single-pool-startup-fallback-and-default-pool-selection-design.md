@@ -204,6 +204,17 @@ still giving users a productized local preference mechanism.
 The resolver must not hard-code local SQLite membership as the abstract source
 of pool existence. It should consume a backend-neutral startup pool inventory.
 
+Implementation should introduce a small backend-facing shape, for example
+`StartupPoolInventory`, containing `StartupPoolCandidate` rows with:
+
+- `pool_id`
+- optional display label
+- optional status suitable for user-facing selection guidance
+
+The exact type names can follow the crate's local conventions, but the
+abstraction should make the resolver depend on candidate pools rather than on
+local membership tables.
+
 For local backends, the inventory is derived from registered account
 membership:
 
@@ -342,8 +353,8 @@ ambiguous.
 - validate that `<POOL_ID>` is visible in the backend startup inventory
 - write `default_pool_id = <POOL_ID>`
 - preserve `suppressed`
-- clear `preferred_account_id` only when the state-backed default is the active
-  default source after the write
+- clear `preferred_account_id` only when the state-backed default source is
+  active after the write
 
 The preferred-account reset is a pool-scoped preference reset. It prevents a
 preferred account from the old effective pool from blocking automatic selection
@@ -367,8 +378,8 @@ prints that no state change was needed.
 
 - clear persisted `default_pool_id`
 - preserve `suppressed`
-- clear `preferred_account_id` only when the persisted default was the active
-  default source before the clear
+- clear `preferred_account_id` only when the state-backed default source was
+  active before the clear
 
 This keeps "default pool selection" separate from "resume pooled startup".
 Users should continue to use the existing `accounts resume` command when they
@@ -392,6 +403,48 @@ Required text messages:
 - missing pool: fail with a clear error naming the requested pool
 - rejected `--account-pool`: fail with a clear error saying persistent default
   mutation cannot be combined with a process-local override
+
+#### Preferred-account reset matrix
+
+For the default mutation commands, "state-backed default source is active"
+means there is no configured default in `config.toml` and no process-local
+override participating in the command. Validity does not matter for this
+specific reset rule: an invalid persisted default still counts as the active
+state-backed source when no higher-priority source exists.
+
+| Command state | Preferred-account behavior |
+| --- | --- |
+| `default set` with no configured default | clear `preferred_account_id` |
+| `default set` with configured default present, valid or invalid | preserve `preferred_account_id` |
+| `default clear` when persisted default exists and no configured default exists | clear `preferred_account_id` |
+| `default clear` when configured default exists, valid or invalid | preserve `preferred_account_id` |
+| `default clear` when no persisted default exists | preserve `preferred_account_id` |
+| any `default set|clear` with `--account-pool` | reject before mutation |
+
+This rule avoids hidden mutations under config-controlled startup while still
+clearing stale pool-scoped preferences when the state-backed default is the
+selection source being changed.
+
+#### Registration interaction
+
+The single-pool fallback remains read-only even when registration commands run.
+Registration must not persist `default_pool_id` merely because startup resolved
+through `singleVisiblePool`.
+
+Existing first-default bootstrap behavior should be narrowed to explicit
+registration into an otherwise empty pool inventory:
+
+- `accounts add --account-pool <POOL_ID>` may persist `default_pool_id` only
+  when no configured default exists, no persisted default exists, and the
+  visible pool inventory before the command is empty
+- `import-legacy --pool <POOL_ID>` follows the same rule
+- registering into a second or later visible pool does not auto-persist or
+  auto-switch the default; the user should run
+  `mcodex accounts pool default set <POOL_ID>` when they want a durable
+  default
+
+This preserves the first-account UX while preventing single-pool fallback from
+silently becoming durable state or switching to a newly added second pool.
 
 ### 9. Keep startup-selection concerns separate
 
@@ -445,8 +498,9 @@ Recommended behavior:
   default-selection command from the shell
 
 The notice should print the exact CLI command shape and enough pool context for
-the user to pick the right pool. It does not need to implement an interactive
-pool picker in this slice.
+the user to pick the right pool. That context must come from the backend
+startup inventory and, for remote clients, from protocol fields described
+below. It does not need to implement an interactive pool picker in this slice.
 
 Invalid explicit defaults should use the same blocking notice shell with
 source-specific copy:
@@ -507,6 +561,7 @@ Issue fields:
 - `source`: `override`, `configDefault`, `persistedSelection`, or `none`
 - `poolId`: the requested pool id when one exists
 - `candidatePoolCount`: visible pool count when relevant
+- `candidatePools`: candidate pools when relevant to user selection
 - `message`: optional user-facing diagnostic text
 
 The field should be additive and should not repurpose existing JSON fields.
@@ -536,6 +591,17 @@ Define `AccountStartupResolutionIssue` as a v2 exported type with
 `#[serde(rename_all = "camelCase")]` and `#[ts(export_to = "v2/")]`. The
 fields above should not use `skip_serializing_if`; they should follow v2
 response/notification conventions.
+
+Define `AccountStartupCandidatePool` as a v2 exported type with:
+
+- `poolId: string`
+- `displayName: string | null`
+- `status: string | null`
+
+For `multiplePoolsRequireDefault`, `startupResolutionIssue.candidatePools`
+must include enough candidate pool rows for the TUI notice to show concrete
+pool ids instead of a placeholder. For invalid explicit defaults,
+`candidatePools` may be present to show alternatives but is not required.
 
 #### `accounts status`
 
@@ -602,6 +668,12 @@ Add focused tests for:
 - rejection of `--account-pool` with persistent default mutation
 - config-controlled set preserving active preferred-account state
 - suppressed set/clear preserving suppression and printing resume guidance
+- preferred-account reset matrix cases for config-controlled, persisted-valid,
+  persisted-invalid, and no-op clear states
+- registration bootstrap only persisting the first explicit pool when the
+  pre-command visible inventory is empty
+- registration into a second visible pool not auto-persisting or auto-switching
+  the default
 - `accounts status` text output for each new resolution state
 - `accounts status --json` additive fields for new resolution and warning
 - observability commands when there is one visible pool, multiple visible
@@ -637,9 +709,14 @@ Add protocol and server coverage for:
 - new resolution source serialization
 - `startupAvailability`
 - `startupResolutionIssue`
+- `AccountStartupCandidatePool` serialization for
+  `multiplePoolsRequireDefault`
 - remote startup responses that represent single-pool fallback and
   multi-pool-without-default distinctly
 - notification conversion preserving availability and issue fields
+- schema regeneration with `just write-app-server-schema`, plus
+  `just write-app-server-schema --experimental` if experimental fixtures are
+  affected
 
 ## Migration And Compatibility
 
