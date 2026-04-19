@@ -5,6 +5,7 @@ use codex_state::AccountStartupSelectionState;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
+use codex_state::logs_db_path;
 use codex_state::state_db_path;
 use pretty_assertions::assert_eq;
 use sqlx::SqlitePool;
@@ -30,6 +31,13 @@ async fn prepared_migrated_home() -> Result<TempDir> {
     let codex_home = TempDir::new()?;
     seed_chatgpt_auth(codex_home.path())?;
     seed_migrated_state(codex_home.path()).await?;
+    Ok(codex_home)
+}
+
+async fn prepared_home_with_two_pools_and_no_config() -> Result<TempDir> {
+    let codex_home = TempDir::new()?;
+    seed_chatgpt_auth(codex_home.path())?;
+    seed_state(codex_home.path()).await?;
     Ok(codex_home)
 }
 
@@ -598,6 +606,149 @@ async fn accounts_status_json_marks_migrated_effective_pool_and_account_source()
     assert_eq!(accounts[0]["accountId"], "acct-legacy");
     assert_eq!(accounts[0]["poolId"], "legacy-default");
     assert_eq!(accounts[0]["source"], "migrated");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_default_set_persists_local_default_without_resuming() -> Result<()> {
+    let codex_home = prepared_home_with_two_pools_and_no_config().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: Some("acct-other".to_string()),
+            suppressed: true,
+        },
+    )
+    .await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "pool", "default", "set", "team-main"],
+    )
+    .await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("default pool set: team-main"));
+    assert!(output.stdout.contains("pooled startup remains paused"));
+    assert!(output.stdout.contains("accounts resume"));
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: true,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_default_clear_reports_config_controlled_message() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-other".to_string()),
+            preferred_account_id: Some("acct-other".to_string()),
+            suppressed: true,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "pool", "default", "clear"]).await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("default pool cleared"));
+    assert!(output.stdout.contains("configured default pool"));
+    assert!(output.stdout.contains("team-main"));
+    assert!(output.stdout.contains("pooled startup remains paused"));
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: None,
+            preferred_account_id: Some("acct-other".to_string()),
+            suppressed: true,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_default_rejects_top_level_account_pool_override_before_mutation()
+-> Result<()> {
+    let codex_home = prepared_home_with_two_pools_and_no_config().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: true,
+        },
+    )
+    .await?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "team-other",
+            "pool",
+            "default",
+            "set",
+            "team-main",
+        ],
+    )
+    .await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("--account-pool"));
+    assert!(output.stderr.contains("accounts pool default"));
+    assert_eq!(
+        read_startup_selection(&codex_home).await?,
+        AccountStartupSelectionState {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: Some("acct-1".to_string()),
+            suppressed: true,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_pool_default_rejects_top_level_account_pool_override_without_creating_state()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let output = run_codex(
+        &codex_home,
+        &[
+            "accounts",
+            "--account-pool",
+            "team-other",
+            "pool",
+            "default",
+            "clear",
+        ],
+    )
+    .await?;
+
+    assert!(!output.success, "stdout: {}", output.stdout);
+    assert!(output.stderr.contains("--account-pool"));
+    assert!(output.stderr.contains("accounts pool default"));
+    assert!(
+        !state_db_path(codex_home.path()).exists(),
+        "state db should not be created for invalid accounts pool default invocation"
+    );
+    assert!(
+        !logs_db_path(codex_home.path()).exists(),
+        "logs db should not be created for invalid accounts pool default invocation"
+    );
 
     Ok(())
 }

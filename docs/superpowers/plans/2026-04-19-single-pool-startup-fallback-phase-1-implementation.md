@@ -676,7 +676,7 @@ git commit -m "feat(accounts): add default pool mutation helper"
 - Add: `codex-rs/cli/src/accounts/default_pool.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Write failing parse and behavior tests**
+- [x] **Step 1: Write failing parse and behavior tests**
 
 Add tests:
 
@@ -726,7 +726,7 @@ async fn accounts_pool_default_set_persists_local_default_without_resuming() -> 
 }
 ```
 
-- [ ] **Step 2: Run focused CLI tests and verify failure**
+- [x] **Step 2: Run focused CLI tests and verify failure**
 
 Run:
 
@@ -737,7 +737,7 @@ cargo test -p codex-cli --test accounts accounts_pool_default -- --nocapture
 
 Expected: FAIL because the subcommand does not exist.
 
-- [ ] **Step 3: Add clap command shape**
+- [x] **Step 3: Add clap command shape**
 
 In `PoolSubcommand`:
 
@@ -767,7 +767,7 @@ pub struct PoolDefaultSetCommand {
 }
 ```
 
-- [ ] **Step 4: Implement CLI presentation module**
+- [x] **Step 4: Implement CLI presentation module**
 
 Create `default_pool.rs` with functions:
 
@@ -794,11 +794,11 @@ Rules:
 - print resume guidance if `suppressed` remains true
 - no JSON output in this phase
 
-- [ ] **Step 5: Dispatch from `run_accounts_impl`**
+- [x] **Step 5: Dispatch from `run_accounts_impl`**
 
 Add a `PoolSubcommand::Default` match arm in the existing runtime-initialized branch.
 
-- [ ] **Step 6: Run CLI tests**
+- [x] **Step 6: Run CLI tests**
 
 Run:
 
@@ -809,7 +809,7 @@ cargo test -p codex-cli --test accounts accounts_pool_default -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/mod.rs codex-rs/cli/src/accounts/default_pool.rs codex-rs/cli/tests/accounts.rs
