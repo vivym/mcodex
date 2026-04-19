@@ -1,7 +1,11 @@
 use super::*;
+use crate::config::Config;
+use crate::config::ConfigBuilder;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX;
 use async_channel::bounded;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ResponseItem;
@@ -15,6 +19,7 @@ use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -25,6 +30,7 @@ use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -153,6 +159,46 @@ async fn forward_ops_preserves_submission_trace_context() {
 }
 
 #[tokio::test]
+async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) = crate::codex::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
+    );
+    runtime_lease_host.attach_legacy_manager_bridge();
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_interactive(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        /*inherited_lease_auth_session*/ None,
+        Arc::clone(&parent_session.services.models_manager),
+        Arc::clone(&parent_session),
+        parent_ctx,
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await?;
+
+    let child_runtime_lease_host = child
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
+    assert!(child_runtime_lease_host.has_legacy_manager_bridge_for_test());
+    assert!(child.session.services.account_pool_manager.is_none());
+
+    child.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, parent_ctx, rx_events) =
         crate::codex::make_session_and_context_with_rx().await;
@@ -238,6 +284,33 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
             response: expected_response,
         }
     );
+}
+
+async fn build_test_config_with_pool(codex_home: &Path) -> Config {
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.to_path_buf())
+        .build()
+        .await
+        .expect("load default test config");
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: None,
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+    config
 }
 
 #[tokio::test]

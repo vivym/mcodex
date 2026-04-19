@@ -94,6 +94,38 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
+    pub(crate) async fn build_root_runtime_lease_host(
+        state_db: Option<StateDbHandle>,
+        accounts: Option<AccountsConfigToml>,
+        holder_instance_id: &str,
+    ) -> anyhow::Result<Option<crate::runtime_lease::RuntimeLeaseHost>> {
+        let Some(state_db) = state_db else {
+            return Ok(None);
+        };
+        let shared_status = read_shared_startup_status(
+            &LocalAccountPoolBackend::new(
+                Arc::clone(&state_db),
+                Duration::seconds(
+                    accounts
+                        .as_ref()
+                        .and_then(|config| config.lease_ttl_secs)
+                        .unwrap_or(300) as i64,
+                ),
+            ),
+            accounts
+                .as_ref()
+                .and_then(|config| config.default_pool.as_deref()),
+            None,
+        )
+        .await?;
+        if accounts.is_none() && !shared_status.pooled_applicable {
+            return Ok(None);
+        }
+        Ok(Some(crate::runtime_lease::RuntimeLeaseHost::pooled(
+            crate::runtime_lease::RuntimeLeaseHostId::new(holder_instance_id.to_string()),
+        )))
+    }
+
     pub(crate) async fn build_account_pool_manager(
         state_db: Option<StateDbHandle>,
         accounts: Option<AccountsConfigToml>,

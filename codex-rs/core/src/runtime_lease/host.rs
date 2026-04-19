@@ -1,5 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
@@ -29,11 +31,12 @@ pub(crate) enum RuntimeLeaseHostMode {
 pub(crate) struct RuntimeLeaseAuthorityMarker;
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
+    legacy_manager_bridge_attached: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +49,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
+            legacy_manager_bridge_attached: AtomicBool::new(false),
         }))
     }
 
@@ -54,6 +58,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
+            legacy_manager_bridge_attached: AtomicBool::new(false),
         }))
     }
 
@@ -63,6 +68,18 @@ impl RuntimeLeaseHost {
 
     pub(crate) fn mode(&self) -> RuntimeLeaseHostMode {
         self.0.mode
+    }
+
+    pub(crate) fn attach_legacy_manager_bridge(&self) {
+        self.0
+            .legacy_manager_bridge_attached
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn has_legacy_manager_bridge(&self) -> bool {
+        self.0
+            .legacy_manager_bridge_attached
+            .load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -83,5 +100,10 @@ impl RuntimeLeaseHost {
     #[cfg(test)]
     pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_legacy_manager_bridge_for_test(&self) -> bool {
+        self.has_legacy_manager_bridge()
     }
 }

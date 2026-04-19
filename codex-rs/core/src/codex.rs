@@ -1686,6 +1686,7 @@ impl Session {
             session_configuration.collaboration_mode.model(),
             session_configuration.provider
         );
+        let session_source_for_runtime_host = session_source.clone();
         let forked_from_id = initial_history.forked_from_id();
 
         let (conversation_id, rollout_params) = match &initial_history {
@@ -2063,10 +2064,29 @@ impl Session {
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
+        let runtime_lease_host = if runtime_lease_host.is_some()
+            || matches!(session_source_for_runtime_host, SessionSource::SubAgent(_))
+        {
+            runtime_lease_host
+        } else {
+            SessionServices::build_root_runtime_lease_host(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                &account_pool_holder_instance_id,
+            )
+            .await?
+        };
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
         lease_auth.replace_current(inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let account_pool_manager = if inherited_lease_auth_session.is_some() {
+        let inherited_pooled_runtime_host = matches!(
+            (&session_source_for_runtime_host, runtime_lease_host.as_ref()),
+            (
+                SessionSource::SubAgent(_),
+                Some(host)
+            ) if host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
+        );
+        let account_pool_manager = if inherited_pooled_runtime_host {
             None
         } else {
             SessionServices::build_account_pool_manager(
@@ -2077,6 +2097,17 @@ impl Session {
             )
             .await?
         };
+        if let Some(runtime_lease_host) = runtime_lease_host.as_ref()
+            && account_pool_manager.is_some()
+        {
+            runtime_lease_host.attach_legacy_manager_bridge();
+        }
+        if inherited_lease_auth_session.is_some()
+            && let Some(runtime_lease_host) = runtime_lease_host.as_ref()
+            && runtime_lease_host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
+        {
+            debug_assert!(runtime_lease_host.has_legacy_manager_bridge());
+        }
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(
                 lease_auth_provider,

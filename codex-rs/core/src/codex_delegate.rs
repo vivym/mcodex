@@ -96,7 +96,7 @@ pub(crate) async fn run_codex_thread_interactive(
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_lease_auth_session,
-        runtime_lease_host: None,
+        runtime_lease_host: parent_session.services.runtime_lease_host.clone(),
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_trace: None,

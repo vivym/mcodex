@@ -41,6 +41,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::W3cTraceContext;
@@ -911,6 +912,19 @@ impl ThreadManagerState {
                 self.plugins_manager.as_ref(),
             )
             .await;
+        let runtime_lease_host = if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            ..
+        }) = &session_source
+        {
+            self.threads
+                .read()
+                .await
+                .get(parent_thread_id)
+                .and_then(|thread| thread.codex.session.services.runtime_lease_host.clone())
+        } else {
+            None
+        };
         let CodexSpawnOk {
             codex, thread_id, ..
         } = Codex::spawn(CodexSpawnArgs {
@@ -931,7 +945,7 @@ impl ThreadManagerState {
             inherited_shell_snapshot,
             inherited_exec_policy,
             inherited_lease_auth_session: None,
-            runtime_lease_host: None,
+            runtime_lease_host,
             user_shell_override,
             parent_trace,
             analytics_events_client: self.analytics_events_client.clone(),
