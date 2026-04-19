@@ -225,9 +225,9 @@ for latest-version discovery. It should stay intentionally small:
   "version": "0.96.0",
   "publishedAt": "2026-04-20T12:00:00Z",
   "notesUrl": "https://github.com/vivym/mcodex/releases/tag/rust-v0.96.0",
-  "checksumsUrl": "https://downloads.example.com/repositories/mcodex/releases/0.96.0/SHA256SUMS",
+  "checksumsUrl": "https://downloads.mcodex.sota.wiki/repositories/mcodex/releases/0.96.0/SHA256SUMS",
   "install": {
-    "unix": "curl -fsSL https://downloads.example.com/install.sh | sh",
+    "unix": "curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh",
     "windows": "powershell -ExecutionPolicy Bypass -File .\\install.ps1"
   }
 }
