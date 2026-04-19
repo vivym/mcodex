@@ -19,6 +19,8 @@ Approved product decisions:
   install metadata env vars, prepend the managed `bin` dir to `PATH`, and
   exec the real binary
 - Update prompts live only in Rust/TUI, not in shell or PowerShell wrappers
+- This slice is stable-only; it does not introduce installer-selectable release
+  channels
 - Installers support both `latest` and explicit version installation
 - Existing npm-installed users are not specially migrated; the cutover is
   clean and documented
@@ -90,6 +92,8 @@ first distribution story.
 - The user wants a thin wrapper, not a second implementation of update logic in
   shell/PowerShell.
 - Update prompts should live in Rust/TUI only.
+- This slice is stable-only; channel selection and persistence are out of
+  scope.
 - OSS distribution must support both latest installs and explicit version pins.
 - GitHub Releases should remain, but only as lightweight publication records.
 - Domestic-user distribution quality matters more than keeping compatibility
@@ -201,7 +205,6 @@ Recommended OSS layout:
 /repositories/mcodex/
   channels/
     stable/latest.json
-    alpha/latest.json
   releases/
     0.96.0/
       mcodex-darwin-arm64.tar.gz
@@ -212,7 +215,6 @@ Recommended OSS layout:
       mcodex-win32-x64.zip
       SHA256SUMS
       SHA256SUMS.sig
-      release.json
 ```
 
 `latest.json` should be the only manifest the runtime and install scripts need
@@ -267,7 +269,9 @@ Recommended PATH entries:
 
 - macOS/Linux: `~/.local/bin/mcodex`
 - Windows PowerShell: `%LOCALAPPDATA%\\Programs\\Mcodex\\bin\\mcodex.ps1`
-- Windows optional `cmd.exe` bridge: `mcodex.cmd`
+
+This slice supports PowerShell as the Windows command surface. `mcodex.cmd` is
+explicitly out of scope.
 
 Wrapper responsibilities:
 
@@ -289,7 +293,6 @@ Recommended env vars:
 
 - `MCODEX_INSTALL_MANAGED=1`
 - `MCODEX_INSTALL_METHOD=script`
-- `MCODEX_INSTALL_CHANNEL=stable`
 - `MCODEX_INSTALL_ROOT=<resolved-root>`
 
 These env vars become the runtime-facing contract for script-managed installs.
@@ -310,7 +313,16 @@ Responsibilities:
 - atomically move the stable `current` pointer
 - write/update installation metadata
 - create the wrapper if missing
-- update user PATH setup on first install
+- update user PATH setup on first install using the platform's native
+  profile/PATH mechanism
+
+Selected PATH strategy:
+
+- macOS/Linux: reuse the current installer behavior and write the wrapper
+  directory into the user's shell startup file on first install (`.zshrc`,
+  `.bashrc`, or `.profile` depending on the detected shell)
+- Windows: write the wrapper directory into the user PATH environment variable
+  in the registry, matching the current PowerShell installer behavior
 
 This design intentionally keeps wrappers read-only and installers stateful.
 
@@ -327,7 +339,6 @@ Recommended shape:
 {
   "product": "mcodex",
   "installMethod": "script",
-  "channel": "stable",
   "currentVersion": "0.96.0",
   "installedAt": "2026-04-20T12:00:00Z",
   "installRoot": "/Users/alice/.mcodex",
@@ -356,11 +367,15 @@ Selected behavior:
   fork still intentionally supports
 - npm/bun should no longer be the primary CLI install/update path for this fork
 
-The script-managed update action should render a user-facing update command that
-matches the platform-supported installer story. The command can either:
+The script-managed update action should render the script-based update command
+directly in the TUI. It should not introduce a new CLI helper command in this
+slice.
 
-- directly show the script-based update command, or
-- point to a small CLI helper that prints the right script command
+Selected rendering:
+
+- Unix: `curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh`
+- Windows: present the script-managed PowerShell update path directly in the
+  prompt text, without adding a helper subcommand
 
 Because the user selected TUI-only update prompts, wrappers should not perform
 their own version checks or print update notices.
@@ -368,8 +383,8 @@ their own version checks or print update notices.
 ### 8. Move runtime update checks from GitHub latest API to OSS manifest
 
 The runtime update check should no longer depend on GitHub latest-release API
-responses. Instead it should fetch the OSS `latest.json` manifest for the active
-channel and compare `version` against the current build version.
+responses. Instead it should fetch the OSS stable `latest.json` manifest and
+compare `version` against the current build version.
 
 This keeps:
 
@@ -451,7 +466,7 @@ The OSS publish order must be atomic from the client's perspective:
 
 1. upload versioned release artifacts
 2. verify upload success
-3. update or upload the channel `latest.json` last
+3. update or upload `stable/latest.json` last
 
 That ensures clients never learn about a version before the corresponding
 artifacts are available.
