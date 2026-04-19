@@ -2740,6 +2740,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
         None,
+        None,
         Some(Arc::new(
             codex_exec_server::Environment::create(/*exec_server_url*/ None)
                 .await
@@ -2886,6 +2887,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
@@ -3735,6 +3737,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),

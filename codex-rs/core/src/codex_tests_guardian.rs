@@ -450,6 +450,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(parent_exec_policy)),
         inherited_lease_auth_session: None,
+        runtime_lease_host: None,
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,

@@ -84,6 +84,7 @@ pub(crate) struct SessionServices {
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) account_pool_manager: Option<Arc<Mutex<AccountPoolManager>>>,
+    pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) lease_auth: Arc<crate::lease_auth::SessionLeaseAuth>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,

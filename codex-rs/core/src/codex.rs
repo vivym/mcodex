@@ -441,6 +441,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
     pub(crate) inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
@@ -496,6 +497,7 @@ impl Codex {
             user_shell_override,
             inherited_exec_policy,
             inherited_lease_auth_session,
+            runtime_lease_host,
             parent_trace: _,
             analytics_events_client,
         } = args;
@@ -688,6 +690,7 @@ impl Codex {
             skills_watcher,
             agent_control,
             inherited_lease_auth_session,
+            runtime_lease_host,
             environment,
             analytics_events_client,
         )
@@ -1674,6 +1677,7 @@ impl Session {
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
         inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
         environment: Option<Arc<Environment>>,
         analytics_events_client: Option<AnalyticsEventsClient>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -2119,6 +2123,7 @@ impl Session {
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             account_pool_manager,
+            runtime_lease_host,
             lease_auth: Arc::clone(&lease_auth),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
