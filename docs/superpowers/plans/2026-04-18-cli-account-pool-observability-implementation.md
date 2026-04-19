@@ -72,7 +72,7 @@ Out of scope:
 - Modify: `codex-rs/cli/src/accounts/diagnostics.rs`
 - Test: `codex-rs/cli/tests/accounts_observability.rs`
 
-- [ ] **Step 1: Write failing command and resolver tests**
+- [x] **Step 1: Write failing command and resolver tests**
 
 Add parser-focused coverage in `codex-rs/cli/tests/accounts_observability.rs` so Task 1 only proves grammar and conflict handling, not the later runtime read path:
 
@@ -128,7 +128,7 @@ async fn resolve_target_pool_rejects_conflicting_command_and_override_pool_ids()
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm they fail**
+- [x] **Step 2: Run the focused tests and confirm they fail**
 
 Run:
 
@@ -139,7 +139,7 @@ cargo test -p codex-cli --test accounts_observability accounts_pool_show_and_exi
 
 Expected: FAIL because the new `pool show` parser branch and explicit conflict handling do not exist yet.
 
-- [ ] **Step 3: Implement clap subcommands and the shared resolver**
+- [x] **Step 3: Implement clap subcommands and the shared resolver**
 
 Add the new command structs and subcommands in `codex-rs/cli/src/accounts/mod.rs`:
 
@@ -203,7 +203,7 @@ pub(crate) fn resolve_target_pool(
 
 Expose the existing startup-status read from `diagnostics.rs` so the observability module can resolve the effective pool without duplicating config/state probing.
 
-- [ ] **Step 4: Run the CLI crate tests for the grammar slice**
+- [x] **Step 4: Run the CLI crate tests for the grammar slice**
 
 Run:
 
@@ -215,7 +215,7 @@ cargo test -p codex-cli
 
 Expected: PASS for the parser/resolver slice, while the later `pool show` / `events` assertions can stay ignored or absent until their tasks land.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -237,7 +237,7 @@ git commit -m "feat(cli): add pooled observability command grammar"
 - Test: `codex-rs/cli/tests/accounts_observability.rs`
 - Test: `codex-rs/cli/src/accounts/observability_output.rs`
 
-- [ ] **Step 1: Write failing `pool show` tests**
+- [x] **Step 1: Write failing `pool show` tests**
 
 Add integration tests that prove both default effective-pool fallback and stable JSON/text output:
 
@@ -291,7 +291,7 @@ async fn accounts_pool_show_text_reports_accounts_none_for_empty_pool() -> Resul
 }
 ```
 
-- [ ] **Step 2: Run the focused `pool show` tests and confirm failure**
+- [x] **Step 2: Run the focused `pool show` tests and confirm failure**
 
 Run:
 
@@ -302,7 +302,7 @@ cargo test -p codex-cli --test accounts_observability accounts_pool_show_json_us
 
 Expected: FAIL because `pool show` does not exist and no output mapping is implemented.
 
-- [ ] **Step 3: Implement the strict read path and output mapping**
+- [x] **Step 3: Implement the strict read path and output mapping**
 
 Add CLI-specific view structs in `codex-rs/cli/src/accounts/observability_types.rs`:
 
@@ -364,7 +364,7 @@ pub(crate) async fn read_pool_show(
 
 Add formatter unit tests in `codex-rs/cli/src/accounts/observability_output.rs` for `leaseId@holderInstanceId`, `accounts: none`, `next cursor: ...`, and JSON null-preservation. Then format text/json there without inventing missing timestamp values.
 
-- [ ] **Step 4: Run `pool show` tests and the full CLI crate tests**
+- [x] **Step 4: Run `pool show` tests and the full CLI crate tests**
 
 Run:
 
@@ -378,7 +378,7 @@ cargo test -p codex-cli
 
 Expected: PASS. `pool show` succeeds, keeps nullable JSON fields, and leaves `pool list|assign` untouched.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -400,7 +400,7 @@ git commit -m "feat(cli): add account pool show"
 - Test: `codex-rs/cli/tests/accounts_observability.rs`
 - Test: `codex-rs/cli/src/accounts/observability_output.rs`
 
-- [ ] **Step 1: Write failing diagnostics tests**
+- [x] **Step 1: Write failing diagnostics tests**
 
 Add coverage for healthy empty issues and blocked/degraded output:
 
@@ -442,7 +442,7 @@ async fn accounts_diagnostics_requires_pool_when_no_effective_pool_resolves() ->
 }
 ```
 
-- [ ] **Step 2: Run the focused diagnostics tests and confirm failure**
+- [x] **Step 2: Run the focused diagnostics tests and confirm failure**
 
 Run:
 
@@ -453,7 +453,7 @@ cargo test -p codex-cli --test accounts_observability accounts_diagnostics_text_
 
 Expected: FAIL because `accounts diagnostics` does not exist yet.
 
-- [ ] **Step 3: Implement diagnostics read and formatting**
+- [x] **Step 3: Implement diagnostics read and formatting**
 
 Add a view model and mapper:
 
@@ -494,7 +494,7 @@ pub(crate) async fn read_pool_diagnostics(
 
 Add formatter unit tests for `issues: none` and stable issue-row text, then render text with backend order preserved.
 
-- [ ] **Step 4: Run diagnostics tests and the full CLI crate tests**
+- [x] **Step 4: Run diagnostics tests and the full CLI crate tests**
 
 Run:
 
@@ -508,7 +508,7 @@ cargo test -p codex-cli
 
 Expected: PASS. Diagnostics remains strict, uses seam ordering, and preserves nullable fields in JSON.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -530,7 +530,7 @@ git commit -m "feat(cli): add account diagnostics view"
 - Test: `codex-rs/cli/tests/accounts_observability.rs`
 - Test: `codex-rs/cli/src/accounts/observability_output.rs`
 
-- [ ] **Step 1: Write failing events tests**
+- [x] **Step 1: Write failing events tests**
 
 Cover cursor pagination, repeatable `--type`, and empty-state text:
 
@@ -595,7 +595,7 @@ async fn accounts_events_rejects_invalid_cursor() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run the focused events tests and confirm failure**
+- [x] **Step 2: Run the focused events tests and confirm failure**
 
 Run:
 
@@ -606,7 +606,7 @@ cargo test -p codex-cli --test accounts_observability accounts_events_json_prese
 
 Expected: FAIL because `accounts events` and the event-type argument mapping do not exist yet.
 
-- [ ] **Step 3: Implement events args, mapper, and formatter**
+- [x] **Step 3: Implement events args, mapper, and formatter**
 
 Add a repeatable event-type argument that maps directly onto seam filters:
 
@@ -658,7 +658,7 @@ pub(crate) async fn read_pool_events(
 
 Add formatter unit tests for `events: none` and `next cursor: ...`, then render text rows newest-first without re-sorting and keep JSON `details` as raw `serde_json::Value`.
 
-- [ ] **Step 4: Run events tests and the full CLI crate tests**
+- [x] **Step 4: Run events tests and the full CLI crate tests**
 
 Run:
 
@@ -672,7 +672,7 @@ cargo test -p codex-cli
 
 Expected: PASS. Events pagination, OR filtering, raw details JSON, and text empty states all match the spec.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -696,7 +696,7 @@ git commit -m "feat(cli): add account events view"
 - Test: `codex-rs/cli/tests/accounts_observability.rs`
 - Test: `codex-rs/cli/src/accounts/observability_output.rs`
 
-- [ ] **Step 1: Write failing `accounts status` observability tests**
+- [x] **Step 1: Write failing `accounts status` observability tests**
 
 Add coverage for the additive JSON contract, the full partial-failure matrix, and the required status text behavior:
 
@@ -782,7 +782,7 @@ async fn accounts_status_text_shows_counts_issue_summary_and_warning() -> Result
 }
 ```
 
-- [ ] **Step 2: Run the focused status tests and confirm failure**
+- [x] **Step 2: Run the focused status tests and confirm failure**
 
 Run:
 
@@ -793,7 +793,7 @@ cargo test -p codex-cli --test accounts_observability accounts_status_json_adds_
 
 Expected: FAIL because `accounts status` does not emit the additive pooled observability object or mixed-failure text behavior yet.
 
-- [ ] **Step 3: Implement additive status reads, output, and docs**
+- [x] **Step 3: Implement additive status reads, output, and docs**
 
 Extend `AccountsStatusDiagnostic` in `codex-rs/cli/src/accounts/diagnostics.rs`:
 
@@ -855,7 +855,7 @@ Use these commands after joining or configuring a pool:
 - `mcodex accounts events --limit 20`
 ```
 
-- [ ] **Step 4: Run the observability file tests and the full CLI crate tests**
+- [x] **Step 4: Run the observability file tests and the full CLI crate tests**
 
 Run:
 
@@ -867,7 +867,7 @@ cargo test -p codex-cli
 
 Expected: PASS. `status` keeps its legacy top-level JSON, adds `poolObservability`, and degrades partially instead of failing when observability reads fail.
 
-- [ ] **Step 5: Format, lint, and commit**
+- [x] **Step 5: Format, lint, and commit**
 
 Run:
 
@@ -881,17 +881,17 @@ git commit -m "feat(cli): surface pooled account observability"
 
 ## Final Verification Checklist
 
-- [ ] `codex accounts pool list` still works unchanged
-- [ ] `codex accounts pool assign <ACCOUNT_ID> <POOL_ID>` still works unchanged
-- [ ] `codex accounts pool show` succeeds against an effective pool and with explicit `--pool`
-- [ ] `codex accounts diagnostics` is strict on missing pool / read failure
-- [ ] `codex accounts events` is strict on missing pool / read failure and preserves cursor semantics
-- [ ] `codex accounts status --json` keeps legacy top-level keys and adds `poolObservability`
-- [ ] strict drill-down commands do not consult startup status when `--pool` or top-level `--account-pool` already provides the target
-- [ ] new CLI JSON timestamps are RFC 3339 UTC strings
-- [ ] text output prints `accounts: none`, `issues: none`, `events: none`, and `next cursor: ...` in the corresponding places
-- [ ] formatter unit tests cover lease rendering, text empty states, cursor lines, and status mixed-failure summaries
-- [ ] formatter unit tests cover JSON null-preservation for nullable observability fields
-- [ ] `cd codex-rs && cargo test -p codex-cli`
-- [ ] `cd codex-rs && just fmt`
-- [ ] `cd codex-rs && just fix -p codex-cli`
+- [x] `codex accounts pool list` still works unchanged
+- [x] `codex accounts pool assign <ACCOUNT_ID> <POOL_ID>` still works unchanged
+- [x] `codex accounts pool show` succeeds against an effective pool and with explicit `--pool`
+- [x] `codex accounts diagnostics` is strict on missing pool / read failure
+- [x] `codex accounts events` is strict on missing pool / read failure and preserves cursor semantics
+- [x] `codex accounts status --json` keeps legacy top-level keys and adds `poolObservability`
+- [x] strict drill-down commands do not consult startup status when `--pool` or top-level `--account-pool` already provides the target
+- [x] new CLI JSON timestamps are RFC 3339 UTC strings
+- [x] text output prints `accounts: none`, `issues: none`, `events: none`, and `next cursor: ...` in the corresponding places
+- [x] formatter unit tests cover lease rendering, text empty states, cursor lines, and status mixed-failure summaries
+- [x] formatter unit tests cover JSON null-preservation for nullable observability fields
+- [x] `cd codex-rs && cargo test -p codex-cli`
+- [x] `cd codex-rs && just fmt`
+- [x] `cd codex-rs && just fix -p codex-cli`
