@@ -243,6 +243,14 @@ The Windows command intentionally downloads the hosted `install.ps1` into
 `https://downloads.mcodex.sota.wiki/install.ps1`; docs and TUI update prompts
 should render the same command string.
 
+Checksum and signature artifacts have distinct roles in this slice:
+
+- installers must download and validate `SHA256SUMS` from OSS before switching
+  `currentLink`
+- installers do not verify `SHA256SUMS.sig` in this slice
+- `SHA256SUMS.sig` is a lightweight GitHub Release record for manual audit,
+  release provenance, and possible future installer signature verification
+
 ### 3. Use a versioned install root plus a stable `current` pointer
 
 Install scripts should not overwrite a single live binary in place. Instead,
@@ -322,6 +330,23 @@ These env vars become the runtime-facing contract for script-managed installs.
 `install.sh` and `install.ps1` become the only supported CLI install/update
 entrypoints. They should own all disk mutation.
 
+Selected invocation syntax:
+
+| Operation | macOS/Linux | Windows |
+| --- | --- | --- |
+| install latest | `curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh` | `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"` |
+| install explicit version | `curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh -s -- 0.96.0` | `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1 0.96.0"` |
+| reinstall/update | same as install latest | same as install latest |
+
+Version argument rules:
+
+- omitted argument means `latest`
+- `latest` means resolve `channels/stable/latest.json`
+- explicit versions are the first positional argument
+- explicit versions may be `0.96.0`, `v0.96.0`, or `rust-v0.96.0`; installers
+  normalize to `0.96.0`
+- any other version syntax should fail before download with a clear error
+
 Responsibilities:
 
 - accept `latest` or explicit version input
@@ -329,6 +354,7 @@ Responsibilities:
 - determine the platform archive name
 - download the archive plus `SHA256SUMS`
 - verify checksums before switching live state
+- treat `SHA256SUMS.sig` as release-record-only in this slice
 - extract into `install/<version>`
 - atomically move the stable `current` pointer
 - write/update installation metadata
@@ -383,11 +409,11 @@ env vars.
 
 Selected behavior:
 
-- if `MCODEX_INSTALL_MANAGED=1` is present, prefer the script-managed update
-  action
-- otherwise, retain any separately supported package-manager detection that the
-  fork still intentionally supports
-- npm/bun should no longer be the primary CLI install/update path for this fork
+- if `MCODEX_INSTALL_MANAGED=1` and `MCODEX_INSTALL_METHOD=script` are present,
+  render the script-managed update action
+- otherwise, do not render a package-manager update action in this slice
+- npm, bun, and Homebrew update actions are not advertised for the `mcodex` CLI
+  after the cutover
 
 The script-managed update action should render the script-based update command
 directly in the TUI. It should not introduce a new CLI helper command in this
@@ -424,16 +450,18 @@ Recommended GitHub Release contents:
 
 - tag and release notes
 - `SHA256SUMS`
-- `SHA256SUMS.sig`
+- `SHA256SUMS.sig` as a release-record-only signature artifact
 - source snapshot references
 - OSS installation and download links in the release body
+- clear cutover notes explaining that CLI users should install and update
+  through the OSS script-managed channel
 
 Large platform archives should live on OSS only. GitHub Releases remain useful
 for:
 
 - public version history
 - changelog visibility
-- checksum/signature anchoring
+- checksum/signature audit trail
 - a lightweight fallback publication record independent of OSS object listing
 
 ### 10. Split CLI distribution changes from SDK npm publishing
@@ -459,6 +487,8 @@ Implications:
 - no dedicated runtime compatibility path for users who installed earlier
   versions of the CLI through npm
 - no dual-track CLI update behavior for npm-installed users
+- no retained npm, bun, or Homebrew update prompts for the `mcodex` CLI after
+  cutover
 - docs and release notes should clearly instruct old users to reinstall using
   the script-managed OSS installer if they want to move onto the new channel
 
@@ -504,6 +534,10 @@ Coverage should include:
   and reinstall/update behavior
 - integration tests for `install.ps1` latest install, explicit version install,
   and reinstall/update behavior
+- installer tests for accepted version inputs: omitted, `latest`, `0.96.0`,
+  `v0.96.0`, and `rust-v0.96.0`
+- installer tests proving invalid version syntax fails before download or disk
+  mutation
 - wrapper smoke tests proving PATH injection and exit-code forwarding
 - release-workflow tests or scripted validations for archive layout and
   checksum generation
@@ -516,8 +550,11 @@ Manual smoke should confirm:
 - upgrade from one script-installed version to another updates `current`
   without leaving PATH broken
 - `mcodex` launched through the wrapper sees script-managed install metadata
-- TUI update prompt points to the script-managed update path, not npm/bun
+- TUI update prompt points to the script-managed update path, not npm, bun, or
+  Homebrew
 - lightweight GitHub Release still provides notes and checksum artifacts
+- docs and release notes explain the clean cutover for old npm-installed CLI
+  users
 
 ## Risks and Mitigations
 
@@ -567,12 +604,14 @@ Mitigation:
 - CLI distribution no longer depends on npm packaging or npm publish
 - install scripts fetch native platform archives from OSS/CDN
 - install scripts support both `latest` and explicit versions
+- install scripts validate `SHA256SUMS` before switching the active version
 - PATH points to a thin wrapper, not directly to the versioned binary
 - wrappers inject script-managed install metadata and otherwise stay minimal
 - TUI update prompts recognize script-managed installs and no longer direct the
-  CLI user to npm/bun
+  CLI user to npm, bun, or Homebrew
 - runtime update checks read the OSS stable manifest instead of GitHub latest
   API
 - GitHub Releases remain lightweight publication records with notes and checksum
   artifacts, not the primary binary distribution channel
+- docs and release notes describe the clean npm-to-script CLI cutover
 - TypeScript SDK npm publishing remains unaffected by the CLI cutover
