@@ -76,6 +76,15 @@ pub(crate) async fn run_codex_thread_interactive(
 ) -> Result<Codex, CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let runtime_lease_host = parent_session.services.runtime_lease_host.clone();
+    let inherited_lease_auth_session = if runtime_lease_host
+        .as_ref()
+        .is_some_and(|host| host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled)
+    {
+        None
+    } else {
+        inherited_lease_auth_session
+    };
 
     let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
         config,
@@ -96,7 +105,7 @@ pub(crate) async fn run_codex_thread_interactive(
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_lease_auth_session,
-        runtime_lease_host: parent_session.services.runtime_lease_host.clone(),
+        runtime_lease_host,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_trace: None,

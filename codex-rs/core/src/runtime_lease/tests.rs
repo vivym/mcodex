@@ -140,6 +140,21 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
             .expect("root runtime lease host")
             .has_legacy_manager_bridge_for_test()
     );
+    assert!(Arc::ptr_eq(
+        root.session
+            .services
+            .account_pool_manager
+            .as_ref()
+            .expect("root account pool manager"),
+        &root
+            .session
+            .services
+            .runtime_lease_host
+            .as_ref()
+            .expect("root runtime lease host")
+            .legacy_manager_bridge_for_test()
+            .expect("registered legacy manager bridge"),
+    ));
     assert!(child.session.services.runtime_lease_host.is_some());
     assert!(child.session.services.account_pool_manager.is_none());
 

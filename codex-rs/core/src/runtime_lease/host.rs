@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
@@ -31,12 +31,25 @@ pub(crate) enum RuntimeLeaseHostMode {
 pub(crate) struct RuntimeLeaseAuthorityMarker;
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug)]
 struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
-    legacy_manager_bridge_attached: AtomicBool,
+    legacy_manager_bridge: OnceLock<Arc<Mutex<crate::state::AccountPoolManager>>>,
+}
+
+impl fmt::Debug for RuntimeLeaseHostInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeLeaseHostInner")
+            .field("id", &self.id)
+            .field("mode", &self.mode)
+            .field("has_authority", &self.authority.is_some())
+            .field(
+                "has_legacy_manager_bridge",
+                &self.legacy_manager_bridge.get().is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,7 +62,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
-            legacy_manager_bridge_attached: AtomicBool::new(false),
+            legacy_manager_bridge: OnceLock::new(),
         }))
     }
 
@@ -58,7 +71,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
-            legacy_manager_bridge_attached: AtomicBool::new(false),
+            legacy_manager_bridge: OnceLock::new(),
         }))
     }
 
@@ -70,16 +83,23 @@ impl RuntimeLeaseHost {
         self.0.mode
     }
 
-    pub(crate) fn attach_legacy_manager_bridge(&self) {
-        self.0
-            .legacy_manager_bridge_attached
-            .store(true, Ordering::Release);
+    pub(crate) fn attach_legacy_manager_bridge(
+        &self,
+        manager: Arc<Mutex<crate::state::AccountPoolManager>>,
+    ) {
+        if let Err(existing) = self.0.legacy_manager_bridge.set(manager) {
+            debug_assert!(
+                self.0
+                    .legacy_manager_bridge
+                    .get()
+                    .is_some_and(|attached| Arc::ptr_eq(attached, &existing)),
+                "legacy manager bridge cannot be replaced"
+            );
+        }
     }
 
     pub(crate) fn has_legacy_manager_bridge(&self) -> bool {
-        self.0
-            .legacy_manager_bridge_attached
-            .load(Ordering::Acquire)
+        self.0.legacy_manager_bridge.get().is_some()
     }
 
     #[cfg(test)]
@@ -105,5 +125,12 @@ impl RuntimeLeaseHost {
     #[cfg(test)]
     pub(crate) fn has_legacy_manager_bridge_for_test(&self) -> bool {
         self.has_legacy_manager_bridge()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_manager_bridge_for_test(
+        &self,
+    ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
+        self.0.legacy_manager_bridge.get().cloned()
     }
 }

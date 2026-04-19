@@ -6,6 +6,10 @@ use crate::mcp_tool_call::MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX;
 use async_channel::bounded;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
+use codex_login::CodexAuth;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
+use codex_login::auth::LeasedTurnAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ResponseItem;
@@ -36,6 +40,40 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::timeout;
+
+struct TestLeaseScopedAuthSession {
+    binding: LeaseAuthBinding,
+}
+
+impl TestLeaseScopedAuthSession {
+    fn new(account_id: &str) -> Self {
+        Self {
+            binding: LeaseAuthBinding {
+                account_id: account_id.to_string(),
+                backend_account_handle: format!("handle-{account_id}"),
+                lease_epoch: 1,
+            },
+        }
+    }
+}
+
+impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+    fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        self.refresh_leased_turn_auth()
+    }
+
+    fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        Ok(LeasedTurnAuth::new(CodexAuth::from_api_key("test api key")))
+    }
+
+    fn binding(&self) -> &LeaseAuthBinding {
+        &self.binding
+    }
+
+    fn ensure_current(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn forward_events_cancelled_while_send_blocked_shuts_down_delegate() {
@@ -165,7 +203,6 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
     let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
         crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
     );
-    runtime_lease_host.attach_legacy_manager_bridge();
     parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
     parent_ctx.config = Arc::clone(&pooled_config);
 
@@ -191,8 +228,56 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
         .as_ref()
         .expect("child runtime lease host");
     assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
-    assert!(child_runtime_lease_host.has_legacy_manager_bridge_for_test());
     assert!(child.session.services.account_pool_manager.is_none());
+
+    child.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_host_exists()
+-> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) = crate::codex::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-b".to_string()),
+    );
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_interactive(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        Some(Arc::new(TestLeaseScopedAuthSession::new(
+            "delegate-child-account",
+        ))),
+        Arc::clone(&parent_session.services.models_manager),
+        Arc::clone(&parent_session),
+        parent_ctx,
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await?;
+
+    assert!(
+        child
+            .session
+            .services
+            .lease_auth
+            .current_session()
+            .is_none(),
+        "delegate child should rely on runtime host, not inherited static lease auth"
+    );
+    let child_runtime_lease_host = child
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
 
     child.shutdown_and_wait().await?;
     Ok(())

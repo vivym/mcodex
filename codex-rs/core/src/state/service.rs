@@ -47,6 +47,7 @@ use codex_state::AccountLeaseError;
 use codex_state::AccountLeaseRecord;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountStartupEligibility;
+use codex_state::EffectivePoolResolutionSource;
 use codex_state::LeaseRenewal;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
@@ -118,7 +119,10 @@ impl SessionServices {
             None,
         )
         .await?;
-        if accounts.is_none() && !shared_status.pooled_applicable {
+        if !matches!(
+            shared_status.startup.effective_pool_resolution_source,
+            EffectivePoolResolutionSource::PersistedSelection
+        ) {
             return Ok(None);
         }
         Ok(Some(crate::runtime_lease::RuntimeLeaseHost::pooled(
@@ -248,6 +252,41 @@ mod tests {
         .await?;
 
         assert!(manager.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_root_runtime_lease_host_skips_config_only_pool() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        let mut pools = HashMap::new();
+        pools.insert(
+            "pool-main".to_string(),
+            AccountPoolDefinitionToml {
+                allow_context_reuse: Some(false),
+                account_kinds: None,
+            },
+        );
+
+        let runtime_lease_host = SessionServices::build_root_runtime_lease_host(
+            Some(state_db),
+            Some(AccountsConfigToml {
+                backend: None,
+                default_pool: None,
+                proactive_switch_threshold_percent: None,
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: Some(pools),
+            }),
+            "holder-config-only",
+        )
+        .await?;
+
+        assert!(runtime_lease_host.is_none());
         Ok(())
     }
 

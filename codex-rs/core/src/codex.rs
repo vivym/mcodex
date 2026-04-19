@@ -2076,9 +2076,6 @@ impl Session {
             )
             .await?
         };
-        let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
-        lease_auth.replace_current(inherited_lease_auth_session.clone());
-        let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
         let inherited_pooled_runtime_host = matches!(
             (&session_source_for_runtime_host, runtime_lease_host.as_ref()),
             (
@@ -2086,6 +2083,15 @@ impl Session {
                 Some(host)
             ) if host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
         );
+        debug_assert!(
+            !(inherited_pooled_runtime_host && inherited_lease_auth_session.is_some()),
+            "inherited pooled runtime host must not be combined with static inherited lease auth"
+        );
+        // Static lease inheritance remains as compatibility for children that do
+        // not receive a pooled runtime host.
+        let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
+        lease_auth.replace_current(inherited_lease_auth_session.clone());
+        let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
         let account_pool_manager = if inherited_pooled_runtime_host {
             None
         } else {
@@ -2098,15 +2104,9 @@ impl Session {
             .await?
         };
         if let Some(runtime_lease_host) = runtime_lease_host.as_ref()
-            && account_pool_manager.is_some()
+            && let Some(account_pool_manager) = account_pool_manager.as_ref()
         {
-            runtime_lease_host.attach_legacy_manager_bridge();
-        }
-        if inherited_lease_auth_session.is_some()
-            && let Some(runtime_lease_host) = runtime_lease_host.as_ref()
-            && runtime_lease_host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
-        {
-            debug_assert!(runtime_lease_host.has_legacy_manager_bridge());
+            runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(account_pool_manager));
         }
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(
