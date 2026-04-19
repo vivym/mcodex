@@ -369,8 +369,13 @@ by config until that config value is removed or changed.
 If startup is suppressed, the command should report that the local default was
 set but pooled startup remains paused until `mcodex accounts resume` is run.
 
-The command is idempotent. Setting the already persisted default succeeds and
-prints that no state change was needed.
+The command has two same-pool outcomes:
+
+- if the persisted default is already `<POOL_ID>` and no preferred-account
+  reset is required, print that no state change was needed
+- if the persisted default is already `<POOL_ID>` but the state-backed default
+  source is active and `preferred_account_id` is present, clear the preferred
+  account and print that the preferred startup selection was reset
 
 #### `default clear`
 
@@ -431,13 +436,26 @@ The single-pool fallback remains read-only even when registration commands run.
 Registration must not persist `default_pool_id` merely because startup resolved
 through `singleVisiblePool`.
 
+Startup validation is not the registration target validator. Mutation commands
+that create or repair pool membership may name a pool that is not yet visible
+in startup inventory.
+
 Existing first-default bootstrap behavior should be narrowed to explicit
 registration into an otherwise empty pool inventory:
 
+- `accounts add --account-pool <POOL_ID>` may target a non-visible pool and
+  makes that pool visible only after successful registration writes membership
+- `import-legacy --pool <POOL_ID>` follows the same creation-target rule
+- if registration supports implicit targeting from `accounts.default_pool`, it
+  may also use that configured pool as a creation target even when it is not
+  yet visible; this is a mutation-time convenience, not evidence that startup
+  should treat the pool as valid before membership exists
 - `accounts add --account-pool <POOL_ID>` may persist `default_pool_id` only
-  when no configured default exists, no persisted default exists, and the
-  visible pool inventory before the command is empty
-- `import-legacy --pool <POOL_ID>` follows the same rule
+  after successful registration, and only when no configured default exists,
+  no persisted default exists, and the visible pool inventory before the
+  command is empty
+- `import-legacy --pool <POOL_ID>` follows the same post-success persistence
+  rule
 - registering into a second or later visible pool does not auto-persist or
   auto-switch the default; the user should run
   `mcodex accounts pool default set <POOL_ID>` when they want a durable
@@ -565,6 +583,10 @@ Issue fields:
 - `message`: optional user-facing diagnostic text
 
 The field should be additive and should not repurpose existing JSON fields.
+For `multiplePoolsRequireDefault`, `candidatePools` should contain the complete
+visible candidate list for the current read, sorted by `poolId` ascending, and
+`candidatePoolCount` should equal the full list length. The first slice should
+not introduce partial pagination or list truncation for this field.
 
 #### App-server v2 fields
 
@@ -672,8 +694,12 @@ Add focused tests for:
   persisted-invalid, and no-op clear states
 - registration bootstrap only persisting the first explicit pool when the
   pre-command visible inventory is empty
+- registration bootstrap allowing a non-visible creation target for explicit
+  `--account-pool` and implicit configured-default repair paths
 - registration into a second visible pool not auto-persisting or auto-switching
   the default
+- same-pool `default set` with an existing preferred account clearing the
+  preferred startup selection instead of reporting a pure no-op
 - `accounts status` text output for each new resolution state
 - `accounts status --json` additive fields for new resolution and warning
 - observability commands when there is one visible pool, multiple visible
@@ -711,6 +737,7 @@ Add protocol and server coverage for:
 - `startupResolutionIssue`
 - `AccountStartupCandidatePool` serialization for
   `multiplePoolsRequireDefault`
+- `candidatePools` completeness and deterministic `poolId` ordering
 - remote startup responses that represent single-pool fallback and
   multi-pool-without-default distinctly
 - notification conversion preserving availability and issue fields
