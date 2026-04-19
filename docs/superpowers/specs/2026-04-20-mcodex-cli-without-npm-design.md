@@ -230,7 +230,7 @@ for latest-version discovery. It should stay intentionally small:
   "checksumsUrl": "https://downloads.mcodex.sota.wiki/repositories/mcodex/releases/0.96.0/SHA256SUMS",
   "install": {
     "unix": "curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh",
-    "windows": "powershell -ExecutionPolicy Bypass -File .\\install.ps1"
+    "windows": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\\mcodex-install.ps1; & $env:TEMP\\mcodex-install.ps1\""
   }
 }
 ```
@@ -238,21 +238,41 @@ for latest-version discovery. It should stay intentionally small:
 The runtime does not need full platform asset URLs in `latest.json`. Installers
 know how to map version + platform to archive path.
 
+The Windows command intentionally downloads the hosted `install.ps1` into
+`$env:TEMP` and then runs that local file. The canonical hosted source is
+`https://downloads.mcodex.sota.wiki/install.ps1`; docs and TUI update prompts
+should render the same command string.
+
 ### 3. Use a versioned install root plus a stable `current` pointer
 
 Install scripts should not overwrite a single live binary in place. Instead,
 they should maintain a versioned install tree with a stable `current`
 reference.
 
-Recommended roots:
+Filesystem terms:
 
-- macOS/Linux: `~/.mcodex/install/<version>/`
-- Windows: `%LOCALAPPDATA%\\Mcodex\\install\\<version>\\`
+- `baseRoot`: the product-managed install root
+- `versionsDir`: directory containing versioned installs
+- `versionDir`: one immutable extracted version
+- `currentLink`: stable pointer used by wrappers to find the active version
+- `installMetadata`: diagnostic metadata written by installers
 
-Recommended stable pointers:
+Selected layout:
 
-- macOS/Linux: `~/.mcodex/current -> ~/.mcodex/install/<version>`
-- Windows: `%LOCALAPPDATA%\\Mcodex\\current`
+| Term | macOS/Linux | Windows |
+| --- | --- | --- |
+| `baseRoot` | `~/.mcodex` | `%LOCALAPPDATA%\\Mcodex` |
+| `versionsDir` | `~/.mcodex/install` | `%LOCALAPPDATA%\\Mcodex\\install` |
+| `versionDir` | `~/.mcodex/install/<version>` | `%LOCALAPPDATA%\\Mcodex\\install\\<version>` |
+| `currentLink` | `~/.mcodex/current` symlink | `%LOCALAPPDATA%\\Mcodex\\current` directory junction |
+| `installMetadata` | `~/.mcodex/install.json` | `%LOCALAPPDATA%\\Mcodex\\install.json` |
+
+`MCODEX_INSTALL_ROOT` should always point to `baseRoot`, not to
+`versionsDir`, `versionDir`, or `currentLink`.
+
+Wrappers should resolve the real binary through `currentLink/bin/mcodex` or
+`currentLink\\bin\\mcodex.exe`. Installers are responsible for maintaining
+`currentLink`.
 
 This layout enables:
 
@@ -293,7 +313,7 @@ Recommended env vars:
 
 - `MCODEX_INSTALL_MANAGED=1`
 - `MCODEX_INSTALL_METHOD=script`
-- `MCODEX_INSTALL_ROOT=<resolved-root>`
+- `MCODEX_INSTALL_ROOT=<baseRoot>`
 
 These env vars become the runtime-facing contract for script-managed installs.
 
@@ -328,10 +348,10 @@ This design intentionally keeps wrappers read-only and installers stateful.
 
 ### 6. Add an installation metadata file for diagnostics
 
-Installers should write a small metadata file at the install root:
+Installers should write a small metadata file at `installMetadata`:
 
-- macOS/Linux: `~/.mcodex/install/install.json`
-- Windows: `%LOCALAPPDATA%\\Mcodex\\install\\install.json`
+- macOS/Linux: `~/.mcodex/install.json`
+- Windows: `%LOCALAPPDATA%\\Mcodex\\install.json`
 
 Recommended shape:
 
@@ -341,7 +361,9 @@ Recommended shape:
   "installMethod": "script",
   "currentVersion": "0.96.0",
   "installedAt": "2026-04-20T12:00:00Z",
-  "installRoot": "/Users/alice/.mcodex",
+  "baseRoot": "/Users/alice/.mcodex",
+  "versionsDir": "/Users/alice/.mcodex/install",
+  "currentLink": "/Users/alice/.mcodex/current",
   "wrapperPath": "/Users/alice/.local/bin/mcodex"
 }
 ```
@@ -374,8 +396,7 @@ slice.
 Selected rendering:
 
 - Unix: `curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh`
-- Windows: present the script-managed PowerShell update path directly in the
-  prompt text, without adding a helper subcommand
+- Windows: `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"`
 
 Because the user selected TUI-only update prompts, wrappers should not perform
 their own version checks or print update notices.
@@ -456,9 +477,9 @@ to:
 
 - build native binaries
 - assemble native platform archives
-- generate `SHA256SUMS`, signature, and `release.json`
+- generate `SHA256SUMS` and signature artifacts
 - upload those artifacts to OSS
-- update `channels/<channel>/latest.json`
+- update `channels/stable/latest.json`
 - create/update a lightweight GitHub Release containing release notes and
   checksum artifacts only
 
@@ -550,7 +571,8 @@ Mitigation:
 - wrappers inject script-managed install metadata and otherwise stay minimal
 - TUI update prompts recognize script-managed installs and no longer direct the
   CLI user to npm/bun
-- runtime update checks read OSS channel manifests instead of GitHub latest API
+- runtime update checks read the OSS stable manifest instead of GitHub latest
+  API
 - GitHub Releases remain lightweight publication records with notes and checksum
   artifacts, not the primary binary distribution channel
 - TypeScript SDK npm publishing remains unaffected by the CLI cutover
