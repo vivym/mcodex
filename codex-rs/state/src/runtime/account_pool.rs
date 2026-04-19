@@ -27,6 +27,23 @@ use uuid::Uuid;
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 const ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
 
+#[derive(Clone, Copy)]
+enum RequestedLeaseQuotaPolicy {
+    RequireAvailableQuota,
+    AllowExhaustedForProbe,
+}
+
+impl RequestedLeaseQuotaPolicy {
+    fn acquisition_failure_message(self) -> &'static str {
+        match self {
+            Self::RequireAvailableQuota => {
+                "preferred account is not eligible for lease acquisition"
+            }
+            Self::AllowExhaustedForProbe => "probe account is not eligible for lease acquisition",
+        }
+    }
+}
+
 pub(super) async fn clean_up_duplicate_active_holder_leases_before_0026(
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -244,6 +261,47 @@ impl StateRuntime {
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        self.acquire_requested_account_lease(
+            pool_id,
+            account_id,
+            holder_instance_id,
+            lease_ttl,
+            RequestedLeaseQuotaPolicy::RequireAvailableQuota,
+            None,
+        )
+        .await
+    }
+
+    /// Acquire a short-lived probe lease for a quota-exhausted account that was
+    /// already selected and reserved for reprobe.
+    pub async fn acquire_quota_probe_account_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        self.acquire_requested_account_lease(
+            pool_id,
+            account_id,
+            holder_instance_id,
+            lease_ttl,
+            RequestedLeaseQuotaPolicy::AllowExhaustedForProbe,
+            Some(selection_family),
+        )
+        .await
+    }
+
+    async fn acquire_requested_account_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+        quota_policy: RequestedLeaseQuotaPolicy,
+        probe_selection_family: Option<&str>,
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         let now = Utc::now();
         let mut tx = self
             .pool
@@ -274,7 +332,14 @@ impl StateRuntime {
             released_at: None,
         };
 
-        let result = insert_requested_lease(&mut *tx, &lease, account_id).await;
+        let result = insert_requested_lease(
+            &mut *tx,
+            &lease,
+            account_id,
+            quota_policy,
+            probe_selection_family,
+        )
+        .await;
 
         let result = match result {
             Ok(result) => result,
@@ -297,7 +362,7 @@ impl StateRuntime {
                             },
                             "leaseAcquireFailed",
                             Some("noEligibleAccount"),
-                            "preferred account is not eligible for lease acquisition",
+                            quota_policy.acquisition_failure_message(),
                         ))
                         .await
                         .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
@@ -320,7 +385,7 @@ impl StateRuntime {
                 },
                 "leaseAcquireFailed",
                 Some("noEligibleAccount"),
-                "preferred account is not eligible for lease acquisition",
+                quota_policy.acquisition_failure_message(),
             ))
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
@@ -1863,22 +1928,42 @@ async fn insert_requested_lease<'e, E>(
     executor: E,
     lease: &AccountLeaseRecord,
     account_id: &str,
+    quota_policy: RequestedLeaseQuotaPolicy,
+    probe_selection_family: Option<&str>,
 ) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
+    let selection_family_expr = if probe_selection_family.is_some() {
+        "?"
+    } else {
+        "account_registry.backend_family"
+    };
     let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
         "selection_quota_state",
         "fallback_quota_state",
         "membership.account_id",
-        "account_registry.backend_family",
+        selection_family_expr,
     );
     let quota_exhausted_windows = super::account_pool_quota::selection_quota_state_field_sql(
         "selection_quota_state",
         "fallback_quota_state",
         "exhausted_windows",
     );
-    sqlx::query(&format!(
+    let quota_next_probe_after = super::account_pool_quota::selection_quota_state_field_sql(
+        "selection_quota_state",
+        "fallback_quota_state",
+        "next_probe_after",
+    );
+    let quota_eligibility_filter = match quota_policy {
+        RequestedLeaseQuotaPolicy::RequireAvailableQuota => {
+            format!("  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'\n")
+        }
+        RequestedLeaseQuotaPolicy::AllowExhaustedForProbe => {
+            format!("  AND COALESCE({quota_next_probe_after}, 0) > ?\n")
+        }
+    };
+    let sql = format!(
         r#"
 INSERT INTO account_leases (
     lease_id,
@@ -1914,8 +1999,7 @@ WHERE membership.pool_id = ?
   AND membership.account_id = ?
   AND account_registry.enabled = 1
   AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
-  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'
-  AND NOT EXISTS (
+{quota_eligibility_filter}  AND NOT EXISTS (
       SELECT 1
       FROM account_leases
       WHERE account_leases.account_id = membership.account_id
@@ -1923,17 +2007,23 @@ WHERE membership.pool_id = ?
   )
 LIMIT 1
         "#,
-    ))
-    .bind(&lease.lease_id)
-    .bind(&lease.pool_id)
-    .bind(&lease.holder_instance_id)
-    .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
-    .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
-    .bind(account_datetime_to_epoch_seconds(lease.expires_at))
-    .bind(&lease.pool_id)
-    .bind(account_id)
-    .execute(executor)
-    .await
+    );
+    let mut query = sqlx::query(&sql);
+    query = query
+        .bind(&lease.lease_id)
+        .bind(&lease.pool_id)
+        .bind(&lease.holder_instance_id)
+        .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
+        .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
+        .bind(account_datetime_to_epoch_seconds(lease.expires_at));
+    if let Some(selection_family) = probe_selection_family {
+        query = query.bind(selection_family);
+    }
+    query = query.bind(&lease.pool_id).bind(account_id);
+    if probe_selection_family.is_some() {
+        query = query.bind(account_datetime_to_epoch_seconds(lease.acquired_at));
+    }
+    query.execute(executor).await
 }
 
 async fn account_has_active_lease<'e, E>(
@@ -2289,6 +2379,55 @@ WHERE released_at IS NULL;
             .await;
 
         assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_requires_reserved_quota_exhausted_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let unreserved = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(
+            unreserved.unwrap_err(),
+            AccountLeaseError::NoEligibleAccount
+        );
+
+        let now = Utc::now();
+        assert!(
+            runtime
+                .reserve_account_quota_probe(
+                    "acct-1",
+                    "codex",
+                    now,
+                    now + chrono::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+        );
+        let lease = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                "inst-b:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-1");
     }
 
     #[tokio::test]

@@ -94,6 +94,26 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         self.grant_for_lease_record(&lease).await
     }
 
+    async fn acquire_probe_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let lease = self
+            .runtime
+            .acquire_quota_probe_account_lease(
+                pool_id,
+                account_id,
+                selection_family,
+                holder_instance_id,
+                self.lease_ttl,
+            )
+            .await?;
+        self.grant_for_lease_record(&lease).await
+    }
+
     async fn reserve_quota_probe(
         &self,
         account_id: &str,
@@ -125,26 +145,29 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         selection_family: &str,
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         let observed_at = Utc::now();
-        if lease.auth_session.ensure_current().is_err() {
-            let backoff_until = observed_at + Duration::seconds(30);
-            let _ = self
-                .runtime
-                .record_account_quota_probe_ambiguous(
-                    lease.account_id(),
-                    selection_family,
-                    observed_at,
-                    backoff_until,
-                    backoff_until,
-                )
-                .await?;
-            return Ok(Some(ProbeOutcome::Ambiguous));
-        }
-
-        let Some(quota_state) = self
+        let quota_state = self
             .runtime
             .read_selection_quota_state(lease.account_id(), selection_family)
-            .await?
-        else {
+            .await?;
+        if lease.auth_session.ensure_current().is_err() {
+            if let Some(quota_state) = quota_state {
+                let backoff_until = observed_at + Duration::seconds(30);
+                let _ = self
+                    .runtime
+                    .record_account_quota_probe_ambiguous(
+                        lease.account_id(),
+                        quota_state.limit_id.as_str(),
+                        observed_at,
+                        backoff_until,
+                        backoff_until,
+                    )
+                    .await?;
+                return Ok(Some(ProbeOutcome::Ambiguous));
+            }
+            return Ok(None);
+        };
+
+        let Some(quota_state) = quota_state else {
             return Ok(None);
         };
 

@@ -105,6 +105,24 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         self.acquire_lease(pool_id, holder_instance_id).await
     }
 
+    /// Acquire the short-lived verification lease for a reserved quota probe.
+    ///
+    /// Implementations that support quota probing may bypass quota-exhaustion
+    /// vetoes here because the lease exists to verify whether those vetoes are
+    /// still accurate. Other eligibility checks, including disabled accounts,
+    /// unauthorized runtime state, and active exclusive leases, still apply.
+    async fn acquire_probe_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = selection_family;
+        self.acquire_preferred_lease(pool_id, account_id, holder_instance_id)
+            .await
+    }
+
     /// Reserve the probe slot for a blocked candidate by advancing `next_probe_after`.
     async fn reserve_quota_probe(
         &self,

@@ -438,6 +438,22 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         .await
                     {
                         Ok(grant) => return self.adopt_active_grant(grant).await,
+                        Err(AccountLeaseError::NoEligibleAccount)
+                            if keep_current_on_no_candidate =>
+                        {
+                            return match self
+                                .backend
+                                .acquire_preferred_lease(
+                                    pool_id,
+                                    active_lease.account_id(),
+                                    &self.holder_instance_id,
+                                )
+                                .await
+                            {
+                                Ok(grant) => self.adopt_active_grant(grant).await,
+                                Err(err) => Err(err),
+                            };
+                        }
                         Err(AccountLeaseError::NoEligibleAccount) => continue,
                         Err(err) => return Err(err),
                     }
@@ -460,9 +476,10 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     let probe_holder_instance_id = self.probe_holder_instance_id();
                     let verification_lease = match self
                         .backend
-                        .acquire_preferred_lease(
+                        .acquire_probe_lease(
                             pool_id,
                             account_id.as_str(),
+                            selection_family.as_str(),
                             probe_holder_instance_id.as_str(),
                         )
                         .await
@@ -544,9 +561,10 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     }
                     let verification_lease = match self
                         .backend
-                        .acquire_preferred_lease(
+                        .acquire_probe_lease(
                             pool_id,
                             account_id.as_str(),
+                            selection_family.as_str(),
                             self.probe_holder_instance_id().as_str(),
                         )
                         .await
