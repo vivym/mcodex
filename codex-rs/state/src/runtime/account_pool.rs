@@ -1,4 +1,5 @@
 use super::*;
+use crate::QuotaExhaustedWindows;
 use crate::model::AccountHealthEvent;
 use crate::model::AccountHealthState;
 use crate::model::AccountLeaseError;
@@ -18,6 +19,7 @@ use crate::model::EffectivePoolResolutionSource;
 use crate::model::LeaseKey;
 use crate::model::LeaseRenewal;
 use crate::model::LegacyAccountImport;
+use crate::model::RegisteredAccountRecord;
 use crate::model::account_datetime_to_epoch_seconds;
 use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
@@ -25,6 +27,28 @@ use uuid::Uuid;
 
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 const ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
+
+#[derive(Clone, Copy)]
+enum RequestedLeaseQuotaCheck<'a> {
+    SelectionFamily {
+        selection_family: &'a str,
+    },
+    ReservedProbe {
+        limit_id: &'a str,
+        reserved_until: DateTime<Utc>,
+    },
+}
+
+impl RequestedLeaseQuotaCheck<'_> {
+    fn acquisition_failure_message(self) -> &'static str {
+        match self {
+            Self::SelectionFamily { .. } => {
+                "preferred account is not eligible for lease acquisition"
+            }
+            Self::ReservedProbe { .. } => "probe account is not eligible for lease acquisition",
+        }
+    }
+}
 
 pub(super) async fn clean_up_duplicate_active_holder_leases_before_0026(
     pool: &SqlitePool,
@@ -240,8 +264,51 @@ impl StateRuntime {
         &self,
         pool_id: &str,
         account_id: &str,
+        selection_family: &str,
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        self.acquire_requested_account_lease(
+            pool_id,
+            account_id,
+            holder_instance_id,
+            lease_ttl,
+            RequestedLeaseQuotaCheck::SelectionFamily { selection_family },
+        )
+        .await
+    }
+
+    /// Acquire a short-lived probe lease for a quota-exhausted account that was
+    /// already selected and reserved for reprobe.
+    pub async fn acquire_quota_probe_account_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        limit_id: &str,
+        reserved_until: DateTime<Utc>,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+    ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
+        self.acquire_requested_account_lease(
+            pool_id,
+            account_id,
+            holder_instance_id,
+            lease_ttl,
+            RequestedLeaseQuotaCheck::ReservedProbe {
+                limit_id,
+                reserved_until,
+            },
+        )
+        .await
+    }
+
+    async fn acquire_requested_account_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        holder_instance_id: &str,
+        lease_ttl: chrono::Duration,
+        quota_check: RequestedLeaseQuotaCheck<'_>,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         let now = Utc::now();
         let mut tx = self
@@ -253,9 +320,13 @@ impl StateRuntime {
             .await
             .map_err(account_lease_storage_error)?;
 
-        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id, now)
-            .await
-            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+        if matches!(
+            quota_check,
+            RequestedLeaseQuotaCheck::SelectionFamily { .. }
+        ) && let Some(existing_lease) =
+            load_active_holder_lease(&mut *tx, holder_instance_id, now)
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
         {
             tx.commit().await.map_err(account_lease_storage_error)?;
             return Ok(existing_lease);
@@ -273,15 +344,21 @@ impl StateRuntime {
             released_at: None,
         };
 
-        let result = insert_requested_lease(&mut *tx, &lease, account_id).await;
+        let result = insert_requested_lease(&mut *tx, &lease, account_id, quota_check).await;
 
         let result = match result {
             Ok(result) => result,
             Err(err) if account_lease_is_contention_error(&err) => {
-                let existing_lease =
+                let existing_lease = if matches!(
+                    quota_check,
+                    RequestedLeaseQuotaCheck::SelectionFamily { .. }
+                ) {
                     load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now())
                         .await
-                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
+                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?
+                } else {
+                    None
+                };
                 return match existing_lease {
                     Some(existing_lease) => Ok(existing_lease),
                     None => {
@@ -296,7 +373,7 @@ impl StateRuntime {
                             },
                             "leaseAcquireFailed",
                             Some("noEligibleAccount"),
-                            "preferred account is not eligible for lease acquisition",
+                            quota_check.acquisition_failure_message(),
                         ))
                         .await
                         .map_err(|append_err| AccountLeaseError::Storage(append_err.to_string()))?;
@@ -319,7 +396,7 @@ impl StateRuntime {
                 },
                 "leaseAcquireFailed",
                 Some("noEligibleAccount"),
-                "preferred account is not eligible for lease acquisition",
+                quota_check.acquisition_failure_message(),
             ))
             .await
             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
@@ -478,17 +555,30 @@ WHERE lease_id = ?
         load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now()).await
     }
 
-    pub async fn read_account_pool_diagnostic(
+    pub async fn read_account_lease_selection_candidates(
         &self,
         pool_id: &str,
-        preferred_account_id: Option<&str>,
-    ) -> anyhow::Result<AccountPoolDiagnostic> {
+    ) -> anyhow::Result<
+        Vec<(
+            RegisteredAccountRecord,
+            Option<AccountHealthState>,
+            Option<AccountLeaseRecord>,
+            i64,
+        )>,
+    > {
         let now = Utc::now();
         let rows = sqlx::query(
             r#"
 SELECT
-    membership.account_id,
-    membership.pool_id,
+    membership.position,
+    account_registry.account_id,
+    account_registry.backend_id,
+    account_registry.backend_family,
+    account_registry.workspace_id,
+    account_registry.backend_account_handle,
+    account_registry.account_kind,
+    account_registry.provider_fingerprint,
+    account_registry.display_name,
     account_registry.source,
     account_registry.enabled,
     account_registry.healthy,
@@ -511,6 +601,129 @@ LEFT JOIN account_leases AS active_lease
  AND active_lease.released_at IS NULL
  AND active_lease.expires_at > ?
 WHERE membership.pool_id = ?
+ORDER BY membership.position ASC, membership.account_id ASC
+            "#,
+        )
+        .bind(account_datetime_to_epoch_seconds(now))
+        .bind(pool_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let account_id: String = row.try_get("account_id")?;
+                let health_state = row
+                    .try_get::<Option<String>, _>("health_state")?
+                    .as_deref()
+                    .map(AccountHealthState::try_from)
+                    .transpose()?;
+                let active_lease = match row.try_get::<Option<String>, _>("lease_id")? {
+                    Some(lease_id) => Some(AccountLeaseRecord {
+                        lease_id,
+                        pool_id: pool_id.to_string(),
+                        account_id: account_id.clone(),
+                        holder_instance_id: row.try_get("holder_instance_id")?,
+                        lease_epoch: row.try_get("lease_epoch")?,
+                        acquired_at: account_epoch_seconds_to_datetime(
+                            row.try_get("acquired_at")?,
+                        )?,
+                        renewed_at: account_epoch_seconds_to_datetime(row.try_get("renewed_at")?)?,
+                        expires_at: account_epoch_seconds_to_datetime(row.try_get("expires_at")?)?,
+                        released_at: row
+                            .try_get::<Option<i64>, _>("released_at")?
+                            .map(account_epoch_seconds_to_datetime)
+                            .transpose()?,
+                    }),
+                    None => None,
+                };
+
+                let source = row
+                    .try_get::<Option<String>, _>("source")?
+                    .as_deref()
+                    .map(AccountSource::try_from)
+                    .transpose()?;
+
+                Ok((
+                    RegisteredAccountRecord {
+                        account_id,
+                        backend_id: row.try_get("backend_id")?,
+                        backend_family: row.try_get("backend_family")?,
+                        workspace_id: row.try_get("workspace_id")?,
+                        backend_account_handle: row.try_get("backend_account_handle")?,
+                        account_kind: row.try_get("account_kind")?,
+                        provider_fingerprint: row.try_get("provider_fingerprint")?,
+                        display_name: row.try_get("display_name")?,
+                        source,
+                        enabled: row.try_get::<i64, _>("enabled")? != 0,
+                        healthy: row.try_get::<i64, _>("healthy")? != 0,
+                    },
+                    health_state,
+                    active_lease,
+                    row.try_get("position")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn read_account_pool_diagnostic(
+        &self,
+        pool_id: &str,
+        preferred_account_id: Option<&str>,
+    ) -> anyhow::Result<AccountPoolDiagnostic> {
+        let now = Utc::now();
+        let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
+            "selection_quota_state",
+            "fallback_quota_state",
+            "membership.account_id",
+            "account_registry.backend_family",
+        );
+        let quota_exhausted_windows = super::account_pool_quota::selection_quota_state_field_sql(
+            "selection_quota_state",
+            "fallback_quota_state",
+            "exhausted_windows",
+        );
+        let quota_predicted_blocked_until =
+            super::account_pool_quota::selection_quota_state_field_sql(
+                "selection_quota_state",
+                "fallback_quota_state",
+                "predicted_blocked_until",
+            );
+        let quota_next_probe_after = super::account_pool_quota::selection_quota_state_field_sql(
+            "selection_quota_state",
+            "fallback_quota_state",
+            "next_probe_after",
+        );
+        let rows = sqlx::query(&format!(
+            r#"
+SELECT
+    membership.account_id,
+    membership.pool_id,
+    account_registry.source,
+    account_registry.enabled,
+    account_registry.healthy,
+    account_runtime_state.health_state,
+    {quota_exhausted_windows} AS quota_exhausted_windows,
+    {quota_predicted_blocked_until} AS quota_predicted_blocked_until,
+    {quota_next_probe_after} AS quota_next_probe_after,
+    active_lease.lease_id,
+    active_lease.holder_instance_id,
+    active_lease.lease_epoch,
+    active_lease.acquired_at,
+    active_lease.renewed_at,
+    active_lease.expires_at,
+    active_lease.released_at
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+{quota_joins}
+LEFT JOIN account_leases AS active_lease
+  ON active_lease.account_id = membership.account_id
+ AND active_lease.pool_id = membership.pool_id
+ AND active_lease.released_at IS NULL
+ AND active_lease.expires_at > ?
+WHERE membership.pool_id = ?
 ORDER BY
     CASE
         WHEN ? IS NOT NULL AND membership.account_id = ? THEN 0
@@ -519,7 +732,7 @@ ORDER BY
     membership.position ASC,
     membership.account_id ASC
             "#,
-        )
+        ))
         .bind(account_datetime_to_epoch_seconds(now))
         .bind(pool_id)
         .bind(preferred_account_id)
@@ -543,11 +756,33 @@ ORDER BY
                 .transpose()?;
             let enabled = row.try_get::<i64, _>("enabled")? != 0;
             let healthy = row.try_get::<i64, _>("healthy")? != 0;
-            let health_state = row
+            let legacy_health_state = row
                 .try_get::<Option<String>, _>("health_state")?
                 .as_deref()
                 .map(AccountHealthState::try_from)
                 .transpose()?;
+            let quota_exhausted = row
+                .try_get::<Option<String>, _>("quota_exhausted_windows")?
+                .is_some_and(|exhausted_windows| exhausted_windows != "none");
+            let quota_next_eligible_at = if quota_exhausted {
+                row.try_get::<Option<i64>, _>("quota_predicted_blocked_until")?
+                    .or(row.try_get::<Option<i64>, _>("quota_next_probe_after")?)
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?
+            } else {
+                None
+            };
+            let health_state = match legacy_health_state {
+                Some(AccountHealthState::Unauthorized) => Some(AccountHealthState::Unauthorized),
+                _ if quota_exhausted => Some(AccountHealthState::RateLimited),
+                Some(AccountHealthState::Healthy) => Some(AccountHealthState::Healthy),
+                Some(AccountHealthState::RateLimited) | None => None,
+            };
+            let selector_auth_eligible = match legacy_health_state {
+                Some(AccountHealthState::Unauthorized) => false,
+                Some(AccountHealthState::Healthy | AccountHealthState::RateLimited) => true,
+                None => true,
+            };
             let active_lease = match row.try_get::<Option<String>, _>("lease_id")? {
                 Some(lease_id) => Some(AccountLeaseRecord {
                     lease_id,
@@ -565,8 +800,17 @@ ORDER BY
                 }),
                 None => None,
             };
-            let account_next_eligible_at = if enabled && healthy {
-                active_lease.as_ref().map(|lease| lease.expires_at)
+            let account_next_eligible_at = if enabled && selector_auth_eligible {
+                match (
+                    active_lease.as_ref().map(|lease| lease.expires_at),
+                    quota_next_eligible_at,
+                ) {
+                    (Some(lease_expires_at), Some(quota_next_eligible_at)) => {
+                        Some(lease_expires_at.max(quota_next_eligible_at))
+                    }
+                    (Some(lease_expires_at), None) => Some(lease_expires_at),
+                    (None, quota_next_eligible_at) => quota_next_eligible_at,
+                }
             } else {
                 None
             };
@@ -576,8 +820,14 @@ ORDER BY
                 AccountStartupEligibility::PreferredAccountDisabled
             } else if active_lease.is_some() {
                 AccountStartupEligibility::PreferredAccountBusy
-            } else if !healthy {
+            } else if !selector_auth_eligible {
                 AccountStartupEligibility::PreferredAccountUnhealthy
+            } else if quota_exhausted {
+                if is_preferred {
+                    AccountStartupEligibility::PreferredAccountUnhealthy
+                } else {
+                    AccountStartupEligibility::NoEligibleAccount
+                }
             } else if !enabled {
                 AccountStartupEligibility::NoEligibleAccount
             } else if is_preferred {
@@ -1005,28 +1255,55 @@ WHERE singleton = 1
                 .await?;
             let eligibility = match membership {
                 None => AccountStartupEligibility::PreferredAccountMissing,
-                Some(membership) if membership.pool_id != pool_id => {
-                    AccountStartupEligibility::PreferredAccountInOtherPool {
-                        actual_pool_id: membership.pool_id,
+                Some(membership) => {
+                    if membership.pool_id != pool_id {
+                        AccountStartupEligibility::PreferredAccountInOtherPool {
+                            actual_pool_id: membership.pool_id,
+                        }
+                    } else if !membership.enabled {
+                        AccountStartupEligibility::PreferredAccountDisabled
+                    } else {
+                        let health_state = sqlx::query_scalar::<_, Option<String>>(
+                            r#"
+SELECT health_state
+FROM account_runtime_state
+WHERE account_id = ?
+                            "#,
+                        )
+                        .bind(&preferred_account_id)
+                        .fetch_optional(self.pool.as_ref())
+                        .await?
+                        .flatten()
+                        .as_deref()
+                        .map(AccountHealthState::try_from)
+                        .transpose()?;
+                        let selector_auth_eligible = match health_state {
+                            Some(AccountHealthState::Unauthorized) => false,
+                            Some(AccountHealthState::Healthy | AccountHealthState::RateLimited) => {
+                                true
+                            }
+                            None => true,
+                        };
+                        let quota_exhausted = self
+                            .read_registered_account_selection_quota_state(&preferred_account_id)
+                            .await?
+                            .is_some_and(|record| record.exhausted_windows.is_exhausted());
+
+                        if !selector_auth_eligible || quota_exhausted {
+                            AccountStartupEligibility::PreferredAccountUnhealthy
+                        } else if account_has_active_lease(
+                            self.pool.as_ref(),
+                            &preferred_account_id,
+                            Utc::now(),
+                        )
+                        .await?
+                        {
+                            AccountStartupEligibility::PreferredAccountBusy
+                        } else {
+                            AccountStartupEligibility::PreferredAccountSelected
+                        }
                     }
                 }
-                Some(membership) if !membership.enabled => {
-                    AccountStartupEligibility::PreferredAccountDisabled
-                }
-                Some(membership) if !membership.healthy => {
-                    AccountStartupEligibility::PreferredAccountUnhealthy
-                }
-                Some(_)
-                    if account_has_active_lease(
-                        self.pool.as_ref(),
-                        &preferred_account_id,
-                        Utc::now(),
-                    )
-                    .await? =>
-                {
-                    AccountStartupEligibility::PreferredAccountBusy
-                }
-                Some(_) => AccountStartupEligibility::PreferredAccountSelected,
             };
             let predicted_account_id = match eligibility {
                 AccountStartupEligibility::PreferredAccountSelected => {
@@ -1605,20 +1882,35 @@ INSERT INTO account_leases (
     query.push_bind(account_datetime_to_epoch_seconds(lease.renewed_at));
     query.push(", ");
     query.push_bind(account_datetime_to_epoch_seconds(lease.expires_at));
-    query.push(
+    let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
+        "selection_quota_state",
+        "fallback_quota_state",
+        "membership.account_id",
+        "account_registry.backend_family",
+    );
+    let quota_exhausted_windows = super::account_pool_quota::selection_quota_state_field_sql(
+        "selection_quota_state",
+        "fallback_quota_state",
+        "exhausted_windows",
+    );
+    query.push(format!(
         r#",
     NULL
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+{quota_joins}
         "#,
-    );
+    ));
     query.push("WHERE membership.pool_id = ");
     query.push_bind(pool_id);
-    query.push(
+    query.push(format!(
         r#"
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
@@ -1626,7 +1918,7 @@ JOIN account_registry
         AND account_leases.released_at IS NULL
   )
         "#,
-    );
+    ));
     if !excluded_account_ids.is_empty() {
         query.push("  AND membership.account_id NOT IN (");
         let mut separated = query.separated(", ");
@@ -1647,11 +1939,41 @@ async fn insert_requested_lease<'e, E>(
     executor: E,
     lease: &AccountLeaseRecord,
     account_id: &str,
+    quota_check: RequestedLeaseQuotaCheck<'_>,
 ) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    sqlx::query(
+    let (quota_joins, quota_eligibility_filter) = match quota_check {
+        RequestedLeaseQuotaCheck::SelectionFamily { .. } => {
+            let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
+                "selection_quota_state",
+                "fallback_quota_state",
+                "membership.account_id",
+                "?",
+            );
+            let quota_exhausted_windows = super::account_pool_quota::selection_quota_state_field_sql(
+                "selection_quota_state",
+                "fallback_quota_state",
+                "exhausted_windows",
+            );
+            (
+                quota_joins,
+                format!("  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'\n"),
+            )
+        }
+        RequestedLeaseQuotaCheck::ReservedProbe { .. } => (
+            r#"
+JOIN account_quota_state AS probe_quota_state
+  ON probe_quota_state.account_id = membership.account_id
+ AND probe_quota_state.limit_id = ?
+            "#
+            .to_string(),
+            "  AND probe_quota_state.exhausted_windows != ?\n  AND probe_quota_state.next_probe_after = ?\n"
+                .to_string(),
+        ),
+    };
+    let sql = format!(
         r#"
 INSERT INTO account_leases (
     lease_id,
@@ -1680,11 +2002,14 @@ INSERT INTO account_leases (
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+{quota_joins}
 WHERE membership.pool_id = ?
   AND membership.account_id = ?
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
-  AND NOT EXISTS (
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+{quota_eligibility_filter}  AND NOT EXISTS (
       SELECT 1
       FROM account_leases
       WHERE account_leases.account_id = membership.account_id
@@ -1692,17 +2017,30 @@ WHERE membership.pool_id = ?
   )
 LIMIT 1
         "#,
-    )
-    .bind(&lease.lease_id)
-    .bind(&lease.pool_id)
-    .bind(&lease.holder_instance_id)
-    .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
-    .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
-    .bind(account_datetime_to_epoch_seconds(lease.expires_at))
-    .bind(&lease.pool_id)
-    .bind(account_id)
-    .execute(executor)
-    .await
+    );
+    let mut query = sqlx::query(&sql);
+    query = query
+        .bind(&lease.lease_id)
+        .bind(&lease.pool_id)
+        .bind(&lease.holder_instance_id)
+        .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
+        .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
+        .bind(account_datetime_to_epoch_seconds(lease.expires_at));
+    match quota_check {
+        RequestedLeaseQuotaCheck::SelectionFamily { selection_family } => {
+            query = query.bind(selection_family);
+        }
+        RequestedLeaseQuotaCheck::ReservedProbe { limit_id, .. } => {
+            query = query.bind(limit_id);
+        }
+    }
+    query = query.bind(&lease.pool_id).bind(account_id);
+    if let RequestedLeaseQuotaCheck::ReservedProbe { reserved_until, .. } = quota_check {
+        query = query
+            .bind(QuotaExhaustedWindows::None.as_str())
+            .bind(account_datetime_to_epoch_seconds(reserved_until));
+    }
+    query.execute(executor).await
 }
 
 async fn account_has_active_lease<'e, E>(
@@ -1737,15 +2075,30 @@ async fn read_first_eligible_account_id<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    sqlx::query_scalar(
+    let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
+        "selection_quota_state",
+        "fallback_quota_state",
+        "membership.account_id",
+        "account_registry.backend_family",
+    );
+    let quota_exhausted_windows = super::account_pool_quota::selection_quota_state_field_sql(
+        "selection_quota_state",
+        "fallback_quota_state",
+        "exhausted_windows",
+    );
+    sqlx::query_scalar(&format!(
         r#"
 SELECT membership.account_id
 FROM account_pool_membership AS membership
 JOIN account_registry
   ON account_registry.account_id = membership.account_id
+LEFT JOIN account_runtime_state
+  ON account_runtime_state.account_id = membership.account_id
+{quota_joins}
 WHERE membership.pool_id = ?
   AND account_registry.enabled = 1
-  AND account_registry.healthy = 1
+  AND COALESCE(account_runtime_state.health_state, '') != 'unauthorized'
+  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'
   AND NOT EXISTS (
       SELECT 1
       FROM account_leases
@@ -1756,7 +2109,7 @@ WHERE membership.pool_id = ?
 ORDER BY membership.position ASC, membership.account_id ASC
 LIMIT 1
         "#,
-    )
+    ))
     .bind(pool_id)
     .bind(account_datetime_to_epoch_seconds(now))
     .fetch_optional(executor)
@@ -2007,6 +2360,359 @@ WHERE released_at IS NULL;
     }
 
     #[tokio::test]
+    async fn acquire_account_lease_skips_quota_exhausted_accounts() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-2");
+    }
+
+    #[tokio::test]
+    async fn acquire_preferred_account_lease_rejects_quota_exhausted_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let lease = runtime
+            .acquire_preferred_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                "inst-a",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_requires_reserved_quota_exhausted_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+        let expected_reserved_until = Utc::now() + chrono::Duration::seconds(30);
+
+        let unreserved = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                expected_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(
+            unreserved.unwrap_err(),
+            AccountLeaseError::NoEligibleAccount
+        );
+
+        let mut stale_backoff = exhausted_quota_record("acct-1");
+        stale_backoff.next_probe_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        runtime
+            .upsert_account_quota_state(stale_backoff)
+            .await
+            .unwrap();
+        let stale_backoff_attempt = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                expected_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(
+            stale_backoff_attempt.unwrap_err(),
+            AccountLeaseError::NoEligibleAccount
+        );
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let reserved_until = now + chrono::Duration::seconds(30);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-1", "codex", now, reserved_until,)
+                .await
+                .unwrap()
+        );
+        let lease = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                reserved_until,
+                "inst-b:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-1");
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_rejects_non_reserved_limit_id() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let reserved_until = now + chrono::Duration::seconds(30);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-1", "codex", now, reserved_until,)
+                .await
+                .unwrap()
+        );
+
+        let wrong_limit_id = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "chatgpt",
+                reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(
+            wrong_limit_id.unwrap_err(),
+            AccountLeaseError::NoEligibleAccount
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_rejects_null_probe_reservation_at_epoch_zero() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        let mut quota = exhausted_quota_record("acct-1");
+        quota.next_probe_after = None;
+        runtime.upsert_account_quota_state(quota).await.unwrap();
+
+        let lease = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                test_timestamp(0),
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_rejects_stale_probe_holder_lease() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-2"))
+            .await
+            .unwrap();
+
+        let first_reserved_until = Utc::now() + chrono::Duration::seconds(30);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-1", "codex", Utc::now(), first_reserved_until,)
+                .await
+                .unwrap()
+        );
+        let first = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                first_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.account_id, "acct-1");
+
+        let second_now = Utc::now();
+        let second_reserved_until = second_now + chrono::Duration::seconds(45);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-2", "codex", second_now, second_reserved_until,)
+                .await
+                .unwrap()
+        );
+        let second = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-2",
+                "codex",
+                second_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn acquire_account_lease_skips_backend_family_quota_exhausted_accounts() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record_for_limit("acct-1", "chatgpt"))
+            .await
+            .unwrap();
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-2");
+    }
+
+    #[tokio::test]
+    async fn acquire_preferred_account_lease_uses_requested_selection_family_before_backend_family_fallback()
+     {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "chatgpt".to_string(),
+                primary_used_percent: Some(5.0),
+                primary_resets_at: None,
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(61),
+                exhausted_windows: crate::QuotaExhaustedWindows::None,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let lease = runtime
+            .acquire_preferred_account_lease(
+                "pool-main",
+                "acct-1",
+                "chatgpt",
+                "inst-a",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(lease.account_id, "acct-1");
+    }
+
+    #[tokio::test]
+    async fn acquire_preferred_account_lease_rejects_backend_family_quota_exhausted_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record_for_limit("acct-1", "chatgpt"))
+            .await
+            .unwrap();
+
+        let lease = runtime
+            .acquire_preferred_account_lease(
+                "pool-main",
+                "acct-1",
+                "chatgpt",
+                "inst-a",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+
+        assert_eq!(lease.unwrap_err(), AccountLeaseError::NoEligibleAccount);
+    }
+
+    #[tokio::test]
+    async fn selector_paths_ignore_legacy_unhealthy_without_runtime_auth_failure() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, false).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+        let lease = runtime
+            .acquire_account_lease("pool-main", "inst-a", chrono::Duration::seconds(300))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+                predicted_account_id: Some("acct-1".to_string()),
+                eligibility: crate::AccountStartupEligibility::PreferredAccountSelected,
+            }
+        );
+        assert_eq!(lease.account_id, "acct-1");
+    }
+
+    #[tokio::test]
     async fn acquire_account_lease_excluding_rejects_when_all_accounts_are_excluded() {
         let runtime = test_runtime().await;
         seed_account(runtime.as_ref(), "acct-1").await;
@@ -2147,7 +2853,7 @@ WHERE holder_instance_id = ?
             .unwrap();
 
         assert_eq!(diagnostic.pool_id, "team-main");
-        assert_eq!(diagnostic.next_eligible_at, Some(lease.expires_at));
+        assert_eq!(diagnostic.next_eligible_at, None);
         assert_eq!(diagnostic.accounts.len(), 2);
         assert_eq!(diagnostic.accounts[0].account_id, "acct-1");
         assert_eq!(diagnostic.accounts[0].pool_id, "team-main");
@@ -2166,15 +2872,234 @@ WHERE holder_instance_id = ?
         assert_eq!(diagnostic.accounts[1].pool_id, "team-main");
         assert_eq!(diagnostic.accounts[1].healthy, false);
         assert_eq!(diagnostic.accounts[1].active_lease, None);
+        assert_eq!(diagnostic.accounts[1].health_state, None);
         assert_eq!(
-            diagnostic.accounts[1].health_state,
+            diagnostic.accounts[1].eligibility,
+            crate::AccountStartupEligibility::AutomaticAccountSelected
+        );
+        assert_eq!(diagnostic.accounts[1].next_eligible_at, None);
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostic_derives_rate_limited_health_from_quota_state() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(120)),
+                next_probe_after: Some(test_timestamp(90)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostic_blocks_exhausted_quota_accounts_until_quota_cooldown() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "team-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(120)),
+                next_probe_after: Some(test_timestamp(90)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-2".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: None,
+                next_probe_after: Some(test_timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", Some("acct-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(diagnostic.next_eligible_at, Some(test_timestamp(120)));
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::PreferredAccountUnhealthy
+        );
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
             Some(AccountHealthState::RateLimited)
         );
         assert_eq!(
-            diagnostic.accounts[1].eligibility,
-            crate::AccountStartupEligibility::PreferredAccountUnhealthy
+            diagnostic.accounts[0].next_eligible_at,
+            Some(test_timestamp(120))
         );
-        assert_eq!(diagnostic.accounts[1].next_eligible_at, None);
+        assert_eq!(
+            diagnostic.accounts[1].eligibility,
+            crate::AccountStartupEligibility::NoEligibleAccount
+        );
+        assert_eq!(
+            diagnostic.accounts[1].next_eligible_at,
+            Some(test_timestamp(150))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_pool_diagnostic_does_not_splice_codex_timing_into_family_row() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "team-main", 0, true).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(99.0),
+                primary_resets_at: Some(test_timestamp(180)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(test_timestamp(180)),
+                next_probe_after: Some(test_timestamp(150)),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "chatgpt".to_string(),
+                primary_used_percent: Some(97.0),
+                primary_resets_at: Some(test_timestamp(240)),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: test_timestamp(120),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let diagnostic = runtime
+            .read_account_pool_diagnostic("team-main", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            diagnostic.accounts[0].health_state,
+            Some(AccountHealthState::RateLimited)
+        );
+        assert_eq!(
+            diagnostic.accounts[0].eligibility,
+            crate::AccountStartupEligibility::NoEligibleAccount
+        );
+        assert_eq!(diagnostic.accounts[0].next_eligible_at, None);
+        assert_eq!(diagnostic.next_eligible_at, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_rate_limited_state_does_not_block_startup_preview_or_lease_acquisition() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+
+        sqlx::query(
+            r#"
+UPDATE account_registry
+SET healthy = 0
+WHERE account_id = ?
+            "#,
+        )
+        .bind("acct-1")
+        .execute(runtime.pool.as_ref())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+INSERT INTO account_runtime_state (
+    account_id,
+    pool_id,
+    health_state,
+    last_health_event_sequence,
+    last_health_event_at,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    pool_id = excluded.pool_id,
+    health_state = excluded.health_state,
+    last_health_event_sequence = excluded.last_health_event_sequence,
+    last_health_event_at = excluded.last_health_event_at,
+    updated_at = excluded.updated_at
+            "#,
+        )
+        .bind("acct-1")
+        .bind("pool-main")
+        .bind(AccountHealthState::RateLimited.as_str())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(runtime.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .preview_account_startup_selection(Some("pool-main"))
+                .await
+                .unwrap(),
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-1".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
+        );
+
+        let lease = runtime
+            .acquire_account_lease("pool-main", "holder-1", chrono::Duration::seconds(60))
+            .await
+            .unwrap();
+        assert_eq!(lease.account_id, "acct-1");
     }
 
     #[tokio::test]
@@ -2186,6 +3111,7 @@ WHERE holder_instance_id = ?
             .acquire_preferred_account_lease(
                 "team-main",
                 "acct-1",
+                "chatgpt",
                 "holder-1",
                 chrono::Duration::seconds(300),
             )
@@ -3434,6 +4360,128 @@ WHERE account_id = ?
     }
 
     #[tokio::test]
+    async fn preview_startup_selection_blocks_quota_exhausted_preferred_account() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: crate::AccountStartupEligibility::PreferredAccountUnhealthy,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_startup_selection_uses_backend_family_quota_row() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record_for_limit("acct-1", "chatgpt"))
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+                predicted_account_id: None,
+                eligibility: crate::AccountStartupEligibility::PreferredAccountUnhealthy,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_startup_selection_skips_quota_exhausted_automatic_account() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-2".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_startup_selection_skips_backend_family_quota_exhausted_automatic_account() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record_for_limit("acct-1", "chatgpt"))
+            .await
+            .unwrap();
+
+        let preview = runtime
+            .preview_account_startup_selection(Some("pool-main"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            preview,
+            crate::AccountStartupSelectionPreview {
+                effective_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-2".to_string()),
+                eligibility: crate::AccountStartupEligibility::AutomaticAccountSelected,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn write_account_startup_selection_persists_account_pool_event() {
         let runtime = test_runtime().await;
 
@@ -3710,7 +4758,7 @@ WHERE account_id = ?
                 healthy: false,
                 active_lease: None,
                 health_state: None,
-                eligibility: AccountStartupEligibility::PreferredAccountUnhealthy,
+                eligibility: AccountStartupEligibility::PreferredAccountSelected,
                 next_eligible_at: None,
             }]
         );
@@ -3720,8 +4768,8 @@ WHERE account_id = ?
                 effective_pool_id: Some("pool-main".to_string()),
                 preferred_account_id: Some("acct-1".to_string()),
                 suppressed: false,
-                predicted_account_id: None,
-                eligibility: AccountStartupEligibility::PreferredAccountUnhealthy,
+                predicted_account_id: Some("acct-1".to_string()),
+                eligibility: AccountStartupEligibility::PreferredAccountSelected,
             }
         );
     }
@@ -4684,6 +5732,7 @@ FROM account_registry
             .acquire_preferred_account_lease(
                 "pool-main",
                 "acct-1",
+                "chatgpt",
                 "inst-a",
                 chrono::Duration::seconds(300),
             )
@@ -4712,6 +5761,30 @@ FROM account_registry
 
     async fn seed_account(runtime: &StateRuntime, account_id: &str) {
         seed_account_in_pool(runtime, account_id, "pool-main", 0, true).await;
+    }
+
+    fn exhausted_quota_record(account_id: &str) -> crate::AccountQuotaStateRecord {
+        exhausted_quota_record_for_limit(account_id, "codex")
+    }
+
+    fn exhausted_quota_record_for_limit(
+        account_id: &str,
+        limit_id: &str,
+    ) -> crate::AccountQuotaStateRecord {
+        crate::AccountQuotaStateRecord {
+            account_id: account_id.to_string(),
+            limit_id: limit_id.to_string(),
+            primary_used_percent: Some(99.0),
+            primary_resets_at: Some(test_timestamp(120)),
+            secondary_used_percent: None,
+            secondary_resets_at: None,
+            observed_at: test_timestamp(60),
+            exhausted_windows: crate::QuotaExhaustedWindows::Primary,
+            predicted_blocked_until: Some(test_timestamp(120)),
+            next_probe_after: Some(test_timestamp(90)),
+            probe_backoff_level: 0,
+            last_probe_result: None,
+        }
     }
 
     async fn seed_account_in_pool(

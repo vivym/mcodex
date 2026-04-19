@@ -48,6 +48,10 @@ pub use model::AccountPoolQuotaRecord;
 pub use model::AccountPoolSelectionRecord;
 pub use model::AccountPoolSnapshotRecord;
 pub use model::AccountPoolSummaryRecord;
+pub use model::AccountQuotaProbeBackoff;
+pub use model::AccountQuotaProbeObservation;
+pub use model::AccountQuotaProbeStillBlocked;
+pub use model::AccountQuotaStateRecord;
 pub use model::AccountRegistryEntryUpdate;
 pub use model::AccountSource;
 pub use model::AccountStartupEligibility;
@@ -74,6 +78,8 @@ pub use model::LeaseRenewal;
 pub use model::LegacyAccountImport;
 pub use model::NewPendingAccountRegistration;
 pub use model::PendingAccountRegistration;
+pub use model::QuotaExhaustedWindows;
+pub use model::QuotaProbeResult;
 pub use model::RegisteredAccountMembership;
 pub use model::RegisteredAccountRecord;
 pub use model::RegisteredAccountUpsert;
@@ -98,7 +104,7 @@ pub const SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 pub const LOGS_DB_FILENAME: &str = "logs";
 pub const LOGS_DB_VERSION: u32 = 2;
 pub const STATE_DB_FILENAME: &str = "state";
-pub const STATE_DB_VERSION: u32 = 5;
+pub const STATE_DB_VERSION: u32 = 6;
 
 /// Errors encountered during DB operations. Tags: [stage]
 pub const DB_ERROR_METRIC: &str = "codex.db.error";

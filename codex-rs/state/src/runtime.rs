@@ -53,6 +53,7 @@ use tracing::warn;
 mod account_pool;
 mod account_pool_control;
 mod account_pool_observability;
+mod account_pool_quota;
 mod agent_jobs;
 mod backfill;
 mod logs;

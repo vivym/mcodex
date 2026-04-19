@@ -4,15 +4,80 @@ use chrono::Duration;
 use chrono::Utc;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_state::AccountLeaseRecord;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::LeaseKey;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::quota::QuotaFamilyView;
+use crate::quota::SelectionIntent;
+
 /// Request for choosing the startup account.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionRequest {
     pub now: Option<DateTime<Utc>>,
     pub pool_id: Option<String>,
+    pub intent: SelectionIntent,
+    pub selection_family: Option<String>,
+    pub current_account_id: Option<String>,
+    pub just_replaced_account_id: Option<String>,
+    pub reserved_probe_target_account_id: Option<String>,
+    pub proactive_threshold_percent: u8,
+}
+
+impl Default for SelectionRequest {
+    fn default() -> Self {
+        Self::for_intent(SelectionIntent::Startup)
+    }
+}
+
+impl SelectionRequest {
+    pub fn for_intent(intent: SelectionIntent) -> Self {
+        Self {
+            now: None,
+            pool_id: None,
+            intent,
+            selection_family: None,
+            current_account_id: None,
+            just_replaced_account_id: None,
+            reserved_probe_target_account_id: None,
+            proactive_threshold_percent: 85,
+        }
+    }
+
+    pub fn selection_family(&self) -> &str {
+        self.selection_family.as_deref().unwrap_or("codex")
+    }
+
+    pub fn with_now(mut self, now: DateTime<Utc>) -> Self {
+        self.now = Some(now);
+        self
+    }
+
+    pub fn with_selection_family(mut self, selection_family: &str) -> Self {
+        self.selection_family = Some(selection_family.to_string());
+        self
+    }
+
+    pub fn with_current_account(mut self, account_id: &str) -> Self {
+        self.current_account_id = Some(account_id.to_string());
+        self
+    }
+
+    pub fn with_just_replaced_account(mut self, account_id: &str) -> Self {
+        self.just_replaced_account_id = Some(account_id.to_string());
+        self
+    }
+
+    pub fn with_reserved_probe_target(mut self, account_id: &str) -> Self {
+        self.reserved_probe_target_account_id = Some(account_id.to_string());
+        self
+    }
+
+    pub fn with_proactive_threshold_percent(mut self, proactive_threshold_percent: u8) -> Self {
+        self.proactive_threshold_percent = proactive_threshold_percent;
+        self
+    }
 }
 
 /// Result of choosing the startup account.
@@ -29,11 +94,22 @@ pub enum AccountKind {
 }
 
 /// Minimal account record used by the policy test scaffold.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AccountRecord {
     pub account_id: String,
     pub healthy: bool,
     pub kind: AccountKind,
+    pub enabled: bool,
+    pub selector_auth_eligible: bool,
+    pub pool_position: usize,
+    pub leased_to_other_holder: bool,
+    pub quota: QuotaFamilyView,
+}
+
+impl AccountRecord {
+    pub fn selection_quota(&self, selection_family: &str) -> Option<&AccountQuotaStateRecord> {
+        self.quota.effective_quota(selection_family)
+    }
 }
 
 /// Local manager configuration for lease lifecycle and switch policy.

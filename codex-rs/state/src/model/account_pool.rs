@@ -318,7 +318,17 @@ pub(crate) fn datetime_to_epoch_seconds(value: DateTime<Utc>) -> i64 {
     value.timestamp()
 }
 
+pub(crate) fn datetime_to_epoch_nanos(value: DateTime<Utc>) -> i64 {
+    value
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| panic!("timestamp out of range: {value}"))
+}
+
 pub(crate) fn epoch_seconds_to_datetime(value: i64) -> Result<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid unix timestamp: {value}"))
+}
+
+pub(crate) fn epoch_nanos_to_datetime(value: i64) -> Result<DateTime<Utc>> {
+    Ok(DateTime::<Utc>::from_timestamp_nanos(value))
 }
