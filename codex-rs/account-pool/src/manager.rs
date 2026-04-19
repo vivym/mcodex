@@ -412,7 +412,11 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         request: SelectionRequest,
         active_lease: LeaseGrant,
     ) -> std::result::Result<LeasedAccount, AccountLeaseError> {
+        let mut request = request;
         let keep_current_on_no_candidate = matches!(request.intent, SelectionIntent::SoftRotation);
+        let current_account_id = active_lease.account_id().to_string();
+        let mut current_released = false;
+        let mut current_reacquire_exhausted = false;
         let pool_id = request.pool_id.as_deref().ok_or_else(|| {
             AccountLeaseError::Storage("runtime selection requires pool id".to_string())
         })?;
@@ -425,9 +429,12 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
 
             match plan.terminal_action {
                 SelectionAction::Select(account_id) => {
-                    self.release_active_lease_at(request.now.unwrap_or_else(Utc::now))
-                        .await
-                        .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                    if !current_released {
+                        self.release_active_lease_at(request.now.unwrap_or_else(Utc::now))
+                            .await
+                            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                        current_released = true;
+                    }
                     match self
                         .backend
                         .acquire_preferred_lease(
@@ -438,33 +445,19 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                         .await
                     {
                         Ok(grant) => return self.adopt_active_grant(grant).await,
-                        Err(AccountLeaseError::NoEligibleAccount)
-                            if keep_current_on_no_candidate =>
-                        {
-                            return match self
-                                .backend
-                                .acquire_preferred_lease(
-                                    pool_id,
-                                    active_lease.account_id(),
-                                    &self.holder_instance_id,
-                                )
-                                .await
-                            {
-                                Ok(grant) => self.adopt_active_grant(grant).await,
-                                Err(err) => Err(err),
-                            };
-                        }
                         Err(AccountLeaseError::NoEligibleAccount) => continue,
                         Err(err) => return Err(err),
                     }
                 }
                 SelectionAction::Probe(account_id) => {
+                    let now = request.now.unwrap_or_else(Utc::now);
+                    let reserved_until = now + self.probe_reservation_duration();
                     if !self
                         .backend
                         .reserve_quota_probe(
                             account_id.as_str(),
                             selection_family.as_str(),
-                            request.now.unwrap_or_else(Utc::now),
+                            now,
                             self.probe_reservation_duration(),
                         )
                         .await
@@ -480,6 +473,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                             pool_id,
                             account_id.as_str(),
                             selection_family.as_str(),
+                            reserved_until,
                             probe_holder_instance_id.as_str(),
                         )
                         .await
@@ -505,12 +499,31 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     let _ = release_result?;
                     continue;
                 }
-                SelectionAction::StayOnCurrent if keep_current_on_no_candidate => {
-                    return Ok(active_lease.leased_account());
-                }
                 SelectionAction::StayOnCurrent | SelectionAction::NoCandidate => {
                     if keep_current_on_no_candidate {
-                        return Ok(active_lease.leased_account());
+                        if !current_released {
+                            return Ok(active_lease.leased_account());
+                        }
+                        if current_reacquire_exhausted {
+                            return Err(AccountLeaseError::NoEligibleAccount);
+                        }
+                        current_reacquire_exhausted = true;
+                        match self
+                            .backend
+                            .acquire_preferred_lease(
+                                pool_id,
+                                current_account_id.as_str(),
+                                &self.holder_instance_id,
+                            )
+                            .await
+                        {
+                            Ok(grant) => return self.adopt_active_grant(grant).await,
+                            Err(AccountLeaseError::NoEligibleAccount) => {
+                                request.current_account_id = None;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
                     self.release_active_lease_at(request.now.unwrap_or_else(Utc::now))
                         .await
@@ -546,12 +559,14 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     Err(err) => return Err(err),
                 },
                 SelectionAction::Probe(account_id) => {
+                    let now = request.now.unwrap_or_else(Utc::now);
+                    let reserved_until = now + self.probe_reservation_duration();
                     if !self
                         .backend
                         .reserve_quota_probe(
                             account_id.as_str(),
                             selection_family.as_str(),
-                            request.now.unwrap_or_else(Utc::now),
+                            now,
                             self.probe_reservation_duration(),
                         )
                         .await
@@ -565,6 +580,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                             pool_id,
                             account_id.as_str(),
                             selection_family.as_str(),
+                            reserved_until,
                             self.probe_holder_instance_id().as_str(),
                         )
                         .await

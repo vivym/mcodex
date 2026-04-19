@@ -770,6 +770,7 @@ mod lease_lifecycle {
         assert_eq!(outcome.active_lease_retained_during_probe, true);
         assert_eq!(outcome.verification_lease_released, true);
         assert_eq!(outcome.final_selected_account_id, "acct-recovered");
+        assert_eq!(harness.probe_state().probe_acquire_called, true);
     }
 
     #[tokio::test]
@@ -818,7 +819,7 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
-    async fn soft_rotation_select_contention_reacquires_current_before_returning() {
+    async fn soft_rotation_select_contention_replans_to_fresh_candidate() {
         let mut harness = ScriptedProbeHarness::new(ProbeScenario::OrdinarySelectContention)
             .await
             .expect("create ordinary-select contention harness");
@@ -829,9 +830,9 @@ mod lease_lifecycle {
             .expect("run ordinary-select contention scenario");
         let state = harness.probe_state();
 
-        assert_eq!(result, Ok("acct-current".to_string()));
+        assert_eq!(result, Ok("acct-fallback".to_string()));
         assert!(state.normal_select_failed);
-        assert!(state.current_reacquired_after_select_failure);
+        assert_eq!(state.current_reacquired_after_select_failure, false);
     }
 
     #[cfg(unix)]
@@ -1716,6 +1717,7 @@ struct ProbeBackendState {
     refresh_called: bool,
     active_released_before_refresh: bool,
     verification_released: bool,
+    probe_acquire_called: bool,
     normal_select_failed: bool,
     current_reacquired_after_select_failure: bool,
 }
@@ -1854,6 +1856,7 @@ struct ScriptedProbeBackend {
     main_holder_instance_id: String,
     current_grant: LeaseGrant,
     recovered_grant: LeaseGrant,
+    fallback_grant: LeaseGrant,
     verification_grant: LeaseGrant,
     scenario: ProbeScenario,
     state: Arc<Mutex<ProbeBackendState>>,
@@ -1865,6 +1868,7 @@ impl ScriptedProbeBackend {
             main_holder_instance_id: main_holder_instance_id.to_string(),
             current_grant: scripted_grant("acct-current", main_holder_instance_id).await?,
             recovered_grant: scripted_grant("acct-recovered", main_holder_instance_id).await?,
+            fallback_grant: scripted_grant("acct-fallback", main_holder_instance_id).await?,
             verification_grant: scripted_grant("acct-recovered", "probe-holder").await?,
             scenario,
             state: Arc::new(Mutex::new(ProbeBackendState::default())),
@@ -1891,11 +1895,13 @@ impl ScriptedProbeBackend {
                 ProbeScenario::OrdinarySelectContention if !self.state().normal_select_failed => {
                     SelectionAction::Select("acct-recovered".to_string())
                 }
+                ProbeScenario::OrdinarySelectContention => {
+                    SelectionAction::Select("acct-fallback".to_string())
+                }
                 ProbeScenario::StillBlocked
                 | ProbeScenario::Ambiguous
                 | ProbeScenario::RefreshError
-                | ProbeScenario::Contention
-                | ProbeScenario::OrdinarySelectContention => SelectionAction::StayOnCurrent,
+                | ProbeScenario::Contention => SelectionAction::StayOnCurrent,
             }
         } else if self.state().probe_reserved_until.is_some() {
             SelectionAction::StayOnCurrent
@@ -1986,11 +1992,31 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
             state.current_reacquired_after_select_failure = true;
             return Ok(self.current_grant.clone());
         }
+        if self.scenario == ProbeScenario::OrdinarySelectContention && account_id == "acct-fallback"
+        {
+            return Ok(self.fallback_grant.clone());
+        }
         if account_id == "acct-recovered" && self.state().refresh_called {
             Ok(self.recovered_grant.clone())
         } else {
             Ok(self.current_grant.clone())
         }
+    }
+
+    async fn acquire_probe_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        reserved_until: chrono::DateTime<Utc>,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let _ = (account_id, selection_family, reserved_until);
+        {
+            let mut state = self.state.lock().expect("lock probe state");
+            state.probe_acquire_called = true;
+        }
+        self.acquire_lease(pool_id, holder_instance_id).await
     }
 
     async fn reserve_quota_probe(

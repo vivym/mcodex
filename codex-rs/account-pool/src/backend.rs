@@ -116,9 +116,11 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
         pool_id: &str,
         account_id: &str,
         selection_family: &str,
+        reserved_until: DateTime<Utc>,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let _ = selection_family;
+        let _ = reserved_until;
         self.acquire_preferred_lease(pool_id, account_id, holder_instance_id)
             .await
     }

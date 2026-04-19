@@ -99,6 +99,7 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         pool_id: &str,
         account_id: &str,
         selection_family: &str,
+        reserved_until: DateTime<Utc>,
         holder_instance_id: &str,
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         let lease = self
@@ -107,6 +108,7 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
                 pool_id,
                 account_id,
                 selection_family,
+                reserved_until,
                 holder_instance_id,
                 self.lease_ttl,
             )

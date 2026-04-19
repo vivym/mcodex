@@ -279,6 +279,7 @@ impl StateRuntime {
         pool_id: &str,
         account_id: &str,
         selection_family: &str,
+        reserved_until: DateTime<Utc>,
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
@@ -288,7 +289,7 @@ impl StateRuntime {
             holder_instance_id,
             lease_ttl,
             RequestedLeaseQuotaPolicy::AllowExhaustedForProbe,
-            Some(selection_family),
+            Some((selection_family, reserved_until)),
         )
         .await
     }
@@ -300,7 +301,7 @@ impl StateRuntime {
         holder_instance_id: &str,
         lease_ttl: chrono::Duration,
         quota_policy: RequestedLeaseQuotaPolicy,
-        probe_selection_family: Option<&str>,
+        probe_reservation: Option<(&str, DateTime<Utc>)>,
     ) -> std::result::Result<AccountLeaseRecord, AccountLeaseError> {
         let now = Utc::now();
         let mut tx = self
@@ -312,9 +313,13 @@ impl StateRuntime {
             .await
             .map_err(account_lease_storage_error)?;
 
-        if let Some(existing_lease) = load_active_holder_lease(&mut *tx, holder_instance_id, now)
-            .await
-            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
+        if matches!(
+            quota_policy,
+            RequestedLeaseQuotaPolicy::RequireAvailableQuota
+        ) && let Some(existing_lease) =
+            load_active_holder_lease(&mut *tx, holder_instance_id, now)
+                .await
+                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
         {
             tx.commit().await.map_err(account_lease_storage_error)?;
             return Ok(existing_lease);
@@ -337,17 +342,23 @@ impl StateRuntime {
             &lease,
             account_id,
             quota_policy,
-            probe_selection_family,
+            probe_reservation,
         )
         .await;
 
         let result = match result {
             Ok(result) => result,
             Err(err) if account_lease_is_contention_error(&err) => {
-                let existing_lease =
+                let existing_lease = if matches!(
+                    quota_policy,
+                    RequestedLeaseQuotaPolicy::RequireAvailableQuota
+                ) {
                     load_active_holder_lease(self.pool.as_ref(), holder_instance_id, Utc::now())
                         .await
-                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?;
+                        .map_err(|load_err| AccountLeaseError::Storage(load_err.to_string()))?
+                } else {
+                    None
+                };
                 return match existing_lease {
                     Some(existing_lease) => Ok(existing_lease),
                     None => {
@@ -1929,12 +1940,12 @@ async fn insert_requested_lease<'e, E>(
     lease: &AccountLeaseRecord,
     account_id: &str,
     quota_policy: RequestedLeaseQuotaPolicy,
-    probe_selection_family: Option<&str>,
+    probe_reservation: Option<(&str, DateTime<Utc>)>,
 ) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let selection_family_expr = if probe_selection_family.is_some() {
+    let selection_family_expr = if probe_reservation.is_some() {
         "?"
     } else {
         "account_registry.backend_family"
@@ -1960,7 +1971,7 @@ where
             format!("  AND COALESCE({quota_exhausted_windows}, 'none') = 'none'\n")
         }
         RequestedLeaseQuotaPolicy::AllowExhaustedForProbe => {
-            format!("  AND COALESCE({quota_next_probe_after}, 0) > ?\n")
+            format!("  AND COALESCE({quota_next_probe_after}, 0) = ?\n")
         }
     };
     let sql = format!(
@@ -2016,12 +2027,12 @@ LIMIT 1
         .bind(account_datetime_to_epoch_seconds(lease.acquired_at))
         .bind(account_datetime_to_epoch_seconds(lease.renewed_at))
         .bind(account_datetime_to_epoch_seconds(lease.expires_at));
-    if let Some(selection_family) = probe_selection_family {
+    if let Some((selection_family, _reserved_until)) = probe_reservation {
         query = query.bind(selection_family);
     }
     query = query.bind(&lease.pool_id).bind(account_id);
-    if probe_selection_family.is_some() {
-        query = query.bind(account_datetime_to_epoch_seconds(lease.acquired_at));
+    if let Some((_selection_family, reserved_until)) = probe_reservation {
+        query = query.bind(account_datetime_to_epoch_seconds(reserved_until));
     }
     query.execute(executor).await
 }
@@ -2389,12 +2400,14 @@ WHERE released_at IS NULL;
             .upsert_account_quota_state(exhausted_quota_record("acct-1"))
             .await
             .unwrap();
+        let expected_reserved_until = Utc::now() + chrono::Duration::seconds(30);
 
         let unreserved = runtime
             .acquire_quota_probe_account_lease(
                 "pool-main",
                 "acct-1",
                 "codex",
+                expected_reserved_until,
                 "inst-a:probe",
                 chrono::Duration::seconds(300),
             )
@@ -2404,15 +2417,36 @@ WHERE released_at IS NULL;
             AccountLeaseError::NoEligibleAccount
         );
 
+        let mut stale_backoff = exhausted_quota_record("acct-1");
+        stale_backoff.next_probe_after = Some(Utc::now() + chrono::Duration::minutes(5));
+        runtime
+            .upsert_account_quota_state(stale_backoff)
+            .await
+            .unwrap();
+        let stale_backoff_attempt = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                expected_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(
+            stale_backoff_attempt.unwrap_err(),
+            AccountLeaseError::NoEligibleAccount
+        );
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+
         let now = Utc::now();
+        let reserved_until = now + chrono::Duration::seconds(30);
         assert!(
             runtime
-                .reserve_account_quota_probe(
-                    "acct-1",
-                    "codex",
-                    now,
-                    now + chrono::Duration::seconds(30),
-                )
+                .reserve_account_quota_probe("acct-1", "codex", now, reserved_until,)
                 .await
                 .unwrap()
         );
@@ -2421,6 +2455,7 @@ WHERE released_at IS NULL;
                 "pool-main",
                 "acct-1",
                 "codex",
+                reserved_until,
                 "inst-b:probe",
                 chrono::Duration::seconds(300),
             )
@@ -2428,6 +2463,61 @@ WHERE released_at IS NULL;
             .unwrap();
 
         assert_eq!(lease.account_id, "acct-1");
+    }
+
+    #[tokio::test]
+    async fn acquire_quota_probe_account_lease_rejects_stale_probe_holder_lease() {
+        let runtime = test_runtime().await;
+        seed_account(runtime.as_ref(), "acct-1").await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-main", 1, true).await;
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-1"))
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(exhausted_quota_record("acct-2"))
+            .await
+            .unwrap();
+
+        let first_reserved_until = Utc::now() + chrono::Duration::seconds(30);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-1", "codex", Utc::now(), first_reserved_until,)
+                .await
+                .unwrap()
+        );
+        let first = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-1",
+                "codex",
+                first_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.account_id, "acct-1");
+
+        let second_now = Utc::now();
+        let second_reserved_until = second_now + chrono::Duration::seconds(45);
+        assert!(
+            runtime
+                .reserve_account_quota_probe("acct-2", "codex", second_now, second_reserved_until,)
+                .await
+                .unwrap()
+        );
+        let second = runtime
+            .acquire_quota_probe_account_lease(
+                "pool-main",
+                "acct-2",
+                "codex",
+                second_reserved_until,
+                "inst-a:probe",
+                chrono::Duration::seconds(300),
+            )
+            .await;
+        assert_eq!(second.unwrap_err(), AccountLeaseError::NoEligibleAccount);
     }
 
     #[tokio::test]
