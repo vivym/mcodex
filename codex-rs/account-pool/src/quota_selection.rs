@@ -64,7 +64,7 @@ pub fn evaluate_selection(
             continue;
         }
 
-        let block_class = classify_candidate(&candidate, selection_family, now, &request);
+        let block_class = classify_candidate(&candidate, selection_family, now);
         if matches!(
             block_class,
             QuotaBlockClass::PredictedBlocked | QuotaBlockClass::ProbeEligibleBlocked
@@ -219,7 +219,6 @@ fn classify_candidate(
     candidate: &AccountRecord,
     selection_family: &str,
     now: DateTime<Utc>,
-    request: &SelectionRequest,
 ) -> QuotaBlockClass {
     let Some(row) = candidate.quota.effective_quota(selection_family) else {
         return QuotaBlockClass::NotBlocked {
@@ -228,10 +227,9 @@ fn classify_candidate(
     };
 
     if row.exhausted_windows.is_exhausted() {
-        return if request.intent.is_probe_recovery()
-            || row
-                .next_probe_after
-                .is_none_or(|next_probe_after| now >= next_probe_after)
+        return if row
+            .next_probe_after
+            .is_none_or(|next_probe_after| now >= next_probe_after)
         {
             QuotaBlockClass::ProbeEligibleBlocked
         } else {

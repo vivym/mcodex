@@ -133,6 +133,22 @@ fn quota_selection_probe_recovery_only_rechecks_reserved_target_and_returns_prob
 }
 
 #[test]
+fn quota_selection_probe_recovery_returns_no_candidate_until_reserved_target_becomes_probe_eligible()
+ {
+    let plan = build_selection_plan(
+        selection_request(SelectionIntent::ProbeRecovery).with_reserved_probe_target("acct-probe"),
+    )
+    .with_candidate(candidate("acct-probe").with_primary_block(now_plus_minutes(30)))
+    .run();
+
+    assert!(plan.eligible_candidates.is_empty());
+    assert_eq!(plan.probe_candidate, None);
+    assert_eq!(plan.decision_reason, SelectionDecisionReason::NoCandidate);
+    assert_eq!(plan.terminal_action, SelectionAction::NoCandidate);
+    assert_rejected_reason(&plan, "acct-probe", SelectionRejectReason::PredictedBlocked);
+}
+
+#[test]
 fn quota_selection_primary_threshold_beats_later_tie_breakers() {
     let plan = build_selection_plan(
         selection_request(SelectionIntent::Startup).with_proactive_threshold_percent(85),
@@ -156,6 +172,29 @@ fn quota_selection_primary_threshold_beats_later_tie_breakers() {
 }
 
 #[test]
+fn quota_selection_secondary_safety_breaks_primary_ties_before_reset_ordering() {
+    let plan = build_selection_plan(selection_request(SelectionIntent::Startup))
+        .with_candidate(
+            candidate("acct-reset-early")
+                .with_primary_used(40.0)
+                .with_secondary_used(30.0)
+                .with_primary_reset(now_plus_minutes(5)),
+        )
+        .with_candidate(
+            candidate("acct-secondary-safe")
+                .with_primary_used(40.0)
+                .with_secondary_used(10.0)
+                .with_primary_reset(now_plus_minutes(20)),
+        )
+        .run();
+
+    assert_eq!(
+        plan.eligible_candidates[0].account_id,
+        "acct-secondary-safe"
+    );
+}
+
+#[test]
 fn quota_selection_ranking_uses_primary_then_secondary_then_reset_then_stable_tie_breakers() {
     let plan = build_selection_plan(selection_request(SelectionIntent::Startup))
         .with_candidate(
@@ -172,6 +211,45 @@ fn quota_selection_ranking_uses_primary_then_secondary_then_reset_then_stable_ti
         .run();
 
     assert_eq!(plan.eligible_candidates[0].account_id, "acct-a");
+}
+
+#[test]
+fn quota_selection_ranking_uses_pool_position_then_account_id_as_stable_tie_breakers() {
+    let plan = build_selection_plan(selection_request(SelectionIntent::Startup))
+        .with_candidate(
+            candidate("acct-b")
+                .with_primary_used(40.0)
+                .with_secondary_used(30.0)
+                .with_primary_reset(now_plus_minutes(5))
+                .with_pool_position(2),
+        )
+        .with_candidate(
+            candidate("acct-a")
+                .with_primary_used(40.0)
+                .with_secondary_used(30.0)
+                .with_primary_reset(now_plus_minutes(5))
+                .with_pool_position(2),
+        )
+        .with_candidate(
+            candidate("acct-front")
+                .with_primary_used(40.0)
+                .with_secondary_used(30.0)
+                .with_primary_reset(now_plus_minutes(5))
+                .with_pool_position(1),
+        )
+        .run();
+
+    assert_eq!(
+        plan.eligible_candidates
+            .into_iter()
+            .map(|candidate| candidate.account_id)
+            .collect::<Vec<_>>(),
+        vec![
+            "acct-front".to_string(),
+            "acct-a".to_string(),
+            "acct-b".to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -324,6 +402,11 @@ impl CandidateBuilder {
             primary_resets_at: Some(primary_resets_at),
             ..row
         });
+        self
+    }
+
+    fn with_pool_position(mut self, pool_position: usize) -> Self {
+        self.record.pool_position = pool_position;
         self
     }
 
