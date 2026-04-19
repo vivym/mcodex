@@ -822,7 +822,7 @@ impl Codex {
     }
 
     pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
-        let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
+        let account_pool_manager = self.session.services.account_pool_manager_for_turn()?;
         let snapshot_seed = {
             let account_pool_manager = account_pool_manager.lock().await;
             account_pool_manager.snapshot_seed()
@@ -2314,7 +2314,7 @@ impl Session {
                 ));
             }
         }
-        if sess.services.account_pool_manager.is_none() {
+        if !sess.services.pooled_runtime_active() {
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
         }
@@ -4131,7 +4131,7 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
-        if let Some(account_pool_manager) = self.services.account_pool_manager.as_ref() {
+        if let Some(account_pool_manager) = self.services.account_pool_manager_for_turn() {
             let mut account_pool_manager = account_pool_manager.lock().await;
             if let Err(err) = account_pool_manager
                 .report_rate_limits(&new_rate_limits)
@@ -6302,9 +6302,10 @@ pub(crate) async fn run_turn(
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut prewarmed_client_session = prewarmed_client_session;
-    let pooled_mode_enabled = sess.services.account_pool_manager.is_some();
+    let pooled_mode_enabled = sess.services.pooled_runtime_active();
+    let turn_account_pool_manager = sess.services.account_pool_manager_for_turn();
     let turn_account_selection =
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+        if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
             let mut account_pool_manager = account_pool_manager.lock().await;
             match account_pool_manager.prepare_turn().await {
                 Ok(selection) => {
@@ -6352,7 +6353,7 @@ pub(crate) async fn run_turn(
         .is_some_and(|selection| selection.reset_remote_context);
     if reset_remote_context_for_turn {
         sess.services.model_client.reset_remote_session_identity();
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+        if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
             let mut account_pool_manager = account_pool_manager.lock().await;
             account_pool_manager.record_remote_context_reset(&turn_context.sub_id);
         }
@@ -7286,7 +7287,7 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
                     let mut account_pool_manager = account_pool_manager.lock().await;
                     if let Err(err) = account_pool_manager.report_usage_limit_reached().await {
                         warn!("failed to record account-pool usage-limit event: {err:#}");
@@ -7295,7 +7296,7 @@ async fn run_sampling_request(
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(err @ CodexErr::RefreshTokenFailed(_)) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
                     let mut account_pool_manager = account_pool_manager.lock().await;
                     if let Err(report_err) = account_pool_manager.report_unauthorized().await {
                         warn!(
@@ -7311,7 +7312,7 @@ async fn run_sampling_request(
                     ..
                 }),
             ) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
+                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
                     let mut account_pool_manager = account_pool_manager.lock().await;
                     if let Err(report_err) = account_pool_manager.report_unauthorized().await {
                         warn!(

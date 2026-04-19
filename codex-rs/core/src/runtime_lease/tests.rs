@@ -10,16 +10,25 @@ use crate::config::ConfigBuilder;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::skills_watcher::SkillsWatcher;
+use base64::Engine;
+use chrono::Utc;
+use codex_app_server_protocol::AuthMode;
 use codex_config::types::AccountPoolDefinitionToml;
 use codex_config::types::AccountsConfigToml;
 use codex_exec_server::EnvironmentManager;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
+use codex_login::save_auth;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::ModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_state::AccountRegistryEntryUpdate;
+use codex_state::AccountStartupSelectionUpdate;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,6 +64,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
+    let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = Arc::new(ModelsManager::new(
@@ -157,6 +167,95 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
     ));
     assert!(child.session.services.runtime_lease_host.is_some());
     assert!(child.session.services.account_pool_manager.is_none());
+    assert!(
+        child.session.take_session_startup_prewarm().await.is_none(),
+        "pooled-host children must not prewarm before lease-backed auth is selected"
+    );
+
+    let account_id = "acct-pooled-child";
+    let state_db = root
+        .session
+        .services
+        .state_db
+        .as_ref()
+        .expect("root state db");
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(config_codex_home.as_path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    assert!(
+        child
+            .session
+            .services
+            .auth_manager
+            .auth()
+            .await
+            .is_some_and(|auth| auth.is_api_key_auth()),
+        "child fallback AuthManager should remain non-pooled"
+    );
+    let child_turn_manager = child
+        .session
+        .services
+        .account_pool_manager_for_turn()
+        .expect("pooled child should use root bridge manager for turns");
+    let root_bridge_manager = root
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host")
+        .legacy_manager_bridge()
+        .expect("registered root legacy bridge manager");
+    assert!(Arc::ptr_eq(&child_turn_manager, &root_bridge_manager));
+    let selection = {
+        let mut manager = child_turn_manager.lock().await;
+        manager.prepare_turn().await?
+    }
+    .expect("bridge manager should select a pooled account");
+    let leased_auth = selection.auth_session.leased_turn_auth()?;
+    assert_eq!(selection.account_id, account_id);
+    assert_eq!(
+        leased_auth.auth().get_account_id().as_deref(),
+        Some(account_id)
+    );
+    child
+        .session
+        .services
+        .lease_auth
+        .replace_current(Some(Arc::clone(&selection.auth_session)));
+    let child_model_auth = child
+        .session
+        .services
+        .model_client
+        .new_session()
+        .current_auth_provider_for_test()
+        .await?;
+    assert_eq!(child_model_auth.account_id.as_deref(), Some(account_id));
+    assert_eq!(
+        child_model_auth.token.as_deref(),
+        Some(fake_access_token(account_id).as_str())
+    );
 
     child.shutdown_and_wait().await?;
     root.shutdown_and_wait().await?;
@@ -188,4 +287,47 @@ async fn build_test_config_with_pool(codex_home: &Path) -> Config {
         pools: Some(pools),
     });
     config
+}
+
+fn pooled_auth_home(codex_home: &Path, account_id: &str) -> std::path::PathBuf {
+    codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(account_id)
+}
+
+fn auth_dot_json_for_account(account_id: &str) -> AuthDotJson {
+    let access_token = fake_access_token(account_id);
+    AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: codex_login::token_data::parse_chatgpt_jwt_claims(&access_token)
+                .expect("fake access token should parse"),
+            access_token,
+            refresh_token: "refresh-token".to_string(),
+            account_id: Some(account_id.to_string()),
+        }),
+        last_refresh: Some(Utc::now()),
+    }
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    let header = serde_json::json!({
+        "alg": "none",
+        "typ": "JWT",
+    });
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&value).expect("serialize fake JWT part"))
+    };
+    format!("{}.{}.sig", b64(header), b64(payload))
 }

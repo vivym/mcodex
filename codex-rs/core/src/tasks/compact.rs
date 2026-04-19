@@ -32,10 +32,10 @@ impl SessionTask for CompactTask {
     ) -> Option<String> {
         let session = session.clone_session();
         let use_remote_compact = crate::compact::should_use_remote_compact_task(&ctx.provider);
-        let pooled_mode_enabled =
-            use_remote_compact && session.services.account_pool_manager.is_some();
+        let pooled_mode_enabled = use_remote_compact && session.services.pooled_runtime_active();
+        let turn_account_pool_manager = session.services.account_pool_manager_for_turn();
         let turn_account_selection = if use_remote_compact {
-            if let Some(account_pool_manager) = session.services.account_pool_manager.as_ref() {
+            if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
                 let mut account_pool_manager = account_pool_manager.lock().await;
                 match account_pool_manager.prepare_turn().await {
                     Ok(selection) => {

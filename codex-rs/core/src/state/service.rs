@@ -94,6 +94,23 @@ pub(crate) struct SessionServices {
 }
 
 impl SessionServices {
+    pub(crate) fn pooled_runtime_active(&self) -> bool {
+        self.account_pool_manager.is_some()
+            || self
+                .runtime_lease_host
+                .as_ref()
+                .is_some_and(crate::runtime_lease::RuntimeLeaseHost::is_pooled)
+    }
+
+    pub(crate) fn account_pool_manager_for_turn(&self) -> Option<Arc<Mutex<AccountPoolManager>>> {
+        self.account_pool_manager.as_ref().cloned().or_else(|| {
+            self.runtime_lease_host
+                .as_ref()
+                .filter(|host| host.is_pooled())
+                .and_then(crate::runtime_lease::RuntimeLeaseHost::legacy_manager_bridge)
+        })
+    }
+
     pub(crate) async fn build_root_runtime_lease_host(
         state_db: Option<StateDbHandle>,
         accounts: Option<AccountsConfigToml>,

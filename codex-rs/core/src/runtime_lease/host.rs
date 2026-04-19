@@ -83,6 +83,10 @@ impl RuntimeLeaseHost {
         self.0.mode
     }
 
+    pub(crate) fn is_pooled(&self) -> bool {
+        self.mode() == RuntimeLeaseHostMode::Pooled
+    }
+
     pub(crate) fn attach_legacy_manager_bridge(
         &self,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
@@ -100,6 +104,12 @@ impl RuntimeLeaseHost {
 
     pub(crate) fn has_legacy_manager_bridge(&self) -> bool {
         self.0.legacy_manager_bridge.get().is_some()
+    }
+
+    pub(crate) fn legacy_manager_bridge(
+        &self,
+    ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
+        self.0.legacy_manager_bridge.get().cloned()
     }
 
     #[cfg(test)]
@@ -131,6 +141,6 @@ impl RuntimeLeaseHost {
     pub(crate) fn legacy_manager_bridge_for_test(
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
-        self.0.legacy_manager_bridge.get().cloned()
+        self.legacy_manager_bridge()
     }
 }

@@ -188,7 +188,8 @@ async fn run_remote_compact_task_inner_impl(
                     if let Some(rate_limits) = e.rate_limits.clone() {
                         sess.update_rate_limits(turn_context, *rate_limits).await;
                     }
-                    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
+                    if let Some(account_pool_manager) =
+                        sess.services.account_pool_manager_for_turn()
                     {
                         let mut account_pool_manager = account_pool_manager.lock().await;
                         if let Err(report_err) =
@@ -205,7 +206,8 @@ async fn run_remote_compact_task_inner_impl(
                     status: StatusCode::UNAUTHORIZED,
                     ..
                 }) => {
-                    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
+                    if let Some(account_pool_manager) =
+                        sess.services.account_pool_manager_for_turn()
                     {
                         let mut account_pool_manager = account_pool_manager.lock().await;
                         if let Err(report_err) = account_pool_manager.report_unauthorized().await {

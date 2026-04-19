@@ -908,6 +908,11 @@ impl ModelClientSession {
         Ok(client_setup)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn current_auth_provider_for_test(&self) -> Result<CoreAuthProvider> {
+        Ok(self.current_client_setup().await?.api_auth)
+    }
+
     fn current_auth_recovery(&self) -> Option<Box<dyn AuthRecovery>> {
         if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
             return Some(Box::new(crate::lease_auth::LeaseSessionAuthRecovery::new(
