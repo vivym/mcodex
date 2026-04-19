@@ -101,8 +101,21 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         now: DateTime<Utc>,
         reserved_for: Duration,
     ) -> anyhow::Result<bool> {
+        let Some(quota_state) = self
+            .runtime
+            .read_selection_quota_state(account_id, selection_family)
+            .await?
+        else {
+            return Ok(false);
+        };
+
         self.runtime
-            .reserve_account_quota_probe(account_id, selection_family, now, now + reserved_for)
+            .reserve_account_quota_probe(
+                account_id,
+                quota_state.limit_id.as_str(),
+                now,
+                now + reserved_for,
+            )
             .await
     }
 

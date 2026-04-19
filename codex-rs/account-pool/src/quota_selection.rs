@@ -195,7 +195,7 @@ fn hard_reject_reason(
     if !candidate.enabled {
         return Some(SelectionRejectReason::Disabled);
     }
-    if !candidate.healthy || !candidate.selector_auth_eligible {
+    if !candidate.selector_auth_eligible {
         return Some(SelectionRejectReason::Unhealthy);
     }
     if candidate.leased_to_other_holder {

@@ -559,6 +559,75 @@ mod lease_lifecycle {
     }
 
     #[tokio::test]
+    async fn runtime_selection_ignores_legacy_registry_health_flag() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .runtime
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                healthy: false,
+                ..registry_entry_update("acct-a", /* enabled */ true)
+            })
+            .await
+            .expect("mark account unhealthy in legacy registry field");
+        harness
+            .write_quota("acct-a", "codex", healthy_primary(5.0))
+            .await
+            .expect("write best quota");
+        harness
+            .write_quota("acct-b", "codex", healthy_primary(42.0))
+            .await
+            .expect("write fallback quota");
+
+        let lease = harness
+            .acquire_runtime_selected_lease(runtime_selection_request())
+            .await
+            .expect("acquire runtime-selected lease");
+
+        assert_eq!(lease.account_id(), "acct-a");
+    }
+
+    #[tokio::test]
+    async fn probe_reservation_uses_codex_fallback_when_requested_family_row_is_absent() {
+        let harness = quota_fixture_with_three_accounts().await;
+        harness
+            .write_quota("acct-a", "codex", exhausted_primary())
+            .await
+            .expect("write codex fallback quota");
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let now = Utc::now();
+
+        let reserved = backend
+            .reserve_quota_probe("acct-a", "chatgpt", now, Duration::seconds(30))
+            .await
+            .expect("reserve fallback probe");
+
+        let codex_quota = harness
+            .runtime
+            .read_account_quota_state("acct-a", "codex")
+            .await
+            .expect("read codex quota")
+            .expect("codex quota should exist");
+        assert_eq!(reserved, true);
+        assert_eq!(
+            harness
+                .runtime
+                .read_account_quota_state("acct-a", "chatgpt")
+                .await
+                .expect("read requested family quota"),
+            None
+        );
+        assert!(
+            codex_quota
+                .next_probe_after
+                .is_some_and(|next_probe_after| next_probe_after >= now),
+            "codex fallback row should receive the reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_reservation_is_left_in_place_when_verification_lease_loses_a_race() {
         let mut harness = ScriptedProbeHarness::new(ProbeScenario::Contention)
             .await
@@ -592,6 +661,51 @@ mod lease_lifecycle {
         assert_eq!(outcome.active_lease_retained_during_probe, true);
         assert_eq!(outcome.verification_lease_released, true);
         assert_eq!(outcome.final_selected_account_id, "acct-recovered");
+    }
+
+    #[tokio::test]
+    async fn soft_rotation_probe_releases_verification_lease_when_refresh_is_still_blocked() {
+        let mut harness = ScriptedProbeHarness::new(ProbeScenario::StillBlocked)
+            .await
+            .expect("create still-blocked harness");
+
+        let result = harness
+            .trigger_soft_rotation_probe_attempt()
+            .await
+            .expect("run probe still-blocked scenario");
+
+        assert_eq!(result, Ok("acct-current".to_string()));
+        assert_eq!(harness.probe_state().verification_released, true);
+    }
+
+    #[tokio::test]
+    async fn soft_rotation_probe_releases_verification_lease_when_refresh_is_ambiguous() {
+        let mut harness = ScriptedProbeHarness::new(ProbeScenario::Ambiguous)
+            .await
+            .expect("create ambiguous harness");
+
+        let result = harness
+            .trigger_soft_rotation_probe_attempt()
+            .await
+            .expect("run probe ambiguous scenario");
+
+        assert_eq!(result, Ok("acct-current".to_string()));
+        assert_eq!(harness.probe_state().verification_released, true);
+    }
+
+    #[tokio::test]
+    async fn soft_rotation_probe_releases_verification_lease_when_refresh_errors() {
+        let mut harness = ScriptedProbeHarness::new(ProbeScenario::RefreshError)
+            .await
+            .expect("create refresh-error harness");
+
+        let result = harness
+            .trigger_soft_rotation_probe_attempt()
+            .await
+            .expect("run probe refresh-error scenario");
+
+        assert_eq!(result, Err("probe refresh failed".to_string()));
+        assert_eq!(harness.probe_state().verification_released, true);
     }
 
     #[cfg(unix)]
@@ -1450,6 +1564,9 @@ impl LegacyAuthBootstrap for TestLegacyBootstrap {
 enum ProbeScenario {
     Contention,
     Success,
+    StillBlocked,
+    Ambiguous,
+    RefreshError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1567,6 +1684,37 @@ impl ScriptedProbeHarness {
         })
     }
 
+    async fn trigger_soft_rotation_probe_attempt(
+        &mut self,
+    ) -> anyhow::Result<Result<String, String>> {
+        let current = self
+            .manager
+            .ensure_active_lease(runtime_selection_request())
+            .await?;
+        self.manager
+            .report_rate_limits(
+                current.key(),
+                snapshot_at(95.0, current.acquired_at() + Duration::seconds(121)),
+            )
+            .await?;
+
+        Ok(self
+            .manager
+            .ensure_active_lease(SelectionRequest {
+                now: Some(current.acquired_at() + Duration::seconds(122)),
+                pool_id: Some(current.pool_id().to_string()),
+                intent: SelectionIntent::SoftRotation,
+                selection_family: None,
+                current_account_id: None,
+                just_replaced_account_id: None,
+                reserved_probe_target_account_id: None,
+                proactive_threshold_percent: 85,
+            })
+            .await
+            .map(|lease| lease.account_id().to_string())
+            .map_err(|err| err.to_string()))
+    }
+
     fn probe_state(&self) -> ProbeBackendState {
         self.backend.state()
     }
@@ -1609,7 +1757,13 @@ impl ScriptedProbeBackend {
         let terminal_action = if request.current_account_id.is_none() {
             SelectionAction::Select("acct-current".to_string())
         } else if self.state().refresh_called {
-            SelectionAction::Select("acct-recovered".to_string())
+            match self.scenario {
+                ProbeScenario::Success => SelectionAction::Select("acct-recovered".to_string()),
+                ProbeScenario::StillBlocked
+                | ProbeScenario::Ambiguous
+                | ProbeScenario::RefreshError
+                | ProbeScenario::Contention => SelectionAction::StayOnCurrent,
+            }
         } else if self.state().probe_reserved_until.is_some() {
             SelectionAction::StayOnCurrent
         } else {
@@ -1661,7 +1815,10 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
         if self.is_probe_holder(holder_instance_id) {
             match self.scenario {
                 ProbeScenario::Contention => Err(AccountLeaseError::NoEligibleAccount),
-                ProbeScenario::Success => Ok(self.verification_grant.clone()),
+                ProbeScenario::Success
+                | ProbeScenario::StillBlocked
+                | ProbeScenario::Ambiguous
+                | ProbeScenario::RefreshError => Ok(self.verification_grant.clone()),
             }
         } else if self.state().refresh_called {
             Ok(self.recovered_grant.clone())
@@ -1787,7 +1944,12 @@ impl AccountPoolExecutionBackend for ScriptedProbeBackend {
     ) -> anyhow::Result<Option<ProbeOutcome>> {
         let mut state = self.state.lock().expect("lock probe state");
         state.refresh_called = true;
-        Ok(Some(ProbeOutcome::Success))
+        match self.scenario {
+            ProbeScenario::Success | ProbeScenario::Contention => Ok(Some(ProbeOutcome::Success)),
+            ProbeScenario::StillBlocked => Ok(Some(ProbeOutcome::StillBlocked)),
+            ProbeScenario::Ambiguous => Ok(Some(ProbeOutcome::Ambiguous)),
+            ProbeScenario::RefreshError => Err(anyhow::anyhow!("probe refresh failed")),
+        }
     }
 }
 
