@@ -1,3 +1,5 @@
+use crate::StartupPoolInventory;
+use crate::StartupSelectionFacts;
 use crate::types::AccountRecord;
 use crate::types::LeaseGrant;
 use async_trait::async_trait;
@@ -88,11 +90,31 @@ pub trait AccountPoolExecutionBackend: Send + Sync {
     /// Read persisted startup selection state.
     async fn read_startup_selection(&self) -> anyhow::Result<AccountStartupSelectionState>;
 
+    /// Read visible startup pools in backend-neutral form.
+    async fn read_startup_pool_inventory(&self) -> anyhow::Result<StartupPoolInventory>;
+
+    /// Read account-selection facts for a specific resolved startup pool.
+    async fn read_startup_selection_facts(
+        &self,
+        pool_id: &str,
+    ) -> anyhow::Result<StartupSelectionFacts>;
+
     /// Read startup selection facts annotated with effective source metadata.
     async fn read_account_startup_status(
         &self,
         configured_default_pool_id: Option<&str>,
-    ) -> anyhow::Result<AccountStartupStatus>;
+    ) -> anyhow::Result<AccountStartupStatus>
+    where
+        Self: Sized,
+    {
+        Ok(crate::startup_status::read_shared_startup_status(
+            self,
+            configured_default_pool_id,
+            None,
+        )
+        .await?
+        .startup)
+    }
 }
 
 /// Control-plane backend for pooled account registration and deletion.

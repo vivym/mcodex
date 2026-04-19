@@ -6,6 +6,7 @@ mod observability;
 mod policy;
 mod proactive_switch;
 mod selection;
+mod startup_resolution;
 mod startup_status;
 mod types;
 
@@ -45,6 +46,10 @@ pub use proactive_switch::ProactiveSwitchSnapshot;
 pub use proactive_switch::ProactiveSwitchState;
 pub use proactive_switch::ProactiveSwitchTurnDecision;
 pub use selection::evaluate_context_reuse;
+pub use startup_resolution::StartupPoolCandidate;
+pub use startup_resolution::StartupPoolInventory;
+pub use startup_resolution::StartupPreferredAccountOutcome;
+pub use startup_resolution::StartupSelectionFacts;
 pub use startup_status::SharedStartupStatus;
 pub use startup_status::read_shared_startup_status;
 pub use types::AccountKind;

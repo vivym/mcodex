@@ -24,6 +24,8 @@ use codex_login::TokenData;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_state::AccountRegistryEntryUpdate;
+use codex_state::AccountStartupAvailability;
+use codex_state::AccountStartupResolutionIssueKind;
 use codex_state::EffectivePoolResolutionSource;
 use codex_state::LegacyAccountImport;
 use codex_state::RegisteredAccountMembership;
@@ -85,7 +87,7 @@ async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
 }
 
 #[tokio::test]
-async fn shared_startup_status_treats_config_default_as_pooled_applicable() {
+async fn shared_startup_status_treats_invisible_config_default_as_invalid() {
     let harness = fixture_with_legacy_auth("acct-legacy").await;
     let backend = LocalAccountPoolBackend::new(
         harness.runtime.clone(),
@@ -96,7 +98,7 @@ async fn shared_startup_status_treats_config_default_as_pooled_applicable() {
         .await
         .expect("read shared startup status");
 
-    assert_eq!(status.pooled_applicable, true);
+    assert_eq!(status.pooled_applicable, false);
     assert_eq!(
         status.startup.effective_pool_resolution_source,
         EffectivePoolResolutionSource::ConfigDefault
@@ -106,6 +108,18 @@ async fn shared_startup_status_treats_config_default_as_pooled_applicable() {
         Some("configured-main")
     );
     assert_eq!(status.startup.persisted_default_pool_id, None);
+    assert_eq!(
+        status.startup.startup_availability,
+        AccountStartupAvailability::InvalidExplicitDefault
+    );
+    assert_eq!(
+        status
+            .startup
+            .startup_resolution_issue
+            .as_ref()
+            .map(|issue| issue.kind),
+        Some(AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable)
+    );
 }
 
 #[tokio::test]
@@ -411,7 +425,7 @@ mod lease_lifecycle {
             .expect_err("legacy auth should not bootstrap pooled state implicitly");
 
         assert!(
-            err.to_string().contains("no eligible account"),
+            err.to_string().contains("default is unavailable"),
             "unexpected error: {err}"
         );
 
@@ -424,6 +438,42 @@ mod lease_lifecycle {
         assert_eq!(selection.preferred_account_id, None);
         assert_eq!(selection.suppressed, false);
         assert_eq!(harness.bootstrap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_selection_facts_keep_any_eligible_account_true_when_preferred_is_busy() {
+        let harness = fixture_with_registered_accounts(&["acct-a", "acct-b"]).await;
+        harness
+            .runtime
+            .write_account_startup_selection(codex_state::AccountStartupSelectionUpdate {
+                default_pool_id: Some("legacy-default".to_string()),
+                preferred_account_id: Some("acct-a".to_string()),
+                suppressed: false,
+            })
+            .await
+            .expect("write startup selection");
+        harness
+            .runtime
+            .acquire_preferred_account_lease(
+                "legacy-default",
+                "acct-a",
+                "holder-1",
+                Duration::seconds(300),
+            )
+            .await
+            .expect("acquire preferred account lease");
+
+        let backend = LocalAccountPoolBackend::new(
+            harness.runtime.clone(),
+            default_config().lease_ttl_duration(),
+        );
+        let facts = backend
+            .read_startup_selection_facts("legacy-default")
+            .await
+            .expect("read startup selection facts");
+
+        assert_eq!(facts.any_eligible_account, true);
+        assert_eq!(facts.predicted_account_id.as_deref(), Some("acct-b"));
     }
 
     #[tokio::test]

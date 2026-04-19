@@ -69,7 +69,7 @@ Do not modify the existing untracked runtime lease plan file unless the user exp
 - Read: `docs/superpowers/specs/2026-04-19-single-pool-startup-fallback-and-default-pool-selection-design.md`
 - Read: `docs/superpowers/specs/2026-04-18-runtime-lease-authority-for-subagents-design.md`
 
-- [ ] **Step 1: Confirm branch and unrelated files**
+- [x] **Step 1: Confirm branch and unrelated files**
 
 Run:
 
@@ -80,7 +80,7 @@ git branch --show-current
 
 Expected: current branch is the intended feature branch. Unrelated files, especially `docs/superpowers/plans/2026-04-19-runtime-lease-authority-for-subagents-implementation.md`, are not staged.
 
-- [ ] **Step 2: Locate current startup and CLI seams**
+- [x] **Step 2: Locate current startup and CLI seams**
 
 Run:
 
@@ -101,7 +101,7 @@ Expected: current implementation still has `EffectivePoolResolutionSource::{Over
 - Modify: `codex-rs/state/src/runtime/account_pool.rs`
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 
-- [ ] **Step 1: Write failing model/resolution tests**
+- [x] **Step 1: Write failing model/resolution tests**
 
 Add tests near the existing account-pool runtime tests:
 
@@ -167,7 +167,7 @@ async fn startup_status_requires_default_when_multiple_pools_are_visible() {
 }
 ```
 
-- [ ] **Step 2: Run focused state tests and verify failure**
+- [x] **Step 2: Run focused state tests and verify failure**
 
 Run:
 
@@ -178,7 +178,7 @@ cargo test -p codex-state startup_status_uses_single_visible_pool_when_no_defaul
 
 Expected: FAIL to compile because the new model fields and enum variants do not exist.
 
-- [ ] **Step 3: Add the new model fields and enums**
+- [x] **Step 3: Add the new model fields and enums**
 
 In `codex-rs/state/src/model/account_pool.rs`, extend the model:
 
@@ -251,7 +251,7 @@ Also re-export all newly added public model types from:
 Cross-crate consumers such as `codex-account-pool`, `codex-cli`, and Phase 2
 app-server code must not need to reach into the private `model` module.
 
-- [ ] **Step 4: Update all current status constructors**
+- [x] **Step 4: Update all current status constructors**
 
 Run:
 
@@ -268,7 +268,7 @@ startup_resolution_issue: None,
 candidate_pools: Vec::new(),
 ```
 
-- [ ] **Step 5: Re-run model tests**
+- [x] **Step 5: Re-run model tests**
 
 Run:
 
@@ -287,11 +287,12 @@ Expected: tests compile; new behavior still fails until resolver logic lands.
 - Modify: `codex-rs/account-pool/src/startup_status.rs`
 - Modify: `codex-rs/account-pool/src/backend.rs`
 - Modify: `codex-rs/account-pool/src/manager.rs`
+- Modify: `codex-rs/cli/src/accounts/registration.rs`
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 - Test: `codex-rs/account-pool/src/startup_resolution.rs`
 - Test: `codex-rs/account-pool/src/startup_status.rs`
 
-- [ ] **Step 1: Add failing resolver tests for invalid explicit defaults and suppression overlay**
+- [x] **Step 1: Add failing resolver tests for invalid explicit defaults and suppression overlay**
 
 Add tests:
 
@@ -374,7 +375,7 @@ async fn invalid_override_reports_override_issue_not_config_issue() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run:
 
@@ -385,7 +386,7 @@ cargo test -p codex-state invalid_config_default_does_not_fall_back_to_single_vi
 
 Expected: FAIL because current resolver treats missing defaults as normal effective pool ids, synthetic suppression, or config-default failures.
 
-- [ ] **Step 3: Add backend-neutral resolver input types**
+- [x] **Step 3: Add backend-neutral resolver input types**
 
 Create `codex-rs/account-pool/src/startup_resolution.rs` and define resolver-facing shapes:
 
@@ -432,7 +433,7 @@ The resolver must own default precedence, single-pool fallback, explicit-source
 validation, suppression overlay, issue generation, and candidate-pool ordering.
 It must not query SQLite directly.
 
-- [ ] **Step 4: Add local inventory and facts providers**
+- [x] **Step 4: Add local inventory and facts providers**
 
 In `StateRuntime`, add local helpers that return the backend-neutral inventory
 and facts. The local inventory returns distinct pool ids from
@@ -445,7 +446,7 @@ Required behavior:
 - ignore config-only `accounts.pools` entries
 - include pools even when all accounts are disabled/unhealthy
 
-- [ ] **Step 5: Refactor preview to evaluate account eligibility independent of suppression**
+- [x] **Step 5: Refactor preview to evaluate account eligibility independent of suppression**
 
 Keep the account-level selection logic that produces:
 
@@ -461,7 +462,7 @@ Keep the account-level selection logic that produces:
 
 Do not produce `AccountStartupEligibility::Suppressed` from the new resolver path. Preserve the enum variant only for old conversion call sites until Phase 2 cleans projections.
 
-- [ ] **Step 6: Implement precedence and availability**
+- [x] **Step 6: Implement precedence and availability**
 
 Implement this order:
 
@@ -479,20 +480,30 @@ Explicit-source validation must produce the right issue kind:
 
 An invalid higher-priority source must not fall back to a lower-priority single visible pool.
 
-- [ ] **Step 7: Update `read_shared_startup_status` pooled applicability and override mapping**
+- [x] **Step 7: Update `read_shared_startup_status` pooled applicability and override mapping**
 
 In `codex-rs/account-pool/src/startup_status.rs`, pass both
 `configured_default_pool_id` and `explicit_override_pool_id` into the shared
 resolver instead of flattening them with `.or(...)`.
 
-Derive `pooled_applicable` from availability:
+Keep `pooled_applicable` conservative for the legacy pooled-mode gate:
 
 ```rust
-pooled_applicable: !matches!(
-    startup.startup_availability,
-    AccountStartupAvailability::Unavailable
-),
+pooled_applicable: startup.preview.effective_pool_id.is_some(),
 ```
+
+Implementation note: a review pass found that deriving this from
+`startup_availability != Unavailable` would make multi-pool/default-blocker states
+look pooled-applicable to existing core and app-server gates. New CLI/TUI
+surfaces should use `startup_availability` directly; the legacy boolean remains
+true only when an effective pool exists.
+
+Review follow-up: registration is a mutation path, so it must not require a
+configured or persisted default pool to already be visible in registered
+membership. `accounts add chatgpt` resolves its write target as explicit
+override, configured default, persisted default, then resolved startup pool.
+Only an explicit override with no existing durable default is persisted as the
+first durable default; single-visible fallback remains read-only.
 
 When `explicit_override_pool_id` is present:
 
@@ -501,7 +512,7 @@ When `explicit_override_pool_id` is present:
 - map invalid override to `OverridePoolUnavailable`
 - leave config-default issue kinds only for invalid config defaults
 
-- [ ] **Step 8: Update `AccountPoolManager::resolve_pool_id`**
+- [x] **Step 8: Update `AccountPoolManager::resolve_pool_id`**
 
 Replace direct `read_startup_selection().default_pool_id` fallback with shared startup status:
 
@@ -518,7 +529,7 @@ status
 
 Keep this small. The runtime-lease plan may later move this into `RuntimeLeaseAuthority`; this change makes current code consume Phase 1 semantics until then.
 
-- [ ] **Step 9: Run focused tests**
+- [x] **Step 9: Run focused tests**
 
 Run:
 
@@ -530,7 +541,7 @@ cargo test -p codex-account-pool startup_status -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add codex-rs/state/src/model/account_pool.rs codex-rs/state/src/model/mod.rs codex-rs/state/src/lib.rs codex-rs/state/src/runtime/account_pool.rs codex-rs/account-pool/src/backend.rs codex-rs/account-pool/src/startup_resolution.rs codex-rs/account-pool/src/startup_status.rs codex-rs/account-pool/src/manager.rs

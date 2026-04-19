@@ -310,15 +310,20 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
         if let Some(pool_id) = requested_pool_id {
             return Ok(pool_id);
         }
-        if let Some(pool_id) = self.config.default_pool_id.clone() {
+        let status = self
+            .backend
+            .read_account_startup_status(self.config.default_pool_id.as_deref())
+            .await?;
+        if let Some(pool_id) = status.preview.effective_pool_id {
             return Ok(pool_id);
         }
+        if let Some(issue) = status.startup_resolution_issue
+            && let Some(pool_id) = issue.pool_id
+        {
+            anyhow::bail!("account pool default is unavailable: {pool_id}");
+        }
 
-        self.backend
-            .read_startup_selection()
-            .await?
-            .default_pool_id
-            .context("account pool has no default pool configured")
+        anyhow::bail!("account pool has no default pool configured")
     }
 
     async fn try_rotate_active_lease_if_needed(

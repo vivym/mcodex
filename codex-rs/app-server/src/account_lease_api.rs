@@ -372,6 +372,7 @@ fn effective_pool_resolution_source_to_wire_string(
         EffectivePoolResolutionSource::Override => "override",
         EffectivePoolResolutionSource::ConfigDefault => "configDefault",
         EffectivePoolResolutionSource::PersistedSelection => "persistedSelection",
+        EffectivePoolResolutionSource::SingleVisiblePool => "singleVisiblePool",
         EffectivePoolResolutionSource::None => "none",
     }
 }

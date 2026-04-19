@@ -9,7 +9,12 @@ use crate::model::AccountPoolEventRecord;
 use crate::model::AccountPoolMembership;
 use crate::model::AccountRegistryEntryUpdate;
 use crate::model::AccountSource;
+use crate::model::AccountStartupAvailability;
+use crate::model::AccountStartupCandidatePool;
 use crate::model::AccountStartupEligibility;
+use crate::model::AccountStartupResolutionIssue;
+use crate::model::AccountStartupResolutionIssueKind;
+use crate::model::AccountStartupResolutionIssueSource;
 use crate::model::AccountStartupSelectionPreview;
 use crate::model::AccountStartupSelectionState;
 use crate::model::AccountStartupSelectionUpdate;
@@ -979,7 +984,183 @@ WHERE singleton = 1
             .map(ToOwned::to_owned)
             .or_else(|| selection.default_pool_id.clone());
 
-        if selection.suppressed {
+        self.preview_account_startup_selection_with_selection(
+            selection,
+            effective_pool_id,
+            /*allow_suppressed_short_circuit*/ true,
+        )
+        .await
+    }
+
+    pub async fn preview_account_startup_selection_without_suppression(
+        &self,
+        effective_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupSelectionPreview> {
+        let selection = self.read_account_startup_selection().await?;
+        self.preview_account_startup_selection_with_selection(
+            selection,
+            effective_pool_id.map(ToOwned::to_owned),
+            /*allow_suppressed_short_circuit*/ false,
+        )
+        .await
+    }
+
+    pub async fn read_account_startup_inventory(
+        &self,
+    ) -> anyhow::Result<Vec<AccountStartupCandidatePool>> {
+        let visible_pool_ids: Vec<String> = sqlx::query_scalar(
+            r#"
+SELECT DISTINCT membership.pool_id
+FROM account_pool_membership AS membership
+JOIN account_registry
+  ON account_registry.account_id = membership.account_id
+ORDER BY membership.pool_id ASC
+            "#,
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?;
+
+        Ok(visible_pool_ids
+            .into_iter()
+            .map(|pool_id| AccountStartupCandidatePool {
+                pool_id,
+                display_name: None,
+                status: None,
+            })
+            .collect())
+    }
+
+    pub async fn read_first_eligible_startup_account_id(
+        &self,
+        pool_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        read_first_eligible_account_id(self.pool.as_ref(), pool_id, Utc::now()).await
+    }
+
+    pub async fn read_account_startup_status(
+        &self,
+        configured_default_pool_id: Option<&str>,
+    ) -> anyhow::Result<AccountStartupStatus> {
+        let selection = self.read_account_startup_selection().await?;
+        let configured_default_pool_id = configured_default_pool_id.map(ToOwned::to_owned);
+        let persisted_default_pool_id = selection.default_pool_id.clone();
+        let candidate_pools = self.read_account_startup_inventory().await?;
+        let candidate_pool_ids = candidate_pools
+            .iter()
+            .map(|pool| pool.pool_id.as_str())
+            .collect::<Vec<_>>();
+
+        let (
+            effective_pool_id,
+            effective_pool_resolution_source,
+            startup_availability,
+            startup_resolution_issue,
+        ) = if let Some(pool_id) = configured_default_pool_id.as_deref() {
+            if candidate_pool_ids.contains(&pool_id) {
+                (
+                    Some(pool_id.to_string()),
+                    EffectivePoolResolutionSource::ConfigDefault,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    EffectivePoolResolutionSource::ConfigDefault,
+                    Some(AccountStartupAvailability::InvalidExplicitDefault),
+                    Some(AccountStartupResolutionIssue {
+                        kind: AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable,
+                        source: AccountStartupResolutionIssueSource::ConfigDefault,
+                        pool_id: Some(pool_id.to_string()),
+                        candidate_pool_count: Some(candidate_pools.len()),
+                        candidate_pools: Some(candidate_pools.clone()),
+                        message: None,
+                    }),
+                )
+            }
+        } else if let Some(pool_id) = persisted_default_pool_id.as_deref() {
+            if candidate_pool_ids.contains(&pool_id) {
+                (
+                    Some(pool_id.to_string()),
+                    EffectivePoolResolutionSource::PersistedSelection,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    EffectivePoolResolutionSource::PersistedSelection,
+                    Some(AccountStartupAvailability::InvalidExplicitDefault),
+                    Some(AccountStartupResolutionIssue {
+                        kind: AccountStartupResolutionIssueKind::PersistedDefaultPoolUnavailable,
+                        source: AccountStartupResolutionIssueSource::PersistedSelection,
+                        pool_id: Some(pool_id.to_string()),
+                        candidate_pool_count: Some(candidate_pools.len()),
+                        candidate_pools: Some(candidate_pools.clone()),
+                        message: None,
+                    }),
+                )
+            }
+        } else if candidate_pools.len() == 1 {
+            (
+                Some(candidate_pools[0].pool_id.clone()),
+                EffectivePoolResolutionSource::SingleVisiblePool,
+                None,
+                None,
+            )
+        } else if candidate_pools.len() > 1 {
+            (
+                None,
+                EffectivePoolResolutionSource::None,
+                Some(AccountStartupAvailability::MultiplePoolsRequireDefault),
+                Some(AccountStartupResolutionIssue {
+                    kind: AccountStartupResolutionIssueKind::MultiplePoolsRequireDefault,
+                    source: AccountStartupResolutionIssueSource::None,
+                    pool_id: None,
+                    candidate_pool_count: Some(candidate_pools.len()),
+                    candidate_pools: Some(candidate_pools.clone()),
+                    message: None,
+                }),
+            )
+        } else {
+            (
+                None,
+                EffectivePoolResolutionSource::None,
+                Some(AccountStartupAvailability::Unavailable),
+                None,
+            )
+        };
+        let preview = self
+            .preview_account_startup_selection_with_selection(
+                selection.clone(),
+                effective_pool_id.clone(),
+                /*allow_suppressed_short_circuit*/ false,
+            )
+            .await?;
+        let startup_availability = match startup_availability {
+            Some(startup_availability) => startup_availability,
+            None if selection.suppressed => AccountStartupAvailability::Suppressed,
+            None => AccountStartupAvailability::Available,
+        };
+
+        Ok(AccountStartupStatus {
+            preview,
+            configured_default_pool_id,
+            persisted_default_pool_id,
+            effective_pool_resolution_source,
+            startup_availability,
+            startup_resolution_issue,
+            candidate_pools,
+        })
+    }
+
+    async fn preview_account_startup_selection_with_selection(
+        &self,
+        selection: AccountStartupSelectionState,
+        effective_pool_id: Option<String>,
+        allow_suppressed_short_circuit: bool,
+    ) -> anyhow::Result<AccountStartupSelectionPreview> {
+        if allow_suppressed_short_circuit && selection.suppressed {
             return Ok(AccountStartupSelectionPreview {
                 effective_pool_id,
                 preferred_account_id: selection.preferred_account_id,
@@ -993,7 +1174,7 @@ WHERE singleton = 1
             return Ok(AccountStartupSelectionPreview {
                 effective_pool_id: None,
                 preferred_account_id: selection.preferred_account_id,
-                suppressed: false,
+                suppressed: selection.suppressed,
                 predicted_account_id: None,
                 eligibility: AccountStartupEligibility::MissingPool,
             });
@@ -1046,7 +1227,7 @@ WHERE singleton = 1
             return Ok(AccountStartupSelectionPreview {
                 effective_pool_id: Some(pool_id),
                 preferred_account_id: Some(preferred_account_id),
-                suppressed: false,
+                suppressed: selection.suppressed,
                 predicted_account_id,
                 eligibility,
             });
@@ -1063,34 +1244,9 @@ WHERE singleton = 1
         Ok(AccountStartupSelectionPreview {
             effective_pool_id: Some(pool_id),
             preferred_account_id: None,
-            suppressed: false,
+            suppressed: selection.suppressed,
             predicted_account_id,
             eligibility,
-        })
-    }
-
-    pub async fn read_account_startup_status(
-        &self,
-        configured_default_pool_id: Option<&str>,
-    ) -> anyhow::Result<AccountStartupStatus> {
-        let persisted_default_pool_id =
-            self.read_account_startup_selection().await?.default_pool_id;
-        let preview = self
-            .preview_account_startup_selection(configured_default_pool_id)
-            .await?;
-        let effective_pool_resolution_source = if configured_default_pool_id.is_some() {
-            EffectivePoolResolutionSource::ConfigDefault
-        } else if persisted_default_pool_id.is_some() {
-            EffectivePoolResolutionSource::PersistedSelection
-        } else {
-            EffectivePoolResolutionSource::None
-        };
-
-        Ok(AccountStartupStatus {
-            preview,
-            configured_default_pool_id: configured_default_pool_id.map(ToOwned::to_owned),
-            persisted_default_pool_id,
-            effective_pool_resolution_source,
         })
     }
 
@@ -1888,7 +2044,12 @@ mod tests {
     use crate::AccountPoolMembership;
     use crate::AccountRegistryEntryUpdate;
     use crate::AccountSource;
+    use crate::AccountStartupAvailability;
+    use crate::AccountStartupCandidatePool;
     use crate::AccountStartupEligibility;
+    use crate::AccountStartupResolutionIssue;
+    use crate::AccountStartupResolutionIssueKind;
+    use crate::AccountStartupResolutionIssueSource;
     use crate::AccountStartupSelectionPreview;
     use crate::AccountStartupStatus;
     use crate::EffectivePoolResolutionSource;
@@ -3332,16 +3493,177 @@ WHERE account_id = ?
             status,
             AccountStartupStatus {
                 preview: AccountStartupSelectionPreview {
-                    effective_pool_id: Some("configured-main".to_string()),
+                    effective_pool_id: None,
                     preferred_account_id: None,
                     suppressed: false,
                     predicted_account_id: None,
-                    eligibility: AccountStartupEligibility::NoEligibleAccount,
+                    eligibility: AccountStartupEligibility::MissingPool,
                 },
                 configured_default_pool_id: Some("configured-main".to_string()),
                 persisted_default_pool_id: Some("persisted-main".to_string()),
                 effective_pool_resolution_source: EffectivePoolResolutionSource::ConfigDefault,
+                startup_availability: AccountStartupAvailability::InvalidExplicitDefault,
+                startup_resolution_issue: Some(AccountStartupResolutionIssue {
+                    kind: AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable,
+                    source: AccountStartupResolutionIssueSource::ConfigDefault,
+                    pool_id: Some("configured-main".to_string()),
+                    candidate_pool_count: Some(0),
+                    candidate_pools: Some(Vec::new()),
+                    message: None,
+                }),
+                candidate_pools: Vec::new(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_status_uses_single_visible_pool_when_no_default_exists() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+
+        let status = runtime.read_account_startup_status(None).await.unwrap();
+
+        assert_eq!(
+            status,
+            AccountStartupStatus {
+                preview: AccountStartupSelectionPreview {
+                    effective_pool_id: Some("pool-main".to_string()),
+                    preferred_account_id: None,
+                    suppressed: false,
+                    predicted_account_id: Some("acct-1".to_string()),
+                    eligibility: AccountStartupEligibility::AutomaticAccountSelected,
+                },
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+                effective_pool_resolution_source: EffectivePoolResolutionSource::SingleVisiblePool,
+                startup_availability: AccountStartupAvailability::Available,
+                startup_resolution_issue: None,
+                candidate_pools: vec![AccountStartupCandidatePool {
+                    pool_id: "pool-main".to_string(),
+                    display_name: None,
+                    status: None,
+                }],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_status_requires_default_when_multiple_pools_are_visible() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        seed_account_in_pool(runtime.as_ref(), "acct-2", "pool-other", 0, true).await;
+
+        let status = runtime.read_account_startup_status(None).await.unwrap();
+
+        assert_eq!(
+            status,
+            AccountStartupStatus {
+                preview: AccountStartupSelectionPreview {
+                    effective_pool_id: None,
+                    preferred_account_id: None,
+                    suppressed: false,
+                    predicted_account_id: None,
+                    eligibility: AccountStartupEligibility::MissingPool,
+                },
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+                effective_pool_resolution_source: EffectivePoolResolutionSource::None,
+                startup_availability: AccountStartupAvailability::MultiplePoolsRequireDefault,
+                startup_resolution_issue: Some(AccountStartupResolutionIssue {
+                    kind: AccountStartupResolutionIssueKind::MultiplePoolsRequireDefault,
+                    source: AccountStartupResolutionIssueSource::None,
+                    pool_id: None,
+                    candidate_pool_count: Some(2),
+                    candidate_pools: Some(vec![
+                        AccountStartupCandidatePool {
+                            pool_id: "pool-main".to_string(),
+                            display_name: None,
+                            status: None,
+                        },
+                        AccountStartupCandidatePool {
+                            pool_id: "pool-other".to_string(),
+                            display_name: None,
+                            status: None,
+                        },
+                    ]),
+                    message: None,
+                }),
+                candidate_pools: vec![
+                    AccountStartupCandidatePool {
+                        pool_id: "pool-main".to_string(),
+                        display_name: None,
+                        status: None,
+                    },
+                    AccountStartupCandidatePool {
+                        pool_id: "pool-other".to_string(),
+                        display_name: None,
+                        status: None,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_config_default_does_not_fall_back_to_single_visible_pool() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+
+        let status = runtime
+            .read_account_startup_status(Some("missing-pool"))
+            .await
+            .expect("read startup status");
+
+        assert_eq!(status.preview.effective_pool_id, None);
+        assert_eq!(
+            status.startup_availability,
+            AccountStartupAvailability::InvalidExplicitDefault
+        );
+        assert_eq!(
+            status
+                .startup_resolution_issue
+                .as_ref()
+                .map(|issue| issue.kind),
+            Some(AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable)
+        );
+        assert_eq!(
+            status
+                .startup_resolution_issue
+                .as_ref()
+                .and_then(|issue| issue.pool_id.as_deref()),
+            Some("missing-pool")
+        );
+    }
+
+    #[tokio::test]
+    async fn suppression_overlays_single_visible_pool_without_replacing_eligibility() {
+        let runtime = test_runtime().await;
+        seed_account_in_pool(runtime.as_ref(), "acct-1", "pool-main", 0, true).await;
+        runtime
+            .write_account_startup_selection(crate::AccountStartupSelectionUpdate {
+                default_pool_id: None,
+                preferred_account_id: None,
+                suppressed: true,
+            })
+            .await
+            .expect("write selection");
+
+        let status = runtime
+            .read_account_startup_status(None)
+            .await
+            .expect("read startup status");
+
+        assert_eq!(
+            status.preview.effective_pool_id.as_deref(),
+            Some("pool-main")
+        );
+        assert_eq!(
+            status.startup_availability,
+            AccountStartupAvailability::Suppressed
+        );
+        assert_eq!(
+            status.preview.eligibility,
+            AccountStartupEligibility::AutomaticAccountSelected
         );
     }
 

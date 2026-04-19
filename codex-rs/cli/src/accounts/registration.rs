@@ -177,10 +177,17 @@ async fn add_chatgpt_account_with_dependencies(
     let startup_status = read_accounts_startup_status(runtime, config, account_pool_override)
         .await
         .context("resolve current account pool")?;
-    let should_persist_startup_default =
-        startup_status.startup.configured_default_pool_id.is_none()
-            && startup_status.startup.persisted_default_pool_id.is_none();
-    let Some(pool_id) = startup_status.startup.preview.effective_pool_id else {
+    let lacks_durable_default = startup_status.startup.configured_default_pool_id.is_none()
+        && startup_status.startup.persisted_default_pool_id.is_none();
+    let (pool_id, should_persist_startup_default) = if let Some(pool_id) = account_pool_override {
+        (pool_id.to_string(), lacks_durable_default)
+    } else if let Some(pool_id) = startup_status.startup.configured_default_pool_id {
+        (pool_id, false)
+    } else if let Some(pool_id) = startup_status.startup.persisted_default_pool_id {
+        (pool_id, false)
+    } else if let Some(pool_id) = startup_status.startup.preview.effective_pool_id {
+        (pool_id, false)
+    } else {
         anyhow::bail!(
             "no account pool is configured; pass `--account-pool <POOL_ID>` or configure a pool before running `{} accounts add chatgpt`",
             MCODEX.binary_name
@@ -677,6 +684,94 @@ mod tests {
             harness.runtime.read_account_startup_selection().await?,
             AccountStartupSelectionState {
                 default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_uses_persisted_default_before_pool_is_visible() -> Result<()>
+    {
+        let harness = RegistrationHarness::without_configured_pool().await?;
+        harness
+            .runtime
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.pool_id, "team-main");
+        assert_eq!(
+            harness.runtime.read_account_startup_selection().await?,
+            AccountStartupSelectionState {
+                default_pool_id: Some("team-main".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn add_chatgpt_registration_does_not_persist_single_visible_pool_fallback() -> Result<()>
+    {
+        let harness = RegistrationHarness::without_configured_pool().await?;
+        harness
+            .runtime
+            .upsert_registered_account(RegisteredAccountUpsert {
+                account_id: "acct-existing".to_string(),
+                backend_id: "local".to_string(),
+                backend_family: "chatgpt".to_string(),
+                workspace_id: Some("provider-existing".to_string()),
+                backend_account_handle: "provider-existing".to_string(),
+                account_kind: "chatgpt".to_string(),
+                provider_fingerprint: provider_fingerprint("provider-existing"),
+                display_name: Some("Managed ChatGPT".to_string()),
+                source: None,
+                enabled: true,
+                healthy: true,
+                membership: Some(RegisteredAccountMembership {
+                    pool_id: "team-main".to_string(),
+                    position: 0,
+                }),
+            })
+            .await?;
+        let runner = FakeChatgptRegistrationRunner::browser_success("provider-acct-new");
+        let control_plane = RuntimeBackedControlPlane::new(harness.runtime.clone());
+
+        let result = add_chatgpt_account_with_dependencies(
+            &harness.runtime,
+            &harness.config,
+            None,
+            /*device_auth*/ false,
+            &runner,
+            &control_plane,
+            &RuntimePendingRegistrationFinalizer,
+        )
+        .await?;
+
+        assert_eq!(result.pool_id, "team-main");
+        assert_eq!(
+            harness.runtime.read_account_startup_selection().await?,
+            AccountStartupSelectionState {
+                default_pool_id: None,
                 preferred_account_id: None,
                 suppressed: false,
             }
