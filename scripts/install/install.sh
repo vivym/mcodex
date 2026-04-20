@@ -358,6 +358,11 @@ publish_version_dir() {
 switch_current_link() {
   target_dir="$1"
   tmp_link="$BASE_ROOT/.current.$$.tmp"
+
+  if [ -e "$CURRENT_LINK" ] && [ ! -L "$CURRENT_LINK" ]; then
+    fail "$CURRENT_LINK exists and is not a symlink. Move it aside and rerun the installer."
+  fi
+
   rm -f "$tmp_link"
   ln -s "$target_dir" "$tmp_link"
 

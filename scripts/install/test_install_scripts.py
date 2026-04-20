@@ -251,6 +251,21 @@ class InstallShTests(unittest.TestCase):
             self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
             self.assertIn("version=0.96.0", wrapper.stdout)
 
+    def test_install_fails_if_current_path_is_real_directory(self) -> None:
+        with self.install_fixture() as fixture:
+            current_path = fixture.home / ".mcodex" / "current"
+            current_path.mkdir(parents=True)
+            sentinel = current_path / "sentinel.txt"
+            sentinel.write_text("keep me\n", encoding="utf-8")
+
+            result = fixture.run_install("0.96.0")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exists and is not a symlink", result.stderr)
+            self.assertTrue(current_path.is_dir())
+            self.assertFalse(current_path.is_symlink())
+            self.assertTrue(sentinel.exists())
+
     def test_wrapper_defaults_to_installed_custom_root(self) -> None:
         with self.install_fixture() as fixture:
             install_root = fixture.root / "custom-mcodex-root"
