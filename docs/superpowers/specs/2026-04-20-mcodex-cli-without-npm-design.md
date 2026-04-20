@@ -552,8 +552,9 @@ to:
   slice
 - keep the minisign public key in the repository and repeat it in release notes
   or linked release documentation
-- store the encrypted minisign private key and password as GitHub Actions
-  repository secrets owned by the release maintainers
+- store an unencrypted CI-only minisign private key, generated with
+  `minisign -G -W`, as a GitHub Actions repository secret owned by the release
+  maintainers
 - the release workflow should fail if signing is unavailable, rather than
   publishing unsigned checksum artifacts
 
