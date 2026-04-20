@@ -337,8 +337,6 @@ jobs:
       contents: write
       actions: read
     outputs:
-      version: ${{ steps.release_contract.outputs.name }}
-      tag: ${{ steps.release_contract.outputs.release_tag }}
       release_version: ${{ steps.release_contract.outputs.release_version }}
       release_tag: ${{ steps.release_contract.outputs.release_tag }}
       stable_release_version: ${{ steps.release_contract.outputs.stable_release_version }}
@@ -381,8 +379,8 @@ jobs:
         run: |
           rm -rf dist/windows-binaries*
           # cargo-timing.html appears under multiple target-specific directories.
-          # If included in files: dist/**, release upload races on duplicate
-          # asset names and can fail with 404s.
+          # If left in place, duplicate artifact names can still cause release
+          # asset upload failures when the release payload changes.
           find dist -type f -name 'cargo-timing.html' -delete
           find dist -type d -empty -delete
 
@@ -396,16 +394,15 @@ jobs:
         id: release_contract
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#rust-v}"
-          echo "name=${version}" >> $GITHUB_OUTPUT
-          echo "release_version=${version}" >> "$GITHUB_OUTPUT"
+          release_version="${GITHUB_REF_NAME#rust-v}"
+          echo "release_version=${release_version}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "stable_release_version=${version}" >> "$GITHUB_OUTPUT"
+          if [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "stable_release_version=${release_version}" >> "$GITHUB_OUTPUT"
           else
             echo "stable_release_version=" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "$version" == *-* ]]; then
+          if [[ "${release_version}" == *-* ]]; then
             echo "release_is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "release_is_prerelease=false" >> "$GITHUB_OUTPUT"
@@ -448,15 +445,15 @@ jobs:
       - name: Determine npm publish settings
         id: npm_publish_settings
         env:
-          VERSION: ${{ steps.release_contract.outputs.name }}
+          RELEASE_VERSION: ${{ steps.release_contract.outputs.release_version }}
         run: |
           set -euo pipefail
-          version="${VERSION}"
+          release_version="${RELEASE_VERSION}"
 
-          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "npm_tag=" >> "$GITHUB_OUTPUT"
-          elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+          elif [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "npm_tag=alpha" >> "$GITHUB_OUTPUT"
           else
@@ -482,11 +479,10 @@ jobs:
       - name: Stage npm packages
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.release_contract.outputs.name }}
+          RELEASE_VERSION: ${{ steps.release_contract.outputs.release_version }}
         run: |
           ./scripts/stage_npm_packages.py \
             --release-version "$RELEASE_VERSION" \
-            --package codex \
             --package codex-responses-api-proxy \
             --package codex-sdk
 
@@ -495,13 +491,115 @@ jobs:
           cp scripts/install/install.sh dist/install.sh
           cp scripts/install/install.ps1 dist/install.ps1
 
-      - name: Create GitHub Release
+      - name: Install minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Sign CLI checksums
+        shell: bash
+        env:
+          MINISIGN_PRIVATE_KEY_B64: ${{ secrets.MINISIGN_PRIVATE_KEY_B64 }}
+          RELEASE_VERSION: ${{ steps.release_contract.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          checksum_dir="dist/oss/repositories/mcodex/releases/${RELEASE_VERSION}"
+          test -s "${checksum_dir}/SHA256SUMS"
+          [[ -n "${MINISIGN_PRIVATE_KEY_B64}" ]]
+          printf '%s' "${MINISIGN_PRIVATE_KEY_B64}" | base64 -d > "${RUNNER_TEMP}/minisign.key"
+          trap 'rm -f "${RUNNER_TEMP}/minisign.key"' EXIT
+          chmod 600 "${RUNNER_TEMP}/minisign.key"
+          test -s release/minisign.pub
+          minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "${checksum_dir}/SHA256SUMS" -x "${checksum_dir}/SHA256SUMS.sig"
+          minisign -V -p release/minisign.pub -m "${checksum_dir}/SHA256SUMS" -x "${checksum_dir}/SHA256SUMS.sig"
+          test -s "${checksum_dir}/SHA256SUMS.sig"
+
+      - name: Upload CLI archives to OSS
+        shell: bash
+        env:
+          ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
+          ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
+          ALIYUN_OSS_ENDPOINT: ${{ secrets.ALIYUN_OSS_ENDPOINT }}
+          ALIYUN_OSS_BUCKET: ${{ secrets.ALIYUN_OSS_BUCKET }}
+          RELEASE_VERSION: ${{ steps.release_contract.outputs.release_version }}
+          STABLE_RELEASE_VERSION: ${{ steps.release_contract.outputs.stable_release_version }}
+          RELEASE_TAG: ${{ steps.release_contract.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_VERSION}" =~ ^[0-9]+[.][0-9]+[.][0-9]+(-((alpha|beta)[.][0-9]+))?$ ]]; then
+            echo "Expected normalized release semver, got: ${RELEASE_VERSION}" >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_TAG}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta)\.[0-9]+)?$ ]]; then
+            echo "Expected canonical GitHub release tag rust-v<semver>, got: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          release_dir="dist/oss/repositories/mcodex/releases/${RELEASE_VERSION}"
+          channel_manifest="dist/oss/repositories/mcodex/channels/stable/latest.json"
+          test -d "${release_dir}"
+          test -s "${release_dir}/SHA256SUMS"
+          test -s "${release_dir}/SHA256SUMS.sig"
+          test -s dist/install.sh
+          test -s dist/install.ps1
+          curl -fsSL -o "${RUNNER_TEMP}/ossutil.zip" \
+            https://gosspublic.alicdn.com/ossutil/v2/2.2.2/ossutil-2.2.2-linux-amd64.zip
+          unzip -q "${RUNNER_TEMP}/ossutil.zip" -d "${RUNNER_TEMP}/ossutil"
+          ossutil="${RUNNER_TEMP}/ossutil/ossutil-2.2.2-linux-amd64/ossutil"
+          chmod +x "${ossutil}"
+          "${ossutil}" config -e "${ALIYUN_OSS_ENDPOINT}" -i "${ALIYUN_ACCESS_KEY_ID}" -k "${ALIYUN_ACCESS_KEY_SECRET}"
+          "${ossutil}" cp -r "${release_dir}/" "oss://${ALIYUN_OSS_BUCKET}/repositories/mcodex/releases/${RELEASE_VERSION}/"
+          "${ossutil}" cp "dist/install.sh" "oss://${ALIYUN_OSS_BUCKET}/install.sh"
+          "${ossutil}" cp "dist/install.ps1" "oss://${ALIYUN_OSS_BUCKET}/install.ps1"
+          if [[ -n "${STABLE_RELEASE_VERSION}" ]]; then
+            test -s "${channel_manifest}"
+            "${ossutil}" cp "${channel_manifest}" "oss://${ALIYUN_OSS_BUCKET}/repositories/mcodex/channels/stable/latest.json"
+          fi
+
+      - name: Append OSS install instructions to release notes
+        shell: bash
+        env:
+          RELEASE_NOTES_PATH: ${{ steps.release_notes.outputs.path }}
+        run: |
+          set -euo pipefail
+          {
+            cat <<'EOF'
+            Install mcodex CLI from OSS:
+
+            macOS/Linux:
+            curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
+
+            Windows PowerShell:
+            powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"
+
+            This release uses the script-managed OSS distribution channel. npm, bun, Homebrew, and WinGet are no longer advertised CLI install or update paths for mcodex.
+
+            If you previously installed mcodex through npm, reinstall now with the OSS installer to move onto the supported update channel.
+
+            If this release is a prerelease, install it explicitly by passing the version to the installer script (for example `sh -s -- 0.96.0-alpha.1` on macOS/Linux or `mcodex-install.ps1 0.96.0-alpha.1` on PowerShell). `latest` remains the stable channel.
+
+            Checksum signature audit:
+            The public minisign key for SHA256SUMS.sig is committed at release/minisign.pub and is repeated below:
+            EOF
+            cat release/minisign.pub
+            echo
+          } >> "${RELEASE_NOTES_PATH}"
+
+      - name: Create lightweight GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
-          name: ${{ steps.release_contract.outputs.name }}
+          name: ${{ steps.release_contract.outputs.release_version }}
           tag_name: ${{ steps.release_contract.outputs.release_tag }}
           body_path: ${{ steps.release_notes.outputs.path }}
-          files: dist/**
+          files: |
+            dist/oss/repositories/mcodex/releases/${{ steps.release_contract.outputs.release_version }}/SHA256SUMS
+            dist/oss/repositories/mcodex/releases/${{ steps.release_contract.outputs.release_version }}/SHA256SUMS.sig
+            dist/install.sh
+            dist/install.ps1
+            dist/config-schema.json
+            dist/npm/codex-responses-api-proxy-npm-${{ steps.release_contract.outputs.release_version }}.tgz
+            dist/npm/codex-sdk-npm-${{ steps.release_contract.outputs.release_version }}.tgz
           # Mark as prerelease only when the version has a suffix after x.y.z
           # (e.g. -alpha, -beta). Otherwise publish a normal release.
           prerelease: ${{ steps.release_contract.outputs.release_is_prerelease == 'true' }}
@@ -558,18 +656,14 @@ jobs:
       - name: Download npm tarballs from release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.release.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
         run: |
           set -euo pipefail
           version="$RELEASE_VERSION"
           tag="$RELEASE_TAG"
           mkdir -p dist/npm
           patterns=(
-            "codex-npm-${version}.tgz"
-            "codex-npm-linux-*-${version}.tgz"
-            "codex-npm-darwin-*-${version}.tgz"
-            "codex-npm-win32-*-${version}.tgz"
             "codex-responses-api-proxy-npm-${version}.tgz"
             "codex-sdk-npm-${version}.tgz"
           )
@@ -583,34 +677,23 @@ jobs:
       # No NODE_AUTH_TOKEN needed because we use OIDC.
       - name: Publish to npm
         env:
-          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
           NPM_TAG: ${{ needs.release.outputs.npm_tag }}
         run: |
           set -euo pipefail
-          prefix=""
-          if [[ -n "${NPM_TAG}" ]]; then
-            prefix="${NPM_TAG}-"
-          fi
-
-          shopt -s nullglob
-          tarballs=(dist/npm/*-"${VERSION}".tgz)
-          if [[ ${#tarballs[@]} -eq 0 ]]; then
-            echo "No npm tarballs found in dist/npm for version ${VERSION}"
-            exit 1
-          fi
+          tarballs=(
+            "dist/npm/codex-responses-api-proxy-npm-${RELEASE_VERSION}.tgz"
+            "dist/npm/codex-sdk-npm-${RELEASE_VERSION}.tgz"
+          )
 
           for tarball in "${tarballs[@]}"; do
+            if [[ ! -f "${tarball}" ]]; then
+              echo "Expected npm tarball not found: ${tarball}"
+              exit 1
+            fi
             filename="$(basename "${tarball}")"
-            tag=""
-
             case "${filename}" in
-              codex-npm-linux-*-"${VERSION}".tgz|codex-npm-darwin-*-"${VERSION}".tgz|codex-npm-win32-*-"${VERSION}".tgz)
-                platform="${filename#codex-npm-}"
-                platform="${platform%-${VERSION}.tgz}"
-                tag="${prefix}${platform}"
-                ;;
-              codex-npm-"${VERSION}".tgz|codex-responses-api-proxy-npm-"${VERSION}".tgz|codex-sdk-npm-"${VERSION}".tgz)
-                tag="${NPM_TAG}"
+              codex-responses-api-proxy-npm-"${RELEASE_VERSION}".tgz|codex-sdk-npm-"${RELEASE_VERSION}".tgz)
                 ;;
               *)
                 echo "Unexpected npm tarball: ${filename}"
@@ -619,8 +702,8 @@ jobs:
             esac
 
             publish_cmd=(npm publish "${GITHUB_WORKSPACE}/${tarball}")
-            if [[ -n "${tag}" ]]; then
-              publish_cmd+=(--tag "${tag}")
+            if [[ -n "${NPM_TAG}" ]]; then
+              publish_cmd+=(--tag "${NPM_TAG}")
             fi
 
             echo "+ ${publish_cmd[*]}"
@@ -641,29 +724,6 @@ jobs:
 
             exit "${publish_status}"
           done
-
-  winget:
-    name: winget
-    needs: release
-    # Only publish stable/mainline releases to WinGet; pre-releases include a
-    # '-' in the semver string (e.g., 1.2.3-alpha.1).
-    if: ${{ !contains(needs.release.outputs.version, '-') }}
-    # This job only invokes a GitHub Action to open/update the winget-pkgs PR;
-    # it does not execute Windows-only tooling, so Linux is sufficient.
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Publish to WinGet
-        uses: vedantmgoyal9/winget-releaser@7bd472be23763def6e16bd06cc8b1cdfab0e2fd5
-        with:
-          identifier: OpenAI.Codex
-          version: ${{ needs.release.outputs.version }}
-          release-tag: ${{ needs.release.outputs.tag }}
-          fork-user: openai-oss-forks
-          installers-regex: '^mcodex-(?:x86_64|aarch64)-pc-windows-msvc\.exe\.zip$'
-          token: ${{ secrets.WINGET_PUBLISH_PAT }}
 
   update-branch:
     name: Update latest-alpha-cli branch
