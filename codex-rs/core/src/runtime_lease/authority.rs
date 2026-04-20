@@ -153,7 +153,6 @@ impl RuntimeLeaseAuthority {
         snapshot: &LeaseSnapshot,
         rate_limits: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
-        let _ = snapshot;
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
@@ -164,7 +163,16 @@ impl RuntimeLeaseAuthority {
             }
         };
         if let Some(manager) = manager {
-            manager.lock().await.report_rate_limits(rate_limits).await?;
+            manager
+                .lock()
+                .await
+                .report_rate_limits_for_generation(
+                    snapshot.generation,
+                    snapshot.account_id.as_str(),
+                    snapshot.pool_id.as_str(),
+                    rate_limits,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -173,7 +181,6 @@ impl RuntimeLeaseAuthority {
         &self,
         snapshot: &LeaseSnapshot,
     ) -> anyhow::Result<()> {
-        let _ = snapshot;
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
@@ -184,7 +191,15 @@ impl RuntimeLeaseAuthority {
             }
         };
         if let Some(manager) = manager {
-            manager.lock().await.report_usage_limit_reached().await?;
+            manager
+                .lock()
+                .await
+                .report_usage_limit_reached_for_generation(
+                    snapshot.generation,
+                    snapshot.account_id.as_str(),
+                    snapshot.pool_id.as_str(),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -193,7 +208,6 @@ impl RuntimeLeaseAuthority {
         &self,
         snapshot: &LeaseSnapshot,
     ) -> anyhow::Result<()> {
-        let _ = snapshot;
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
@@ -204,7 +218,15 @@ impl RuntimeLeaseAuthority {
             }
         };
         if let Some(manager) = manager {
-            manager.lock().await.report_unauthorized().await?;
+            manager
+                .lock()
+                .await
+                .report_unauthorized_for_generation(
+                    snapshot.generation,
+                    snapshot.account_id.as_str(),
+                    snapshot.pool_id.as_str(),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -214,18 +236,26 @@ impl RuntimeLeaseAuthority {
         context: LeaseRequestContext,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     ) -> Result<LeaseAdmission, LeaseAdmissionError> {
+        let mut manager = tokio::select! {
+            () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
+            manager = manager.lock_owned() => manager,
+        };
+        if context.cancel.is_cancelled() {
+            return Err(LeaseAdmissionError::Cancelled);
+        }
         let selection = manager
-            .lock()
-            .await
             .prepare_turn()
             .await
             .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
             .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
+        if context.cancel.is_cancelled() {
+            return Err(LeaseAdmissionError::Cancelled);
+        }
         let generation = GenerationState {
-            pool_id: "legacy-manager-bridge".to_string(),
+            pool_id: selection.pool_id,
             account_id: selection.account_id,
             selection_family: "codex".to_string(),
-            generation: 0,
+            generation: selection.generation,
             auth_session: selection.auth_session,
             allow_context_reuse: selection.allow_context_reuse,
             accepting: true,

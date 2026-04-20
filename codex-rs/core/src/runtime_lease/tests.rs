@@ -34,6 +34,8 @@ use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::ModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::AccountRegistryEntryUpdate;
@@ -174,6 +176,245 @@ async fn draining_acquire_waits_until_replacement_generation() {
 
     assert_eq!(second.snapshot.account_id(), "acct-b");
     assert_eq!(second.snapshot.generation(), 12);
+}
+
+#[tokio::test]
+async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_admission()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-legacy-a", "acct-legacy-b"] {
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some("acct-legacy-a".to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-legacy-generation".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    assert_eq!(first.snapshot.account_id(), "acct-legacy-a");
+    assert_ne!(first.snapshot.generation(), 0);
+
+    {
+        let mut manager = manager.lock().await;
+        manager.report_unauthorized().await?;
+    }
+
+    let err = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await
+        .expect_err(
+            "rotated replacement lease must not admit while the prior generation is active",
+        );
+    assert_eq!(err, LeaseAdmissionError::UnsupportedPooledPath);
+
+    let first_generation = first.snapshot.generation();
+    drop(first.guard);
+
+    let second = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(second.snapshot.account_id(), "acct-legacy-b");
+    assert!(second.snapshot.generation() > first_generation);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_bridge_rejects_stale_reporting_after_rotation() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-stale-a", "acct-stale-b"] {
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some("acct-stale-a".to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-stale-reporting".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    let first_snapshot = first.snapshot.clone();
+
+    {
+        let mut manager = manager.lock().await;
+        manager.report_unauthorized().await?;
+    }
+    drop(first.guard);
+
+    let second = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    assert_eq!(second.snapshot.account_id(), "acct-stale-b");
+
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("Codex".to_string()),
+        primary: Some(RateLimitWindow {
+            used_percent: 99.0,
+            window_minutes: Some(60),
+            resets_at: None,
+        }),
+        secondary: None,
+        credits: None,
+        plan_type: None,
+    };
+    let rate_limit_err = authority
+        .report_rate_limits(&first_snapshot, &rate_limits)
+        .await
+        .expect_err("stale rate-limit reports must be rejected");
+    assert!(
+        rate_limit_err.to_string().contains("stale"),
+        "unexpected stale rate-limit error: {rate_limit_err:#}"
+    );
+    let usage_limit_err = authority
+        .report_usage_limit_reached(&first_snapshot)
+        .await
+        .expect_err("stale usage-limit reports must be rejected");
+    assert!(
+        usage_limit_err.to_string().contains("stale"),
+        "unexpected stale usage-limit error: {usage_limit_err:#}"
+    );
+    let unauthorized_err = authority
+        .report_terminal_unauthorized(&first_snapshot)
+        .await
+        .expect_err("stale unauthorized reports must be rejected");
+    assert!(
+        unauthorized_err.to_string().contains("stale"),
+        "unexpected stale unauthorized error: {unauthorized_err:#}"
+    );
+
+    let second_generation = second.snapshot.generation();
+    drop(second.guard);
+
+    let current = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(current.snapshot.account_id(), "acct-stale-b");
+    assert_eq!(current.snapshot.generation(), second_generation);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_bridge_acquire_honors_cancellation_while_waiting_for_manager_lock()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-legacy-cancel".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let token = CancellationToken::new();
+    let request_context = LeaseRequestContext::for_test_with_cancel(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+        token.clone(),
+    );
+    let _held_manager_lock = manager.lock().await;
+
+    let acquire = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(!acquire.is_finished());
+
+    token.cancel();
+
+    let err = tokio::time::timeout(Duration::from_secs(1), acquire)
+        .await
+        .expect("cancelled acquire should finish without waiting for the manager lock")?
+        .expect_err("cancelled acquire should return a typed cancellation error");
+    assert_eq!(err, LeaseAdmissionError::Cancelled);
+
+    Ok(())
 }
 
 #[tokio::test]

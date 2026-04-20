@@ -556,6 +556,8 @@ pub(crate) struct AccountPoolManager {
     suppression_reason: Option<AccountLeaseRuntimeReason>,
     transport_reset_generation: u64,
     last_remote_context_reset_turn_id: Option<String>,
+    active_lease_generation: u64,
+    active_lease_identity: Option<ActiveLeaseIdentity>,
 }
 
 pub(crate) struct AccountPoolManagerSnapshotSeed {
@@ -576,8 +578,17 @@ struct ActiveAccountLease {
     auth_session: Arc<dyn LeaseScopedAuthSession>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveLeaseIdentity {
+    lease_id: String,
+    account_id: String,
+    lease_epoch: i64,
+}
+
 pub(crate) struct TurnAccountSelection {
+    pub(crate) pool_id: String,
     pub(crate) account_id: String,
+    pub(crate) generation: u64,
     pub(crate) allow_context_reuse: bool,
     pub(crate) auth_session: Arc<dyn LeaseScopedAuthSession>,
 }
@@ -647,6 +658,8 @@ impl AccountPoolManager {
             suppression_reason: None,
             transport_reset_generation: 0,
             last_remote_context_reset_turn_id: None,
+            active_lease_generation: 0,
+            active_lease_identity: None,
         }
     }
 
@@ -821,21 +834,31 @@ impl AccountPoolManager {
             }
         }
 
-        let active_lease = self
-            .active_lease
-            .as_ref()
-            .context("active lease missing after account pool acquisition")?;
-        let account_id = active_lease.record.account_id.clone();
+        let (record, auth_session) = {
+            let active_lease = self
+                .active_lease
+                .as_ref()
+                .context("active lease missing after account pool acquisition")?;
+            (
+                active_lease.record.clone(),
+                Arc::clone(&active_lease.auth_session),
+            )
+        };
+        let generation = self.observe_active_lease_generation(&record);
+        let pool_id = record.pool_id.clone();
+        let account_id = record.account_id.clone();
         let allow_context_reuse = self
             .allow_context_reuse_by_pool_id
-            .get(&active_lease.record.pool_id)
+            .get(&pool_id)
             .copied()
             .unwrap_or(true);
         self.previous_turn_account_id = Some(account_id.clone());
         Ok(Some(TurnAccountSelection {
+            pool_id,
             account_id,
+            generation,
             allow_context_reuse,
-            auth_session: Arc::clone(&active_lease.auth_session),
+            auth_session,
         }))
     }
 
@@ -882,6 +905,7 @@ impl AccountPoolManager {
                 LeaseRenewal::Missing => {
                     self.clear_auth_marker(&active_lease.record).await?;
                     self.active_lease = None;
+                    self.active_lease_identity = None;
                     self.next_health_event_sequence = 0;
                     self.proactive_switch_state.reset();
                     self.pending_rotation = None;
@@ -960,14 +984,45 @@ impl AccountPoolManager {
         Ok(())
     }
 
+    pub(crate) async fn report_rate_limits_for_generation(
+        &mut self,
+        generation: u64,
+        account_id: &str,
+        pool_id: &str,
+        snapshot: &RateLimitSnapshot,
+    ) -> anyhow::Result<()> {
+        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        self.report_rate_limits(snapshot).await
+    }
+
     pub(crate) async fn report_usage_limit_reached(&mut self) -> anyhow::Result<()> {
         self.record_health_event(AccountHealthState::RateLimited, Utc::now())
             .await
     }
 
+    pub(crate) async fn report_usage_limit_reached_for_generation(
+        &mut self,
+        generation: u64,
+        account_id: &str,
+        pool_id: &str,
+    ) -> anyhow::Result<()> {
+        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        self.report_usage_limit_reached().await
+    }
+
     pub(crate) async fn report_unauthorized(&mut self) -> anyhow::Result<()> {
         self.record_health_event(AccountHealthState::Unauthorized, Utc::now())
             .await
+    }
+
+    pub(crate) async fn report_unauthorized_for_generation(
+        &mut self,
+        generation: u64,
+        account_id: &str,
+        pool_id: &str,
+    ) -> anyhow::Result<()> {
+        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        self.report_unauthorized().await
     }
     async fn release_active_lease(&mut self) -> anyhow::Result<()> {
         if let Some(lease) = self.active_lease.as_ref() {
@@ -978,6 +1033,7 @@ impl AccountPoolManager {
             self.clear_auth_marker(&lease.record).await?;
         }
         self.active_lease = None;
+        self.active_lease_identity = None;
         self.next_health_event_sequence = 0;
         self.proactive_switch_state.reset();
         Ok(())
@@ -1129,10 +1185,54 @@ impl AccountPoolManager {
             .await
     }
 
+    fn ensure_generation_matches(
+        &self,
+        generation: u64,
+        account_id: &str,
+        pool_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(active_lease) = self.active_lease.as_ref() else {
+            anyhow::bail!(
+                "stale bridged lease snapshot generation {generation} for account {account_id} in pool {pool_id}: no active bridged lease"
+            );
+        };
+        if self.active_lease_generation != generation
+            || active_lease.record.account_id != account_id
+            || active_lease.record.pool_id != pool_id
+        {
+            anyhow::bail!(
+                "stale bridged lease snapshot generation {generation} for account {account_id} in pool {pool_id}: current bridged lease is generation {} for account {} in pool {}",
+                self.active_lease_generation,
+                active_lease.record.account_id,
+                active_lease.record.pool_id,
+            );
+        }
+        Ok(())
+    }
+
+    fn observe_active_lease_generation(&mut self, lease: &AccountLeaseRecord) -> u64 {
+        let identity = ActiveLeaseIdentity::from_record(lease);
+        if self.active_lease_identity.as_ref() != Some(&identity) {
+            self.active_lease_generation = self.active_lease_generation.saturating_add(1);
+            self.active_lease_identity = Some(identity);
+        }
+        self.active_lease_generation
+    }
+
     fn backend_private_auth_home(&self, backend_account_handle: &str) -> PathBuf {
         self.codex_home
             .join(".pooled-auth/backends/local/accounts")
             .join(backend_account_handle)
+    }
+}
+
+impl ActiveLeaseIdentity {
+    fn from_record(lease: &AccountLeaseRecord) -> Self {
+        Self {
+            lease_id: lease.lease_id.clone(),
+            account_id: lease.account_id.clone(),
+            lease_epoch: lease.lease_epoch,
+        }
     }
 }
 
