@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Install Codex native binaries (Rust CLI plus ripgrep helpers)."""
 
+from __future__ import annotations
+
 import argparse
 from contextlib import contextmanager
 import json
@@ -164,6 +166,20 @@ def main() -> int:
         "codex-command-runner",
         "rg",
     ]
+    component_set = set(components)
+
+    if component_set == {"rg"}:
+        with _gha_group("Fetch ripgrep binaries"):
+            print("Fetching ripgrep binaries...")
+            fetch_rg(
+                vendor_dir,
+                DEFAULT_RG_TARGETS,
+                manifest_path=RG_MANIFEST,
+                use_dotslash=False,
+            )
+
+        print(f"Installed native dependencies into {vendor_dir}")
+        return 0
 
     workflow_url = (args.workflow_url or DEFAULT_WORKFLOW_URL).strip()
     if not workflow_url:
@@ -196,23 +212,28 @@ def fetch_rg(
     targets: Sequence[str] | None = None,
     *,
     manifest_path: Path,
+    use_dotslash: bool = True,
 ) -> list[Path]:
     """Download ripgrep binaries described by the DotSlash manifest."""
 
     if targets is None:
         targets = DEFAULT_RG_TARGETS
 
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"DotSlash manifest not found: {manifest_path}")
-
-    manifest = _load_manifest(manifest_path)
-    platforms = manifest.get("platforms", {})
-
-    vendor_dir.mkdir(parents=True, exist_ok=True)
-
     targets = list(targets)
     if not targets:
         return []
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"DotSlash manifest not found: {manifest_path}")
+
+    manifest = (
+        _load_manifest_with_dotslash(manifest_path)
+        if use_dotslash
+        else _load_manifest(manifest_path)
+    )
+    platforms = manifest.get("platforms", {})
+
+    vendor_dir.mkdir(parents=True, exist_ok=True)
 
     task_configs: list[tuple[str, str, dict]] = []
     for target in targets:
@@ -454,6 +475,25 @@ def extract_archive(
 
 
 def _load_manifest(manifest_path: Path) -> dict:
+    text = manifest_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if lines and lines[0].startswith("#!"):
+        text = "\n".join(lines[1:])
+
+    try:
+        manifest = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid DotSlash manifest in {manifest_path}.") from exc
+
+    if not isinstance(manifest, dict):
+        raise RuntimeError(
+            f"Unexpected DotSlash manifest structure for {manifest_path}: {type(manifest)!r}"
+        )
+
+    return manifest
+
+
+def _load_manifest_with_dotslash(manifest_path: Path) -> dict:
     cmd = ["dotslash", "--", "parse", str(manifest_path)]
     stdout = subprocess.check_output(cmd, text=True)
     try:
