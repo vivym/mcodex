@@ -77,6 +77,7 @@ use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -202,6 +203,45 @@ struct AdmittedClientSetup {
     guard: Option<LeaseAdmissionGuard>,
 }
 
+#[derive(Default)]
+struct ActiveStreamingRequest {
+    reporter: Option<LeaseRequestReporter>,
+    _guard: Option<LeaseAdmissionGuard>,
+}
+
+impl ActiveStreamingRequest {
+    fn new(reporter: Option<LeaseRequestReporter>, guard: Option<LeaseAdmissionGuard>) -> Self {
+        Self {
+            reporter,
+            _guard: guard,
+        }
+    }
+
+    fn lease_generation(&self) -> Option<u64> {
+        self.reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().generation())
+    }
+
+    async fn report_rate_limits(&self, rate_limits: &RateLimitSnapshot) {
+        if let Some(reporter) = self.reporter.as_ref() {
+            reporter.report_rate_limits(rate_limits).await;
+        }
+    }
+
+    async fn report_usage_limit_reached(&self) {
+        if let Some(reporter) = self.reporter.as_ref() {
+            reporter.report_usage_limit_reached().await;
+        }
+    }
+
+    async fn report_terminal_unauthorized(&self) {
+        if let Some(reporter) = self.reporter.as_ref() {
+            reporter.report_terminal_unauthorized().await;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RequestRouteTelemetry {
     endpoint: &'static str,
@@ -245,6 +285,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    #[cfg_attr(not(test), allow(dead_code))]
     lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     account_id_override: Option<String>,
     /// Turn state for sticky routing.
@@ -290,6 +331,8 @@ struct LastResponse {
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     account_id: Option<String>,
+    lease_generation: Option<u64>,
+    transport_reset_generation: Option<u64>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     connection_reused: StdMutex<bool>,
@@ -308,6 +351,28 @@ impl WebsocketSession {
             .connection_reused
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn matches_admission(
+        &self,
+        account_id: &Option<String>,
+        lease_generation: Option<u64>,
+        transport_reset_generation: u64,
+    ) -> bool {
+        self.account_id == *account_id
+            && self.lease_generation == lease_generation
+            && self.transport_reset_generation == Some(transport_reset_generation)
+    }
+
+    fn set_admission(
+        &mut self,
+        account_id: Option<String>,
+        lease_generation: Option<u64>,
+        transport_reset_generation: u64,
+    ) {
+        self.account_id = account_id;
+        self.lease_generation = lease_generation;
+        self.transport_reset_generation = Some(transport_reset_generation);
     }
 }
 
@@ -1226,6 +1291,31 @@ impl ModelClientSession {
         Ok(())
     }
 
+    async fn admitted_client_setup(
+        &mut self,
+        boundary: RequestBoundaryKind,
+        request_id: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<AdmittedClientSetup> {
+        let previous_window_generation = self.client.current_window_generation();
+        let admitted_setup = self
+            .client
+            .admitted_client_setup(
+                boundary,
+                /*turn_id*/ None,
+                request_id,
+                cancellation_token,
+            )
+            .await?;
+        if previous_window_generation != self.client.current_window_generation() {
+            self.reset_websocket_session();
+            self.turn_state = Arc::new(OnceLock::new());
+            self.account_id_override = None;
+        }
+        Ok(admitted_setup)
+    }
+
+    #[cfg(test)]
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
         let mut client_setup = if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
             let auth = Some(
@@ -1257,16 +1347,6 @@ impl ModelClientSession {
         Ok(self.current_client_setup().await?.api_auth)
     }
 
-    fn current_auth_recovery_legacy(&self) -> Option<Box<dyn AuthRecovery>> {
-        if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
-            return Some(Box::new(crate::lease_auth::LeaseSessionAuthRecovery::new(
-                Arc::clone(lease_auth_session),
-            )));
-        }
-
-        self.client.current_auth_recovery_legacy()
-    }
-
     pub(crate) fn set_account_id_override(&mut self, account_id: Option<String>) {
         self.account_id_override = account_id;
     }
@@ -1278,6 +1358,8 @@ impl ModelClientSession {
     pub(crate) fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
         self.websocket_session.account_id = None;
+        self.websocket_session.lease_generation = None;
+        self.websocket_session.transport_reset_generation = None;
         self.websocket_session.last_request = None;
         self.clear_previous_response_id();
         self.websocket_session
@@ -1484,42 +1566,46 @@ impl ModelClientSession {
             return Ok(());
         }
 
-        let client_setup = self.current_client_setup().await.map_err(|err| {
-            ApiError::Stream(format!(
-                "failed to build websocket prewarm client setup: {err}"
-            ))
-        })?;
-        if self.websocket_session.connection.is_some()
-            && self.websocket_session.account_id != client_setup.api_auth.account_id
-        {
-            self.reset_websocket_session();
-        }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
+        let admitted_setup = self
+            .admitted_client_setup(
+                RequestBoundaryKind::ResponsesWebSocketPrewarm,
+                "responses-websocket-preconnect",
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|err| {
+                ApiError::Stream(format!(
+                    "failed to build websocket prewarm client setup: {err}"
+                ))
+            })?;
+        let AdmittedClientSetup {
+            setup: client_setup,
+            reporter,
+            auth_recovery: _auth_recovery,
+            guard,
+        } = admitted_setup;
+        let handshake_request = ActiveStreamingRequest::new(reporter, guard);
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             &client_setup.api_auth,
             PendingUnauthorizedRetry::default(),
         );
-        let connection_account_id = client_setup.api_auth.account_id.clone();
-        let connection = self
-            .client
-            .connect_websocket(
-                session_telemetry,
-                client_setup.api_provider,
-                client_setup.api_auth,
-                Some(Arc::clone(&self.turn_state)),
-                /*turn_metadata_header*/ None,
-                auth_context,
-                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-            )
-            .await?;
-        self.websocket_session.connection = Some(connection);
-        self.websocket_session.account_id = connection_account_id;
-        self.websocket_session
-            .set_connection_reused(/*connection_reused*/ false);
-        Ok(())
+        let options = self.build_responses_options(
+            /*turn_metadata_header*/ None,
+            self.responses_request_compression(client_setup.auth.as_ref()),
+        );
+        self.websocket_connection(WebsocketConnectParams {
+            session_telemetry,
+            api_provider: client_setup.api_provider,
+            api_auth: client_setup.api_auth,
+            turn_metadata_header: None,
+            options: &options,
+            auth_context,
+            request_route_telemetry: RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+            lease_generation: handshake_request.lease_generation(),
+        })
+        .await
+        .map(|_| ())
     }
     /// Returns a websocket connection for this turn.
     #[instrument(
@@ -1546,20 +1632,27 @@ impl ModelClientSession {
             options,
             auth_context,
             request_route_telemetry,
+            lease_generation,
         } = params;
+        let mut transport_reset_generation = self.client.current_window_generation();
         let connection_closed = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
             None => false,
         };
-        let account_changed = self.websocket_session.connection.is_some()
-            && self.websocket_session.account_id != api_auth.account_id;
+        let admission_mismatch = self.websocket_session.connection.is_some()
+            && !self.websocket_session.matches_admission(
+                &api_auth.account_id,
+                lease_generation,
+                transport_reset_generation,
+            );
         let needs_new =
-            self.websocket_session.connection.is_none() || connection_closed || account_changed;
+            self.websocket_session.connection.is_none() || connection_closed || admission_mismatch;
 
         if needs_new {
             if connection_closed {
                 self.reset_remote_session_identity();
-            } else if account_changed {
+                transport_reset_generation = self.client.current_window_generation();
+            } else if admission_mismatch {
                 self.reset_websocket_session();
             }
             self.websocket_session.last_request = None;
@@ -1591,7 +1684,11 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
-            self.websocket_session.account_id = connection_account_id;
+            self.websocket_session.set_admission(
+                connection_account_id,
+                lease_generation,
+                transport_reset_generation,
+            );
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -1637,7 +1734,7 @@ impl ModelClientSession {
         )
     )]
     async fn stream_responses_api(
-        &self,
+        &mut self,
         prompt: &Prompt,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
@@ -1653,14 +1750,31 @@ impl ModelClientSession {
                 self.client.state.provider.stream_idle_timeout(),
             )
             .map_err(map_api_error)?;
-            let (stream, _last_request_rx) = map_response_stream(stream, session_telemetry.clone());
+            let (stream, _last_request_rx) = map_response_stream(
+                stream,
+                session_telemetry.clone(),
+                ActiveStreamingRequest::default(),
+            );
             return Ok(stream);
         }
 
-        let mut auth_recovery = self.current_auth_recovery_legacy();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.current_client_setup().await?;
+            let admitted_setup = self
+                .admitted_client_setup(
+                    RequestBoundaryKind::ResponsesHttp,
+                    "responses-http",
+                    CancellationToken::new(),
+                )
+                .await?;
+            let AdmittedClientSetup {
+                setup: client_setup,
+                reporter,
+                auth_recovery,
+                guard,
+            } = admitted_setup;
+            let active_request = ActiveStreamingRequest::new(reporter, guard);
+            let mut auth_recovery = auth_recovery;
             let transport = ReqwestTransport::new(build_reqwest_client());
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -1694,23 +1808,35 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
-                    let (stream, _) = map_response_stream(stream, session_telemetry.clone());
+                    let (stream, _) =
+                        map_response_stream(stream, session_telemetry.clone(), active_request);
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
                 )) if status == StatusCode::UNAUTHORIZED => {
-                    pending_retry = PendingUnauthorizedRetry::from_recovery(
-                        handle_unauthorized(
-                            unauthorized_transport,
-                            &mut auth_recovery,
-                            session_telemetry,
-                        )
-                        .await?,
-                    );
+                    pending_retry = match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        session_telemetry,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => PendingUnauthorizedRetry::from_recovery(recovery),
+                        Err(err) => {
+                            active_request.report_terminal_unauthorized().await;
+                            return Err(err);
+                        }
+                    };
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    let mapped = map_api_error(err);
+                    if matches!(mapped, CodexErr::UsageLimitReached(_)) {
+                        active_request.report_usage_limit_reached().await;
+                    }
+                    return Err(mapped);
+                }
             }
         }
     }
@@ -1742,10 +1868,31 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
     ) -> Result<WebsocketStreamOutcome> {
-        let mut auth_recovery = self.current_auth_recovery_legacy();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.current_client_setup().await?;
+            let admitted_setup = self
+                .admitted_client_setup(
+                    if warmup {
+                        RequestBoundaryKind::ResponsesWebSocketPrewarm
+                    } else {
+                        RequestBoundaryKind::ResponsesWebSocket
+                    },
+                    if warmup {
+                        "responses-websocket-prewarm"
+                    } else {
+                        "responses-websocket"
+                    },
+                    CancellationToken::new(),
+                )
+                .await?;
+            let AdmittedClientSetup {
+                setup: client_setup,
+                reporter,
+                auth_recovery,
+                guard,
+            } = admitted_setup;
+            let active_request = ActiveStreamingRequest::new(reporter, guard);
+            let mut auth_recovery = auth_recovery;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 &client_setup.api_auth,
@@ -1784,6 +1931,7 @@ impl ModelClientSession {
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,
                     ),
+                    lease_generation: active_request.lease_generation(),
                 })
                 .await
             {
@@ -1796,17 +1944,28 @@ impl ModelClientSession {
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
                 )) if status == StatusCode::UNAUTHORIZED => {
-                    pending_retry = PendingUnauthorizedRetry::from_recovery(
-                        handle_unauthorized(
-                            unauthorized_transport,
-                            &mut auth_recovery,
-                            session_telemetry,
-                        )
-                        .await?,
-                    );
+                    pending_retry = match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut auth_recovery,
+                        session_telemetry,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => PendingUnauthorizedRetry::from_recovery(recovery),
+                        Err(err) => {
+                            active_request.report_terminal_unauthorized().await;
+                            return Err(err);
+                        }
+                    };
                     continue;
                 }
-                Err(err) => return Err(map_api_error(err)),
+                Err(err) => {
+                    let mapped = map_api_error(err);
+                    if matches!(mapped, CodexErr::UsageLimitReached(_)) {
+                        active_request.report_usage_limit_reached().await;
+                    }
+                    return Err(mapped);
+                }
             }
 
             let ws_request = self.prepare_websocket_request(ws_payload, &request);
@@ -1821,7 +1980,7 @@ impl ModelClientSession {
                 .await
                 .map_err(map_api_error)?;
             let (stream, last_request_rx) =
-                map_response_stream(stream_result, session_telemetry.clone());
+                map_response_stream(stream_result, session_telemetry.clone(), active_request);
             self.websocket_session.last_response_rx = Some(last_request_rx);
             return Ok(WebsocketStreamOutcome::Stream(stream));
         }
@@ -2063,6 +2222,7 @@ fn map_lease_admission_error(err: LeaseAdmissionError) -> CodexErr {
 fn map_response_stream<S>(
     api_stream: S,
     session_telemetry: SessionTelemetry,
+    active_request: ActiveStreamingRequest,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -2073,11 +2233,12 @@ where
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut logged_error = false;
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut api_stream = api_stream;
+        let active_request = active_request;
         while let Some(event) = api_stream.next().await {
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -2120,6 +2281,16 @@ where
                         return;
                     }
                 }
+                Ok(ResponseEvent::RateLimits(rate_limits)) => {
+                    active_request.report_rate_limits(&rate_limits).await;
+                    if tx_event
+                        .send(Ok(ResponseEvent::RateLimits(rate_limits)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 Ok(event) => {
                     if tx_event.send(Ok(event)).await.is_err() {
                         return;
@@ -2127,6 +2298,9 @@ where
                 }
                 Err(err) => {
                     let mapped = map_api_error(err);
+                    if matches!(mapped, CodexErr::UsageLimitReached(_)) {
+                        active_request.report_usage_limit_reached().await;
+                    }
                     if !logged_error {
                         session_telemetry.see_event_completed_failed(&mapped);
                         logged_error = true;
@@ -2139,7 +2313,7 @@ where
         }
     });
 
-    (ResponseStream { rx_event }, rx_last_response)
+    (ResponseStream::new(rx_event, Some(task)), rx_last_response)
 }
 
 /// Handles a 401 response by optionally refreshing ChatGPT tokens once.
@@ -2207,6 +2381,7 @@ struct WebsocketConnectParams<'a> {
     options: &'a ApiResponsesOptions,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
+    lease_generation: Option<u64>,
 }
 
 async fn handle_unauthorized(
