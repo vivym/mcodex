@@ -903,7 +903,7 @@ git commit -m "fix(cli): resolve legacy import pool target explicitly"
 - Modify: `codex-rs/cli/src/accounts/output.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Add failing status JSON tests**
+- [x] **Step 1: Add failing status JSON tests**
 
 Add test:
 
@@ -926,7 +926,7 @@ async fn accounts_status_json_includes_startup_object_for_single_pool_fallback()
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -937,7 +937,7 @@ cargo test -p codex-cli --test accounts accounts_status_json_includes_startup_ob
 
 Expected: FAIL because the `startup` object is absent.
 
-- [ ] **Step 3: Add wire conversion helpers**
+- [x] **Step 3: Add wire conversion helpers**
 
 In `output.rs`, add private helpers for:
 
@@ -948,7 +948,7 @@ In `output.rs`, add private helpers for:
 
 Keep existing top-level fields unchanged.
 
-- [ ] **Step 4: Add text diagnostics**
+- [x] **Step 4: Add text diagnostics**
 
 Text output should explicitly show:
 
@@ -958,7 +958,7 @@ Text output should explicitly show:
 - suppressed with resolved pool
 - no eligible account
 
-- [ ] **Step 5: Run CLI status tests**
+- [x] **Step 5: Run CLI status tests**
 
 Run:
 
@@ -970,7 +970,7 @@ cargo test -p codex-cli --test accounts_observability
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/diagnostics.rs codex-rs/cli/src/accounts/output.rs codex-rs/cli/tests/accounts.rs codex-rs/cli/tests/accounts_observability.rs

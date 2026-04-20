@@ -720,6 +720,89 @@ async fn accounts_status_reports_suppression_and_eligibility() -> Result<()> {
 }
 
 #[tokio::test]
+async fn accounts_status_text_explains_multiple_visible_pools_require_default() -> Result<()> {
+    let codex_home = prepared_home_with_two_pools_and_no_config().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(
+        output
+            .stdout
+            .contains("multiple visible pools require a default")
+    );
+    assert!(output.stdout.contains("team-main"));
+    assert!(output.stdout.contains("team-other"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_includes_startup_object_for_single_pool_fallback() -> Result<()> {
+    let codex_home = prepared_home_with_one_pool_and_no_default().await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert_eq!(json["effectivePoolId"], "team-main");
+    assert_eq!(json["startup"]["effectivePoolId"], "team-main");
+    assert_eq!(
+        json["startup"]["effectivePoolResolutionSource"],
+        "singleVisiblePool"
+    );
+    assert_eq!(json["startup"]["startupAvailability"], "available");
+    assert!(json["startup"]["startupResolutionIssue"].is_null());
+    assert_eq!(
+        json["startup"]["selectionEligibility"],
+        "automaticAccountSelected"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_json_keeps_invalid_config_default_out_of_top_level_effective_pool()
+-> Result<()> {
+    let codex_home = prepared_home().await?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"
+[accounts]
+default_pool = "missing-config-default"
+
+[accounts.pools.team-main]
+allow_context_reuse = false
+"#,
+    )?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    assert!(json["effectivePoolId"].is_null());
+    assert!(json["startup"]["effectivePoolId"].is_null());
+    assert_eq!(
+        json["startup"]["startupResolutionIssue"]["kind"],
+        "configDefaultPoolUnavailable"
+    );
+    assert_eq!(
+        json["startup"]["startupResolutionIssue"]["poolId"],
+        "missing-config-default"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_status_json_suppressed_normalizes_healthy_account_eligibility() -> Result<()> {
     let codex_home = prepared_home().await?;
     let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;

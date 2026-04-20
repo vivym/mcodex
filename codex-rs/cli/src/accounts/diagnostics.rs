@@ -4,6 +4,7 @@ use codex_account_pool::SharedStartupStatus;
 use codex_account_pool::read_shared_startup_status;
 use codex_core::config::Config;
 use codex_state::AccountPoolDiagnostic;
+use codex_state::AccountStartupResolutionIssueSource;
 use codex_state::StateRuntime;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub(crate) struct AccountsStatusDiagnostic {
     pub configured_pool_count: usize,
     pub registered_pool_count: usize,
     pub startup: SharedStartupStatus,
+    pub status_pool_id: Option<String>,
     pub pool: Option<AccountPoolDiagnostic>,
     pub pool_observability: Option<StatusPoolObservabilityView>,
 }
@@ -42,6 +44,21 @@ pub(crate) async fn read_status_diagnostic(
     account_pool_override_id: Option<&str>,
 ) -> anyhow::Result<AccountsStatusDiagnostic> {
     let current = read_current_diagnostic(runtime, config, account_pool_override_id).await?;
+    let status_pool_id = current
+        .startup
+        .startup
+        .preview
+        .effective_pool_id
+        .clone()
+        .or_else(|| {
+            current
+                .startup
+                .startup
+                .startup_resolution_issue
+                .as_ref()
+                .filter(|issue| issue.source == AccountStartupResolutionIssueSource::Override)
+                .and_then(|issue| issue.pool_id.clone())
+        });
     let pool = match current.startup.startup.preview.effective_pool_id.as_deref() {
         Some(pool_id) => Some(
             runtime
@@ -58,18 +75,15 @@ pub(crate) async fn read_status_diagnostic(
         ),
         None => None,
     };
-    let pool_observability = read_status_pool_observability(
-        runtime,
-        config,
-        current.startup.startup.preview.effective_pool_id.as_deref(),
-    )
-    .await;
+    let pool_observability =
+        read_status_pool_observability(runtime, config, status_pool_id.as_deref()).await;
 
     Ok(AccountsStatusDiagnostic {
         account_pool_override_id: current.account_pool_override_id,
         configured_pool_count: configured_pool_count(config),
         registered_pool_count: registered_pool_count(runtime).await?,
         startup: current.startup,
+        status_pool_id,
         pool,
         pool_observability,
     })

@@ -6,8 +6,14 @@ use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountDiagnostic;
 use codex_state::AccountPoolDiagnostic;
 use codex_state::AccountSource;
+use codex_state::AccountStartupAvailability;
+use codex_state::AccountStartupCandidatePool;
 use codex_state::AccountStartupEligibility;
+use codex_state::AccountStartupResolutionIssue;
+use codex_state::AccountStartupResolutionIssueKind;
+use codex_state::AccountStartupResolutionIssueSource;
 use codex_state::AccountStartupSelectionPreview;
+use codex_state::AccountStartupStatus;
 use codex_state::EffectivePoolResolutionSource;
 
 struct EligibilityView {
@@ -37,11 +43,11 @@ pub(crate) fn print_current_json(diagnostic: &AccountsCurrentDiagnostic) -> anyh
             startup.effective_pool_resolution_source
         ),
         "preferredAccountId": preview.preferred_account_id.as_deref(),
-        "predictedAccountId": preview.predicted_account_id.as_deref(),
+        "predictedAccountId": display_predicted_account_id(preview),
         "suppressed": preview.suppressed,
         "eligibility": {
-            "code": eligibility_code(&preview.eligibility),
-            "reason": eligibility_reason(&preview.eligibility),
+            "code": display_eligibility_code(preview),
+            "reason": display_eligibility_reason(preview),
         },
     }))?;
     println!("{output}");
@@ -84,6 +90,7 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
         "effective pool resolution: {}",
         effective_pool_resolution_source_to_wire_string(startup.effective_pool_resolution_source)
     );
+    print_startup_resolution_text(startup);
 
     if let Some(account_pool_override_id) = diagnostic.account_pool_override_id.as_deref() {
         println!("account pool override: {account_pool_override_id}");
@@ -123,7 +130,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "accountPoolOverrideId": diagnostic.account_pool_override_id.as_deref(),
         "configuredPoolCount": diagnostic.configured_pool_count,
         "registeredPoolCount": diagnostic.registered_pool_count,
-        "effectivePoolId": preview.effective_pool_id.as_deref(),
+        "effectivePoolId": diagnostic.status_pool_id.as_deref(),
         "effectivePoolSource": effective_pool_source(diagnostic).map(AccountSource::as_str),
         "effectivePoolResolutionSource": effective_pool_resolution_source_to_wire_string(
             startup.effective_pool_resolution_source
@@ -131,13 +138,14 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "configuredDefaultPoolId": startup.configured_default_pool_id.as_deref(),
         "persistedDefaultPoolId": startup.persisted_default_pool_id.as_deref(),
         "preferredAccountId": preview.preferred_account_id.as_deref(),
-        "predictedAccountId": preview.predicted_account_id.as_deref(),
+        "predictedAccountId": display_predicted_account_id(preview),
         "suppressed": preview.suppressed,
         "healthState": status_health_state(preview, diagnostic.pool.as_ref()),
         "switchReason": {
-            "code": eligibility_code(&preview.eligibility),
-            "reason": eligibility_reason(&preview.eligibility),
+            "code": display_eligibility_code(preview),
+            "reason": display_eligibility_reason(preview),
         },
+        "startup": startup_status_json(startup),
         "nextEligibleAt": diagnostic
             .pool
             .as_ref()
@@ -192,7 +200,7 @@ fn print_preview(preview: &AccountStartupSelectionPreview) {
         "predicted account: {}",
         preview.predicted_account_id.as_deref().unwrap_or("none")
     );
-    println!("eligibility: {}", eligibility_reason(&preview.eligibility));
+    println!("eligibility: {}", display_eligibility_reason(preview));
 }
 
 fn print_status_preview(
@@ -215,7 +223,7 @@ fn print_status_preview(
         "predicted account: {}",
         preview.predicted_account_id.as_deref().unwrap_or("none")
     );
-    println!("eligibility: {}", eligibility_reason(&preview.eligibility));
+    println!("eligibility: {}", display_eligibility_reason(preview));
 }
 
 fn eligibility_code(eligibility: &AccountStartupEligibility) -> &'static str {
@@ -232,6 +240,197 @@ fn eligibility_code(eligibility: &AccountStartupEligibility) -> &'static str {
         AccountStartupEligibility::PreferredAccountUnhealthy => "preferredAccountUnhealthy",
         AccountStartupEligibility::PreferredAccountBusy => "preferredAccountBusy",
         AccountStartupEligibility::NoEligibleAccount => "noEligibleAccount",
+    }
+}
+
+fn display_eligibility_code(preview: &AccountStartupSelectionPreview) -> &'static str {
+    if preview.suppressed {
+        "suppressed"
+    } else {
+        eligibility_code(&preview.eligibility)
+    }
+}
+
+fn display_eligibility_reason(preview: &AccountStartupSelectionPreview) -> String {
+    if preview.suppressed {
+        eligibility_reason(&AccountStartupEligibility::Suppressed)
+    } else {
+        eligibility_reason(&preview.eligibility)
+    }
+}
+
+fn display_predicted_account_id(preview: &AccountStartupSelectionPreview) -> Option<&str> {
+    if preview.suppressed {
+        None
+    } else {
+        preview.predicted_account_id.as_deref()
+    }
+}
+
+fn startup_status_json(startup: &AccountStartupStatus) -> serde_json::Value {
+    serde_json::json!({
+        "effectivePoolId": startup.preview.effective_pool_id.as_deref(),
+        "effectivePoolResolutionSource": effective_pool_resolution_source_to_wire_string(
+            startup.effective_pool_resolution_source
+        ),
+        "startupAvailability": startup_availability_code(startup.startup_availability),
+        "startupResolutionIssue": startup
+            .startup_resolution_issue
+            .as_ref()
+            .map(startup_issue_json),
+        "candidatePools": startup
+            .candidate_pools
+            .iter()
+            .map(candidate_pool_json)
+            .collect::<Vec<_>>(),
+        "preferredAccountId": startup.preview.preferred_account_id.as_deref(),
+        "predictedAccountId": startup.preview.predicted_account_id.as_deref(),
+        "suppressed": startup.preview.suppressed,
+        "selectionEligibility": eligibility_code(&startup.preview.eligibility),
+        "selectionEligibilityReason": eligibility_reason(&startup.preview.eligibility),
+    })
+}
+
+fn startup_availability_code(availability: AccountStartupAvailability) -> &'static str {
+    match availability {
+        AccountStartupAvailability::Available => "available",
+        AccountStartupAvailability::Suppressed => "suppressed",
+        AccountStartupAvailability::MultiplePoolsRequireDefault => "multiplePoolsRequireDefault",
+        AccountStartupAvailability::InvalidExplicitDefault => "invalidExplicitDefault",
+        AccountStartupAvailability::Unavailable => "unavailable",
+    }
+}
+
+fn startup_issue_json(issue: &AccountStartupResolutionIssue) -> serde_json::Value {
+    serde_json::json!({
+        "kind": startup_issue_kind_code(issue.kind),
+        "source": startup_issue_source_code(issue.source),
+        "poolId": issue.pool_id.as_deref(),
+        "candidatePoolCount": issue.candidate_pool_count,
+        "candidatePools": issue
+            .candidate_pools
+            .as_ref()
+            .map(|candidate_pools| {
+                candidate_pools
+                    .iter()
+                    .map(candidate_pool_json)
+                    .collect::<Vec<_>>()
+            }),
+        "message": issue.message.as_deref(),
+    })
+}
+
+fn candidate_pool_json(candidate_pool: &AccountStartupCandidatePool) -> serde_json::Value {
+    serde_json::json!({
+        "poolId": candidate_pool.pool_id,
+        "displayName": candidate_pool.display_name.as_deref(),
+        "status": candidate_pool.status.as_deref(),
+    })
+}
+
+fn startup_issue_kind_code(kind: AccountStartupResolutionIssueKind) -> &'static str {
+    match kind {
+        AccountStartupResolutionIssueKind::MultiplePoolsRequireDefault => {
+            "multiplePoolsRequireDefault"
+        }
+        AccountStartupResolutionIssueKind::OverridePoolUnavailable => "overridePoolUnavailable",
+        AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable => {
+            "configDefaultPoolUnavailable"
+        }
+        AccountStartupResolutionIssueKind::PersistedDefaultPoolUnavailable => {
+            "persistedDefaultPoolUnavailable"
+        }
+    }
+}
+
+fn startup_issue_source_code(source: AccountStartupResolutionIssueSource) -> &'static str {
+    match source {
+        AccountStartupResolutionIssueSource::Override => "override",
+        AccountStartupResolutionIssueSource::ConfigDefault => "configDefault",
+        AccountStartupResolutionIssueSource::PersistedSelection => "persistedSelection",
+        AccountStartupResolutionIssueSource::None => "none",
+    }
+}
+
+fn print_startup_resolution_text(startup: &AccountStartupStatus) {
+    println!(
+        "startup availability: {}",
+        startup_availability_code(startup.startup_availability)
+    );
+
+    match startup.effective_pool_resolution_source {
+        EffectivePoolResolutionSource::SingleVisiblePool => {
+            if let Some(pool_id) = startup.preview.effective_pool_id.as_deref() {
+                println!("single visible pool fallback: {pool_id}");
+            }
+        }
+        EffectivePoolResolutionSource::Override
+        | EffectivePoolResolutionSource::ConfigDefault
+        | EffectivePoolResolutionSource::PersistedSelection
+        | EffectivePoolResolutionSource::None => {}
+    }
+
+    if startup.preview.suppressed {
+        println!(
+            "suppressed with resolved pool: {}",
+            startup
+                .preview
+                .effective_pool_id
+                .as_deref()
+                .unwrap_or("none")
+        );
+    }
+
+    if startup.preview.predicted_account_id.is_none()
+        && matches!(
+            startup.preview.eligibility,
+            AccountStartupEligibility::NoEligibleAccount
+        )
+    {
+        println!(
+            "no eligible account: {}",
+            eligibility_reason(&startup.preview.eligibility)
+        );
+    }
+
+    if let Some(issue) = startup.startup_resolution_issue.as_ref() {
+        println!("startup resolution issue: {}", startup_issue_text(issue));
+    }
+}
+
+fn startup_issue_text(issue: &AccountStartupResolutionIssue) -> String {
+    if let Some(message) = issue.message.as_deref() {
+        return message.to_string();
+    }
+
+    match issue.kind {
+        AccountStartupResolutionIssueKind::MultiplePoolsRequireDefault => {
+            let candidate_pools = issue
+                .candidate_pools
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|candidate_pool| candidate_pool.pool_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if candidate_pools.is_empty() {
+                "multiple visible pools require a default".to_string()
+            } else {
+                format!("multiple visible pools require a default: {candidate_pools}")
+            }
+        }
+        AccountStartupResolutionIssueKind::OverridePoolUnavailable => format!(
+            "override default pool is unavailable: {}",
+            issue.pool_id.as_deref().unwrap_or("unknown")
+        ),
+        AccountStartupResolutionIssueKind::ConfigDefaultPoolUnavailable => format!(
+            "configured default pool is unavailable: {}",
+            issue.pool_id.as_deref().unwrap_or("unknown")
+        ),
+        AccountStartupResolutionIssueKind::PersistedDefaultPoolUnavailable => format!(
+            "persisted default pool is unavailable: {}",
+            issue.pool_id.as_deref().unwrap_or("unknown")
+        ),
     }
 }
 
