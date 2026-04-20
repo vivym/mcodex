@@ -15,6 +15,9 @@ path_action="already"
 path_profile=""
 TMP_ROOT=""
 STAGING_DIR=""
+REPLACE_BACKUP_DIR=""
+REPLACE_TARGET_DIR=""
+REPLACE_ACTIVE=0
 
 step() {
   printf '==> %s\n' "$1"
@@ -34,7 +37,37 @@ cleanup() {
   fi
 }
 
-trap cleanup EXIT INT TERM
+restore_replaced_version_dir() {
+  if [ "$REPLACE_ACTIVE" = "1" ] && [ -n "$REPLACE_BACKUP_DIR" ] && [ -d "$REPLACE_BACKUP_DIR" ]; then
+    set +e
+    if [ -n "$REPLACE_TARGET_DIR" ]; then
+      rm -rf "$REPLACE_TARGET_DIR"
+      mv "$REPLACE_BACKUP_DIR" "$REPLACE_TARGET_DIR"
+    fi
+  fi
+}
+
+on_exit() {
+  status="$?"
+  trap - EXIT INT TERM
+  if [ "$status" -ne 0 ]; then
+    restore_replaced_version_dir
+  fi
+  cleanup
+  exit "$status"
+}
+
+on_signal() {
+  status="$1"
+  trap - EXIT INT TERM
+  restore_replaced_version_dir
+  cleanup
+  exit "$status"
+}
+
+trap on_exit EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -218,6 +251,14 @@ timestamp() {
   date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+shell_quote() {
+  printf '%s\n' "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
+}
+
 write_completion_marker() {
   directory="$1"
   version="$2"
@@ -225,13 +266,17 @@ write_completion_marker() {
   sha256="$4"
   installed_at="$5"
   marker_path="$directory/.mcodex-install-complete.json"
+  marker_version="$(json_escape "$version")"
+  marker_archive_name="$(json_escape "$archive_name")"
+  marker_sha256="$(json_escape "$sha256")"
+  marker_installed_at="$(json_escape "$installed_at")"
 
   cat >"$marker_path" <<EOF
 {
-  "version": "$version",
-  "archiveName": "$archive_name",
-  "sha256": "$sha256",
-  "installedAt": "$installed_at"
+  "version": "$marker_version",
+  "archiveName": "$marker_archive_name",
+  "sha256": "$marker_sha256",
+  "installedAt": "$marker_installed_at"
 }
 EOF
 }
@@ -290,11 +335,19 @@ publish_version_dir() {
   version_dir="$1"
 
   if [ -e "$version_dir" ]; then
-    previous_dir="$VERSIONS_DIR/.replace.$$.old"
-    rm -rf "$previous_dir"
-    mv "$version_dir" "$previous_dir"
+    REPLACE_TARGET_DIR="$version_dir"
+    REPLACE_BACKUP_DIR="$VERSIONS_DIR/.replace.$$.old"
+    rm -rf "$REPLACE_BACKUP_DIR"
+    REPLACE_ACTIVE=1
+    mv "$version_dir" "$REPLACE_BACKUP_DIR"
+    if [ "${MCODEX_TEST_FAIL_AFTER_BACKUP:-}" = "1" ]; then
+      fail "Test failure after backing up existing version directory."
+    fi
     mv "$STAGING_DIR" "$version_dir"
-    rm -rf "$previous_dir"
+    rm -rf "$REPLACE_BACKUP_DIR"
+    REPLACE_ACTIVE=0
+    REPLACE_BACKUP_DIR=""
+    REPLACE_TARGET_DIR=""
   else
     mv "$STAGING_DIR" "$version_dir"
   fi
@@ -325,21 +378,26 @@ switch_current_link() {
 write_wrapper() {
   mkdir -p "$WRAPPER_DIR"
   wrapper_tmp="$(mktemp "$WRAPPER_DIR/.mcodex-wrapper.XXXXXX")"
+  base_root_literal="$(shell_quote "$BASE_ROOT")"
 
-  cat >"$wrapper_tmp" <<'EOF'
+  cat >"$wrapper_tmp" <<EOF
 #!/bin/sh
 set -eu
-base_root="${MCODEX_INSTALL_ROOT:-$HOME/.mcodex}"
-target="$base_root/current/bin/mcodex"
-if [ ! -x "$target" ]; then
+if [ -n "\${MCODEX_INSTALL_ROOT:-}" ]; then
+  base_root="\$MCODEX_INSTALL_ROOT"
+else
+  base_root=$base_root_literal
+fi
+target="\$base_root/current/bin/mcodex"
+if [ ! -x "\$target" ]; then
   echo "mcodex installation missing or corrupted; rerun the installer." >&2
   exit 1
 fi
 export MCODEX_INSTALL_MANAGED=1
 export MCODEX_INSTALL_METHOD=script
-export MCODEX_INSTALL_ROOT="$base_root"
-export PATH="$base_root/current/bin:$PATH"
-exec "$target" "$@"
+export MCODEX_INSTALL_ROOT="\$base_root"
+export PATH="\$base_root/current/bin:\$PATH"
+exec "\$target" "\$@"
 EOF
 
   chmod 0755 "$wrapper_tmp"
@@ -350,17 +408,23 @@ write_metadata() {
   version="$1"
   installed_at="$2"
   metadata_tmp="$BASE_ROOT/.install.json.tmp"
+  metadata_version="$(json_escape "$version")"
+  metadata_installed_at="$(json_escape "$installed_at")"
+  metadata_base_root="$(json_escape "$BASE_ROOT")"
+  metadata_versions_dir="$(json_escape "$VERSIONS_DIR")"
+  metadata_current_link="$(json_escape "$CURRENT_LINK")"
+  metadata_wrapper_path="$(json_escape "$WRAPPER_PATH")"
 
   cat >"$metadata_tmp" <<EOF
 {
   "product": "mcodex",
   "installMethod": "script",
-  "currentVersion": "$version",
-  "installedAt": "$installed_at",
-  "baseRoot": "$BASE_ROOT",
-  "versionsDir": "$VERSIONS_DIR",
-  "currentLink": "$CURRENT_LINK",
-  "wrapperPath": "$WRAPPER_PATH"
+  "currentVersion": "$metadata_version",
+  "installedAt": "$metadata_installed_at",
+  "baseRoot": "$metadata_base_root",
+  "versionsDir": "$metadata_versions_dir",
+  "currentLink": "$metadata_current_link",
+  "wrapperPath": "$metadata_wrapper_path"
 }
 EOF
 
@@ -388,7 +452,9 @@ add_to_path() {
   esac
 
   path_profile="$profile"
-  path_line="export PATH=\"$WRAPPER_DIR:\$PATH\""
+  # shellcheck disable=SC2016
+  wrapper_dir_escaped="$(printf '%s' "$WRAPPER_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g')"
+  path_line="export PATH=\"$wrapper_dir_escaped:\$PATH\""
 
   if [ -f "$profile" ] && grep -F "$path_line" "$profile" >/dev/null 2>&1; then
     path_action="configured"

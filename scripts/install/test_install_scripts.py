@@ -251,6 +251,78 @@ class InstallShTests(unittest.TestCase):
             self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
             self.assertIn("version=0.96.0", wrapper.stdout)
 
+    def test_wrapper_defaults_to_installed_custom_root(self) -> None:
+        with self.install_fixture() as fixture:
+            install_root = fixture.root / "custom-mcodex-root"
+            result = fixture.run_install("0.96.0", install_root=install_root)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            wrapper = fixture.run_wrapper()
+            self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
+            self.assertIn("version=0.96.0", wrapper.stdout)
+            self.assertIn(f"root={install_root}", wrapper.stdout)
+
+    def test_json_metadata_and_profile_escape_literal_paths(self) -> None:
+        with self.install_fixture() as fixture:
+            install_root = fixture.root / 'root"with\\slashes$and-dollar' / ".mcodex"
+            wrapper_dir = fixture.root / 'bin"with\\slashes$and-dollar'
+            result = fixture.run_install(
+                "0.96.0",
+                install_root=install_root,
+                wrapper_dir=wrapper_dir,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+            metadata = json.loads((install_root / "install.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["baseRoot"], str(install_root))
+            self.assertEqual(metadata["versionsDir"], str(install_root / "install"))
+            self.assertEqual(metadata["currentLink"], str(install_root / "current"))
+            self.assertEqual(metadata["wrapperPath"], str(wrapper_dir / "mcodex"))
+
+            profile_path = fixture.home / ".zshrc"
+            self.assertTrue(profile_path.exists())
+            sourced = subprocess.run(
+                [
+                    "sh",
+                    "-c",
+                    '. "$HOME/.zshrc"; printf "%s\\n" "$PATH"',
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_wrapper_env(fixture.home, path="/usr/bin:/bin"),
+            )
+            self.assertEqual(sourced.returncode, 0, msg=sourced.stderr)
+            first_path_entry = sourced.stdout.rstrip("\n").split(":", 1)[0]
+            self.assertEqual(first_path_entry, str(wrapper_dir))
+            wrapper = fixture.run_wrapper(wrapper_dir=wrapper_dir)
+            self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
+            self.assertIn(f"root={install_root}", wrapper.stdout)
+
+    def test_failed_repair_after_backup_restores_old_version_dir(self) -> None:
+        with self.install_fixture() as fixture:
+            first = fixture.run_install("0.96.0")
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            version_dir = fixture.home / ".mcodex" / "install" / "0.96.0"
+            sentinel = version_dir / "sentinel.txt"
+            sentinel.write_text("keep me\n", encoding="utf-8")
+            marker = version_dir / ".mcodex-install-complete.json"
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            marker_data["sha256"] = "broken"
+            marker.write_text(json.dumps(marker_data), encoding="utf-8")
+
+            failed = fixture.run_install(
+                "0.96.0",
+                extra_env={"MCODEX_TEST_FAIL_AFTER_BACKUP": "1"},
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(sentinel.exists())
+            self.assertTrue((version_dir / "bin" / "mcodex").exists())
+            self.assert_current_version(fixture.home, "0.96.0")
+            wrapper = fixture.run_wrapper()
+            self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
+            self.assertIn("version=0.96.0", wrapper.stdout)
+
     def assert_latest_install_layout(self, home: Path, version: str) -> None:
         version_dir = home / ".mcodex" / "install" / version
         current_link = home / ".mcodex" / "current"
@@ -354,25 +426,47 @@ class _InstallFixture:
         self.server.close()
         self._tempdir.cleanup()
 
-    def run_install(self, version: str) -> subprocess.CompletedProcess[str]:
+    def run_install(
+        self,
+        version: str,
+        *,
+        install_root: Path | None = None,
+        wrapper_dir: Path | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = _install_env(self.home, self.server.base_url)
+        if install_root is not None:
+            env["MCODEX_INSTALL_ROOT"] = str(install_root)
+        if wrapper_dir is not None:
+            env["MCODEX_WRAPPER_DIR"] = str(wrapper_dir)
+        if extra_env is not None:
+            env.update(extra_env)
         return subprocess.run(
             ["sh", str(INSTALL_SH), version],
             cwd=REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_install_env(self.home, self.server.base_url),
+            env=env,
             timeout=10,
         )
 
-    def run_wrapper(self) -> subprocess.CompletedProcess[str]:
+    def run_wrapper(
+        self,
+        *,
+        wrapper_dir: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = _wrapper_env(self.home)
+        wrapper_path = self.home / ".local" / "bin" / "mcodex"
+        if wrapper_dir is not None:
+            wrapper_path = wrapper_dir / "mcodex"
         return subprocess.run(
-            [str(self.home / ".local" / "bin" / "mcodex")],
+            [str(wrapper_path)],
             cwd=REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_wrapper_env(self.home),
+            env=env,
         )
 
 
@@ -394,9 +488,13 @@ def _install_env(home: Path, base_url: str) -> dict[str, str]:
     return env
 
 
-def _wrapper_env(home: Path) -> dict[str, str]:
+def _wrapper_env(home: Path, *, path: str | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
+    if path is not None:
+        env["PATH"] = path
+    env.pop("MCODEX_INSTALL_ROOT", None)
+    env.pop("MCODEX_WRAPPER_DIR", None)
     return env
 
 
