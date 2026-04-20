@@ -1,5 +1,6 @@
 import * as child_process from "node:child_process";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, it } from "@jest/globals";
@@ -41,6 +42,99 @@ function createEarlyExitChild(exitCode = 2): FakeChildProcess {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
+  describe("_findCodexPathForTesting", () => {
+    it("prefers mcodex from PATH when no explicit executable is provided", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const envPath = ["/usr/local/bin", "/opt/homebrew/bin"].join(path.delimiter);
+      const expected = path.posix.join("/opt/homebrew/bin", "mcodex");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform: "darwin",
+        arch: "arm64",
+        pathExists: (candidate: string) => candidate === expected,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("reports script-install guidance when no CLI can be found", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+
+      expect(() =>
+        _findCodexPathForTesting({
+          envPath: "/usr/local/bin:/opt/homebrew/bin",
+          platform: "linux",
+          arch: "x64",
+          pathExists: () => false,
+          resolvePackageJson: () => {
+            throw new Error("missing package");
+          },
+        }),
+      ).toThrow(
+        /install\.sh.*install\.ps1.*explicit executable path/i,
+      );
+    });
+
+    it("prefers mcodex.exe on Windows", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const envPath = ["C:\\tools", "D:\\bin"].join(";");
+      const expected = path.win32.join("C:\\tools", "mcodex.exe");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform: "win32",
+        arch: "x64",
+        pathExists: (candidate: string) =>
+          candidate === expected || candidate === path.win32.join("C:\\tools", "mcodex"),
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex.exe");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("falls back to the legacy npm package when PATH lookup fails", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const resolvePackageJson = jest.fn(
+        (specifier: string, from?: string) => {
+          if (specifier === "@openai/codex/package.json" && from === undefined) {
+            return "/repo/node_modules/@openai/codex/package.json";
+          }
+          if (
+            specifier === "@openai/codex-linux-x64/package.json" &&
+            from === "/repo/node_modules/@openai/codex/package.json"
+          ) {
+            return "/repo/node_modules/@openai/codex-linux-x64/package.json";
+          }
+          throw new Error(`Unexpected package lookup: ${specifier} from ${from}`);
+        },
+      );
+
+      const result = _findCodexPathForTesting({
+        envPath: "/usr/local/bin:/opt/bin",
+        platform: "linux",
+        arch: "x64",
+        pathExists: () => false,
+        resolvePackageJson,
+      });
+
+      expect(result).toBe(
+        "/repo/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+      );
+      expect(resolvePackageJson).toHaveBeenNthCalledWith(1, "@openai/codex/package.json");
+      expect(resolvePackageJson).toHaveBeenNthCalledWith(
+        2,
+        "@openai/codex-linux-x64/package.json",
+        "/repo/node_modules/@openai/codex/package.json",
+      );
+    });
+  });
+
   it("rejects when exit happens before stdout closes", async () => {
     const { CodexExec } = await import("../src/exec");
     const child = createEarlyExitChild();

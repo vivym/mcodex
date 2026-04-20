@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
@@ -53,6 +54,16 @@ const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
 };
 
 const moduleRequire = createRequire(import.meta.url);
+const MCODEX_NAMES = ["mcodex"] as const;
+const WINDOWS_MCODEX_NAMES = ["mcodex.exe", "mcodex"] as const;
+
+type FindCodexPathOptions = {
+  envPath?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  pathExists?: (candidate: string) => boolean;
+  resolvePackageJson?: (specifier: string, from?: string) => string;
+};
 
 export class CodexExec {
   private executablePath: string;
@@ -315,7 +326,27 @@ function isPlainObject(value: unknown): value is CodexConfigObject {
 }
 
 function findCodexPath() {
-  const { platform, arch } = process;
+  return _findCodexPathForTesting();
+}
+
+export function _findCodexPathForTesting(options: FindCodexPathOptions = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const envPath = options.envPath ?? process.env.PATH;
+  const pathExists = options.pathExists ?? fs.existsSync;
+  const resolvePackageJson = options.resolvePackageJson ?? defaultResolvePackageJson;
+  const pathModule = platform === "win32" ? path.win32 : path.posix;
+  const delimiter = platform === "win32" ? ";" : ":";
+  const executableNames = platform === "win32" ? WINDOWS_MCODEX_NAMES : MCODEX_NAMES;
+
+  for (const directory of envPath?.split(delimiter).filter(Boolean) ?? []) {
+    for (const executableName of executableNames) {
+      const candidate = pathModule.join(directory, executableName);
+      if (pathExists(candidate)) {
+        return candidate;
+      }
+    }
+  }
 
   let targetTriple = null;
   switch (platform) {
@@ -361,29 +392,46 @@ function findCodexPath() {
   }
 
   if (!targetTriple) {
-    throw new Error(`Unsupported platform: ${platform} (${arch})`);
+    throw new Error(getMissingCliErrorMessage());
   }
 
   const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
   if (!platformPackage) {
-    throw new Error(`Unsupported target triple: ${targetTriple}`);
+    throw new Error(getMissingCliErrorMessage());
   }
 
   let vendorRoot: string;
   try {
-    const codexPackageJsonPath = moduleRequire.resolve(`${CODEX_NPM_NAME}/package.json`);
-    const codexRequire = createRequire(codexPackageJsonPath);
-    const platformPackageJsonPath = codexRequire.resolve(`${platformPackage}/package.json`);
-    vendorRoot = path.join(path.dirname(platformPackageJsonPath), "vendor");
-  } catch {
-    throw new Error(
-      `Unable to locate Codex CLI binaries. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
+    const codexPackageJsonPath = resolvePackageJson(`${CODEX_NPM_NAME}/package.json`);
+    const platformPackageJsonPath = resolvePackageJson(
+      `${platformPackage}/package.json`,
+      codexPackageJsonPath,
     );
+    vendorRoot = pathModule.join(pathModule.dirname(platformPackageJsonPath), "vendor");
+  } catch {
+    throw new Error(getMissingCliErrorMessage());
   }
 
-  const archRoot = path.join(vendorRoot, targetTriple);
-  const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-  const binaryPath = path.join(archRoot, "codex", codexBinaryName);
+  const archRoot = pathModule.join(vendorRoot, targetTriple);
+  const codexBinaryName = platform === "win32" ? "codex.exe" : "codex";
+  const binaryPath = pathModule.join(archRoot, "codex", codexBinaryName);
 
   return binaryPath;
+}
+
+function defaultResolvePackageJson(specifier: string, from?: string): string {
+  if (from) {
+    return createRequire(from).resolve(specifier);
+  }
+
+  return moduleRequire.resolve(specifier);
+}
+
+function getMissingCliErrorMessage(): string {
+  return (
+    "Unable to locate the mcodex CLI. Install it with " +
+    "https://downloads.mcodex.sota.wiki/install.sh on macOS/Linux or " +
+    "https://downloads.mcodex.sota.wiki/install.ps1 on Windows, " +
+    "or pass an explicit executable path to the CodexExec constructor."
+  );
 }
