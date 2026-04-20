@@ -231,6 +231,88 @@ class InstallPs1Tests(unittest.TestCase):
             ["0.96.0", "0.96.0-alpha.1", "0.96.0", "0.96.0"],
         )
 
+    def test_write_wrapper_outputs_literal_runtime_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper_path = Path(tmp) / "mcodex.ps1"
+            result = run_powershell(
+                "\n".join(
+                    [
+                        "$ErrorActionPreference = 'Stop'",
+                        f". '{INSTALL_PS1}'",
+                        f"$wrapperPath = {_powershell_single_quote(str(wrapper_path))}",
+                        "Write-Wrapper -BaseRoot 'C:\\tmp\\mcodex' -WrapperPath $wrapperPath",
+                        "Get-Content -LiteralPath $wrapperPath -Raw",
+                    ]
+                )
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn(
+            '$BaseRoot = if ($env:MCODEX_INSTALL_ROOT) { $env:MCODEX_INSTALL_ROOT } else { \'C:\\tmp\\mcodex\' }',
+            result.stdout,
+        )
+        self.assertIn('if (-not (Test-Path -LiteralPath $Target)) {', result.stdout)
+        self.assertIn('$env:MCODEX_INSTALL_ROOT = $BaseRoot', result.stdout)
+        self.assertIn('& $Target @args', result.stdout)
+        self.assertIn('exit $LASTEXITCODE', result.stdout)
+
+    def test_path_update_helper_models_registry_branch_without_mutation(self) -> None:
+        wrapper_dir = r"C:\Users\viv\AppData\Local\Programs\Mcodex\bin"
+        result = run_powershell(
+            "\n".join(
+                [
+                    "$ErrorActionPreference = 'Stop'",
+                    f". '{INSTALL_PS1}'",
+                    "$results = @(",
+                    (
+                        "    Get-WrapperDirPathUpdate "
+                        f"-WrapperDir '{wrapper_dir}' "
+                        "-UserPath 'C:\\Windows\\System32' "
+                        "-ProcessPath 'C:\\Windows\\System32'"
+                    ),
+                    (
+                        "    Get-WrapperDirPathUpdate "
+                        f"-WrapperDir '{wrapper_dir}' "
+                        f"-UserPath '{wrapper_dir};C:\\Windows\\System32' "
+                        "-ProcessPath 'C:\\Windows\\System32'"
+                    ),
+                    (
+                        "    Get-WrapperDirPathUpdate "
+                        f"-WrapperDir '{wrapper_dir}' "
+                        f"-UserPath '{wrapper_dir};C:\\Windows\\System32' "
+                        f"-ProcessPath '{wrapper_dir};C:\\Windows\\System32'"
+                    ),
+                    ")",
+                    "$results | ConvertTo-Json -Depth 4 -Compress",
+                ]
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                {
+                    "Action": "added",
+                    "UserPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "ProcessPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "UpdateUserPath": True,
+                },
+                {
+                    "Action": "configured",
+                    "UserPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "ProcessPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "UpdateUserPath": False,
+                },
+                {
+                    "Action": "already",
+                    "UserPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "ProcessPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "UpdateUserPath": False,
+                },
+            ],
+        )
+
     def test_invalid_versions_fail_before_download(self) -> None:
         with self.install_fixture() as fixture:
             for version in ("invalid-version", "vlatest", "rust-vlatest"):
@@ -819,6 +901,10 @@ def _powershell_env(localappdata: Path, base_url: str) -> dict[str, str]:
     env.pop("MCODEX_WRAPPER_DIR", None)
     Path(env["TEMP"]).mkdir(parents=True, exist_ok=True)
     return env
+
+
+def _powershell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 if __name__ == "__main__":

@@ -193,6 +193,59 @@ function Path-Contains {
     return $false
 }
 
+function Get-WrapperDirPathUpdate {
+    param(
+        [string]$WrapperDir,
+        [string]$UserPath,
+        [string]$ProcessPath
+    )
+
+    if (-not (Path-Contains -PathValue $UserPath -Entry $WrapperDir)) {
+        $nextUserPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {
+            $WrapperDir
+        } else {
+            "$WrapperDir;$UserPath"
+        }
+
+        $nextProcessPath = if (Path-Contains -PathValue $ProcessPath -Entry $WrapperDir) {
+            $ProcessPath
+        } elseif ([string]::IsNullOrWhiteSpace($ProcessPath)) {
+            $WrapperDir
+        } else {
+            "$WrapperDir;$ProcessPath"
+        }
+
+        return [PSCustomObject]@{
+            Action = "added"
+            UserPath = $nextUserPath
+            ProcessPath = $nextProcessPath
+            UpdateUserPath = $true
+        }
+    }
+
+    if (-not (Path-Contains -PathValue $ProcessPath -Entry $WrapperDir)) {
+        $nextProcessPath = if ([string]::IsNullOrWhiteSpace($ProcessPath)) {
+            $WrapperDir
+        } else {
+            "$WrapperDir;$ProcessPath"
+        }
+
+        return [PSCustomObject]@{
+            Action = "configured"
+            UserPath = $UserPath
+            ProcessPath = $nextProcessPath
+            UpdateUserPath = $false
+        }
+    }
+
+    return [PSCustomObject]@{
+        Action = "already"
+        UserPath = $UserPath
+        ProcessPath = $ProcessPath
+        UpdateUserPath = $false
+    }
+}
+
 function Get-PlatformDetails {
     if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
         throw "install.ps1 supports Windows only. Use install.sh on macOS or Linux."
@@ -420,25 +473,25 @@ function Switch-CurrentJunction {
 
 function Write-Wrapper {
     param(
-        [string]$WrapperPath,
-        [string]$InstalledBaseRoot
+        [string]$BaseRoot,
+        [string]$WrapperPath
     )
 
-    $baseRootLiteral = Convert-ToSingleQuotedLiteral -Value $InstalledBaseRoot
-    $wrapper = @"
-$BaseRoot = if (`$env:MCODEX_INSTALL_ROOT) { `$env:MCODEX_INSTALL_ROOT } else { $baseRootLiteral }
-$Target = Join-Path `$BaseRoot "current\bin\mcodex.exe"
-if (-not (Test-Path `$Target)) {
+    $baseRootLiteral = Convert-ToSingleQuotedLiteral -Value $BaseRoot
+    $wrapper = @'
+$BaseRoot = if ($env:MCODEX_INSTALL_ROOT) { $env:MCODEX_INSTALL_ROOT } else { __BASE_ROOT_LITERAL__ }
+$Target = Join-Path $BaseRoot "current\bin\mcodex.exe"
+if (-not (Test-Path -LiteralPath $Target)) {
     Write-Error "mcodex installation missing or corrupted; rerun the installer."
     exit 1
 }
-`$env:MCODEX_INSTALL_MANAGED = "1"
-`$env:MCODEX_INSTALL_METHOD = "script"
-`$env:MCODEX_INSTALL_ROOT = `$BaseRoot
-`$env:Path = "$(Join-Path `$BaseRoot "current\bin");`$env:Path"
-& `$Target @args
-exit `$LASTEXITCODE
-"@
+$env:MCODEX_INSTALL_MANAGED = "1"
+$env:MCODEX_INSTALL_METHOD = "script"
+$env:MCODEX_INSTALL_ROOT = $BaseRoot
+$env:Path = "$(Join-Path $BaseRoot "current\bin");$env:Path"
+& $Target @args
+exit $LASTEXITCODE
+'@.Replace("__BASE_ROOT_LITERAL__", $baseRootLiteral)
 
     Write-Utf8File -Path $WrapperPath -Content $wrapper
 }
@@ -474,56 +527,16 @@ function Add-WrapperDirToUserPath {
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
-    if ($env:MCODEX_SKIP_USER_PATH_REGISTRY -eq "1") {
-        if (-not (Path-Contains -PathValue $env:Path -Entry $WrapperDir)) {
-            if ([string]::IsNullOrWhiteSpace($env:Path)) {
-                $env:Path = $WrapperDir
-            } else {
-                $env:Path = "$WrapperDir;$env:Path"
-            }
-        }
-
-        return [PSCustomObject]@{
-            Action = "configured"
-        }
+    $pathUpdate = Get-WrapperDirPathUpdate -WrapperDir $WrapperDir -UserPath $userPath -ProcessPath $env:Path
+    if ($env:MCODEX_SKIP_USER_PATH_REGISTRY -ne "1" -and $pathUpdate.UpdateUserPath) {
+        [Environment]::SetEnvironmentVariable("Path", $pathUpdate.UserPath, "User")
     }
 
-    if (-not (Path-Contains -PathValue $userPath -Entry $WrapperDir)) {
-        if ([string]::IsNullOrWhiteSpace($userPath)) {
-            $newUserPath = $WrapperDir
-        } else {
-            $newUserPath = "$WrapperDir;$userPath"
-        }
-
-        [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
-        if (-not (Path-Contains -PathValue $env:Path -Entry $WrapperDir)) {
-            if ([string]::IsNullOrWhiteSpace($env:Path)) {
-                $env:Path = $WrapperDir
-            } else {
-                $env:Path = "$WrapperDir;$env:Path"
-            }
-        }
-
-        return [PSCustomObject]@{
-            Action = "added"
-        }
+    if ($pathUpdate.ProcessPath -ne $env:Path) {
+        $env:Path = $pathUpdate.ProcessPath
     }
 
-    if (-not (Path-Contains -PathValue $env:Path -Entry $WrapperDir)) {
-        if ([string]::IsNullOrWhiteSpace($env:Path)) {
-            $env:Path = $WrapperDir
-        } else {
-            $env:Path = "$WrapperDir;$env:Path"
-        }
-
-        return [PSCustomObject]@{
-            Action = "configured"
-        }
-    }
-
-    return [PSCustomObject]@{
-        Action = "already"
-    }
+    return $pathUpdate
 }
 
 function Invoke-McodexInstall {
@@ -562,7 +575,7 @@ function Invoke-McodexInstall {
         }
 
         Switch-CurrentJunction -BaseRoot $config.BaseRoot -CurrentLink $config.CurrentLink -TargetDir $versionDir
-        Write-Wrapper -WrapperPath $config.WrapperPath -InstalledBaseRoot $config.BaseRoot
+        Write-Wrapper -BaseRoot $config.BaseRoot -WrapperPath $config.WrapperPath
         Write-InstallMetadata -MetadataFile $config.MetadataFile -Version $resolvedVersion -InstalledAt (Get-Timestamp) -BaseRoot $config.BaseRoot -VersionsDir $config.VersionsDir -CurrentLink $config.CurrentLink -WrapperPath $config.WrapperPath
         $pathAction = Add-WrapperDirToUserPath -WrapperDir $config.WrapperDir
     } finally {
