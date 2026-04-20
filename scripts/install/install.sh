@@ -416,7 +416,7 @@ HOST_OS="$(host_platform)"
 detect_platform
 
 resolved_input="$(normalize_version "$VERSION_INPUT")"
-if [ "$resolved_input" = "latest" ]; then
+if [ "$VERSION_INPUT" = "latest" ]; then
   RESOLVED_VERSION="$(resolve_latest_version)"
 else
   validate_version "$resolved_input"

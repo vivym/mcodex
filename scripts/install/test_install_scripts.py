@@ -181,6 +181,20 @@ class InstallShTests(unittest.TestCase):
             self.assertIn("Invalid version", result.stderr)
             self.assertEqual(fixture.server.request_log(), "")
 
+    def test_vlatest_fails_before_http_requests(self) -> None:
+        with self.install_fixture() as fixture:
+            result = fixture.run_install("vlatest")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid version", result.stderr)
+            self.assertEqual(fixture.server.request_log(), "")
+
+    def test_rust_vlatest_fails_before_http_requests(self) -> None:
+        with self.install_fixture() as fixture:
+            result = fixture.run_install("rust-vlatest")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Invalid version", result.stderr)
+            self.assertEqual(fixture.server.request_log(), "")
+
     def test_reinstall_reuses_valid_version_directory(self) -> None:
         with self.install_fixture() as fixture:
             first = fixture.run_install("0.96.0")
