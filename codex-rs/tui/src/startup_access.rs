@@ -8,20 +8,124 @@ use anyhow::anyhow;
 use codex_account_pool::AccountPoolConfig;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::read_shared_startup_status;
+use codex_state::AccountStartupAvailability;
+use codex_state::AccountStartupResolutionIssue;
+use codex_state::AccountStartupResolutionIssueSource;
+use codex_state::AccountStartupStatus;
 use codex_state::StateRuntime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartupProbe {
-    Unavailable,
-    PooledAvailable { remote: bool },
-    PooledSuppressed { remote: bool },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartupNoticeData {
+    pub issue_kind: StartupNoticeIssueKind,
+    pub issue_source: StartupNoticeIssueSource,
+    pub candidate_pool_ids: Vec<String>,
+}
+
+impl StartupNoticeData {
+    fn from_startup_status(startup_status: &AccountStartupStatus) -> Option<Self> {
+        match startup_status.startup_availability {
+            AccountStartupAvailability::MultiplePoolsRequireDefault => Some(Self {
+                issue_kind: StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+                issue_source: startup_status
+                    .startup_resolution_issue
+                    .as_ref()
+                    .map_or(StartupNoticeIssueSource::None, |issue| {
+                        StartupNoticeIssueSource::from(issue.source)
+                    }),
+                candidate_pool_ids: candidate_pool_ids(
+                    startup_status.startup_resolution_issue.as_ref(),
+                    &startup_status.candidate_pools,
+                ),
+            }),
+            AccountStartupAvailability::InvalidExplicitDefault => Some(Self {
+                issue_kind: StartupNoticeIssueKind::InvalidExplicitDefault,
+                issue_source: startup_status
+                    .startup_resolution_issue
+                    .as_ref()
+                    .map_or(StartupNoticeIssueSource::None, |issue| {
+                        StartupNoticeIssueSource::from(issue.source)
+                    }),
+                candidate_pool_ids: candidate_pool_ids(
+                    startup_status.startup_resolution_issue.as_ref(),
+                    &startup_status.candidate_pools,
+                ),
+            }),
+            AccountStartupAvailability::Available
+            | AccountStartupAvailability::Suppressed
+            | AccountStartupAvailability::Unavailable => None,
+        }
+    }
+}
+
+fn candidate_pool_ids(
+    issue: Option<&AccountStartupResolutionIssue>,
+    fallback_candidates: &[codex_state::AccountStartupCandidatePool],
+) -> Vec<String> {
+    if let Some(candidate_pools) =
+        issue.and_then(|resolution_issue| resolution_issue.candidate_pools.as_deref())
+    {
+        return candidate_pools
+            .iter()
+            .map(|candidate_pool| candidate_pool.pool_id.clone())
+            .collect();
+    }
+
+    fallback_candidates
+        .iter()
+        .map(|candidate_pool| candidate_pool.pool_id.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupNoticeIssueKind {
+    MultiplePoolsRequireDefault,
+    InvalidExplicitDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupNoticeIssueSource {
+    Override,
+    ConfigDefault,
+    PersistedSelection,
+    None,
+}
+
+impl From<AccountStartupResolutionIssueSource> for StartupNoticeIssueSource {
+    fn from(source: AccountStartupResolutionIssueSource) -> Self {
+        match source {
+            AccountStartupResolutionIssueSource::Override => Self::Override,
+            AccountStartupResolutionIssueSource::ConfigDefault => Self::ConfigDefault,
+            AccountStartupResolutionIssueSource::PersistedSelection => Self::PersistedSelection,
+            AccountStartupResolutionIssueSource::None => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupProbe {
+    Unavailable,
+    PooledAvailable {
+        remote: bool,
+    },
+    PooledSuppressed {
+        remote: bool,
+    },
+    PooledDefaultSelectionRequired {
+        remote: bool,
+        notice: StartupNoticeData,
+    },
+    PooledInvalidDefault {
+        remote: bool,
+        notice: StartupNoticeData,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupPromptDecision {
     NeedsLogin,
     PooledOnlyNotice,
     PooledAccessPausedNotice,
+    PooledDefaultSelectionNotice(StartupNoticeData),
     NoPrompt,
 }
 
@@ -38,6 +142,10 @@ pub(crate) fn decide_startup_access(
     match probe {
         StartupProbe::Unavailable => StartupPromptDecision::NeedsLogin,
         StartupProbe::PooledSuppressed { .. } => StartupPromptDecision::PooledAccessPausedNotice,
+        StartupProbe::PooledDefaultSelectionRequired { notice, .. }
+        | StartupProbe::PooledInvalidDefault { notice, .. } => {
+            StartupPromptDecision::PooledDefaultSelectionNotice(notice)
+        }
         StartupProbe::PooledAvailable { .. } if notice_hidden => StartupPromptDecision::NoPrompt,
         StartupProbe::PooledAvailable { .. } => StartupPromptDecision::PooledOnlyNotice,
     }
@@ -94,26 +202,31 @@ async fn probe_local_startup_access(config: &Config) -> Result<StartupProbe> {
     );
     let startup_status =
         read_shared_startup_status(&backend, configured_default_pool_id(config), None).await?;
-    if !startup_status.pooled_applicable {
-        return Ok(StartupProbe::Unavailable);
-    }
 
-    let preview = &startup_status.startup.preview;
-    let Some(pool_id) = preview.effective_pool_id.as_deref() else {
-        return Ok(StartupProbe::Unavailable);
-    };
-    let diagnostic = runtime
-        .read_account_pool_diagnostic(pool_id, preview.preferred_account_id.as_deref())
-        .await?;
-
-    if !diagnostic.accounts.iter().any(|account| account.enabled) {
-        return Ok(StartupProbe::Unavailable);
-    }
-
-    if preview.suppressed {
-        Ok(StartupProbe::PooledSuppressed { remote: false })
-    } else {
-        Ok(StartupProbe::PooledAvailable { remote: false })
+    match startup_status.startup.startup_availability {
+        AccountStartupAvailability::Available => {
+            Ok(StartupProbe::PooledAvailable { remote: false })
+        }
+        AccountStartupAvailability::Suppressed => {
+            Ok(StartupProbe::PooledSuppressed { remote: false })
+        }
+        AccountStartupAvailability::MultiplePoolsRequireDefault => {
+            let notice = StartupNoticeData::from_startup_status(&startup_status.startup)
+                .ok_or_else(|| anyhow!("missing startup notice data for multi-pool blocker"))?;
+            Ok(StartupProbe::PooledDefaultSelectionRequired {
+                remote: false,
+                notice,
+            })
+        }
+        AccountStartupAvailability::InvalidExplicitDefault => {
+            let notice = StartupNoticeData::from_startup_status(&startup_status.startup)
+                .ok_or_else(|| anyhow!("missing startup notice data for invalid default"))?;
+            Ok(StartupProbe::PooledInvalidDefault {
+                remote: false,
+                notice,
+            })
+        }
+        AccountStartupAvailability::Unavailable => Ok(StartupProbe::Unavailable),
     }
 }
 
@@ -259,6 +372,29 @@ mod tests {
     }
 
     #[test]
+    fn startup_decision_uses_pool_default_notice_for_multi_pool_blocker() {
+        let notice = StartupNoticeData {
+            issue_kind: StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+            issue_source: StartupNoticeIssueSource::None,
+            candidate_pool_ids: vec!["team-main".to_string(), "team-other".to_string()],
+        };
+        let decision = decide_startup_access(
+            LoginStatus::NotAuthenticated,
+            true,
+            false,
+            StartupProbe::PooledDefaultSelectionRequired {
+                remote: false,
+                notice: notice.clone(),
+            },
+        );
+
+        assert_eq!(
+            decision,
+            StartupPromptDecision::PooledDefaultSelectionNotice(notice)
+        );
+    }
+
+    #[test]
     fn startup_decision_honors_hidden_notice_without_redefining_login() {
         let decision = decide_startup_access(
             LoginStatus::NotAuthenticated,
@@ -299,7 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_probe_rejects_policy_only_migrated_config_without_membership() {
+    async fn local_probe_reports_invalid_config_default_without_membership() {
         let codex_home = tempdir().expect("tempdir");
         let config = test_config(codex_home.path()).await;
 
@@ -307,11 +443,21 @@ mod tests {
             .await
             .expect("probe local startup access");
 
-        assert_eq!(probe, StartupProbe::Unavailable);
+        assert_eq!(
+            probe,
+            StartupProbe::PooledInvalidDefault {
+                remote: false,
+                notice: StartupNoticeData {
+                    issue_kind: StartupNoticeIssueKind::InvalidExplicitDefault,
+                    issue_source: StartupNoticeIssueSource::ConfigDefault,
+                    candidate_pool_ids: Vec::new(),
+                },
+            }
+        );
     }
 
     #[tokio::test]
-    async fn local_probe_does_not_require_preexisting_sqlite_file_for_config_default() {
+    async fn local_probe_reports_invalid_config_default_without_preexisting_sqlite_file() {
         let codex_home = tempdir().expect("tempdir");
         let config = test_config(codex_home.path()).await;
         let state_path = state_db_path(config.sqlite_home.as_path());
@@ -321,7 +467,17 @@ mod tests {
             .await
             .expect("probe local startup access");
 
-        assert_eq!(probe, StartupProbe::Unavailable);
+        assert_eq!(
+            probe,
+            StartupProbe::PooledInvalidDefault {
+                remote: false,
+                notice: StartupNoticeData {
+                    issue_kind: StartupNoticeIssueKind::InvalidExplicitDefault,
+                    issue_source: StartupNoticeIssueSource::ConfigDefault,
+                    candidate_pool_ids: Vec::new(),
+                },
+            }
+        );
         assert!(state_path.exists());
     }
 
@@ -392,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_probe_returns_unavailable_when_pool_has_no_enabled_accounts() {
+    async fn local_probe_reports_available_when_effective_pool_has_no_enabled_accounts() {
         let codex_home = tempdir().expect("tempdir");
         let config = test_config(codex_home.path()).await;
         let runtime =
@@ -416,7 +572,7 @@ mod tests {
             .await
             .expect("probe local startup access");
 
-        assert_eq!(probe, StartupProbe::Unavailable);
+        assert_eq!(probe, StartupProbe::PooledAvailable { remote: false });
     }
 
     #[test]

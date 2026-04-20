@@ -985,7 +985,7 @@ git commit -m "feat(cli): explain startup pool resolution"
 - Modify: `codex-rs/tui/src/onboarding/onboarding_screen.rs`
 - Update snapshots: `codex-rs/tui/src/onboarding/snapshots/*.snap`
 
-- [ ] **Step 1: Add failing startup decision tests**
+- [x] **Step 1: Add failing startup decision tests**
 
 In `startup_access.rs` tests:
 
@@ -1014,7 +1014,7 @@ fn startup_decision_uses_pool_default_notice_for_multi_pool_blocker() {
 }
 ```
 
-- [ ] **Step 2: Add failing widget snapshot test**
+- [x] **Step 2: Add failing widget snapshot test**
 
 In `pooled_access_notice.rs` tests:
 
@@ -1029,7 +1029,7 @@ fn pooled_default_selection_notice_renders_snapshot() {
 }
 ```
 
-- [ ] **Step 3: Run TUI tests and verify failure**
+- [x] **Step 3: Run TUI tests and verify failure**
 
 Run:
 
@@ -1040,7 +1040,7 @@ cargo test -p codex-tui startup_decision_uses_pool_default_notice_for_multi_pool
 
 Expected: FAIL because the new probe/notice does not exist.
 
-- [ ] **Step 4: Implement new probe and decision**
+- [x] **Step 4: Implement new probe and decision**
 
 Add:
 
@@ -1065,7 +1065,7 @@ For local probing, use `startup_availability`:
 
 Do not let the notice-hidden preference suppress blocker notices.
 
-- [ ] **Step 5: Implement notice kind**
+- [x] **Step 5: Implement notice kind**
 
 Add `PooledAccessNoticeKind::DefaultPoolRequired` with:
 
@@ -1080,13 +1080,13 @@ Add `PooledAccessNoticeKind::DefaultPoolRequired` with:
 
 Keep this read-only; do not implement a picker.
 
-- [ ] **Step 6: Update onboarding routing**
+- [x] **Step 6: Update onboarding routing**
 
 Route `StartupPromptDecision::PooledDefaultSelectionNotice(data)` through the
 existing onboarding screen and pass `candidate_pool_ids` plus issue source into
 the widget. Ensure the login handoff path remains available.
 
-- [ ] **Step 7: Generate and review snapshots**
+- [x] **Step 7: Generate and review snapshots**
 
 Run:
 
@@ -1102,7 +1102,7 @@ Review the new `.snap.new` file, then accept only if correct:
 cargo insta accept -p codex-tui
 ```
 
-- [ ] **Step 8: Run TUI package tests**
+- [x] **Step 8: Run TUI package tests**
 
 Run:
 
@@ -1113,7 +1113,7 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add codex-rs/tui/src/startup_access.rs codex-rs/tui/src/onboarding/pooled_access_notice.rs codex-rs/tui/src/onboarding/onboarding_screen.rs codex-rs/tui/src/onboarding/snapshots

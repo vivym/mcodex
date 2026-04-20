@@ -1164,12 +1164,12 @@ async fn run_ratatui_app(
     let should_show_onboarding = should_show_onboarding(
         login_status,
         should_show_trust_screen_flag,
-        startup_prompt_decision,
+        &startup_prompt_decision,
     );
 
     let config = if should_show_onboarding {
         let show_login_screen =
-            should_show_login_screen(login_status, &initial_config, startup_prompt_decision);
+            should_show_login_screen(login_status, &initial_config, &startup_prompt_decision);
         let onboarding_result = run_onboarding_app(
             OnboardingScreenArgs {
                 show_login_screen,
@@ -1786,7 +1786,7 @@ fn should_show_trust_screen(config: &Config) -> bool {
 fn should_show_onboarding(
     login_status: LoginStatus,
     show_trust_screen: bool,
-    startup_prompt_decision: StartupPromptDecision,
+    startup_prompt_decision: &StartupPromptDecision,
 ) -> bool {
     if show_trust_screen {
         return true;
@@ -1795,7 +1795,8 @@ fn should_show_onboarding(
     match startup_prompt_decision {
         StartupPromptDecision::NeedsLogin => login_status == LoginStatus::NotAuthenticated,
         StartupPromptDecision::PooledOnlyNotice
-        | StartupPromptDecision::PooledAccessPausedNotice => true,
+        | StartupPromptDecision::PooledAccessPausedNotice
+        | StartupPromptDecision::PooledDefaultSelectionNotice(_) => true,
         StartupPromptDecision::NoPrompt => false,
     }
 }
@@ -1803,7 +1804,7 @@ fn should_show_onboarding(
 fn should_show_login_screen(
     login_status: LoginStatus,
     config: &Config,
-    startup_prompt_decision: StartupPromptDecision,
+    startup_prompt_decision: &StartupPromptDecision,
 ) -> bool {
     // Only show the login screen for providers that actually require OpenAI auth
     // (OpenAI or equivalents). For OSS/other providers, skip login entirely.
@@ -2021,7 +2022,7 @@ mod tests {
         assert!(should_show_onboarding(
             LoginStatus::NotAuthenticated,
             /*show_trust_screen*/ false,
-            StartupPromptDecision::PooledOnlyNotice,
+            &StartupPromptDecision::PooledOnlyNotice,
         ));
         assert!(config.model_provider.requires_openai_auth);
         Ok(())
@@ -2035,7 +2036,28 @@ mod tests {
         assert!(should_show_onboarding(
             LoginStatus::NotAuthenticated,
             /*show_trust_screen*/ false,
-            StartupPromptDecision::PooledAccessPausedNotice,
+            &StartupPromptDecision::PooledAccessPausedNotice,
+        ));
+        assert!(config.model_provider.requires_openai_auth);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_default_notice_triggers_onboarding() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+
+        assert!(should_show_onboarding(
+            LoginStatus::NotAuthenticated,
+            /*show_trust_screen*/ false,
+            &StartupPromptDecision::PooledDefaultSelectionNotice(
+                crate::startup_access::StartupNoticeData {
+                    issue_kind:
+                        crate::startup_access::StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+                    issue_source: crate::startup_access::StartupNoticeIssueSource::None,
+                    candidate_pool_ids: vec!["team-main".to_string()],
+                },
+            ),
         ));
         assert!(config.model_provider.requires_openai_auth);
         Ok(())
@@ -2049,7 +2071,7 @@ mod tests {
         assert!(!should_show_onboarding(
             LoginStatus::NotAuthenticated,
             /*show_trust_screen*/ false,
-            StartupPromptDecision::NoPrompt,
+            &StartupPromptDecision::NoPrompt,
         ));
         assert!(config.model_provider.requires_openai_auth);
         Ok(())
@@ -2063,7 +2085,7 @@ mod tests {
         assert!(should_show_onboarding(
             LoginStatus::NotAuthenticated,
             /*show_trust_screen*/ false,
-            StartupPromptDecision::NeedsLogin,
+            &StartupPromptDecision::NeedsLogin,
         ));
         assert!(config.model_provider.requires_openai_auth);
         Ok(())
@@ -2077,17 +2099,29 @@ mod tests {
         assert!(!should_show_login_screen(
             LoginStatus::NotAuthenticated,
             &config,
-            StartupPromptDecision::PooledOnlyNotice,
+            &StartupPromptDecision::PooledOnlyNotice,
         ));
         assert!(!should_show_login_screen(
             LoginStatus::NotAuthenticated,
             &config,
-            StartupPromptDecision::PooledAccessPausedNotice,
+            &StartupPromptDecision::PooledAccessPausedNotice,
+        ));
+        assert!(!should_show_login_screen(
+            LoginStatus::NotAuthenticated,
+            &config,
+            &StartupPromptDecision::PooledDefaultSelectionNotice(
+                crate::startup_access::StartupNoticeData {
+                    issue_kind:
+                        crate::startup_access::StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+                    issue_source: crate::startup_access::StartupNoticeIssueSource::None,
+                    candidate_pool_ids: vec!["team-main".to_string()],
+                },
+            ),
         ));
         assert!(should_show_login_screen(
             LoginStatus::NotAuthenticated,
             &config,
-            StartupPromptDecision::NeedsLogin,
+            &StartupPromptDecision::NeedsLogin,
         ));
         Ok(())
     }

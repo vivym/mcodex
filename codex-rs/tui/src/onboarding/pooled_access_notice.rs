@@ -20,11 +20,16 @@ use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt as _;
+use crate::startup_access::StartupNoticeIssueSource;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PooledAccessNoticeKind {
     PooledOnly,
     PooledPaused,
+    DefaultPoolRequired {
+        issue_source: StartupNoticeIssueSource,
+        candidate_pool_ids: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +63,32 @@ impl PooledAccessNoticeWidget {
         }
     }
 
+    pub(crate) fn default_pool_required(
+        candidate_pool_ids: Vec<String>,
+        animations_enabled: bool,
+    ) -> Self {
+        Self::default_pool_required_with_source(
+            candidate_pool_ids,
+            StartupNoticeIssueSource::None,
+            animations_enabled,
+        )
+    }
+
+    pub(crate) fn default_pool_required_with_source(
+        candidate_pool_ids: Vec<String>,
+        issue_source: StartupNoticeIssueSource,
+        _animations_enabled: bool,
+    ) -> Self {
+        Self {
+            kind: PooledAccessNoticeKind::DefaultPoolRequired {
+                issue_source,
+                candidate_pool_ids,
+            },
+            outcome: None,
+            error: None,
+        }
+    }
+
     pub(crate) fn outcome(&self) -> Option<PooledAccessNoticeOutcome> {
         self.outcome
     }
@@ -70,16 +101,55 @@ impl PooledAccessNoticeWidget {
         match self.kind {
             PooledAccessNoticeKind::PooledOnly => "Pooled access is available",
             PooledAccessNoticeKind::PooledPaused => "Pooled access is paused",
+            PooledAccessNoticeKind::DefaultPoolRequired { .. } => "Choose a default account pool",
         }
     }
 
-    fn body(&self) -> &'static str {
-        match self.kind {
+    fn body(&self) -> Vec<String> {
+        match &self.kind {
             PooledAccessNoticeKind::PooledOnly => {
-                "You can continue with pooled access or hand off to login."
+                vec!["You can continue with pooled access or hand off to login.".to_string()]
             }
-            PooledAccessNoticeKind::PooledPaused => {
+            PooledAccessNoticeKind::PooledPaused => vec![
                 "Pooled access is paused for this startup. Resume it or hand off to login."
+                    .to_string(),
+            ],
+            PooledAccessNoticeKind::DefaultPoolRequired {
+                issue_source,
+                candidate_pool_ids,
+            } => {
+                let mut paragraphs = vec![match issue_source {
+                    StartupNoticeIssueSource::None => {
+                        "Startup found multiple visible account pools and needs a default before pooled access can continue.".to_string()
+                    }
+                    StartupNoticeIssueSource::PersistedSelection => {
+                        "The saved default account pool is no longer available for startup.".to_string()
+                    }
+                    StartupNoticeIssueSource::ConfigDefault => {
+                        "The configured default account pool is not available for startup.".to_string()
+                    }
+                    StartupNoticeIssueSource::Override => {
+                        "The process-local account pool override is not available for startup.".to_string()
+                    }
+                }];
+                if !candidate_pool_ids.is_empty() {
+                    paragraphs.push(format!("Visible pools: {}", candidate_pool_ids.join(", ")));
+                }
+                paragraphs.push(match issue_source {
+                    StartupNoticeIssueSource::None => {
+                        "Run `mcodex accounts pool default set <POOL_ID>` to choose one of the visible pools.".to_string()
+                    }
+                    StartupNoticeIssueSource::PersistedSelection => {
+                        "Run `mcodex accounts pool default set <POOL_ID>` to choose another pool, or `mcodex accounts pool default clear` to remove the saved default.".to_string()
+                    }
+                    StartupNoticeIssueSource::ConfigDefault => {
+                        "Fix or remove `accounts.default_pool`, then restart startup or hand off to login.".to_string()
+                    }
+                    StartupNoticeIssueSource::Override => {
+                        "Correct the process-local override, then restart startup or hand off to login.".to_string()
+                    }
+                });
+                paragraphs
             }
         }
     }
@@ -102,6 +172,13 @@ impl PooledAccessNoticeWidget {
                 key_hint::plain(KeyCode::Char('l')).into(),
                 " to log in".dim(),
             ]),
+            PooledAccessNoticeKind::DefaultPoolRequired { .. } => Line::from(vec![
+                "Press ".dim(),
+                key_hint::plain(KeyCode::Enter).into(),
+                " or ".dim(),
+                key_hint::plain(KeyCode::Char('l')).into(),
+                " to log in".dim(),
+            ]),
         }
     }
 }
@@ -118,6 +195,9 @@ impl KeyboardHandler for PooledAccessNoticeWidget {
                     PooledAccessNoticeKind::PooledOnly => PooledAccessNoticeOutcome::Continue,
                     PooledAccessNoticeKind::PooledPaused => {
                         PooledAccessNoticeOutcome::ResumeAndContinue
+                    }
+                    PooledAccessNoticeKind::DefaultPoolRequired { .. } => {
+                        PooledAccessNoticeOutcome::OpenLogin
                     }
                 });
             }
@@ -148,14 +228,16 @@ impl WidgetRef for &PooledAccessNoticeWidget {
         let mut column = ColumnRenderable::new();
         column.push(Line::from(vec!["  ".into(), self.title().bold()]));
         column.push("");
-        column.push(
-            Paragraph::new(self.body().to_string())
-                .wrap(Wrap { trim: true })
-                .inset(Insets::tlbr(
-                    /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
-                )),
-        );
-        column.push("");
+        for paragraph in self.body() {
+            column.push(
+                Paragraph::new(paragraph)
+                    .wrap(Wrap { trim: true })
+                    .inset(Insets::tlbr(
+                        /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
+                    )),
+            );
+            column.push("");
+        }
         column.push(self.footer().inset(Insets::tlbr(
             /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
         )));
@@ -261,6 +343,15 @@ mod tests {
     fn pooled_paused_notice_renders_snapshot() {
         let widget = PooledAccessNoticeWidget::pooled_paused(false);
         assert_snapshot!("pooled_paused_notice", render_to_string(&widget));
+    }
+
+    #[test]
+    fn pooled_default_selection_notice_renders_snapshot() {
+        let widget = PooledAccessNoticeWidget::default_pool_required(
+            vec!["team-main".to_string(), "team-other".to_string()],
+            /*animations_enabled*/ false,
+        );
+        assert_snapshot!("pooled_default_selection_notice", render_to_string(&widget));
     }
 
     #[test]
