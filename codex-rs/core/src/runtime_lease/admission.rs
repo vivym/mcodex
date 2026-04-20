@@ -157,6 +157,62 @@ impl LeaseSnapshot {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        generation: u64,
+        allow_context_reuse: bool,
+    ) -> Self {
+        use codex_login::CodexAuth;
+        use codex_login::auth::LeaseAuthBinding;
+        use codex_login::auth::LeasedTurnAuth;
+
+        struct TestLeaseScopedAuthSession {
+            binding: LeaseAuthBinding,
+        }
+
+        impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+            fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+                Ok(LeasedTurnAuth::new(
+                    CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                ))
+            }
+
+            fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+                self.leased_turn_auth()
+            }
+
+            fn binding(&self) -> &LeaseAuthBinding {
+                &self.binding
+            }
+
+            fn ensure_current(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        Self {
+            admission_id: Uuid::now_v7(),
+            pool_id: pool_id.to_string(),
+            account_id: account_id.to_string(),
+            selection_family: selection_family.to_string(),
+            generation,
+            boundary: RequestBoundaryKind::ResponsesHttp,
+            session_id: "session-for-test".to_string(),
+            collaboration_tree_id: CollaborationTreeId::for_test("tree-for-test"),
+            allow_context_reuse,
+            auth_handle: LeaseAuthHandle::new(Arc::new(TestLeaseScopedAuthSession {
+                binding: LeaseAuthBinding {
+                    account_id: account_id.to_string(),
+                    backend_account_handle: format!("handle-{account_id}"),
+                    lease_epoch: generation,
+                },
+            })),
+        }
+    }
 }
 
 #[allow(dead_code)]

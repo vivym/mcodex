@@ -77,6 +77,12 @@ pub(crate) struct SessionLeaseAuthProvider {
     shared_auth_provider: Arc<SharedAuthProvider>,
 }
 
+pub(crate) fn leased_turn_auth_as_auth(
+    lease_auth_session: &dyn LeaseScopedAuthSession,
+) -> anyhow::Result<CodexAuth> {
+    Ok(lease_auth_session.leased_turn_auth()?.auth().clone())
+}
+
 impl SessionLeaseAuthBridge {
     async fn auth_from_lease(&self) -> Option<CodexAuth> {
         if let Some(session) = self.lease_auth_session.as_ref() {

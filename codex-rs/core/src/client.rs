@@ -105,6 +105,14 @@ use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::lease_auth::SessionLeaseAuth;
+use crate::lease_auth::leased_turn_auth_as_auth;
+use crate::runtime_lease::CollaborationTreeBindingHandle;
+use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::LeaseSnapshot;
+use crate::runtime_lease::RemoteContextResetRecord;
+use crate::runtime_lease::RuntimeLeaseHost;
+use crate::runtime_lease::SessionLeaseView;
+use crate::runtime_lease::SessionLeaseViewDecision;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::CoreAuthProvider;
 use codex_api::map_api_error;
@@ -150,6 +158,11 @@ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
 struct ModelClientState {
     auth_manager: Option<Arc<AuthManager>>,
     lease_auth: Option<Arc<SessionLeaseAuth>>,
+    runtime_lease_host: Option<RuntimeLeaseHost>,
+    session_lease_view: Option<Arc<tokio::sync::Mutex<SessionLeaseView>>>,
+    session_id: String,
+    #[allow(dead_code)]
+    collaboration_tree_binding: Arc<CollaborationTreeBindingHandle>,
     conversation_id: ThreadId,
     remote_session_id: StdMutex<RemoteSessionId>,
     window_generation: AtomicU64,
@@ -284,6 +297,12 @@ impl WebsocketSession {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CachedWebsocketSessionSnapshot {
+    pub(crate) connection: Option<()>,
+}
+
 enum WebsocketStreamOutcome {
     Stream(ResponseStream),
     FallbackToHttp,
@@ -322,13 +341,13 @@ fn sideband_websocket_auth_headers(api_auth: &CoreAuthProvider) -> ApiHeaderMap 
 
 impl ModelClient {
     #[allow(clippy::too_many_arguments)]
-    /// Creates a new session-scoped `ModelClient`.
-    ///
-    /// All arguments are expected to be stable for the lifetime of a Codex session. Per-turn values
-    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
-    pub fn new(
+    fn new_with_session_context_internal(
         auth_manager: Option<Arc<AuthManager>>,
         lease_auth: Option<Arc<SessionLeaseAuth>>,
+        runtime_lease_host: Option<RuntimeLeaseHost>,
+        session_lease_view: Option<Arc<tokio::sync::Mutex<SessionLeaseView>>>,
+        session_id: String,
+        collaboration_tree_binding: Arc<CollaborationTreeBindingHandle>,
         conversation_id: ThreadId,
         installation_id: String,
         provider: ModelProviderInfo,
@@ -347,6 +366,10 @@ impl ModelClient {
             state: Arc::new(ModelClientState {
                 auth_manager,
                 lease_auth,
+                runtime_lease_host,
+                session_lease_view,
+                session_id,
+                collaboration_tree_binding,
                 conversation_id,
                 remote_session_id: StdMutex::new(RemoteSessionId::from_conversation_id(
                     conversation_id,
@@ -364,6 +387,79 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Creates a new session-scoped `ModelClient`.
+    ///
+    /// All arguments are expected to be stable for the lifetime of a Codex session. Per-turn values
+    /// are passed to [`ModelClientSession::stream`] (and other turn-scoped methods) explicitly.
+    pub fn new(
+        auth_manager: Option<Arc<AuthManager>>,
+        lease_auth: Option<Arc<SessionLeaseAuth>>,
+        conversation_id: ThreadId,
+        installation_id: String,
+        provider: ModelProviderInfo,
+        session_source: SessionSource,
+        model_verbosity: Option<VerbosityConfig>,
+        enable_request_compression: bool,
+        include_timing_metrics: bool,
+        beta_features_header: Option<String>,
+    ) -> Self {
+        let session_id = conversation_id.to_string();
+        Self::new_with_session_context_internal(
+            auth_manager,
+            lease_auth,
+            /*runtime_lease_host*/ None,
+            /*session_lease_view*/ None,
+            session_id.clone(),
+            Arc::new(CollaborationTreeBindingHandle::new(
+                CollaborationTreeId::root_for_session(&session_id),
+            )),
+            conversation_id,
+            installation_id,
+            provider,
+            session_source,
+            model_verbosity,
+            enable_request_compression,
+            include_timing_metrics,
+            beta_features_header,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_runtime_lease(
+        auth_manager: Option<Arc<AuthManager>>,
+        lease_auth: Option<Arc<SessionLeaseAuth>>,
+        runtime_lease_host: Option<RuntimeLeaseHost>,
+        session_lease_view: Option<Arc<tokio::sync::Mutex<SessionLeaseView>>>,
+        session_id: String,
+        collaboration_tree_binding: Arc<CollaborationTreeBindingHandle>,
+        conversation_id: ThreadId,
+        installation_id: String,
+        provider: ModelProviderInfo,
+        session_source: SessionSource,
+        model_verbosity: Option<VerbosityConfig>,
+        enable_request_compression: bool,
+        include_timing_metrics: bool,
+        beta_features_header: Option<String>,
+    ) -> Self {
+        Self::new_with_session_context_internal(
+            auth_manager,
+            lease_auth,
+            runtime_lease_host,
+            session_lease_view,
+            session_id,
+            collaboration_tree_binding,
+            conversation_id,
+            installation_id,
+            provider,
+            session_source,
+            model_verbosity,
+            enable_request_compression,
+            include_timing_metrics,
+            beta_features_header,
+        )
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -402,6 +498,10 @@ impl ModelClient {
         format!("{conversation_id}:{window_generation}")
     }
 
+    pub(crate) fn current_window_generation(&self) -> u64 {
+        self.state.window_generation.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn remote_session_id(&self) -> RemoteSessionId {
         self.state
             .remote_session_id
@@ -417,6 +517,77 @@ impl ModelClient {
             .remote_session_id
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = RemoteSessionId::new();
+    }
+
+    pub(crate) async fn apply_lease_snapshot_before_request(
+        &self,
+        snapshot: &LeaseSnapshot,
+        turn_id: Option<&str>,
+        request_id: &str,
+    ) -> Result<SessionLeaseViewDecision> {
+        if let Some(view) = self.state.session_lease_view.as_ref() {
+            let mut view = view.lock().await;
+            let decision = view.before_request(snapshot);
+            if decision == SessionLeaseViewDecision::ResetRemoteContext {
+                self.reset_remote_session_identity();
+                if let Some(host) = self.state.runtime_lease_host.as_ref() {
+                    host.record_remote_context_reset(RemoteContextResetRecord {
+                        session_id: self.state.session_id.clone(),
+                        turn_id: turn_id.map(ToString::to_string),
+                        request_id: request_id.to_string(),
+                        lease_generation: snapshot.generation(),
+                        transport_reset_generation: self.current_window_generation(),
+                    });
+                }
+            }
+            return Ok(decision);
+        }
+        Ok(SessionLeaseViewDecision::Continue)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply_test_lease_snapshot(
+        &self,
+        account_id: &str,
+        generation: u64,
+        turn_id: Option<&str>,
+        request_id: &str,
+    ) {
+        let snapshot = LeaseSnapshot::for_test(
+            "pool-main",
+            account_id,
+            "codex",
+            generation,
+            /*allow_context_reuse*/ false,
+        );
+        self.apply_lease_snapshot_before_request(&snapshot, turn_id, request_id)
+            .await
+            .expect("test lease snapshot should apply");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_websocket_session_for_test(&self) -> CachedWebsocketSessionSnapshot {
+        let websocket_session = self
+            .state
+            .cached_websocket_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        CachedWebsocketSessionSnapshot {
+            connection: websocket_session.connection.as_ref().map(|_| ()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_remote_context_reset_for_test(&self) -> Option<RemoteContextResetRecord> {
+        self.state
+            .runtime_lease_host
+            .as_ref()
+            .and_then(RuntimeLeaseHost::latest_remote_context_reset)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_id_for_test(&self) -> String {
+        self.state.session_id.clone()
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -722,11 +893,8 @@ impl ModelClient {
             && let Some(lease_auth_session) = lease_auth.current_session()
         {
             Some(
-                lease_auth_session
-                    .leased_turn_auth()
-                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?
-                    .auth()
-                    .clone(),
+                leased_turn_auth_as_auth(lease_auth_session.as_ref())
+                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?,
             )
         } else {
             match self.state.auth_manager.as_ref() {
@@ -879,14 +1047,30 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    #[allow(dead_code)]
+    pub(crate) async fn apply_lease_snapshot_before_request(
+        &mut self,
+        snapshot: &LeaseSnapshot,
+        turn_id: Option<&str>,
+        request_id: &str,
+    ) -> Result<()> {
+        let decision = self
+            .client
+            .apply_lease_snapshot_before_request(snapshot, turn_id, request_id)
+            .await?;
+        if decision == SessionLeaseViewDecision::ResetRemoteContext {
+            self.reset_websocket_session();
+            self.turn_state = Arc::new(OnceLock::new());
+            self.account_id_override = None;
+        }
+        Ok(())
+    }
+
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
         let mut client_setup = if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
             let auth = Some(
-                lease_auth_session
-                    .leased_turn_auth()
-                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?
-                    .auth()
-                    .clone(),
+                leased_turn_auth_as_auth(lease_auth_session.as_ref())
+                    .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?,
             );
             let api_provider = self
                 .client

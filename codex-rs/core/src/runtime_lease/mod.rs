@@ -7,6 +7,7 @@ mod admission;
 mod authority;
 mod collaboration_tree;
 mod host;
+mod session_view;
 
 #[cfg(test)]
 mod tests;
@@ -28,7 +29,10 @@ pub(crate) use admission::RequestBoundaryKind;
 #[allow(unused_imports)]
 pub(crate) use authority::RuntimeLeaseAuthority;
 #[allow(unused_imports)]
+pub(crate) use collaboration_tree::CollaborationTreeBindingHandle;
+#[allow(unused_imports)]
 pub(crate) use collaboration_tree::CollaborationTreeId;
+pub(crate) use host::RemoteContextResetRecord;
 pub(crate) use host::RuntimeLeaseHost;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use host::RuntimeLeaseHostId;
@@ -37,3 +41,7 @@ pub(crate) use host::RuntimeLeaseHostMode;
 #[allow(unused_imports)]
 pub(crate) use host::RuntimeLeaseStartupReservation;
 pub(crate) use host::retry_shutdown_release;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use session_view::SessionLeaseView;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use session_view::SessionLeaseViewDecision;

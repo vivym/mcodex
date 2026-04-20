@@ -8,6 +8,12 @@ use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::lease_auth::SessionLeaseAuth;
+use crate::runtime_lease::CollaborationTreeBindingHandle;
+use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::RemoteContextResetRecord;
+use crate::runtime_lease::RuntimeLeaseHost;
+use crate::runtime_lease::RuntimeLeaseHostId;
+use crate::runtime_lease::SessionLeaseView;
 use anyhow::bail;
 use codex_api::CoreAuthProvider;
 use codex_app_server_protocol::AuthMode;
@@ -44,6 +50,32 @@ fn test_model_client_with_lease_auth(
         /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
         provider,
         session_source,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    )
+}
+
+fn test_model_client_with_runtime_lease_view(_allow_context_reuse: bool) -> ModelClient {
+    let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    let conversation_id = ThreadId::new();
+    let session_id = conversation_id.to_string();
+    ModelClient::new_with_runtime_lease(
+        /*auth_manager*/ None,
+        /*lease_auth*/ None,
+        Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+            "runtime-lease-test".to_string(),
+        ))),
+        Some(Arc::new(tokio::sync::Mutex::new(SessionLeaseView::new()))),
+        session_id.clone(),
+        Arc::new(CollaborationTreeBindingHandle::new(
+            CollaborationTreeId::root_for_session(&session_id),
+        )),
+        conversation_id,
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
+        provider,
+        SessionSource::Cli,
         /*model_verbosity*/ None,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
@@ -228,6 +260,32 @@ async fn direct_request_setup_uses_leased_auth_snapshot_without_refresh() {
     );
     assert_eq!(lease_session.leased_calls.load(Ordering::SeqCst), 1);
     assert_eq!(lease_session.refresh_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn lease_view_reset_uses_existing_model_client_reset_boundary() {
+    let client = test_model_client_with_runtime_lease_view(/*allow_context_reuse*/ false);
+    let before = client.remote_session_id();
+
+    client
+        .apply_test_lease_snapshot("acct-a", 1, Some("turn-1"), "turn-1")
+        .await;
+    client
+        .apply_test_lease_snapshot("acct-b", 2, Some("turn-2"), "turn-2")
+        .await;
+
+    assert_ne!(client.remote_session_id(), before);
+    assert_eq!(client.cached_websocket_session_for_test().connection, None);
+    assert_eq!(
+        client.latest_remote_context_reset_for_test(),
+        Some(RemoteContextResetRecord {
+            session_id: client.session_id_for_test(),
+            turn_id: Some("turn-2".to_string()),
+            request_id: "turn-2".to_string(),
+            lease_generation: 2,
+            transport_reset_generation: client.current_window_generation(),
+        })
+    );
 }
 
 #[test]

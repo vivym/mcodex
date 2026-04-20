@@ -38,6 +38,15 @@ pub(crate) struct RuntimeLeaseAuthorityMarker;
 
 type LegacyManagerBridge = Option<Arc<Mutex<crate::state::AccountPoolManager>>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteContextResetRecord {
+    pub(crate) session_id: String,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) request_id: String,
+    pub(crate) lease_generation: u64,
+    pub(crate) transport_reset_generation: u64,
+}
+
 #[derive(Default)]
 struct RuntimeLeaseHostLifecycle {
     attached_sessions: HashSet<String>,
@@ -50,6 +59,7 @@ struct RuntimeLeaseHostInner {
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
     legacy_manager_bridge: StdMutex<LegacyManagerBridge>,
+    latest_remote_context_reset: StdMutex<Option<RemoteContextResetRecord>>,
     lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
 }
 
@@ -66,6 +76,13 @@ impl fmt::Debug for RuntimeLeaseHostInner {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .is_some(),
+            )
+            .field(
+                "latest_remote_context_reset",
+                &self
+                    .latest_remote_context_reset
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
             )
             .finish()
     }
@@ -181,6 +198,7 @@ impl RuntimeLeaseHost {
             mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
             legacy_manager_bridge: StdMutex::new(None),
+            latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
@@ -191,6 +209,7 @@ impl RuntimeLeaseHost {
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
             legacy_manager_bridge: StdMutex::new(None),
+            latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
@@ -233,6 +252,22 @@ impl RuntimeLeaseHost {
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
         lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).clone()
+    }
+
+    pub(crate) fn record_remote_context_reset(&self, record: RemoteContextResetRecord) {
+        *self
+            .0
+            .latest_remote_context_reset
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+    }
+
+    pub(crate) fn latest_remote_context_reset(&self) -> Option<RemoteContextResetRecord> {
+        self.0
+            .latest_remote_context_reset
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn ensure_legacy_manager_bridge_attached_for_child(&self) -> anyhow::Result<()> {

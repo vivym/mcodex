@@ -1,11 +1,14 @@
 use super::CollaborationTreeId;
 use super::LeaseAdmissionError;
 use super::LeaseRequestContext;
+use super::LeaseSnapshot;
 use super::RequestBoundaryKind;
 use super::RuntimeLeaseAuthority;
 use super::RuntimeLeaseHost;
 use super::RuntimeLeaseHostId;
 use super::RuntimeLeaseHostMode;
+use super::session_view::SessionLeaseView;
+use super::session_view::SessionLeaseViewDecision;
 use crate::SkillsManager;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
@@ -46,6 +49,45 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[test]
+fn session_view_resets_only_when_account_changes_and_pool_disallows_reuse() {
+    let mut view = SessionLeaseView::for_test();
+    let first = LeaseSnapshot::for_test(
+        "pool-main",
+        "acct-a",
+        "codex",
+        1,
+        /*allow_context_reuse*/ false,
+    );
+    let second = LeaseSnapshot::for_test(
+        "pool-main",
+        "acct-a",
+        "codex",
+        1,
+        /*allow_context_reuse*/ false,
+    );
+    let third = LeaseSnapshot::for_test(
+        "pool-main",
+        "acct-b",
+        "codex",
+        2,
+        /*allow_context_reuse*/ false,
+    );
+
+    assert_eq!(
+        view.before_request_for_test(&first),
+        SessionLeaseViewDecision::Continue
+    );
+    assert_eq!(
+        view.before_request_for_test(&second),
+        SessionLeaseViewDecision::Continue
+    );
+    assert_eq!(
+        view.before_request_for_test(&third),
+        SessionLeaseViewDecision::ResetRemoteContext
+    );
+}
 
 #[test]
 fn pooled_host_id_is_stable_for_one_runtime() {

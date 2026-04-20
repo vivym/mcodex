@@ -2112,6 +2112,11 @@ impl Session {
             )
             .await?
         };
+        let session_id = conversation_id.to_string();
+        let root_collaboration_tree_binding =
+            Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
+                crate::runtime_lease::CollaborationTreeId::root_for_session(&session_id),
+            ));
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(
                 lease_auth_provider,
@@ -2158,12 +2163,18 @@ impl Session {
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             account_pool_manager,
-            runtime_lease_host,
+            runtime_lease_host: runtime_lease_host.clone(),
             lease_auth: Arc::clone(&lease_auth),
             lease_continuity: Mutex::new(crate::state::SessionLeaseContinuity::default()),
-            model_client: ModelClient::new(
+            model_client: ModelClient::new_with_runtime_lease(
                 Some(Arc::clone(&auth_manager)),
                 Some(lease_auth),
+                runtime_lease_host,
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runtime_lease::SessionLeaseView::new(),
+                ))),
+                session_id,
+                root_collaboration_tree_binding,
                 conversation_id,
                 installation_id,
                 session_configuration.provider.clone(),
