@@ -68,6 +68,7 @@ const VERSION_FILENAME: &str = "version.json";
 #[serde(rename_all = "camelCase")]
 struct LatestManifest {
     version: String,
+    #[serde(default)]
     notes_url: String,
 }
 
@@ -96,7 +97,7 @@ async fn check_for_update(version_file: &Path) -> anyhow::Result<()> {
     let prev_info = read_version_info(version_file).ok();
     let info = VersionInfo {
         latest_version,
-        latest_notes_url: Some(notes_url),
+        latest_notes_url: normalize_notes_url(Some(notes_url)),
         last_checked_at: Utc::now(),
         dismissed_version: prev_info.and_then(|p| p.dismissed_version),
     };
@@ -166,11 +167,18 @@ fn cached_update_info(info: VersionInfo) -> Option<CachedUpdateInfo> {
     if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
         Some(CachedUpdateInfo {
             latest_version: info.latest_version,
-            latest_notes_url: info.latest_notes_url,
+            latest_notes_url: normalize_notes_url(info.latest_notes_url),
         })
     } else {
         None
     }
+}
+
+fn normalize_notes_url(notes_url: Option<String>) -> Option<String> {
+    notes_url.and_then(|notes_url| {
+        let notes_url = notes_url.trim();
+        (!notes_url.is_empty()).then(|| notes_url.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -194,6 +202,62 @@ mod tests {
                 version: "1.5.0".to_string(),
                 notes_url: "https://example.com/releases/1.5.0".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn latest_manifest_allows_missing_notes_url() {
+        let manifest: LatestManifest = serde_json::from_str(
+            r#"{
+                "version": "1.5.0"
+            }"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest,
+            LatestManifest {
+                version: "1.5.0".to_string(),
+                notes_url: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn old_cache_without_notes_url_still_deserializes_and_surfaces_update() {
+        let info: VersionInfo = serde_json::from_str(&format!(
+            r#"{{
+                    "latest_version": "999.999.999",
+                    "last_checked_at": "{}"
+                }}"#,
+            Utc::now().to_rfc3339()
+        ))
+        .expect("old cache payload should parse");
+
+        assert_eq!(
+            cached_update_info(info),
+            Some(CachedUpdateInfo {
+                latest_version: "999.999.999".to_string(),
+                latest_notes_url: None,
+            })
+        );
+    }
+
+    #[test]
+    fn blank_notes_url_is_normalized_to_none_in_cached_handoff() {
+        let info = VersionInfo {
+            latest_version: "999.999.999".to_string(),
+            latest_notes_url: Some("   ".to_string()),
+            last_checked_at: Utc::now(),
+            dismissed_version: None,
+        };
+
+        assert_eq!(
+            cached_update_info(info),
+            Some(CachedUpdateInfo {
+                latest_version: "999.999.999".to_string(),
+                latest_notes_url: None,
+            })
         );
     }
 
