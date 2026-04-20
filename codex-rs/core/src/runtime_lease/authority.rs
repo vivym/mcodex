@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::state::BridgedTurnPreview;
+
 use super::admission::LeaseAdmission;
 use super::admission::LeaseAdmissionError;
 use super::admission::LeaseAdmissionGuard;
@@ -59,6 +61,11 @@ struct HostOwnedLeaseState {
 
 enum AdmissionAttempt {
     Admitted(LeaseAdmission),
+    Draining,
+}
+
+enum AdmissionPreview {
+    Compatible,
     Draining,
 }
 
@@ -243,6 +250,25 @@ impl RuntimeLeaseAuthority {
         if context.cancel.is_cancelled() {
             return Err(LeaseAdmissionError::Cancelled);
         }
+        let preview = manager
+            .preview_next_bridged_turn()
+            .await
+            .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
+            .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
+        if context.cancel.is_cancelled() {
+            return Err(LeaseAdmissionError::Cancelled);
+        }
+        let previewed_generation = match &preview {
+            BridgedTurnPreview::ReuseCurrent(preview) | BridgedTurnPreview::Rotate(preview) => {
+                preview.generation
+            }
+        };
+        if matches!(
+            self.inner.preview_admission(previewed_generation),
+            AdmissionPreview::Draining
+        ) {
+            return Err(LeaseAdmissionError::UnsupportedPooledPath);
+        }
         let selection = manager
             .prepare_turn()
             .await
@@ -317,25 +343,39 @@ impl RuntimeLeaseAuthority {
 }
 
 impl AuthorityInner {
+    fn preview_admission(&self, generation: u64) -> AdmissionPreview {
+        let admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match admissions.active_generation {
+            Some(active_generation) if active_generation != generation => {
+                AdmissionPreview::Draining
+            }
+            Some(_) | None => AdmissionPreview::Compatible,
+        }
+    }
+
     fn try_admit(
         self: &Arc<Self>,
         context: &LeaseRequestContext,
         generation: &GenerationState,
     ) -> AdmissionAttempt {
+        if matches!(
+            self.preview_admission(generation.generation),
+            AdmissionPreview::Draining
+        ) {
+            return AdmissionAttempt::Draining;
+        }
+
         let admission_id = Uuid::new_v4();
         {
             let mut admissions = self
                 .admissions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match admissions.active_generation {
-                Some(active_generation) if active_generation != generation.generation => {
-                    return AdmissionAttempt::Draining;
-                }
-                Some(_) => {}
-                None => {
-                    admissions.active_generation = Some(generation.generation);
-                }
+            if admissions.active_generation.is_none() {
+                admissions.active_generation = Some(generation.generation);
             }
             admissions.admissions.insert(admission_id);
         }

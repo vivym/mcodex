@@ -258,6 +258,115 @@ async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_adm
 }
 
 #[tokio::test]
+async fn legacy_bridge_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-preserve-a", "acct-preserve-b"] {
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some("acct-preserve-a".to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-preserve-first-snapshot".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    let first_snapshot = first.snapshot.clone();
+
+    {
+        let mut manager = manager.lock().await;
+        manager.report_unauthorized().await?;
+    }
+
+    let err = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await
+        .expect_err(
+            "rotated replacement lease must not mutate the active bridged generation while the prior admission is active",
+        );
+    assert_eq!(err, LeaseAdmissionError::UnsupportedPooledPath);
+
+    let active_holder_lease = state_db
+        .read_active_holder_lease("holder-preserve-first-snapshot")
+        .await?
+        .expect("the first bridged lease should remain active until its admission guard drops");
+    assert_eq!(active_holder_lease.account_id, "acct-preserve-a");
+
+    let leased_auth = first_snapshot
+        .auth_handle
+        .auth_session()
+        .leased_turn_auth()?;
+    assert_eq!(
+        leased_auth.auth().get_account_id().as_deref(),
+        Some("acct-preserve-a")
+    );
+
+    authority
+        .report_rate_limits(
+            &first_snapshot,
+            &RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("Codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 99.0,
+                    window_minutes: Some(60),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            },
+        )
+        .await?;
+
+    drop(first.guard);
+
+    let second = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(second.snapshot.account_id(), "acct-preserve-b");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_bridge_rejects_stale_reporting_after_rotation() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =

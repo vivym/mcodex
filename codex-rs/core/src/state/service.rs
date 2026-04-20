@@ -593,6 +593,19 @@ pub(crate) struct TurnAccountSelection {
     pub(crate) auth_session: Arc<dyn LeaseScopedAuthSession>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BridgedTurnPreview {
+    ReuseCurrent(BridgedTurnSelectionPreview),
+    Rotate(BridgedTurnSelectionPreview),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BridgedTurnSelectionPreview {
+    pub(crate) pool_id: String,
+    pub(crate) account_id: Option<String>,
+    pub(crate) generation: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct SessionLeaseContinuity {
     previous_turn_account_id: Option<String>,
@@ -661,6 +674,103 @@ impl AccountPoolManager {
             active_lease_generation: 0,
             active_lease_identity: None,
         }
+    }
+
+    pub(crate) async fn preview_next_bridged_turn(
+        &self,
+    ) -> anyhow::Result<Option<BridgedTurnPreview>> {
+        if self.pending_rotation.is_none()
+            && let Some(active_lease) = self.active_lease.as_ref()
+        {
+            let current_holder_lease = self
+                .state_db
+                .read_active_holder_lease(&self.holder_instance_id)
+                .await?;
+            if let Some(current_holder_lease) = current_holder_lease {
+                let current_identity = ActiveLeaseIdentity::from_record(&current_holder_lease);
+                let cached_identity = ActiveLeaseIdentity::from_record(&active_lease.record);
+                if current_identity == cached_identity {
+                    let preview = BridgedTurnSelectionPreview {
+                        pool_id: current_holder_lease.pool_id,
+                        account_id: Some(current_holder_lease.account_id),
+                        generation: if self.active_lease_identity.as_ref()
+                            == Some(&current_identity)
+                        {
+                            self.active_lease_generation
+                        } else {
+                            self.active_lease_generation.saturating_add(1)
+                        },
+                    };
+                    return Ok(Some(
+                        if self.active_lease_identity.as_ref() == Some(&current_identity) {
+                            BridgedTurnPreview::ReuseCurrent(preview)
+                        } else {
+                            BridgedTurnPreview::Rotate(preview)
+                        },
+                    ));
+                }
+            }
+        }
+
+        let startup_preview = self
+            .state_db
+            .preview_account_startup_selection(self.default_pool_id.as_deref())
+            .await?;
+        let Some(pool_id) = startup_preview.effective_pool_id.clone() else {
+            return Ok(None);
+        };
+        let account_id = match self.pending_rotation {
+            Some(_)
+                if matches!(
+                    startup_preview.eligibility,
+                    AccountStartupEligibility::Suppressed
+                ) =>
+            {
+                return Ok(None);
+            }
+            Some(_) => startup_preview.predicted_account_id.clone(),
+            None => match (
+                startup_preview.predicted_account_id.as_deref(),
+                &startup_preview.eligibility,
+            ) {
+                (Some(account_id), AccountStartupEligibility::PreferredAccountSelected)
+                | (Some(account_id), AccountStartupEligibility::AutomaticAccountSelected) => {
+                    Some(account_id.to_string())
+                }
+                (
+                    None,
+                    AccountStartupEligibility::Suppressed
+                    | AccountStartupEligibility::MissingPool
+                    | AccountStartupEligibility::PreferredAccountMissing
+                    | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
+                    | AccountStartupEligibility::PreferredAccountDisabled
+                    | AccountStartupEligibility::PreferredAccountUnhealthy
+                    | AccountStartupEligibility::PreferredAccountBusy
+                    | AccountStartupEligibility::NoEligibleAccount,
+                ) => {
+                    return Ok(None);
+                }
+                (Some(account_id), eligibility) => {
+                    return Err(anyhow::anyhow!(
+                        "unexpected startup-selection preview {eligibility:?} for predicted account {account_id}"
+                    ));
+                }
+                (None, AccountStartupEligibility::PreferredAccountSelected)
+                | (None, AccountStartupEligibility::AutomaticAccountSelected) => {
+                    return Err(anyhow::anyhow!(
+                        "startup-selection preview did not include a predicted account"
+                    ));
+                }
+            },
+        };
+
+        Ok(Some(BridgedTurnPreview::Rotate(
+            BridgedTurnSelectionPreview {
+                pool_id,
+                account_id,
+                generation: self.active_lease_generation.saturating_add(1),
+            },
+        )))
     }
 
     pub(crate) async fn prepare_turn(&mut self) -> anyhow::Result<Option<TurnAccountSelection>> {
