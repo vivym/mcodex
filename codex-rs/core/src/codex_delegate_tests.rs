@@ -203,6 +203,12 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
     let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
         crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
     );
+    attach_legacy_bridge_for_delegate_test(
+        &runtime_lease_host,
+        pooled_config.as_ref(),
+        "holder-delegate-runtime-a",
+    )
+    .await?;
     parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
     parent_ctx.config = Arc::clone(&pooled_config);
 
@@ -242,6 +248,12 @@ async fn run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_ho
     let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
         crate::runtime_lease::RuntimeLeaseHostId::new("runtime-b".to_string()),
     );
+    attach_legacy_bridge_for_delegate_test(
+        &runtime_lease_host,
+        pooled_config.as_ref(),
+        "holder-delegate-runtime-b",
+    )
+    .await?;
     parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
     parent_ctx.config = Arc::clone(&pooled_config);
 
@@ -396,6 +408,26 @@ async fn build_test_config_with_pool(codex_home: &Path) -> Config {
         pools: Some(pools),
     });
     config
+}
+
+async fn attach_legacy_bridge_for_delegate_test(
+    runtime_lease_host: &crate::runtime_lease::RuntimeLeaseHost,
+    config: &Config,
+    holder_instance_id: &str,
+) -> anyhow::Result<()> {
+    let state_db =
+        codex_state::StateRuntime::init(config.codex_home.to_path_buf(), "mock_provider".into())
+            .await?;
+    let manager = crate::state::SessionServices::build_account_pool_manager(
+        Some(state_db),
+        config.accounts.clone(),
+        config.codex_home.to_path_buf(),
+        holder_instance_id.to_string(),
+    )
+    .await?
+    .expect("delegate test bridge manager should build");
+    runtime_lease_host.attach_legacy_manager_bridge(manager)?;
+    Ok(())
 }
 
 #[tokio::test]

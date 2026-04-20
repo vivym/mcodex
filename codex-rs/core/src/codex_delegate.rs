@@ -81,11 +81,16 @@ pub(crate) async fn run_codex_thread_interactive(
     let mut runtime_lease_startup_reservation =
         if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
             Some(
-                host.reserve_startup(format!(
+                host.try_reserve_startup_for_child(format!(
                     "delegate-subagent-startup-{}",
                     uuid::Uuid::now_v7()
                 ))
-                .await,
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to reserve runtime lease startup for delegate child: {err:#}"
+                    ))
+                })?,
             )
         } else {
             None

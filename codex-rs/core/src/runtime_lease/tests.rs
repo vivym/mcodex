@@ -409,8 +409,8 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
     runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
-        .reserve_startup("session-child-startup")
-        .await;
+        .try_reserve_startup_for_child("session-child-startup")
+        .await?;
 
     runtime_lease_host.detach_session("session-parent").await?;
 
@@ -451,8 +451,8 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
         .attach_session("session-parent-rollback")
         .await;
     let child_startup = runtime_lease_host
-        .reserve_startup("session-child-rollback")
-        .await;
+        .try_reserve_startup_for_child("session-child-rollback")
+        .await?;
 
     runtime_lease_host
         .detach_session("session-parent-rollback")
@@ -475,6 +475,53 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
         !runtime_lease_host.has_legacy_manager_bridge_for_test(),
         "rollback of the last pending startup should release the bridge"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears_bridge()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-stale-child-startup".to_string(),
+    ));
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-stale-child-startup".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.attach_session("session-parent").await;
+    runtime_lease_host.detach_session("session-parent").await?;
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "parent final detach should clear the bridge before child startup reservation"
+    );
+
+    let err = runtime_lease_host
+        .try_reserve_startup_for_child("session-child-after-parent-detach")
+        .await
+        .expect_err("stale pooled host must reject child startup reservation");
+
+    assert!(
+        err.to_string()
+            .contains("legacy manager bridge is not attached"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
 
     Ok(())
 }
@@ -539,8 +586,8 @@ async fn startup_rollback_retries_transient_final_release_failure_before_clearin
     ));
     runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
     let child_startup = runtime_lease_host
-        .reserve_startup("session-child-rollback-retry")
-        .await;
+        .try_reserve_startup_for_child("session-child-rollback-retry")
+        .await?;
 
     let release_blocker = lease_epoch_marker.clone();
     let unblock_release = tokio::spawn(async move {
@@ -589,8 +636,8 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_re
     runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
-        .reserve_startup("session-child-dropped-startup")
-        .await;
+        .try_reserve_startup_for_child("session-child-dropped-startup")
+        .await?;
 
     runtime_lease_host.detach_session("session-parent").await?;
     assert_eq!(
@@ -918,6 +965,82 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
 
     child.shutdown_and_wait().await?;
     root.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_bridge() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let config = build_test_config_with_pool(codex_home.path()).await;
+    let config_codex_home = config.codex_home.clone();
+    let auth_manager =
+        codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager.clone(),
+        /*model_catalog*/ None,
+        CollaborationModesConfig::default(),
+    ));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config_codex_home,
+        /*bundled_skills_enabled*/ true,
+    ));
+    let skills_watcher = Arc::new(SkillsWatcher::noop());
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-unbridged-child".to_string(),
+    ));
+
+    let spawn_result = Codex::spawn(CodexSpawnArgs {
+        config,
+        auth_manager,
+        models_manager,
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        skills_watcher,
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::default(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: None,
+        }),
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
+        inherited_lease_auth_session: None,
+        runtime_lease_host: Some(runtime_lease_host.clone()),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await;
+    let err = match spawn_result {
+        Ok(spawned) => {
+            spawned.codex.shutdown_and_wait().await?;
+            panic!("unbridged inherited pooled runtime host should fail child spawn");
+        }
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("inherited pooled runtime host is not usable for child session"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
+
     Ok(())
 }
 

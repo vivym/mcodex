@@ -235,6 +235,16 @@ impl RuntimeLeaseHost {
         lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).clone()
     }
 
+    pub(crate) fn ensure_legacy_manager_bridge_attached_for_child(&self) -> anyhow::Result<()> {
+        if self.is_pooled() && !self.has_legacy_manager_bridge() {
+            anyhow::bail!(
+                "runtime lease host {} legacy manager bridge is not attached for child startup",
+                self.id()
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn attach_session(&self, session_id: &str) {
         if !self.is_pooled() {
             return;
@@ -243,19 +253,20 @@ impl RuntimeLeaseHost {
         lifecycle.attached_sessions.insert(session_id.to_string());
     }
 
-    pub(crate) async fn reserve_startup(
+    pub(crate) async fn try_reserve_startup_for_child(
         &self,
         reservation_id: impl Into<String>,
-    ) -> RuntimeLeaseStartupReservation {
+    ) -> anyhow::Result<RuntimeLeaseStartupReservation> {
         let reservation_id = reservation_id.into();
         if self.is_pooled() {
             let mut lifecycle = self.0.lifecycle.lock().await;
+            self.ensure_legacy_manager_bridge_attached_for_child()?;
             lifecycle.pending_startups.insert(reservation_id.clone());
         }
-        RuntimeLeaseStartupReservation {
+        Ok(RuntimeLeaseStartupReservation {
             host: self.clone(),
             reservation_id: Some(reservation_id),
-        }
+        })
     }
 
     async fn promote_startup_reservation_to_session(

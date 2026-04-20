@@ -2088,6 +2088,14 @@ impl Session {
             !(inherited_pooled_runtime_host && inherited_lease_auth_session.is_some()),
             "inherited pooled runtime host must not be combined with static inherited lease auth"
         );
+        if inherited_pooled_runtime_host && let Some(host) = runtime_lease_host.as_ref() {
+            host.ensure_legacy_manager_bridge_attached_for_child()
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "inherited pooled runtime host is not usable for child session: {err:#}"
+                    ))
+                })?;
+        }
         // Static lease inheritance remains as compatibility for children that do
         // not receive a pooled runtime host.
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
