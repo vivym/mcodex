@@ -480,6 +480,164 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
 }
 
 #[tokio::test]
+async fn startup_rollback_retries_transient_final_release_failure_before_clearing_bridge()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let config = build_test_config_with_pool(codex_home.path()).await;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let account_id = "acct-startup-rollback-retry";
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        config.accounts.clone(),
+        codex_home.path().to_path_buf(),
+        "holder-startup-rollback-retry".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    {
+        let mut manager = manager.lock().await;
+        let selection = manager
+            .prepare_turn()
+            .await?
+            .expect("test manager should acquire a lease before shutdown");
+        assert_eq!(selection.account_id, account_id);
+    }
+
+    let lease_epoch_marker = pooled_auth_home(codex_home.path(), account_id).join("lease_epoch");
+    std::fs::remove_file(&lease_epoch_marker)?;
+    std::fs::create_dir(&lease_epoch_marker)?;
+
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-startup-rollback-retry".to_string(),
+    ));
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    let child_startup = runtime_lease_host
+        .reserve_startup("session-child-rollback-retry")
+        .await;
+
+    let release_blocker = lease_epoch_marker.clone();
+    let unblock_release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::remove_dir(&release_blocker)
+    });
+
+    child_startup.rollback().await?;
+    unblock_release.await??;
+
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "startup rollback should retry transient shutdown release and clear the bridge"
+    );
+    assert!(
+        state_db
+            .read_active_holder_lease("holder-startup-rollback-retry")
+            .await?
+            .is_none(),
+        "startup rollback retry should release the active holder lease"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_reuse()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-dropped-startup".to_string(),
+    ));
+    let first_manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-dropped-startup-old".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager))?;
+    runtime_lease_host.attach_session("session-parent").await;
+    let child_startup = runtime_lease_host
+        .reserve_startup("session-child-dropped-startup")
+        .await;
+
+    runtime_lease_host.detach_session("session-parent").await?;
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
+    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+
+    drop(child_startup);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if runtime_lease_host.pending_startup_count_for_test().await == 0
+                && !runtime_lease_host.has_legacy_manager_bridge_for_test()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropped startup reservation should schedule cleanup");
+
+    let second_manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-dropped-startup-new".to_string(),
+    )
+    .await?
+    .expect("replacement manager should build");
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&second_manager))?;
+    runtime_lease_host.attach_session("session-reused").await;
+
+    assert!(Arc::ptr_eq(
+        &runtime_lease_host
+            .legacy_manager_bridge_for_test()
+            .expect("cleanup should allow a fresh bridge to attach"),
+        &second_manager,
+    ));
+
+    runtime_lease_host.detach_session("session-reused").await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn bridged_sessions_keep_remote_context_continuity_independent() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
