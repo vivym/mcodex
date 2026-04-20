@@ -126,13 +126,21 @@ impl SessionServices {
         if let Some(runtime_lease_host) = self.runtime_lease_host.as_ref()
             && runtime_lease_host.is_pooled()
         {
-            runtime_lease_host.detach_session(session_id).await?;
+            runtime_lease_host
+                .detach_session_with_retry(session_id)
+                .await?;
             self.lease_auth.clear();
             return Ok(());
         }
         if let Some(account_pool_manager) = self.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.release_for_shutdown().await?;
+            crate::runtime_lease::retry_shutdown_release(
+                &format!("session {session_id} local account-pool manager"),
+                || async {
+                    let mut account_pool_manager = account_pool_manager.lock().await;
+                    account_pool_manager.release_for_shutdown().await
+                },
+            )
+            .await?;
             self.lease_auth.clear();
         }
         Ok(())

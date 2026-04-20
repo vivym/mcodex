@@ -46,6 +46,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
 use crate::turn_metadata::TurnMetadataState;
 use crate::util::error_or_panic;
+use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
@@ -2309,6 +2310,18 @@ impl Session {
                 ));
             }
         }
+        if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
+            && let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
+        {
+            runtime_lease_host
+                .attach_legacy_manager_bridge(Arc::clone(account_pool_manager))
+                .with_context(|| {
+                    format!(
+                        "failed to attach runtime lease bridge for session {}",
+                        sess.conversation_id
+                    )
+                })?;
+        }
         if !sess.services.pooled_runtime_active() {
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
@@ -2333,11 +2346,6 @@ impl Session {
             Arc::clone(&config),
             &session_configuration.session_source,
         );
-        if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
-            && let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
-        {
-            runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(account_pool_manager));
-        }
         sess.services
             .attach_runtime_lease_session(&sess.conversation_id.to_string())
             .await;

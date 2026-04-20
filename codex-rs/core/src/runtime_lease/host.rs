@@ -1,11 +1,16 @@
+use anyhow::Context;
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::MutexGuard as StdMutexGuard;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
+
+const SHUTDOWN_RELEASE_MAX_ATTEMPTS: u64 = 3;
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeLeaseHostId {
@@ -31,6 +36,8 @@ pub(crate) enum RuntimeLeaseHostMode {
 #[derive(Debug)]
 pub(crate) struct RuntimeLeaseAuthorityMarker;
 
+type LegacyManagerBridge = Option<Arc<Mutex<crate::state::AccountPoolManager>>>;
+
 #[derive(Default)]
 struct RuntimeLeaseHostLifecycle {
     attached_sessions: HashSet<String>,
@@ -41,7 +48,7 @@ struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
-    legacy_manager_bridge: StdMutex<Option<Arc<Mutex<crate::state::AccountPoolManager>>>>,
+    legacy_manager_bridge: StdMutex<LegacyManagerBridge>,
     lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
 }
 
@@ -56,11 +63,21 @@ impl fmt::Debug for RuntimeLeaseHostInner {
                 &self
                     .legacy_manager_bridge
                     .lock()
-                    .expect("runtime lease host bridge lock poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .is_some(),
             )
             .finish()
     }
+}
+
+fn lock_legacy_manager_bridge(
+    bridge: &StdMutex<LegacyManagerBridge>,
+) -> StdMutexGuard<'_, LegacyManagerBridge> {
+    // Teardown should still be able to clear an attached bridge after a panic
+    // poisons the bookkeeping lock.
+    bridge
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone, Debug)]
@@ -103,38 +120,29 @@ impl RuntimeLeaseHost {
     pub(crate) fn attach_legacy_manager_bridge(
         &self,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
-    ) {
-        let mut legacy_manager_bridge = self
-            .0
-            .legacy_manager_bridge
-            .lock()
-            .expect("runtime lease host bridge lock poisoned");
+    ) -> anyhow::Result<()> {
+        let mut legacy_manager_bridge = lock_legacy_manager_bridge(&self.0.legacy_manager_bridge);
         if let Some(existing) = legacy_manager_bridge.as_ref() {
-            debug_assert!(
-                Arc::ptr_eq(existing, &manager),
-                "legacy manager bridge cannot be replaced while attached"
+            if Arc::ptr_eq(existing, &manager) {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "runtime lease host {} already has a different legacy manager bridge",
+                self.id()
             );
-            return;
         }
         *legacy_manager_bridge = Some(manager);
+        Ok(())
     }
 
     pub(crate) fn has_legacy_manager_bridge(&self) -> bool {
-        self.0
-            .legacy_manager_bridge
-            .lock()
-            .expect("runtime lease host bridge lock poisoned")
-            .is_some()
+        lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).is_some()
     }
 
     pub(crate) fn legacy_manager_bridge(
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
-        self.0
-            .legacy_manager_bridge
-            .lock()
-            .expect("runtime lease host bridge lock poisoned")
-            .clone()
+        lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).clone()
     }
 
     pub(crate) async fn attach_session(&self, session_id: &str) {
@@ -161,13 +169,14 @@ impl RuntimeLeaseHost {
             let mut manager = manager.lock().await;
             manager.release_for_shutdown().await?;
         }
-        self.0
-            .legacy_manager_bridge
-            .lock()
-            .expect("runtime lease host bridge lock poisoned")
-            .take();
+        lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).take();
         lifecycle.attached_sessions.remove(session_id);
         Ok(())
+    }
+
+    pub(crate) async fn detach_session_with_retry(&self, session_id: &str) -> anyhow::Result<()> {
+        let release_target = format!("runtime lease host {} session {session_id}", self.id());
+        retry_shutdown_release(&release_target, || self.detach_session(session_id)).await
     }
 
     #[cfg(test)]
@@ -206,4 +215,39 @@ impl RuntimeLeaseHost {
     pub(crate) async fn attached_session_count_for_test(&self) -> usize {
         self.0.lifecycle.lock().await.attached_sessions.len()
     }
+}
+
+pub(crate) async fn retry_shutdown_release<F, Fut>(
+    release_target: &str,
+    mut operation: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    for attempt in 1..=SHUTDOWN_RELEASE_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < SHUTDOWN_RELEASE_MAX_ATTEMPTS => {
+                let delay = crate::util::backoff(attempt);
+                tracing::warn!(
+                    attempt,
+                    max_attempts = SHUTDOWN_RELEASE_MAX_ATTEMPTS,
+                    %release_target,
+                    ?delay,
+                    error = ?err,
+                    "shutdown release failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to release {release_target} during shutdown after {attempt} attempts"
+                    )
+                });
+            }
+        }
+    }
+    unreachable!("shutdown release retry loop should always return");
 }
