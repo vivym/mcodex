@@ -1,8 +1,6 @@
 #![cfg(not(debug_assertions))]
 
 use crate::legacy_core::config::Config;
-use crate::update_action;
-use crate::update_action::UpdateAction;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
@@ -56,23 +54,10 @@ struct VersionInfo {
 }
 
 const VERSION_FILENAME: &str = "version.json";
-// We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
-
-fn homebrew_cask_api_url() -> String {
-    format!(
-        "https://formulae.brew.sh/api/cask/{}.json",
-        MCODEX.homebrew_cask_token
-    )
-}
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {
     tag_name: String,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct HomebrewCaskInfo {
-    version: String,
 }
 
 fn version_filepath(config: &Config) -> PathBuf {
@@ -85,30 +70,16 @@ fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {
 }
 
 async fn check_for_update(version_file: &Path) -> anyhow::Result<()> {
-    let latest_version = match update_action::get_update_action() {
-        Some(UpdateAction::BrewUpgrade) => {
-            let HomebrewCaskInfo { version } = create_client()
-                .get(homebrew_cask_api_url())
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<HomebrewCaskInfo>()
-                .await?;
-            version
-        }
-        _ => {
-            let ReleaseInfo {
-                tag_name: latest_tag_name,
-            } = create_client()
-                .get(MCODEX.release_api_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<ReleaseInfo>()
-                .await?;
-            extract_version_from_latest_tag(&latest_tag_name)?
-        }
-    };
+    let ReleaseInfo {
+        tag_name: latest_tag_name,
+    } = create_client()
+        .get(MCODEX.release_api_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ReleaseInfo>()
+        .await?;
+    let latest_version = extract_version_from_latest_tag(&latest_tag_name)?;
 
     // Preserve any previously dismissed version if present.
     let prev_info = read_version_info(version_file).ok();
@@ -190,21 +161,6 @@ fn is_source_build_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_version_from_brew_api_json() {
-        //
-        // https://formulae.brew.sh/api/cask/mcodex.json
-        let cask_json = r#"{
-            "token": "mcodex",
-            "full_token": "mcodex",
-            "tap": "homebrew/cask",
-            "version": "0.96.0",
-        }"#;
-        let HomebrewCaskInfo { version } = serde_json::from_str::<HomebrewCaskInfo>(cask_json)
-            .expect("failed to parse version from cask json");
-        assert_eq!(version, "0.96.0");
-    }
 
     #[test]
     fn extracts_version_from_latest_tag() {

@@ -512,25 +512,18 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     println!();
     let cmd_str = action.command_str();
     println!("Updating {} via `{cmd_str}`...", MCODEX.product_name);
+    let (cmd, args) = action.shell_invocation();
 
     let status = {
         #[cfg(windows)]
         {
-            // On Windows, run via cmd.exe so .CMD/.BAT are correctly resolved (PATHEXT semantics).
-            std::process::Command::new("cmd")
-                .args(["/C", &cmd_str])
-                .status()?
+            std::process::Command::new(cmd).args(args).status()?
         }
         #[cfg(not(windows))]
         {
-            let (cmd, args) = action.command_args();
             let command_path = crate::wsl_paths::normalize_for_wsl(cmd);
-            let normalized_args: Vec<String> = args
-                .iter()
-                .map(crate::wsl_paths::normalize_for_wsl)
-                .collect();
             std::process::Command::new(&command_path)
-                .args(&normalized_args)
+                .args(args)
                 .status()?
         }
     };

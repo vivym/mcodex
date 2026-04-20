@@ -23,6 +23,11 @@ pub struct ProductIdentity {
     pub installer_dir_name: &'static str,
     pub npm_package_name: &'static str,
     pub homebrew_cask_token: &'static str,
+    pub download_base_url: &'static str,
+    pub stable_latest_manifest_url: &'static str,
+    pub unix_install_command: &'static str,
+    pub windows_install_command: &'static str,
+    pub windows_install_runner_command: &'static str,
     pub macos_managed_config_domain: &'static str,
     pub legacy_macos_managed_config_domain: &'static str,
 }
@@ -49,6 +54,11 @@ pub const MCODEX: ProductIdentity = ProductIdentity {
     installer_dir_name: "mcodex",
     npm_package_name: "@vivym/mcodex",
     homebrew_cask_token: "mcodex",
+    download_base_url: "https://downloads.mcodex.sota.wiki",
+    stable_latest_manifest_url: "https://downloads.mcodex.sota.wiki/repositories/mcodex/channels/stable/latest.json",
+    unix_install_command: "curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh",
+    windows_install_command: "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\\mcodex-install.ps1; & $env:TEMP\\mcodex-install.ps1\"",
+    windows_install_runner_command: "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\\mcodex-install.ps1; & $env:TEMP\\mcodex-install.ps1",
     macos_managed_config_domain: "com.vivym.mcodex",
     legacy_macos_managed_config_domain: "com.openai.codex",
 };
@@ -85,5 +95,26 @@ mod tests {
         assert_eq!(MCODEX.repository_url, "https://github.com/vivym/mcodex");
         assert_eq!(MCODEX.npm_package_name, "@vivym/mcodex");
         assert_eq!(MCODEX.homebrew_cask_token, "mcodex");
+        assert_eq!(
+            MCODEX.download_base_url,
+            "https://downloads.mcodex.sota.wiki"
+        );
+        assert_eq!(
+            MCODEX.stable_latest_manifest_url,
+            "https://downloads.mcodex.sota.wiki/repositories/mcodex/channels/stable/latest.json"
+        );
+        assert_eq!(
+            MCODEX.unix_install_command,
+            "curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh"
+        );
+        assert_eq!(
+            MCODEX.windows_install_command,
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\\mcodex-install.ps1; & $env:TEMP\\mcodex-install.ps1\""
+        );
+        assert_eq!(
+            MCODEX.windows_install_runner_command,
+            "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\\mcodex-install.ps1; & $env:TEMP\\mcodex-install.ps1"
+        );
+        assert!(!MCODEX.windows_install_runner_command.contains("powershell"));
     }
 }
