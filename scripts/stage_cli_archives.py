@@ -112,7 +112,12 @@ def list_archive_members(path: Path) -> list[str]:
     raise RuntimeError(f"Unsupported archive format: {path}")
 
 
-def resolve_release_binary(artifacts_dir: Path, target: str, binary_name: str) -> Path:
+def resolve_release_binary(
+    artifacts_dir: Path,
+    target: str,
+    binary_name: str,
+    scratch_dir: Path,
+) -> Path:
     target_dir = artifacts_dir / target
     if not target_dir.exists():
         raise FileNotFoundError(f"Target artifact directory not found: {target_dir}")
@@ -124,7 +129,12 @@ def resolve_release_binary(artifacts_dir: Path, target: str, binary_name: str) -
 
     for candidate in _archive_candidates(target_dir, target, binary_name, is_windows):
         if candidate.is_file():
-            return _extract_release_archive(candidate, target_dir / ".resolved", target, binary_name)
+            return _extract_release_archive(
+                candidate,
+                scratch_dir / target,
+                target,
+                binary_name,
+            )
 
     raise FileNotFoundError(
         f"Unable to resolve release binary '{binary_name}' for target '{target}' in {target_dir}"
@@ -239,13 +249,18 @@ def _stage_release_archive(
     archive_name = archive_name_for_platform(os_name, arch)
     expected_members = WINDOWS_ARCHIVE_MEMBERS if is_windows else UNIX_ARCHIVE_MEMBERS
 
-    with tempfile.TemporaryDirectory(prefix=f"stage-cli-{target}-") as staging_dir_str:
+    with tempfile.TemporaryDirectory(
+        prefix=f"stage-cli-{target}-"
+    ) as staging_dir_str, tempfile.TemporaryDirectory(
+        prefix=f"stage-cli-resolved-{target}-"
+    ) as scratch_dir_str:
         staging_dir = Path(staging_dir_str)
+        scratch_dir = Path(scratch_dir_str)
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
 
         _copy_release_binary(
-            resolve_release_binary(artifacts_dir, target, "mcodex"),
+            resolve_release_binary(artifacts_dir, target, "mcodex", scratch_dir),
             bin_dir / ("mcodex.exe" if is_windows else "mcodex"),
             make_executable=not is_windows,
         )
@@ -257,7 +272,7 @@ def _stage_release_archive(
                 "codex-windows-sandbox-setup",
             ):
                 _copy_release_binary(
-                    resolve_release_binary(artifacts_dir, target, binary_name),
+                    resolve_release_binary(artifacts_dir, target, binary_name, scratch_dir),
                     bin_dir / f"{binary_name}.exe",
                 )
 
