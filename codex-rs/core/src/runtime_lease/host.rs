@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -41,7 +41,7 @@ struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
-    legacy_manager_bridge: OnceLock<Arc<Mutex<crate::state::AccountPoolManager>>>,
+    legacy_manager_bridge: StdMutex<Option<Arc<Mutex<crate::state::AccountPoolManager>>>>,
     lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
 }
 
@@ -53,7 +53,11 @@ impl fmt::Debug for RuntimeLeaseHostInner {
             .field("has_authority", &self.authority.is_some())
             .field(
                 "has_legacy_manager_bridge",
-                &self.legacy_manager_bridge.get().is_some(),
+                &self
+                    .legacy_manager_bridge
+                    .lock()
+                    .expect("runtime lease host bridge lock poisoned")
+                    .is_some(),
             )
             .finish()
     }
@@ -69,7 +73,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
             authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
-            legacy_manager_bridge: OnceLock::new(),
+            legacy_manager_bridge: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
@@ -79,7 +83,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: None,
-            legacy_manager_bridge: OnceLock::new(),
+            legacy_manager_bridge: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
     }
@@ -100,25 +104,37 @@ impl RuntimeLeaseHost {
         &self,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     ) {
-        if let Err(existing) = self.0.legacy_manager_bridge.set(manager) {
+        let mut legacy_manager_bridge = self
+            .0
+            .legacy_manager_bridge
+            .lock()
+            .expect("runtime lease host bridge lock poisoned");
+        if let Some(existing) = legacy_manager_bridge.as_ref() {
             debug_assert!(
-                self.0
-                    .legacy_manager_bridge
-                    .get()
-                    .is_some_and(|attached| Arc::ptr_eq(attached, &existing)),
-                "legacy manager bridge cannot be replaced"
+                Arc::ptr_eq(existing, &manager),
+                "legacy manager bridge cannot be replaced while attached"
             );
+            return;
         }
+        *legacy_manager_bridge = Some(manager);
     }
 
     pub(crate) fn has_legacy_manager_bridge(&self) -> bool {
-        self.0.legacy_manager_bridge.get().is_some()
+        self.0
+            .legacy_manager_bridge
+            .lock()
+            .expect("runtime lease host bridge lock poisoned")
+            .is_some()
     }
 
     pub(crate) fn legacy_manager_bridge(
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
-        self.0.legacy_manager_bridge.get().cloned()
+        self.0
+            .legacy_manager_bridge
+            .lock()
+            .expect("runtime lease host bridge lock poisoned")
+            .clone()
     }
 
     pub(crate) async fn attach_session(&self, session_id: &str) {
@@ -134,15 +150,23 @@ impl RuntimeLeaseHost {
             return Ok(());
         }
         let mut lifecycle = self.0.lifecycle.lock().await;
-        if !lifecycle.attached_sessions.remove(session_id)
-            || !lifecycle.attached_sessions.is_empty()
-        {
+        if !lifecycle.attached_sessions.contains(session_id) {
+            return Ok(());
+        }
+        if lifecycle.attached_sessions.len() > 1 {
+            lifecycle.attached_sessions.remove(session_id);
             return Ok(());
         }
         if let Some(manager) = self.legacy_manager_bridge() {
             let mut manager = manager.lock().await;
             manager.release_for_shutdown().await?;
         }
+        self.0
+            .legacy_manager_bridge
+            .lock()
+            .expect("runtime lease host bridge lock poisoned")
+            .take();
+        lifecycle.attached_sessions.remove(session_id);
         Ok(())
     }
 

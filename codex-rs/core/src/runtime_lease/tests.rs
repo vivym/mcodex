@@ -10,6 +10,7 @@ use crate::config::ConfigBuilder;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::skills_watcher::SkillsWatcher;
+use crate::state::SessionServices;
 use base64::Engine;
 use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
@@ -61,6 +62,153 @@ fn cloned_host_shares_one_runtime_handle() {
     let cloned = host.clone();
 
     assert!(host.ptr_eq_for_test(&cloned));
+}
+
+#[tokio::test]
+async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_new_bridge_manager()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-reuse".to_string()));
+    let first_manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-old".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager));
+    runtime_lease_host.attach_session("session-old").await;
+    runtime_lease_host.detach_session("session-old").await?;
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "final successful detach should clear the old bridge"
+    );
+
+    let second_manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-new".to_string(),
+    )
+    .await?
+    .expect("replacement manager should build");
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&second_manager));
+    runtime_lease_host.attach_session("session-new").await;
+
+    let rebound_manager = runtime_lease_host
+        .legacy_manager_bridge_for_test()
+        .expect("replacement manager should be visible to child sessions");
+    assert!(Arc::ptr_eq(&rebound_manager, &second_manager));
+    assert!(!Arc::ptr_eq(&rebound_manager, &first_manager));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_lease_host_failed_final_release_stays_retryable_until_bridge_clears()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let config = build_test_config_with_pool(codex_home.path()).await;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let account_id = "acct-release-retry";
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        config.accounts.clone(),
+        codex_home.path().to_path_buf(),
+        "holder-release-retry".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    {
+        let mut manager = manager.lock().await;
+        let selection = manager
+            .prepare_turn()
+            .await?
+            .expect("test manager should acquire a lease before shutdown");
+        assert_eq!(selection.account_id, account_id);
+    }
+
+    let lease_epoch_marker = pooled_auth_home(codex_home.path(), account_id).join("lease_epoch");
+    std::fs::remove_file(&lease_epoch_marker)?;
+    std::fs::create_dir(&lease_epoch_marker)?;
+
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-retry".to_string()));
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager));
+    runtime_lease_host.attach_session("session-retry").await;
+
+    let first_release = runtime_lease_host.detach_session("session-retry").await;
+    assert!(first_release.is_err());
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        1,
+        "the final session must remain attached when release fails"
+    );
+    assert!(
+        runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "the bridge must remain installed for a later retry"
+    );
+
+    std::fs::remove_dir(&lease_epoch_marker)?;
+
+    runtime_lease_host.detach_session("session-retry").await?;
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "a later successful retry should clear the bridge"
+    );
+    assert!(
+        state_db
+            .read_active_holder_lease("holder-release-retry")
+            .await?
+            .is_none(),
+        "the retried shutdown should finish releasing the lease"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -794,6 +942,28 @@ async fn build_test_config_with_pool_without_default(codex_home: &Path) -> Confi
         accounts.default_pool = None;
     }
     config
+}
+
+fn test_accounts_config() -> AccountsConfigToml {
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+
+    AccountsConfigToml {
+        backend: None,
+        default_pool: None,
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    }
 }
 
 fn pooled_auth_home(codex_home: &Path, account_id: &str) -> std::path::PathBuf {
