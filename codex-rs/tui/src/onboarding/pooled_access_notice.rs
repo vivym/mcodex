@@ -355,6 +355,19 @@ mod tests {
     }
 
     #[test]
+    fn pooled_invalid_config_default_notice_renders_snapshot() {
+        let widget = PooledAccessNoticeWidget::default_pool_required_with_source(
+            vec!["team-main".to_string()],
+            StartupNoticeIssueSource::ConfigDefault,
+            /*animations_enabled*/ false,
+        );
+        assert_snapshot!(
+            "pooled_invalid_config_default_notice",
+            render_to_string(&widget)
+        );
+    }
+
+    #[test]
     fn pooled_paused_notice_renders_error_snapshot() {
         let mut widget = PooledAccessNoticeWidget::pooled_paused(false);
         widget.set_error(Some("resume failed".to_string()));

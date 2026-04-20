@@ -1,0 +1,14 @@
+---
+source: tui/src/onboarding/pooled_access_notice.rs
+expression: render_to_string(&widget)
+---
+  Choose a default account pool
+
+  The configured default account pool is not available for startup.
+
+  Visible pools: team-main
+
+  Fix or remove `accounts.default_pool`, then restart startup or hand
+  off to login.
+
+  Press enter or l to log in
