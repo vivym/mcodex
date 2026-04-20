@@ -1125,7 +1125,7 @@ git commit -m "feat(tui): show default pool selection notice"
 **Files:**
 - All files touched in this plan.
 
-- [ ] **Step 1: Run scoped tests**
+- [x] **Step 1: Run scoped tests**
 
 Run:
 
@@ -1140,7 +1140,7 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 2: Format and fix**
+- [x] **Step 2: Format and fix**
 
 Run:
 
@@ -1155,7 +1155,7 @@ just fix -p codex-tui
 
 Expected: PASS. Do not rerun tests after `fmt`/`fix` unless a command changed behavior manually.
 
-- [ ] **Step 3: Manual local smoke**
+- [x] **Step 3: Manual local smoke**
 
 Use a temp home with one registered pool and no defaults:
 
@@ -1171,7 +1171,7 @@ Expected:
 - `default set` persists `persistedDefaultPoolId`
 - no ChatGPT login prompt path is selected for local single-pool startup
 
-- [ ] **Step 4: Final commit if needed**
+- [x] **Step 4: Final commit if needed**
 
 ```bash
 git status --short
