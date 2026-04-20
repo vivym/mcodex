@@ -7,6 +7,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::MutexGuard as StdMutexGuard;
 use tokio::sync::Mutex;
 
+use super::authority::RuntimeLeaseAuthority;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
 
@@ -32,10 +34,6 @@ pub(crate) enum RuntimeLeaseHostMode {
     NonPooled,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug)]
-pub(crate) struct RuntimeLeaseAuthorityMarker;
-
 type LegacyManagerBridge = Option<Arc<Mutex<crate::state::AccountPoolManager>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +55,7 @@ struct RuntimeLeaseHostLifecycle {
 struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
-    authority: Option<Arc<RuntimeLeaseAuthorityMarker>>,
+    authority: StdMutex<Option<RuntimeLeaseAuthority>>,
     legacy_manager_bridge: StdMutex<LegacyManagerBridge>,
     latest_remote_context_reset: StdMutex<Option<RemoteContextResetRecord>>,
     lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
@@ -68,7 +66,14 @@ impl fmt::Debug for RuntimeLeaseHostInner {
         f.debug_struct("RuntimeLeaseHostInner")
             .field("id", &self.id)
             .field("mode", &self.mode)
-            .field("has_authority", &self.authority.is_some())
+            .field(
+                "has_authority",
+                &self
+                    .authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            )
             .field(
                 "has_legacy_manager_bridge",
                 &self
@@ -196,7 +201,7 @@ impl RuntimeLeaseHost {
         Self(Arc::new(RuntimeLeaseHostInner {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
-            authority: Some(Arc::new(RuntimeLeaseAuthorityMarker)),
+            authority: StdMutex::new(None),
             legacy_manager_bridge: StdMutex::new(None),
             latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
@@ -207,7 +212,7 @@ impl RuntimeLeaseHost {
         Self(Arc::new(RuntimeLeaseHostInner {
             id,
             mode: RuntimeLeaseHostMode::NonPooled,
-            authority: None,
+            authority: StdMutex::new(None),
             legacy_manager_bridge: StdMutex::new(None),
             latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
@@ -230,17 +235,36 @@ impl RuntimeLeaseHost {
         &self,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     ) -> anyhow::Result<()> {
-        let mut legacy_manager_bridge = lock_legacy_manager_bridge(&self.0.legacy_manager_bridge);
-        if let Some(existing) = legacy_manager_bridge.as_ref() {
-            if Arc::ptr_eq(existing, &manager) {
-                return Ok(());
+        {
+            let mut legacy_manager_bridge =
+                lock_legacy_manager_bridge(&self.0.legacy_manager_bridge);
+            if let Some(existing) = legacy_manager_bridge.as_ref() {
+                if Arc::ptr_eq(existing, &manager) {
+                    let mut authority = self
+                        .0
+                        .authority
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if authority.is_none() {
+                        *authority = Some(RuntimeLeaseAuthority::legacy_manager_bridge(manager));
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "runtime lease host {} already has a different legacy manager bridge",
+                    self.id()
+                );
             }
-            anyhow::bail!(
-                "runtime lease host {} already has a different legacy manager bridge",
-                self.id()
-            );
+            *legacy_manager_bridge = Some(Arc::clone(&manager));
         }
-        *legacy_manager_bridge = Some(manager);
+        let mut authority = self
+            .0
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if authority.is_none() {
+            *authority = Some(RuntimeLeaseAuthority::legacy_manager_bridge(manager));
+        }
         Ok(())
     }
 
@@ -252,6 +276,17 @@ impl RuntimeLeaseHost {
         &self,
     ) -> Option<Arc<Mutex<crate::state::AccountPoolManager>>> {
         lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).clone()
+    }
+
+    pub(crate) fn pooled_authority(&self) -> Option<RuntimeLeaseAuthority> {
+        if !self.is_pooled() {
+            return None;
+        }
+        self.0
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn record_remote_context_reset(&self, record: RemoteContextResetRecord) {
@@ -354,6 +389,11 @@ impl RuntimeLeaseHost {
             manager.release_for_shutdown().await?;
         }
         lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).take();
+        self.0
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         lifecycle.pending_startups.remove(reservation_id);
         Ok(())
     }
@@ -399,6 +439,11 @@ impl RuntimeLeaseHost {
             manager.release_for_shutdown().await?;
         }
         lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).take();
+        self.0
+            .authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         lifecycle.attached_sessions.remove(session_id);
         Ok(())
     }
@@ -419,8 +464,23 @@ impl RuntimeLeaseHost {
     }
 
     #[cfg(test)]
-    pub(crate) fn authority_for_test(&self) -> Option<Arc<RuntimeLeaseAuthorityMarker>> {
-        self.0.authority.clone()
+    pub(crate) fn pooled_with_authority_for_test(
+        id: RuntimeLeaseHostId,
+        authority: RuntimeLeaseAuthority,
+    ) -> Self {
+        Self(Arc::new(RuntimeLeaseHostInner {
+            id,
+            mode: RuntimeLeaseHostMode::Pooled,
+            authority: StdMutex::new(Some(authority)),
+            legacy_manager_bridge: StdMutex::new(None),
+            latest_remote_context_reset: StdMutex::new(None),
+            lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authority_for_test(&self) -> Option<RuntimeLeaseAuthority> {
+        self.pooled_authority()
     }
 
     #[cfg(test)]

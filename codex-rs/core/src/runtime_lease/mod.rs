@@ -7,6 +7,7 @@ mod admission;
 mod authority;
 mod collaboration_tree;
 mod host;
+mod reporting;
 mod session_view;
 
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub(crate) use host::RuntimeLeaseHostMode;
 #[allow(unused_imports)]
 pub(crate) use host::RuntimeLeaseStartupReservation;
 pub(crate) use host::retry_shutdown_release;
+pub(crate) use reporting::LeaseRequestReporter;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use session_view::SessionLeaseView;
 #[cfg_attr(not(test), allow(unused_imports))]

@@ -16,6 +16,7 @@ use super::admission::LeaseAdmissionGuard;
 use super::admission::LeaseAuthHandle;
 use super::admission::LeaseRequestContext;
 use super::admission::LeaseSnapshot;
+use super::admission::RequestBoundaryKind;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -26,6 +27,7 @@ pub(crate) struct RuntimeLeaseAuthority {
 struct AuthorityInner {
     state: Mutex<AuthorityState>,
     admissions: StdMutex<AdmissionTrackerState>,
+    recorded_boundaries: StdMutex<Vec<RequestBoundaryKind>>,
     changed: Notify,
 }
 
@@ -85,6 +87,7 @@ impl RuntimeLeaseAuthority {
                     active_generation: None,
                     admissions: HashSet::new(),
                 }),
+                recorded_boundaries: StdMutex::new(Vec::new()),
                 changed: Notify::new(),
             }),
         }
@@ -340,6 +343,15 @@ impl RuntimeLeaseAuthority {
             .admissions
             .len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_boundaries_for_test(&self) -> Vec<RequestBoundaryKind> {
+        self.inner
+            .recorded_boundaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl AuthorityInner {
@@ -379,6 +391,10 @@ impl AuthorityInner {
             }
             admissions.admissions.insert(admission_id);
         }
+        self.recorded_boundaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(context.boundary);
 
         let inner = Arc::clone(self);
         let snapshot = LeaseSnapshot {
@@ -461,11 +477,13 @@ impl TestLeaseScopedAuthSession {
 #[cfg(test)]
 impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
     fn leased_turn_auth(&self) -> anyhow::Result<codex_login::auth::LeasedTurnAuth> {
-        Err(anyhow::anyhow!("test auth session does not mint auth"))
+        Ok(codex_login::auth::LeasedTurnAuth::new(
+            codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ))
     }
 
     fn refresh_leased_turn_auth(&self) -> anyhow::Result<codex_login::auth::LeasedTurnAuth> {
-        Err(anyhow::anyhow!("test auth session does not refresh auth"))
+        self.leased_turn_auth()
     }
 
     fn binding(&self) -> &codex_login::auth::LeaseAuthBinding {

@@ -96,6 +96,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
@@ -108,8 +109,14 @@ use crate::lease_auth::SessionLeaseAuth;
 use crate::lease_auth::leased_turn_auth_as_auth;
 use crate::runtime_lease::CollaborationTreeBindingHandle;
 use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::LeaseAdmission;
+use crate::runtime_lease::LeaseAdmissionError;
+use crate::runtime_lease::LeaseAdmissionGuard;
+use crate::runtime_lease::LeaseRequestContext;
+use crate::runtime_lease::LeaseRequestReporter;
 use crate::runtime_lease::LeaseSnapshot;
 use crate::runtime_lease::RemoteContextResetRecord;
+use crate::runtime_lease::RequestBoundaryKind;
 use crate::runtime_lease::RuntimeLeaseHost;
 use crate::runtime_lease::SessionLeaseView;
 use crate::runtime_lease::SessionLeaseViewDecision;
@@ -186,6 +193,13 @@ struct CurrentClientSetup {
     auth: Option<CodexAuth>,
     api_provider: codex_api::Provider,
     api_auth: CoreAuthProvider,
+}
+
+struct AdmittedClientSetup {
+    setup: CurrentClientSetup,
+    reporter: Option<LeaseRequestReporter>,
+    auth_recovery: Option<Box<dyn AuthRecovery>>,
+    guard: Option<LeaseAdmissionGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -545,6 +559,62 @@ impl ModelClient {
         Ok(SessionLeaseViewDecision::Continue)
     }
 
+    async fn admitted_client_setup(
+        &self,
+        boundary: RequestBoundaryKind,
+        turn_id: Option<&str>,
+        request_id: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<AdmittedClientSetup> {
+        let Some(host) = self.state.runtime_lease_host.as_ref() else {
+            return Ok(AdmittedClientSetup {
+                setup: self.current_client_setup_legacy().await?,
+                reporter: None,
+                auth_recovery: self.current_auth_recovery_legacy(),
+                guard: None,
+            });
+        };
+        let Some(authority) = host.pooled_authority() else {
+            return Ok(AdmittedClientSetup {
+                setup: self.current_client_setup_legacy().await?,
+                reporter: None,
+                auth_recovery: self.current_auth_recovery_legacy(),
+                guard: None,
+            });
+        };
+
+        let request_context = self.build_lease_request_context(boundary, cancellation_token);
+        let admission = authority
+            .acquire_request_lease(request_context)
+            .await
+            .map_err(map_lease_admission_error)?;
+        self.apply_lease_snapshot_before_request(&admission.snapshot, turn_id, request_id)
+            .await?;
+        let setup = self.current_client_setup_from_admission(&admission).await?;
+        let auth_recovery: Box<dyn AuthRecovery> =
+            Box::new(admission.snapshot.auth_handle.auth_recovery());
+        let reporter = LeaseRequestReporter::new(authority, admission.snapshot.clone());
+        Ok(AdmittedClientSetup {
+            setup,
+            reporter: Some(reporter),
+            auth_recovery: Some(auth_recovery),
+            guard: Some(admission.guard),
+        })
+    }
+
+    fn build_lease_request_context(
+        &self,
+        boundary: RequestBoundaryKind,
+        cancellation_token: CancellationToken,
+    ) -> LeaseRequestContext {
+        LeaseRequestContext::new(
+            boundary,
+            self.state.session_id.clone(),
+            self.state.collaboration_tree_binding.current(),
+            cancellation_token,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn apply_test_lease_snapshot(
         &self,
@@ -647,7 +717,20 @@ impl ModelClient {
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
-        let mut client_setup = self.current_client_setup().await?;
+        let admitted_setup = self
+            .admitted_client_setup(
+                RequestBoundaryKind::ResponsesCompact,
+                /*turn_id*/ None,
+                "responses-compact",
+                CancellationToken::new(),
+            )
+            .await?;
+        let AdmittedClientSetup {
+            setup: mut client_setup,
+            reporter: _reporter,
+            auth_recovery: _auth_recovery,
+            guard: _guard,
+        } = admitted_setup;
         if let Some(account_id) = account_id_override {
             client_setup.api_auth.account_id = Some(account_id);
         }
@@ -714,7 +797,20 @@ impl ModelClient {
     ) -> Result<RealtimeWebrtcCallStart> {
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
-        let client_setup = self.current_client_setup().await?;
+        let admitted_setup = self
+            .admitted_client_setup(
+                RequestBoundaryKind::Realtime,
+                /*turn_id*/ None,
+                "realtime-call",
+                CancellationToken::new(),
+            )
+            .await?;
+        let AdmittedClientSetup {
+            setup: client_setup,
+            reporter: _reporter,
+            auth_recovery: _auth_recovery,
+            guard: _guard,
+        } = admitted_setup;
         let mut sideband_headers = extra_headers.clone();
         sideband_headers.extend(sideband_websocket_auth_headers(&client_setup.api_auth));
         let transport = ReqwestTransport::new(build_reqwest_client());
@@ -747,7 +843,20 @@ impl ModelClient {
             return Ok(Vec::new());
         }
 
-        let client_setup = self.current_client_setup().await?;
+        let admitted_setup = self
+            .admitted_client_setup(
+                RequestBoundaryKind::MemorySummary,
+                /*turn_id*/ None,
+                "memory-summary",
+                CancellationToken::new(),
+            )
+            .await?;
+        let AdmittedClientSetup {
+            setup: client_setup,
+            reporter: _reporter,
+            auth_recovery: _auth_recovery,
+            guard: _guard,
+        } = admitted_setup;
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -888,7 +997,12 @@ impl ModelClient {
     ///
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
+    #[cfg(test)]
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        self.current_client_setup_legacy().await
+    }
+
+    async fn current_client_setup_legacy(&self) -> Result<CurrentClientSetup> {
         let auth = if let Some(lease_auth) = self.state.lease_auth.as_ref()
             && let Some(lease_auth_session) = lease_auth.current_session()
         {
@@ -911,6 +1025,33 @@ impl ModelClient {
             auth,
             api_provider,
             api_auth,
+        })
+    }
+
+    async fn current_client_setup_from_admission(
+        &self,
+        admission: &LeaseAdmission,
+    ) -> Result<CurrentClientSetup> {
+        let auth_session = admission.snapshot.auth_handle.auth_session();
+        let auth = Some(
+            leased_turn_auth_as_auth(auth_session.as_ref())
+                .map_err(|err| CodexErr::Io(std::io::Error::other(err.to_string())))?,
+        );
+        let api_provider = self
+            .state
+            .provider
+            .to_api_provider(auth.as_ref().map(CodexAuth::auth_mode))?;
+        let api_auth = auth_provider_from_auth(auth.clone(), &self.state.provider)?;
+        Ok(CurrentClientSetup {
+            auth,
+            api_provider,
+            api_auth,
+        })
+    }
+
+    fn current_auth_recovery_legacy(&self) -> Option<Box<dyn AuthRecovery>> {
+        self.state.auth_manager.as_ref().and_then(|auth_manager| {
+            SharedAuthProvider::new(Arc::clone(auth_manager)).unauthorized_recovery()
         })
     }
 
@@ -1084,7 +1225,7 @@ impl ModelClientSession {
                 api_auth,
             }
         } else {
-            self.client.current_client_setup().await?
+            self.client.current_client_setup_legacy().await?
         };
         if let Some(account_id) = self.account_id_override.clone() {
             client_setup.api_auth.account_id = Some(account_id);
@@ -1097,20 +1238,14 @@ impl ModelClientSession {
         Ok(self.current_client_setup().await?.api_auth)
     }
 
-    fn current_auth_recovery(&self) -> Option<Box<dyn AuthRecovery>> {
+    fn current_auth_recovery_legacy(&self) -> Option<Box<dyn AuthRecovery>> {
         if let Some(lease_auth_session) = self.lease_auth_session.as_ref() {
             return Some(Box::new(crate::lease_auth::LeaseSessionAuthRecovery::new(
                 Arc::clone(lease_auth_session),
             )));
         }
 
-        self.client
-            .state
-            .auth_manager
-            .as_ref()
-            .and_then(|auth_manager| {
-                SharedAuthProvider::new(Arc::clone(auth_manager)).unauthorized_recovery()
-            })
+        self.client.current_auth_recovery_legacy()
     }
 
     pub(crate) fn set_account_id_override(&mut self, account_id: Option<String>) {
@@ -1503,7 +1638,7 @@ impl ModelClientSession {
             return Ok(stream);
         }
 
-        let mut auth_recovery = self.current_auth_recovery();
+        let mut auth_recovery = self.current_auth_recovery_legacy();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.current_client_setup().await?;
@@ -1588,7 +1723,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
     ) -> Result<WebsocketStreamOutcome> {
-        let mut auth_recovery = self.current_auth_recovery();
+        let mut auth_recovery = self.current_auth_recovery_legacy();
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.current_client_setup().await?;
@@ -1900,6 +2035,10 @@ fn parent_thread_id_header_value(session_source: &SessionSource) -> Option<Strin
         | SessionSource::SubAgent(_)
         | SessionSource::Unknown => None,
     }
+}
+
+fn map_lease_admission_error(err: LeaseAdmissionError) -> CodexErr {
+    CodexErr::Io(std::io::Error::other(err.to_string()))
 }
 
 fn map_response_stream<S>(

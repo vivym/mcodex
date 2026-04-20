@@ -7,15 +7,24 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use crate::client_common::Prompt;
 use crate::lease_auth::SessionLeaseAuth;
 use crate::runtime_lease::CollaborationTreeBindingHandle;
 use crate::runtime_lease::CollaborationTreeId;
 use crate::runtime_lease::RemoteContextResetRecord;
+use crate::runtime_lease::RequestBoundaryKind;
+use crate::runtime_lease::RuntimeLeaseAuthority;
 use crate::runtime_lease::RuntimeLeaseHost;
 use crate::runtime_lease::RuntimeLeaseHostId;
 use crate::runtime_lease::SessionLeaseView;
 use anyhow::bail;
 use codex_api::CoreAuthProvider;
+use codex_api::RawMemory;
+use codex_api::RawMemoryMetadata;
+use codex_api::RealtimeEventParser;
+use codex_api::RealtimeOutputModality;
+use codex_api::RealtimeSessionConfig;
+use codex_api::RealtimeSessionMode;
 use codex_app_server_protocol::AuthMode;
 use codex_login::CodexAuth;
 use codex_login::auth::LeaseAuthBinding;
@@ -25,7 +34,11 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
@@ -33,6 +46,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio_util::sync::CancellationToken;
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_lease_auth(session_source, /*lease_auth*/ None)
@@ -67,6 +81,36 @@ fn test_model_client_with_runtime_lease_view(_allow_context_reuse: bool) -> Mode
         Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
             "runtime-lease-test".to_string(),
         ))),
+        Some(Arc::new(tokio::sync::Mutex::new(SessionLeaseView::new()))),
+        session_id.clone(),
+        Arc::new(CollaborationTreeBindingHandle::new(
+            CollaborationTreeId::root_for_session(&session_id),
+        )),
+        conversation_id,
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
+        provider,
+        SessionSource::Cli,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    )
+}
+
+fn test_model_client_with_runtime_authority(
+    authority: RuntimeLeaseAuthority,
+    base_url: &str,
+) -> ModelClient {
+    let provider = create_oss_provider_with_base_url(base_url, WireApi::Responses);
+    let conversation_id = ThreadId::new();
+    let session_id = conversation_id.to_string();
+    ModelClient::new_with_runtime_lease(
+        /*auth_manager*/ None,
+        /*lease_auth*/ None,
+        Some(RuntimeLeaseHost::pooled_with_authority_for_test(
+            RuntimeLeaseHostId::new("runtime-lease-test".to_string()),
+            authority,
+        )),
         Some(Arc::new(tokio::sync::Mutex::new(SessionLeaseView::new()))),
         session_id.clone(),
         Arc::new(CollaborationTreeBindingHandle::new(
@@ -260,6 +304,178 @@ async fn direct_request_setup_uses_leased_auth_snapshot_without_refresh() {
     );
     assert_eq!(lease_session.leased_calls.load(Ordering::SeqCst), 1);
     assert_eq!(lease_session.refresh_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn responses_http_setup_acquires_admission_for_pooled_runtime_host() {
+    let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+    let client =
+        test_model_client_with_runtime_authority(authority.clone(), "https://example.com/v1");
+
+    let setup = client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            Some("turn-1"),
+            "request-1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("pooled runtime request should acquire admission");
+
+    assert_eq!(
+        setup.setup.api_auth.account_id.as_deref(),
+        Some("account_id")
+    );
+    assert_eq!(
+        authority.recorded_boundaries_for_test(),
+        vec![RequestBoundaryKind::ResponsesHttp]
+    );
+    assert_eq!(authority.admitted_count_for_test(), 1);
+
+    drop(setup);
+
+    assert_eq!(authority.admitted_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn compact_conversation_history_uses_responses_compact_admission() {
+    let server = wiremock::MockServer::start().await;
+    core_test_support::responses::mount_compact_json_once(
+        &server,
+        json!({
+            "output": []
+        }),
+    )
+    .await;
+    let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+    let client = test_model_client_with_runtime_authority(authority.clone(), &server.uri());
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "compact me".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }],
+        tools: Vec::new(),
+        parallel_tool_calls: false,
+        base_instructions: BaseInstructions {
+            text: "base".to_string(),
+        },
+        personality: None,
+        output_schema: None,
+    };
+
+    let output = client
+        .compact_conversation_history(
+            &prompt,
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            &test_session_telemetry(),
+            /*account_id_override*/ None,
+        )
+        .await
+        .expect("compact request should succeed");
+
+    assert_eq!(output, Vec::<ResponseItem>::new());
+    assert_eq!(
+        authority.recorded_boundaries_for_test(),
+        vec![RequestBoundaryKind::ResponsesCompact]
+    );
+}
+
+#[tokio::test]
+async fn summarize_memories_uses_memory_summary_admission() {
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path_regex;
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/memories/trace_summarize$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "output": []
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+    let client = test_model_client_with_runtime_authority(authority.clone(), &server.uri());
+
+    let output = client
+        .summarize_memories(
+            vec![RawMemory {
+                id: "trace-1".to_string(),
+                metadata: RawMemoryMetadata {
+                    source_path: "/tmp/trace.json".to_string(),
+                },
+                items: vec![json!({"type": "message", "role": "user", "content": []})],
+            }],
+            &test_model_info(),
+            /*effort*/ None,
+            &test_session_telemetry(),
+        )
+        .await
+        .expect("memory summary request should succeed");
+
+    assert_eq!(output, Vec::new());
+    assert_eq!(
+        authority.recorded_boundaries_for_test(),
+        vec![RequestBoundaryKind::MemorySummary]
+    );
+}
+
+#[tokio::test]
+async fn create_realtime_call_uses_realtime_admission() {
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path_regex;
+
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/realtime/calls$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("location", "/v1/realtime/calls/rtc_test")
+                .set_body_string("sdp-answer"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+    let client = test_model_client_with_runtime_authority(authority.clone(), &server.uri());
+
+    let call = client
+        .create_realtime_call_with_headers(
+            "sdp-offer".to_string(),
+            RealtimeSessionConfig {
+                instructions: String::new(),
+                model: Some("gpt-realtime-test".to_string()),
+                session_id: Some("session-1".to_string()),
+                event_parser: RealtimeEventParser::RealtimeV2,
+                session_mode: RealtimeSessionMode::Conversational,
+                output_modality: RealtimeOutputModality::Text,
+                voice: RealtimeVoice::Alloy,
+            },
+            http::HeaderMap::new(),
+        )
+        .await
+        .expect("realtime call should succeed");
+
+    assert_eq!(call.call_id, "rtc_test");
+    assert_eq!(
+        authority.recorded_boundaries_for_test(),
+        vec![RequestBoundaryKind::Realtime]
+    );
 }
 
 #[tokio::test]
