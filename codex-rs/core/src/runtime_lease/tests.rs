@@ -513,17 +513,17 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         auth_manager: auth_manager.clone(),
         models_manager: Arc::new(ModelsManager::new(
             config_codex_home.to_path_buf(),
-            auth_manager,
+            auth_manager.clone(),
             /*model_catalog*/ None,
             CollaborationModesConfig::default(),
         )),
         environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
         skills_manager: Arc::new(SkillsManager::new(
-            config_codex_home,
+            config_codex_home.clone(),
             /*bundled_skills_enabled*/ true,
         )),
         plugins_manager: Arc::clone(&plugins_manager),
-        mcp_manager: Arc::new(McpManager::new(plugins_manager)),
+        mcp_manager: Arc::new(McpManager::new(Arc::clone(&plugins_manager))),
         skills_watcher: Arc::new(SkillsWatcher::noop()),
         conversation_history: InitialHistory::New,
         session_source: SessionSource::Exec,
@@ -553,6 +553,66 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "failed startup must not leave a stale legacy bridge on the supplied host"
+    );
+
+    let recovered = Codex::spawn(CodexSpawnArgs {
+        config: build_test_config_with_pool(codex_home.path()).await,
+        auth_manager: auth_manager.clone(),
+        models_manager: Arc::new(ModelsManager::new(
+            config_codex_home.to_path_buf(),
+            auth_manager,
+            /*model_catalog*/ None,
+            CollaborationModesConfig::default(),
+        )),
+        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        skills_manager: Arc::new(SkillsManager::new(
+            config_codex_home,
+            /*bundled_skills_enabled*/ true,
+        )),
+        plugins_manager: Arc::clone(&plugins_manager),
+        mcp_manager: Arc::new(McpManager::new(plugins_manager)),
+        skills_watcher: Arc::new(SkillsWatcher::noop()),
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::Exec,
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
+        inherited_lease_auth_session: None,
+        runtime_lease_host: Some(runtime_lease_host.clone()),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await?
+    .codex;
+
+    assert!(
+        runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "a later successful startup should still attach the legacy bridge"
+    );
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        1
+    );
+    assert!(Arc::ptr_eq(
+        &runtime_lease_host
+            .legacy_manager_bridge_for_test()
+            .expect("successful startup should register a legacy bridge"),
+        recovered
+            .session
+            .services
+            .account_pool_manager
+            .as_ref()
+            .expect("successful pooled root should keep a local manager"),
+    ));
+
+    recovered.shutdown_and_wait().await?;
     Ok(())
 }
 

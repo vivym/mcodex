@@ -2103,11 +2103,6 @@ impl Session {
             )
             .await?
         };
-        if let Some(runtime_lease_host) = runtime_lease_host.as_ref()
-            && let Some(account_pool_manager) = account_pool_manager.as_ref()
-        {
-            runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(account_pool_manager));
-        }
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(
                 lease_auth_provider,
@@ -2338,6 +2333,11 @@ impl Session {
             Arc::clone(&config),
             &session_configuration.session_source,
         );
+        if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
+            && let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
+        {
+            runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(account_pool_manager));
+        }
         sess.services
             .attach_runtime_lease_session(&sess.conversation_id.to_string())
             .await;
