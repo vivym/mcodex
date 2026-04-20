@@ -3,10 +3,6 @@ param(
     [string]$Version = "latest"
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-
 function Write-Step {
     param(
         [string]$Message
@@ -398,6 +394,9 @@ function Publish-VersionDirectory {
 
     Rename-Item -LiteralPath $VersionDir -NewName $backupLeaf
     try {
+        if ($env:MCODEX_TEST_FAIL_AFTER_BACKUP -eq "1") {
+            throw "Test failure after backing up existing version directory."
+        }
         Rename-Item -LiteralPath $StagingDir -NewName (Split-Path $VersionDir -Leaf)
     } catch {
         if (Test-Path -LiteralPath $VersionDir) {
@@ -522,18 +521,29 @@ function Write-InstallMetadata {
 
 function Add-WrapperDirToUserPath {
     param(
-        [string]$WrapperDir
+        [string]$WrapperDir,
+        [scriptblock]$GetUserPath = {
+            [Environment]::GetEnvironmentVariable("Path", "User")
+        },
+        [scriptblock]$SetUserPath = {
+            param($PathValue)
+            [Environment]::SetEnvironmentVariable("Path", $PathValue, "User")
+        },
+        [scriptblock]$SetProcessPath = {
+            param($PathValue)
+            $env:Path = $PathValue
+        }
     )
 
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $userPath = & $GetUserPath
 
     $pathUpdate = Get-WrapperDirPathUpdate -WrapperDir $WrapperDir -UserPath $userPath -ProcessPath $env:Path
     if ($env:MCODEX_SKIP_USER_PATH_REGISTRY -ne "1" -and $pathUpdate.UpdateUserPath) {
-        [Environment]::SetEnvironmentVariable("Path", $pathUpdate.UserPath, "User")
+        & $SetUserPath $pathUpdate.UserPath
     }
 
     if ($pathUpdate.ProcessPath -ne $env:Path) {
-        $env:Path = $pathUpdate.ProcessPath
+        & $SetProcessPath $pathUpdate.ProcessPath
     }
 
     return $pathUpdate
@@ -544,62 +554,73 @@ function Invoke-McodexInstall {
         [string]$Version = "latest"
     )
 
-    $platform = Get-PlatformDetails
-    $config = Get-InstallConfig
-
-    Write-Step "Installing mcodex CLI"
-    Write-Step "Detected platform: $($platform.PlatformLabel)"
-
-    New-Item -ItemType Directory -Force -Path $config.BaseRoot, $config.VersionsDir | Out-Null
-
-    $resolvedVersion = Resolve-RequestedVersion -RequestedVersion $Version -DownloadBaseUrl $config.DownloadBaseUrl
-    $tmpRoot = New-TemporaryDirectory -ParentPath $config.BaseRoot -Prefix ".install"
-    $stagingDir = $null
-
+    $originalErrorActionPreference = $ErrorActionPreference
+    $originalProgressPreference = $ProgressPreference
     try {
-        $checksumsPath = Join-Path $tmpRoot "SHA256SUMS"
-        Download-File -Url "$($config.DownloadBaseUrl)/repositories/mcodex/releases/$resolvedVersion/SHA256SUMS" -OutFile $checksumsPath
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = "Stop"
+        $ProgressPreference = "SilentlyContinue"
 
-        $expectedSha = Get-ExpectedSha256 -ChecksumsPath $checksumsPath -ArchiveName $platform.ArchiveName
-        if ([string]::IsNullOrWhiteSpace($expectedSha)) {
-            throw "No checksum entry found for $($platform.ArchiveName)."
+        $platform = Get-PlatformDetails
+        $config = Get-InstallConfig
+
+        Write-Step "Installing mcodex CLI"
+        Write-Step "Detected platform: $($platform.PlatformLabel)"
+
+        New-Item -ItemType Directory -Force -Path $config.BaseRoot, $config.VersionsDir | Out-Null
+
+        $resolvedVersion = Resolve-RequestedVersion -RequestedVersion $Version -DownloadBaseUrl $config.DownloadBaseUrl
+        $tmpRoot = New-TemporaryDirectory -ParentPath $config.BaseRoot -Prefix ".install"
+        $stagingDir = $null
+
+        try {
+            $checksumsPath = Join-Path $tmpRoot "SHA256SUMS"
+            Download-File -Url "$($config.DownloadBaseUrl)/repositories/mcodex/releases/$resolvedVersion/SHA256SUMS" -OutFile $checksumsPath
+
+            $expectedSha = Get-ExpectedSha256 -ChecksumsPath $checksumsPath -ArchiveName $platform.ArchiveName
+            if ([string]::IsNullOrWhiteSpace($expectedSha)) {
+                throw "No checksum entry found for $($platform.ArchiveName)."
+            }
+
+            $versionDir = Join-Path $config.VersionsDir $resolvedVersion
+            Write-Step "Installing mcodex CLI $resolvedVersion"
+
+            if (-not (Test-VersionDirectoryComplete -Directory $versionDir -Version $resolvedVersion -ArchiveName $platform.ArchiveName -Sha256 $expectedSha)) {
+                $stagingDir = Stage-VersionDirectory -Config $config -Version $resolvedVersion -ArchiveName $platform.ArchiveName -ExpectedSha $expectedSha
+                Publish-VersionDirectory -VersionDir $versionDir -StagingDir $stagingDir
+                $stagingDir = $null
+            }
+
+            Switch-CurrentJunction -BaseRoot $config.BaseRoot -CurrentLink $config.CurrentLink -TargetDir $versionDir
+            Write-Wrapper -BaseRoot $config.BaseRoot -WrapperPath $config.WrapperPath
+            Write-InstallMetadata -MetadataFile $config.MetadataFile -Version $resolvedVersion -InstalledAt (Get-Timestamp) -BaseRoot $config.BaseRoot -VersionsDir $config.VersionsDir -CurrentLink $config.CurrentLink -WrapperPath $config.WrapperPath
+            $pathAction = Add-WrapperDirToUserPath -WrapperDir $config.WrapperDir
+        } finally {
+            if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
+                Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $tmpRoot) {
+                Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
 
-        $versionDir = Join-Path $config.VersionsDir $resolvedVersion
-        Write-Step "Installing mcodex CLI $resolvedVersion"
-
-        if (-not (Test-VersionDirectoryComplete -Directory $versionDir -Version $resolvedVersion -ArchiveName $platform.ArchiveName -Sha256 $expectedSha)) {
-            $stagingDir = Stage-VersionDirectory -Config $config -Version $resolvedVersion -ArchiveName $platform.ArchiveName -ExpectedSha $expectedSha
-            Publish-VersionDirectory -VersionDir $versionDir -StagingDir $stagingDir
-            $stagingDir = $null
+        switch ($pathAction.Action) {
+            "added" {
+                Write-Step "PATH updated for future PowerShell sessions."
+            }
+            "configured" {
+                Write-Step "PATH is already configured for future PowerShell sessions."
+            }
+            default {
+                Write-Step "$($config.WrapperDir) is already on PATH."
+            }
         }
 
-        Switch-CurrentJunction -BaseRoot $config.BaseRoot -CurrentLink $config.CurrentLink -TargetDir $versionDir
-        Write-Wrapper -BaseRoot $config.BaseRoot -WrapperPath $config.WrapperPath
-        Write-InstallMetadata -MetadataFile $config.MetadataFile -Version $resolvedVersion -InstalledAt (Get-Timestamp) -BaseRoot $config.BaseRoot -VersionsDir $config.VersionsDir -CurrentLink $config.CurrentLink -WrapperPath $config.WrapperPath
-        $pathAction = Add-WrapperDirToUserPath -WrapperDir $config.WrapperDir
+        Write-Host "mcodex CLI $resolvedVersion installed successfully."
     } finally {
-        if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
-            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path -LiteralPath $tmpRoot) {
-            Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        $ProgressPreference = $originalProgressPreference
+        $ErrorActionPreference = $originalErrorActionPreference
     }
-
-    switch ($pathAction.Action) {
-        "added" {
-            Write-Step "PATH updated for future PowerShell sessions."
-        }
-        "configured" {
-            Write-Step "PATH is already configured for future PowerShell sessions."
-        }
-        default {
-            Write-Step "$($config.WrapperDir) is already on PATH."
-        }
-    }
-
-    Write-Host "mcodex CLI $resolvedVersion installed successfully."
 }
 
 if ($MyInvocation.InvocationName -ne ".") {

@@ -216,6 +216,47 @@ def run_powershell(
 class InstallPs1Tests(unittest.TestCase):
     maxDiff = None
 
+    def test_dot_sourcing_has_no_top_level_caller_state_mutation(self) -> None:
+        result = run_powershell(
+            "\n".join(
+                [
+                    "$ErrorActionPreference = 'Stop'",
+                    f"$path = {_powershell_single_quote(str(INSTALL_PS1))}",
+                    "$tokens = $null",
+                    "$parseErrors = $null",
+                    (
+                        "$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+                        "$path, [ref]$tokens, [ref]$parseErrors)"
+                    ),
+                    "if ($parseErrors.Count -ne 0) { throw $parseErrors[0] }",
+                    "$ast.EndBlock.Statements | ForEach-Object {",
+                    "    [PSCustomObject]@{",
+                    "        Type = $_.GetType().Name",
+                    "        Text = $_.Extent.Text.Trim()",
+                    "    }",
+                    "} | ConvertTo-Json -Depth 4 -Compress",
+                ]
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        statements = json.loads(result.stdout)
+        self.assertNotIn(
+            {"Type": "PipelineAst", "Text": "Set-StrictMode -Version Latest"},
+            statements,
+        )
+        self.assertNotIn(
+            {"Type": "AssignmentStatementAst", "Text": '$ErrorActionPreference = "Stop"'},
+            statements,
+        )
+        self.assertNotIn(
+            {
+                "Type": "AssignmentStatementAst",
+                "Text": '$ProgressPreference = "SilentlyContinue"',
+            },
+            statements,
+        )
+
     def test_normalizes_explicit_versions_without_downloading(self) -> None:
         command = (
             f". '{INSTALL_PS1}'; "
@@ -313,6 +354,50 @@ class InstallPs1Tests(unittest.TestCase):
             ],
         )
 
+    def test_add_wrapper_dir_mutation_branch_updates_user_and_process_paths(self) -> None:
+        wrapper_dir = r"C:\Users\viv\AppData\Local\Programs\Mcodex\bin"
+        result = run_powershell(
+            "\n".join(
+                [
+                    "$ErrorActionPreference = 'Stop'",
+                    f". '{INSTALL_PS1}'",
+                    "$env:MCODEX_SKIP_USER_PATH_REGISTRY = '0'",
+                    "$env:Path = 'C:\\Windows\\System32'",
+                    "$script:userPath = 'C:\\Windows\\System32'",
+                    "$script:setCalls = @()",
+                    (
+                        "$pathUpdate = Add-WrapperDirToUserPath "
+                        f"-WrapperDir '{wrapper_dir}' "
+                        "-GetUserPath { $script:userPath } "
+                        "-SetUserPath { param($value) $script:userPath = $value; $script:setCalls += $value } "
+                        "-SetProcessPath { param($value) $env:Path = $value }"
+                    ),
+                    "[PSCustomObject]@{",
+                    "    Result = $pathUpdate",
+                    "    UserPath = $script:userPath",
+                    "    ProcessPath = $env:Path",
+                    "    SetCalls = @($script:setCalls)",
+                    "} | ConvertTo-Json -Depth 5 -Compress",
+                ]
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "Result": {
+                    "Action": "added",
+                    "UserPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "ProcessPath": rf"{wrapper_dir};C:\Windows\System32",
+                    "UpdateUserPath": True,
+                },
+                "UserPath": rf"{wrapper_dir};C:\Windows\System32",
+                "ProcessPath": rf"{wrapper_dir};C:\Windows\System32",
+                "SetCalls": [rf"{wrapper_dir};C:\Windows\System32"],
+            },
+        )
+
     def test_invalid_versions_fail_before_download(self) -> None:
         with self.install_fixture() as fixture:
             for version in ("invalid-version", "vlatest", "rust-vlatest"):
@@ -365,6 +450,41 @@ class InstallPs1Tests(unittest.TestCase):
                     self.assert_install_layout(fixture, resolved)
 
     @unittest.skipUnless(os.name == "nt", "Windows-only end-to-end install tests")
+    def test_install_fails_if_current_path_is_real_directory(self) -> None:
+        with self.install_fixture() as fixture:
+            current_path = fixture.default_base_root / "current"
+            current_path.mkdir(parents=True)
+            sentinel = current_path / "sentinel.txt"
+            sentinel.write_text("keep me\n", encoding="utf-8")
+
+            result = fixture.run_install_ps1("0.96.0")
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exists and is not a junction", result.stderr)
+            self.assertTrue(current_path.is_dir())
+            self.assertTrue(sentinel.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only end-to-end install tests")
+    def test_install_honors_custom_root_and_wrapper_dir(self) -> None:
+        with self.install_fixture() as fixture:
+            install_root = fixture.root / "custom-mcodex-root"
+            wrapper_dir = fixture.root / "custom-wrapper-dir"
+
+            result = fixture.run_install_ps1(
+                "0.96.0",
+                install_root=install_root,
+                wrapper_dir=wrapper_dir,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assert_install_layout(
+                fixture,
+                "0.96.0",
+                base_root=install_root,
+                wrapper_dir=wrapper_dir,
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only end-to-end install tests")
     def test_repairs_incomplete_version_directory(self) -> None:
         with self.install_fixture() as fixture:
             version_dir = fixture.default_base_root / "install" / "0.96.0"
@@ -376,6 +496,49 @@ class InstallPs1Tests(unittest.TestCase):
 
             self.assert_install_layout(fixture, "0.96.0")
             self.assertFalse((version_dir / "junk.txt").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only end-to-end install tests")
+    def test_failed_repair_after_backup_restores_old_version_dir(self) -> None:
+        with self.install_fixture() as fixture:
+            first = fixture.run_install_ps1("0.96.0")
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+
+            version_dir = fixture.default_base_root / "install" / "0.96.0"
+            marker = version_dir / ".mcodex-install-complete.json"
+            marker_data = json.loads(marker.read_text(encoding="utf-8"))
+            marker_data["sha256"] = "broken"
+            marker.write_text(json.dumps(marker_data), encoding="utf-8")
+            sentinel = version_dir / "sentinel.txt"
+            sentinel.write_text("keep me\n", encoding="utf-8")
+
+            failed = fixture.run_install_ps1(
+                "0.96.0",
+                extra_env={"MCODEX_TEST_FAIL_AFTER_BACKUP": "1"},
+            )
+
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(
+                "Test failure after backing up existing version directory.",
+                failed.stderr,
+            )
+            self.assertTrue(sentinel.exists())
+            self.assertEqual(
+                json.loads(marker.read_text(encoding="utf-8"))["sha256"],
+                "broken",
+            )
+            self.assertTrue((version_dir / "bin" / "mcodex.exe").exists())
+            self.assertEqual(
+                os.path.realpath(fixture.default_base_root / "current"),
+                os.path.realpath(version_dir),
+            )
+            self.assertEqual(
+                list(version_dir.parent.glob(".replace.*.old")),
+                [],
+            )
+
+            wrapper = fixture.run_wrapper_ps1()
+            self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
+            self.assertIn("version=0.96.0", wrapper.stdout)
 
     @unittest.skipUnless(os.name == "nt", "Windows-only end-to-end install tests")
     def test_repairs_marker_mismatched_version_directory(self) -> None:
@@ -396,11 +559,19 @@ class InstallPs1Tests(unittest.TestCase):
             self.assert_install_layout(fixture, "0.96.0")
             self.assertFalse((version_dir / "junk.txt").exists())
 
-    def assert_install_layout(self, fixture: "_InstallFixture", version: str) -> None:
-        base_root = fixture.default_base_root
+    def assert_install_layout(
+        self,
+        fixture: "_InstallFixture",
+        version: str,
+        *,
+        base_root: Path | None = None,
+        wrapper_dir: Path | None = None,
+    ) -> None:
+        base_root = base_root or fixture.default_base_root
         version_dir = base_root / "install" / version
         current_link = base_root / "current"
-        wrapper_path = fixture.localappdata / "Programs" / "Mcodex" / "bin" / "mcodex.ps1"
+        wrapper_dir = wrapper_dir or fixture.localappdata / "Programs" / "Mcodex" / "bin"
+        wrapper_path = wrapper_dir / "mcodex.ps1"
         metadata_path = base_root / "install.json"
 
         self.assertTrue((version_dir / "bin" / "mcodex.exe").exists())
@@ -450,7 +621,7 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertIn('MCODEX_INSTALL_ROOT = $BaseRoot', wrapper_text)
         self.assertIn('current\\bin\\mcodex.exe', wrapper_text)
 
-        wrapper = fixture.run_wrapper_ps1()
+        wrapper = fixture.run_wrapper_ps1(wrapper_dir=wrapper_dir)
         self.assertEqual(wrapper.returncode, 7, msg=wrapper.stderr)
         self.assertIn(f"version={version}", wrapper.stdout)
         self.assertIn("managed=1", wrapper.stdout)
