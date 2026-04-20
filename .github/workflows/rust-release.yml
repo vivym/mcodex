@@ -412,18 +412,22 @@ jobs:
           fi
 
       - name: Install release rg payloads
+        env:
+          RELEASE_VENDOR_ROOT: ${{ runner.temp }}/release-rg-payloads
         run: |
           set -euo pipefail
-          python3 codex-cli/scripts/install_native_deps.py --component rg dist
+          rm -rf "$RELEASE_VENDOR_ROOT"
+          python3 codex-cli/scripts/install_native_deps.py --component rg "$RELEASE_VENDOR_ROOT"
 
       - name: Stage native CLI archives
         env:
           RELEASE_VERSION: ${{ steps.release_contract.outputs.release_version }}
           RELEASE_IS_PRERELEASE: ${{ steps.release_contract.outputs.release_is_prerelease }}
           RELEASE_TAG: ${{ steps.release_contract.outputs.release_tag }}
+          RELEASE_VENDOR_ROOT: ${{ runner.temp }}/release-rg-payloads
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+(-((alpha|beta)[.][0-9]+))?$ ]]; then
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+(-(alpha|beta)([.][0-9]+)?)?$ ]]; then
             echo "Expected normalized release semver, got: $RELEASE_VERSION" >&2
             exit 1
           fi
@@ -433,7 +437,7 @@ jobs:
             --release-tag "$RELEASE_TAG"
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             --artifacts-dir dist
-            --vendor-src dist/vendor
+            --vendor-src "$RELEASE_VENDOR_ROOT/vendor"
             --output-dir "dist/oss/repositories/mcodex/releases/$RELEASE_VERSION"
           )
           if [[ "$RELEASE_IS_PRERELEASE" != "true" ]]; then
@@ -501,13 +505,6 @@ jobs:
           # Mark as prerelease only when the version has a suffix after x.y.z
           # (e.g. -alpha, -beta). Otherwise publish a normal release.
           prerelease: ${{ steps.release_contract.outputs.release_is_prerelease == 'true' }}
-
-      - uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag: ${{ github.ref_name }}
-          config: .github/dotslash-config.json
 
       - uses: facebook/dotslash-publish-release@9c9ec027515c34db9282a09a25a9cab5880b2c52 # v2
         env:
