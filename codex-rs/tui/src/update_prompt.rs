@@ -37,15 +37,23 @@ pub(crate) async fn run_update_prompt_if_needed(
     tui: &mut Tui,
     config: &Config,
 ) -> Result<UpdatePromptOutcome> {
-    let Some(latest_version) = updates::get_upgrade_version_for_popup(config) else {
+    let Some(updates::CachedUpdateInfo {
+        latest_version,
+        latest_notes_url,
+    }) = updates::get_upgrade_version_for_popup(config)
+    else {
         return Ok(UpdatePromptOutcome::Continue);
     };
     let Some(update_action) = crate::update_action::get_update_action() else {
         return Ok(UpdatePromptOutcome::Continue);
     };
 
-    let mut screen =
-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
+    let mut screen = UpdatePromptScreen::new(
+        tui.frame_requester(),
+        latest_version,
+        latest_notes_url,
+        update_action,
+    );
     tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;
@@ -94,6 +102,7 @@ enum UpdateSelection {
 struct UpdatePromptScreen {
     request_frame: FrameRequester,
     latest_version: String,
+    latest_notes_url: Option<String>,
     current_version: String,
     update_action: UpdateAction,
     highlighted: UpdateSelection,
@@ -104,11 +113,13 @@ impl UpdatePromptScreen {
     fn new(
         request_frame: FrameRequester,
         latest_version: String,
+        latest_notes_url: Option<String>,
         update_action: UpdateAction,
     ) -> Self {
         Self {
             request_frame,
             latest_version,
+            latest_notes_url,
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             update_action,
             highlighted: UpdateSelection::UpdateNow,
@@ -162,6 +173,12 @@ impl UpdatePromptScreen {
     fn latest_version(&self) -> &str {
         self.latest_version.as_str()
     }
+
+    fn latest_notes_url(&self) -> &str {
+        self.latest_notes_url
+            .as_deref()
+            .unwrap_or(MCODEX.release_notes_url)
+    }
 }
 
 impl UpdateSelection {
@@ -205,7 +222,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push(
             Line::from(vec![
                 "Release notes: ".dim(),
-                MCODEX.release_notes_url.dim().underlined(),
+                self.latest_notes_url().to_string().dim().underlined(),
             ])
             .inset(Insets::tlbr(0, 2, 0, 0)),
         );
@@ -252,6 +269,7 @@ mod tests {
         UpdatePromptScreen::new(
             FrameRequester::test_dummy(),
             "9.9.9".into(),
+            None,
             UpdateAction::ScriptManagedLatest,
         )
     }

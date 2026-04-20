@@ -13,13 +13,25 @@ use std::path::PathBuf;
 
 use crate::version::CODEX_CLI_VERSION;
 
-pub fn get_upgrade_version(config: &Config) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedUpdateInfo {
+    pub(crate) latest_version: String,
+    pub(crate) latest_notes_url: Option<String>,
+}
+
+pub fn get_upgrade_version(config: &Config) -> Option<CachedUpdateInfo> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
     let version_file = version_filepath(config);
-    let info = read_version_info(&version_file).ok();
+    let info = read_cached_version_info(&version_file);
+
+    info.and_then(cached_update_info)
+}
+
+fn read_cached_version_info(version_file: &Path) -> Option<VersionInfo> {
+    let info = read_version_info(version_file).ok();
 
     if match &info {
         None => true,
@@ -28,6 +40,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
         // Refresh the cached latest version in the background so TUI startup
         // isn’t blocked by a network call. The UI reads the previously cached
         // value (if any) for this run; the next run shows the banner if needed.
+        let version_file = version_file.to_path_buf();
         tokio::spawn(async move {
             check_for_update(&version_file)
                 .await
@@ -35,18 +48,14 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
         });
     }
 
-    info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
-            Some(info.latest_version)
-        } else {
-            None
-        }
-    })
+    info
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct VersionInfo {
     latest_version: String,
+    #[serde(default)]
+    latest_notes_url: Option<String>,
     // ISO-8601 timestamp (RFC3339)
     last_checked_at: DateTime<Utc>,
     #[serde(default)]
@@ -55,9 +64,11 @@ struct VersionInfo {
 
 const VERSION_FILENAME: &str = "version.json";
 
-#[derive(Deserialize, Debug, Clone)]
-struct ReleaseInfo {
-    tag_name: String,
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifest {
+    version: String,
+    notes_url: String,
 }
 
 fn version_filepath(config: &Config) -> PathBuf {
@@ -70,21 +81,22 @@ fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {
 }
 
 async fn check_for_update(version_file: &Path) -> anyhow::Result<()> {
-    let ReleaseInfo {
-        tag_name: latest_tag_name,
+    let LatestManifest {
+        version: latest_version,
+        notes_url,
     } = create_client()
-        .get(MCODEX.release_api_url)
+        .get(MCODEX.stable_latest_manifest_url)
         .send()
         .await?
         .error_for_status()?
-        .json::<ReleaseInfo>()
+        .json::<LatestManifest>()
         .await?;
-    let latest_version = extract_version_from_latest_tag(&latest_tag_name)?;
 
     // Preserve any previously dismissed version if present.
     let prev_info = read_version_info(version_file).ok();
     let info = VersionInfo {
         latest_version,
+        latest_notes_url: Some(notes_url),
         last_checked_at: Utc::now(),
         dismissed_version: prev_info.and_then(|p| p.dismissed_version),
     };
@@ -104,26 +116,18 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
     }
 }
 
-fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
-    latest_tag_name
-        .strip_prefix("rust-v")
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
-}
-
 /// Returns the latest version to show in a popup, if it should be shown.
 /// This respects the user's dismissal choice for the current latest version.
-pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
+pub fn get_upgrade_version_for_popup(config: &Config) -> Option<CachedUpdateInfo> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
     let version_file = version_filepath(config);
-    let latest = get_upgrade_version(config)?;
+    let info = read_cached_version_info(&version_file)?;
+    let latest = cached_update_info(info.clone())?;
     // If the user dismissed this exact version previously, do not show the popup.
-    if let Ok(info) = read_version_info(&version_file)
-        && info.dismissed_version.as_deref() == Some(latest.as_str())
-    {
+    if info.dismissed_version.as_deref() == Some(latest.latest_version.as_str()) {
         return None;
     }
     Some(latest)
@@ -158,21 +162,39 @@ fn is_source_build_version(version: &str) -> bool {
     parse_version(version) == Some((0, 0, 0))
 }
 
+fn cached_update_info(info: VersionInfo) -> Option<CachedUpdateInfo> {
+    if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        Some(CachedUpdateInfo {
+            latest_version: info.latest_version,
+            latest_notes_url: info.latest_notes_url,
+        })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn extracts_version_from_latest_tag() {
+    fn latest_manifest_parses_version_and_notes_url() {
+        let manifest: LatestManifest = serde_json::from_str(
+            r#"{
+                "version": "1.5.0",
+                "notesUrl": "https://example.com/releases/1.5.0"
+            }"#,
+        )
+        .expect("manifest should parse");
+
         assert_eq!(
-            extract_version_from_latest_tag("rust-v1.5.0").expect("failed to parse version"),
-            "1.5.0"
+            manifest,
+            LatestManifest {
+                version: "1.5.0".to_string(),
+                notes_url: "https://example.com/releases/1.5.0".to_string(),
+            }
         );
-    }
-
-    #[test]
-    fn latest_tag_without_prefix_is_invalid() {
-        assert!(extract_version_from_latest_tag("v1.5.0").is_err());
     }
 
     #[test]
