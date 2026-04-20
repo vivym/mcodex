@@ -1,3 +1,8 @@
+use super::CollaborationTreeId;
+use super::LeaseAdmissionError;
+use super::LeaseRequestContext;
+use super::RequestBoundaryKind;
+use super::RuntimeLeaseAuthority;
 use super::RuntimeLeaseHost;
 use super::RuntimeLeaseHostId;
 use super::RuntimeLeaseHostMode;
@@ -115,6 +120,80 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_ne
     assert!(!Arc::ptr_eq(&rebound_manager, &first_manager));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn admission_guard_releases_exactly_once() {
+    let authority = RuntimeLeaseAuthority::for_test_accepting("acct-a", 11);
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+    );
+
+    let admission = authority
+        .acquire_request_lease_for_test(request_context)
+        .await
+        .unwrap();
+    assert_eq!(authority.admitted_count_for_test(), 1);
+
+    drop(admission.guard);
+    assert_eq!(authority.admitted_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn draining_acquire_waits_until_replacement_generation() {
+    let authority = RuntimeLeaseAuthority::for_test_accepting("acct-a", 11);
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+    );
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await
+        .unwrap();
+
+    authority.close_current_generation_for_test().await;
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+                .unwrap()
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    drop(first.guard);
+    authority.install_replacement_for_test("acct-b", 12).await;
+    let second = waiter.await.unwrap();
+
+    assert_eq!(second.snapshot.account_id(), "acct-b");
+    assert_eq!(second.snapshot.generation(), 12);
+}
+
+#[tokio::test]
+async fn cancelled_draining_acquire_returns_typed_cancellation() {
+    let authority = RuntimeLeaseAuthority::for_test_draining("acct-a", 11);
+    let token = tokio_util::sync::CancellationToken::new();
+    let request_context = LeaseRequestContext::for_test_with_cancel(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+        token.clone(),
+    );
+    token.cancel();
+
+    let err = authority
+        .acquire_request_lease_for_test(request_context)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, LeaseAdmissionError::Cancelled);
 }
 
 #[tokio::test]
