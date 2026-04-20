@@ -27,6 +27,12 @@ _SPEC.loader.exec_module(_BUILD_MODULE)
 PACKAGE_NATIVE_COMPONENTS = getattr(_BUILD_MODULE, "PACKAGE_NATIVE_COMPONENTS", {})
 PACKAGE_EXPANSIONS = getattr(_BUILD_MODULE, "PACKAGE_EXPANSIONS", {})
 CODEX_PLATFORM_PACKAGES = getattr(_BUILD_MODULE, "CODEX_PLATFORM_PACKAGES", {})
+BLOCKED_CLI_NPM_PACKAGES = getattr(_BUILD_MODULE, "BLOCKED_CLI_NPM_PACKAGES")
+CLI_NPM_PACKAGE_BLOCKED_ERROR = getattr(_BUILD_MODULE, "CLI_NPM_PACKAGE_BLOCKED_ERROR")
+raise_for_blocked_cli_npm_package = getattr(
+    _BUILD_MODULE,
+    "raise_for_blocked_cli_npm_package",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +77,9 @@ def collect_native_components(packages: list[str]) -> set[str]:
 def expand_packages(packages: list[str]) -> list[str]:
     expanded: list[str] = []
     for package in packages:
+        raise_for_blocked_cli_npm_package(package)
         for expanded_package in PACKAGE_EXPANSIONS.get(package, [package]):
+            raise_for_blocked_cli_npm_package(expanded_package)
             if expanded_package in expanded:
                 continue
             expanded.append(expanded_package)
@@ -139,13 +147,12 @@ def tarball_name_for_package(package: str, version: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    packages = expand_packages(list(args.packages))
 
     output_dir = args.output_dir or (REPO_ROOT / "dist" / "npm")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
-
-    packages = expand_packages(list(args.packages))
     native_components = collect_native_components(packages)
 
     vendor_temp_root: Path | None = None
