@@ -87,6 +87,7 @@ pub(crate) struct SessionServices {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) lease_auth: Arc<crate::lease_auth::SessionLeaseAuth>,
+    pub(crate) lease_continuity: Mutex<SessionLeaseContinuity>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
@@ -144,6 +145,16 @@ impl SessionServices {
             self.lease_auth.clear();
         }
         Ok(())
+    }
+
+    pub(crate) async fn reset_remote_context_for_selection(
+        &self,
+        selection: &TurnAccountSelection,
+    ) -> bool {
+        self.lease_continuity
+            .lock()
+            .await
+            .reset_remote_context_for_selection(selection)
     }
 
     pub(crate) async fn build_root_runtime_lease_host(
@@ -567,8 +578,28 @@ struct ActiveAccountLease {
 
 pub(crate) struct TurnAccountSelection {
     pub(crate) account_id: String,
-    pub(crate) reset_remote_context: bool,
+    pub(crate) allow_context_reuse: bool,
     pub(crate) auth_session: Arc<dyn LeaseScopedAuthSession>,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionLeaseContinuity {
+    previous_turn_account_id: Option<String>,
+}
+
+impl SessionLeaseContinuity {
+    pub(crate) fn reset_remote_context_for_selection(
+        &mut self,
+        selection: &TurnAccountSelection,
+    ) -> bool {
+        let reset_remote_context = self
+            .previous_turn_account_id
+            .as_deref()
+            .is_some_and(|previous| previous != selection.account_id)
+            && !selection.allow_context_reuse;
+        self.previous_turn_account_id = Some(selection.account_id.clone());
+        reset_remote_context
+    }
 }
 
 impl AccountPoolManager {
@@ -800,15 +831,10 @@ impl AccountPoolManager {
             .get(&active_lease.record.pool_id)
             .copied()
             .unwrap_or(true);
-        let reset_remote_context = self
-            .previous_turn_account_id
-            .as_deref()
-            .is_some_and(|previous| previous != account_id)
-            && !allow_context_reuse;
         self.previous_turn_account_id = Some(account_id.clone());
         Ok(Some(TurnAccountSelection {
             account_id,
-            reset_remote_context,
+            allow_context_reuse,
             auth_session: Arc::clone(&active_lease.auth_session),
         }))
     }

@@ -13,4 +13,6 @@ pub(crate) use host::RuntimeLeaseHost;
 pub(crate) use host::RuntimeLeaseHostId;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use host::RuntimeLeaseHostMode;
+#[allow(unused_imports)]
+pub(crate) use host::RuntimeLeaseStartupReservation;
 pub(crate) use host::retry_shutdown_release;

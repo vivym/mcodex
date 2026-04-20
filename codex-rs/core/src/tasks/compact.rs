@@ -82,10 +82,15 @@ impl SessionTask for CompactTask {
         )
         .await;
         let _ = if use_remote_compact {
-            if turn_account_selection
-                .as_ref()
-                .is_some_and(|selection| selection.reset_remote_context)
-            {
+            let reset_remote_context = if let Some(selection) = turn_account_selection.as_ref() {
+                session
+                    .services
+                    .reset_remote_context_for_selection(selection)
+                    .await
+            } else {
+                false
+            };
+            if reset_remote_context {
                 session
                     .services
                     .model_client

@@ -41,6 +41,7 @@ type LegacyManagerBridge = Option<Arc<Mutex<crate::state::AccountPoolManager>>>;
 #[derive(Default)]
 struct RuntimeLeaseHostLifecycle {
     attached_sessions: HashSet<String>,
+    pending_startups: HashSet<String>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -82,6 +83,26 @@ fn lock_legacy_manager_bridge(
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeLeaseHost(Arc<RuntimeLeaseHostInner>);
+
+#[derive(Debug)]
+pub(crate) struct RuntimeLeaseStartupReservation {
+    host: RuntimeLeaseHost,
+    reservation_id: String,
+}
+
+impl RuntimeLeaseStartupReservation {
+    pub(crate) async fn promote_to_session(self, session_id: &str) -> anyhow::Result<()> {
+        self.host
+            .promote_startup_reservation_to_session(&self.reservation_id, session_id)
+            .await
+    }
+
+    pub(crate) async fn rollback(self) -> anyhow::Result<()> {
+        self.host
+            .rollback_startup_reservation(&self.reservation_id)
+            .await
+    }
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeLeaseHost {
@@ -153,6 +174,64 @@ impl RuntimeLeaseHost {
         lifecycle.attached_sessions.insert(session_id.to_string());
     }
 
+    pub(crate) async fn reserve_startup(
+        &self,
+        reservation_id: impl Into<String>,
+    ) -> RuntimeLeaseStartupReservation {
+        let reservation_id = reservation_id.into();
+        if self.is_pooled() {
+            let mut lifecycle = self.0.lifecycle.lock().await;
+            lifecycle.pending_startups.insert(reservation_id.clone());
+        }
+        RuntimeLeaseStartupReservation {
+            host: self.clone(),
+            reservation_id,
+        }
+    }
+
+    async fn promote_startup_reservation_to_session(
+        &self,
+        reservation_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        if !self.is_pooled() {
+            return Ok(());
+        }
+        let mut lifecycle = self.0.lifecycle.lock().await;
+        if !lifecycle.pending_startups.remove(reservation_id) {
+            anyhow::bail!(
+                "runtime lease host {} has no pending startup reservation {reservation_id}",
+                self.id()
+            );
+        }
+        lifecycle.attached_sessions.insert(session_id.to_string());
+        Ok(())
+    }
+
+    async fn rollback_startup_reservation(&self, reservation_id: &str) -> anyhow::Result<()> {
+        if !self.is_pooled() {
+            return Ok(());
+        }
+        let mut lifecycle = self.0.lifecycle.lock().await;
+        if !lifecycle.pending_startups.remove(reservation_id) {
+            return Ok(());
+        }
+        if !lifecycle.attached_sessions.is_empty() || !lifecycle.pending_startups.is_empty() {
+            return Ok(());
+        }
+        if let Some(manager) = self.legacy_manager_bridge() {
+            let mut manager = manager.lock().await;
+            if let Err(err) = manager.release_for_shutdown().await {
+                lifecycle
+                    .pending_startups
+                    .insert(reservation_id.to_string());
+                return Err(err);
+            }
+        }
+        lock_legacy_manager_bridge(&self.0.legacy_manager_bridge).take();
+        Ok(())
+    }
+
     pub(crate) async fn detach_session(&self, session_id: &str) -> anyhow::Result<()> {
         if !self.is_pooled() {
             return Ok(());
@@ -161,7 +240,7 @@ impl RuntimeLeaseHost {
         if !lifecycle.attached_sessions.contains(session_id) {
             return Ok(());
         }
-        if lifecycle.attached_sessions.len() > 1 {
+        if lifecycle.attached_sessions.len() > 1 || !lifecycle.pending_startups.is_empty() {
             lifecycle.attached_sessions.remove(session_id);
             return Ok(());
         }
@@ -214,6 +293,11 @@ impl RuntimeLeaseHost {
     #[cfg(test)]
     pub(crate) async fn attached_session_count_for_test(&self) -> usize {
         self.0.lifecycle.lock().await.attached_sessions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pending_startup_count_for_test(&self) -> usize {
+        self.0.lifecycle.lock().await.pending_startups.len()
     }
 }
 

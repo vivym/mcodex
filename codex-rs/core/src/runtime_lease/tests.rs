@@ -10,6 +10,7 @@ use crate::config::ConfigBuilder;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::skills_watcher::SkillsWatcher;
+use crate::state::SessionLeaseContinuity;
 use crate::state::SessionServices;
 use base64::Engine;
 use chrono::Utc;
@@ -381,6 +382,179 @@ async fn runtime_lease_host_retries_transient_final_release_failure_before_shutd
             .await?
             .is_none(),
         "shutdown retries should eventually release the pooled lease"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-pending-child".to_string(),
+    ));
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-pending-child".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.attach_session("session-parent").await;
+    let child_startup = runtime_lease_host
+        .reserve_startup("session-child-startup")
+        .await;
+
+    runtime_lease_host.detach_session("session-parent").await?;
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
+    assert!(
+        runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "parent shutdown must not clear the bridge while child startup is reserved"
+    );
+
+    child_startup
+        .promote_to_session("session-child")
+        .await
+        .expect("successful child startup should attach the child session");
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        1
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
+    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+
+    runtime_lease_host.detach_session("session-child").await?;
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "final child detach should release the bridge after successful startup"
+    );
+
+    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host
+        .attach_session("session-parent-rollback")
+        .await;
+    let child_startup = runtime_lease_host
+        .reserve_startup("session-child-rollback")
+        .await;
+
+    runtime_lease_host
+        .detach_session("session-parent-rollback")
+        .await?;
+
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
+        0
+    );
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
+    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+
+    child_startup
+        .rollback()
+        .await
+        .expect("failed child startup should release the last reserved bridge");
+
+    assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
+    assert!(
+        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
+        "rollback of the last pending startup should release the bridge"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn bridged_sessions_keep_remote_context_continuity_independent() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let config = test_accounts_config();
+    for (position, account_id) in ["acct-session-a", "acct-session-b"].into_iter().enumerate() {
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: position as i64,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(config),
+        codex_home.path().to_path_buf(),
+        "holder-shared-continuity".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    let mut manager = manager.lock().await;
+    let first_selection = manager
+        .prepare_turn()
+        .await?
+        .expect("first turn should select the preferred account");
+    assert_eq!(first_selection.account_id, "acct-session-a");
+    assert!(
+        !first_selection.allow_context_reuse,
+        "test pool must require reset on account changes"
+    );
+    let mut session_a = SessionLeaseContinuity::default();
+    let mut session_b = SessionLeaseContinuity::default();
+    assert!(
+        !session_a.reset_remote_context_for_selection(&first_selection),
+        "first turn in a session has no prior remote context to reset"
+    );
+    assert!(
+        !session_b.reset_remote_context_for_selection(&first_selection),
+        "each session tracks its own first selected account"
+    );
+
+    manager.report_unauthorized().await?;
+    let second_selection = manager
+        .prepare_turn()
+        .await?
+        .expect("hard failure should rotate to another healthy account");
+    assert_eq!(second_selection.account_id, "acct-session-b");
+    assert!(
+        session_b.reset_remote_context_for_selection(&second_selection),
+        "session B must reset when its selected account changes"
+    );
+    assert!(
+        session_a.reset_remote_context_for_selection(&second_selection),
+        "session A must still reset even after session B observed the new account"
     );
 
     Ok(())

@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::codex::Codex;
 use crate::codex::CodexSpawnArgs;
@@ -77,6 +78,18 @@ pub(crate) async fn run_codex_thread_interactive(
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let runtime_lease_host = parent_session.services.runtime_lease_host.clone();
+    let mut runtime_lease_startup_reservation =
+        if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
+            Some(
+                host.reserve_startup(format!(
+                    "delegate-subagent-startup-{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .await,
+            )
+        } else {
+            None
+        };
     let inherited_lease_auth_session = if runtime_lease_host
         .as_ref()
         .is_some_and(|host| host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled)
@@ -86,7 +99,7 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_lease_auth_session
     };
 
-    let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
+    let spawn_result = Codex::spawn(CodexSpawnArgs {
         config,
         auth_manager,
         models_manager,
@@ -111,7 +124,30 @@ pub(crate) async fn run_codex_thread_interactive(
         parent_trace: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
     })
-    .await?;
+    .await;
+    let CodexSpawnOk { codex, .. } = match spawn_result {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            if let Some(reservation) = runtime_lease_startup_reservation.take()
+                && let Err(rollback_err) = reservation.rollback().await
+            {
+                warn!(
+                    "failed to roll back runtime lease startup reservation after delegate spawn failure: {rollback_err:#}"
+                );
+            }
+            return Err(err);
+        }
+    };
+    if let Some(reservation) = runtime_lease_startup_reservation.take()
+        && let Err(err) = reservation
+            .promote_to_session(&codex.session.conversation_id.to_string())
+            .await
+    {
+        let _ = codex.shutdown_and_wait().await;
+        return Err(CodexErr::Fatal(format!(
+            "failed to promote runtime lease startup reservation: {err:#}"
+        )));
+    }
     if parent_session.enabled(codex_features::Feature::GeneralAnalytics) {
         let thread_config = codex.thread_config_snapshot().await;
         let client_metadata = parent_session.app_server_client_metadata().await;

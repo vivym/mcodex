@@ -925,9 +925,19 @@ impl ThreadManagerState {
         } else {
             None
         };
-        let CodexSpawnOk {
-            codex, thread_id, ..
-        } = Codex::spawn(CodexSpawnArgs {
+        let mut runtime_lease_startup_reservation =
+            if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
+                Some(
+                    host.reserve_startup(format!(
+                        "threadspawn-subagent-startup-{}",
+                        uuid::Uuid::now_v7()
+                    ))
+                    .await,
+                )
+            } else {
+                None
+            };
+        let spawn_result = Codex::spawn(CodexSpawnArgs {
             config,
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
@@ -950,7 +960,32 @@ impl ThreadManagerState {
             parent_trace,
             analytics_events_client: self.analytics_events_client.clone(),
         })
-        .await?;
+        .await;
+        let CodexSpawnOk {
+            codex, thread_id, ..
+        } = match spawn_result {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                if let Some(reservation) = runtime_lease_startup_reservation.take()
+                    && let Err(rollback_err) = reservation.rollback().await
+                {
+                    warn!(
+                        "failed to roll back runtime lease startup reservation after thread spawn failure: {rollback_err:#}"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        if let Some(reservation) = runtime_lease_startup_reservation.take()
+            && let Err(err) = reservation
+                .promote_to_session(&codex.session.conversation_id.to_string())
+                .await
+        {
+            let _ = codex.shutdown_and_wait().await;
+            return Err(CodexErr::Fatal(format!(
+                "failed to promote runtime lease startup reservation: {err:#}"
+            )));
+        }
         self.finalize_thread_spawn(codex, thread_id, watch_registration)
             .await
     }

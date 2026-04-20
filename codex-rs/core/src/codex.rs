@@ -2152,6 +2152,7 @@ impl Session {
             account_pool_manager,
             runtime_lease_host,
             lease_auth: Arc::clone(&lease_auth),
+            lease_continuity: Mutex::new(crate::state::SessionLeaseContinuity::default()),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 Some(lease_auth),
@@ -6358,9 +6359,13 @@ pub(crate) async fn run_turn(
     let turn_account_id_override = turn_account_selection
         .as_ref()
         .map(|selection| selection.account_id.clone());
-    let reset_remote_context_for_turn = turn_account_selection
-        .as_ref()
-        .is_some_and(|selection| selection.reset_remote_context);
+    let reset_remote_context_for_turn = if let Some(selection) = turn_account_selection.as_ref() {
+        sess.services
+            .reset_remote_context_for_selection(selection)
+            .await
+    } else {
+        false
+    };
     if reset_remote_context_for_turn {
         sess.services.model_client.reset_remote_session_identity();
         if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
