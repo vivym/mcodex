@@ -18,6 +18,7 @@ use crate::runtime_lease::RuntimeLeaseHost;
 use crate::runtime_lease::RuntimeLeaseHostId;
 use crate::runtime_lease::SessionLeaseView;
 use anyhow::bail;
+use base64::Engine;
 use codex_api::CoreAuthProvider;
 use codex_api::RawMemory;
 use codex_api::RawMemoryMetadata;
@@ -26,10 +27,16 @@ use codex_api::RealtimeOutputModality;
 use codex_api::RealtimeSessionConfig;
 use codex_api::RealtimeSessionMode;
 use codex_app_server_protocol::AuthMode;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
+use codex_login::AuthCredentialsStoreMode;
+use codex_login::AuthDotJson;
 use codex_login::CodexAuth;
+use codex_login::TokenData;
 use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth::LeasedTurnAuth;
+use codex_login::save_auth;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
@@ -41,8 +48,12 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_state::AccountRegistryEntryUpdate;
+use codex_state::AccountStartupSelectionUpdate;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -101,16 +112,23 @@ fn test_model_client_with_runtime_authority(
     authority: RuntimeLeaseAuthority,
     base_url: &str,
 ) -> ModelClient {
+    test_model_client_with_runtime_host(
+        RuntimeLeaseHost::pooled_with_authority_for_test(
+            RuntimeLeaseHostId::new("runtime-lease-test".to_string()),
+            authority,
+        ),
+        base_url,
+    )
+}
+
+fn test_model_client_with_runtime_host(host: RuntimeLeaseHost, base_url: &str) -> ModelClient {
     let provider = create_oss_provider_with_base_url(base_url, WireApi::Responses);
     let conversation_id = ThreadId::new();
     let session_id = conversation_id.to_string();
     ModelClient::new_with_runtime_lease(
         /*auth_manager*/ None,
         /*lease_auth*/ None,
-        Some(RuntimeLeaseHost::pooled_with_authority_for_test(
-            RuntimeLeaseHostId::new("runtime-lease-test".to_string()),
-            authority,
-        )),
+        Some(host),
         Some(Arc::new(tokio::sync::Mutex::new(SessionLeaseView::new()))),
         session_id.clone(),
         Arc::new(CollaborationTreeBindingHandle::new(
@@ -125,6 +143,117 @@ fn test_model_client_with_runtime_authority(
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
     )
+}
+
+async fn test_pooled_runtime_host_with_attached_legacy_bridge(
+    account_id: &str,
+) -> anyhow::Result<(RuntimeLeaseHost, tempfile::TempDir)> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let manager = crate::state::SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        format!("holder-client-test-{account_id}"),
+    )
+    .await?
+    .expect("test manager should build");
+    let host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(format!(
+        "runtime-lease-{account_id}"
+    )));
+    host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    Ok((host, codex_home))
+}
+
+fn test_accounts_config() -> AccountsConfigToml {
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+
+    AccountsConfigToml {
+        backend: None,
+        default_pool: None,
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    }
+}
+
+fn pooled_auth_home(codex_home: &Path, account_id: &str) -> std::path::PathBuf {
+    codex_home
+        .join(".pooled-auth/backends/local/accounts")
+        .join(account_id)
+}
+
+fn auth_dot_json_for_account(account_id: &str) -> AuthDotJson {
+    let access_token = fake_access_token(account_id);
+    AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: codex_login::token_data::parse_chatgpt_jwt_claims(&access_token)
+                .expect("fake access token should parse"),
+            access_token,
+            refresh_token: "refresh-token".to_string(),
+            account_id: Some(account_id.to_string()),
+        }),
+        last_refresh: Some(chrono::Utc::now()),
+    }
+}
+
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    let header = serde_json::json!({
+        "alg": "none",
+        "typ": "JWT",
+    });
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&value).expect("serialize fake JWT part"))
+    };
+    format!("{}.{}.sig", b64(header), b64(payload))
 }
 
 struct SnapshotOnlyLeaseScopedAuthSession {
@@ -338,9 +467,33 @@ async fn responses_http_setup_acquires_admission_for_pooled_runtime_host() {
 }
 
 #[tokio::test]
+async fn admitted_client_setup_requires_pooled_authority_when_runtime_host_is_pooled() {
+    let client = test_model_client_with_runtime_lease_view(/*allow_context_reuse*/ false);
+
+    let err = match client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesCompact,
+            /*turn_id*/ None,
+            "responses-compact",
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Ok(_) => panic!("pooled runtime host without authority must fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains(
+            "pooled runtime lease host runtime-lease-test is missing published authority"
+        )
+    );
+}
+
+#[tokio::test]
 async fn compact_conversation_history_uses_responses_compact_admission() {
     let server = wiremock::MockServer::start().await;
-    core_test_support::responses::mount_compact_json_once(
+    let compact_mock = core_test_support::responses::mount_compact_json_once(
         &server,
         json!({
             "output": []
@@ -385,6 +538,68 @@ async fn compact_conversation_history_uses_responses_compact_admission() {
         authority.recorded_boundaries_for_test(),
         vec![RequestBoundaryKind::ResponsesCompact]
     );
+    assert_eq!(
+        compact_mock
+            .single_request()
+            .header("chatgpt-account-id")
+            .as_deref(),
+        Some("account_id")
+    );
+}
+
+#[tokio::test]
+async fn compact_conversation_history_ignores_mismatched_account_override_for_pooled_admission()
+-> anyhow::Result<()> {
+    let server = wiremock::MockServer::start().await;
+    let compact_mock = core_test_support::responses::mount_compact_json_once(
+        &server,
+        json!({
+            "output": []
+        }),
+    )
+    .await;
+    let (runtime_host, _codex_home) =
+        test_pooled_runtime_host_with_attached_legacy_bridge("acct-compact-a").await?;
+    let client = test_model_client_with_runtime_host(runtime_host, &server.uri());
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "compact me".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }],
+        tools: Vec::new(),
+        parallel_tool_calls: false,
+        base_instructions: BaseInstructions {
+            text: "base".to_string(),
+        },
+        personality: None,
+        output_schema: None,
+    };
+
+    let output = client
+        .compact_conversation_history(
+            &prompt,
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            &test_session_telemetry(),
+            Some("acct-turn-override".to_string()),
+        )
+        .await?;
+
+    assert_eq!(output, Vec::<ResponseItem>::new());
+    assert_eq!(
+        compact_mock
+            .single_request()
+            .header("chatgpt-account-id")
+            .as_deref(),
+        Some("acct-compact-a")
+    );
+    Ok(())
 }
 
 #[tokio::test]

@@ -574,13 +574,19 @@ impl ModelClient {
                 guard: None,
             });
         };
-        let Some(authority) = host.pooled_authority() else {
+        if !host.is_pooled() {
             return Ok(AdmittedClientSetup {
                 setup: self.current_client_setup_legacy().await?,
                 reporter: None,
                 auth_recovery: self.current_auth_recovery_legacy(),
                 guard: None,
             });
+        }
+        let Some(authority) = host.pooled_authority() else {
+            return Err(CodexErr::Io(std::io::Error::other(format!(
+                "pooled runtime lease host {} is missing published authority",
+                host.id()
+            ))));
         };
 
         let request_context = self.build_lease_request_context(boundary, cancellation_token);
@@ -727,12 +733,25 @@ impl ModelClient {
             .await?;
         let AdmittedClientSetup {
             setup: mut client_setup,
-            reporter: _reporter,
+            reporter,
             auth_recovery: _auth_recovery,
             guard: _guard,
         } = admitted_setup;
         if let Some(account_id) = account_id_override {
-            client_setup.api_auth.account_id = Some(account_id);
+            if let Some(snapshot_account_id) = reporter
+                .as_ref()
+                .map(|reporter| reporter.snapshot().account_id())
+            {
+                if snapshot_account_id != account_id {
+                    warn!(
+                        requested_account_id = %account_id,
+                        admitted_account_id = %snapshot_account_id,
+                        "ignoring compact account override that differs from pooled lease admission"
+                    );
+                }
+            } else {
+                client_setup.api_auth.account_id = Some(account_id);
+            }
         }
         let transport = ReqwestTransport::new(build_reqwest_client());
         let request_telemetry = Self::build_request_telemetry(
