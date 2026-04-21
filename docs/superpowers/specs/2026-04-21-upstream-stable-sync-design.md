@@ -104,7 +104,8 @@ Merge `sync/rust-v0.122.0` to `main` only after the final gate passes and all
 allowed follow-up items are explicitly documented.
 
 The `sync/rust-v0.121.0-base` branch is an internal checkpoint. It should not be
-tagged or released as `mcodex`.
+tagged or released as `mcodex`. After the final branch is merged, the checkpoint
+branch can be deleted once no open review or bisect work depends on it.
 
 ## Conflict Resolution Policy
 
@@ -230,6 +231,13 @@ For the final `rust-v0.122.0` branch:
 - native CLI artifacts are distributed through OSS
 - native CLI artifacts are not republished through npm
 
+Operationally, "lightweight release records" means GitHub Release assets contain
+notes, checksums, signatures, installer scripts, config schema, and non-CLI npm
+tarballs, but not native CLI archives. "Distributed through OSS" means native
+CLI archives are staged under the `downloads.mcodex.sota.wiki` OSS repository
+layout and stable releases update the OSS `channels/stable/latest.json` only
+after versioned artifacts and installer scripts are uploaded.
+
 ## Layered Gates
 
 ### 0.121 checkpoint gate
@@ -280,11 +288,27 @@ cargo test -p codex-tui
 just fmt
 ```
 
+If the sync changes shared crates such as `codex-core`, `codex-common`,
+protocol crates, or app-server protocol definitions, the final `0.122` gate
+must include a broad workspace test pass before merging. Prefer `just test` when
+`cargo-nextest` is installed; otherwise use `cargo test`. Because the full suite
+is intentionally expensive, get explicit maintainer approval before running it
+locally, or document that the final gate is satisfied by required CI if local
+execution is deferred.
+
 Run scoped lint fixes for crates changed by the sync:
 
 ```bash
 cd codex-rs
 just fix -p <crate>
+```
+
+If Rust dependencies change in `Cargo.toml` or `Cargo.lock`, refresh and check
+the Bazel lockfile before merging:
+
+```bash
+just bazel-lock-update
+just bazel-lock-check
 ```
 
 If config or app-server APIs change:
@@ -366,4 +390,3 @@ Before starting a future sync, run a dry-run merge analysis and record:
 - changed path count
 - high-risk files
 - proposed checkpoint tags, if any
-
