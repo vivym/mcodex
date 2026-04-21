@@ -347,6 +347,7 @@ Expected: no tracked sync log commit exists on the maintainer's active checkout.
 ## Task 3: Create the 0.121 Checkpoint Worktree
 
 **Files:**
+- Modify: `codex-rs/Cargo.lock`
 - Modify dynamically: files conflicted by `git merge rust-v0.121.0`
 - Modify: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
 
@@ -407,6 +408,28 @@ git add docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md
 ```
 
 Expected: the log is staged, but do not commit until all merge conflicts are resolved.
+
+- [ ] **Step 6: Regenerate `Cargo.lock` before the first Cargo invocation**
+
+Run:
+
+```bash
+rm -f codex-rs/Cargo.lock
+cd codex-rs
+cargo generate-lockfile
+```
+
+Expected: `codex-rs/Cargo.lock` no longer contains merge markers and is usable for the Cargo commands in Tasks 4-7. Do this before running any `cargo test` or `cargo check`.
+
+- [ ] **Step 7: Stage the lockfile regeneration**
+
+Run:
+
+```bash
+git add codex-rs/Cargo.lock
+```
+
+Expected: the regenerated lockfile is staged or restaged before any later Cargo command updates it again.
 
 ## Task 4: Resolve 0.121 App-Server and Protocol Conflicts
 
@@ -657,16 +680,16 @@ Expected: these files are no longer unresolved.
 - Modify: `codex-rs/Cargo.lock`
 - Modify: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
 
-- [ ] **Step 1: Resolve or regenerate `Cargo.lock`**
+- [ ] **Step 1: Refresh `Cargo.lock` after all 0.121 conflict work if needed**
 
 Run:
 
 ```bash
 cd codex-rs
-cargo check -p codex-core
+cargo generate-lockfile
 ```
 
-Expected: Cargo updates lockfile if needed. If lockfile remains conflicted, resolve by regenerating from `Cargo.toml` with Cargo rather than manually selecting chunks.
+Expected: `Cargo.lock` remains coherent and updates only if dependency resolution changed during earlier conflict resolution. Do not carry forward a conflicted or stale lockfile.
 
 - [ ] **Step 2: Confirm no unresolved conflicts remain**
 
