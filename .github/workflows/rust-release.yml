@@ -550,11 +550,13 @@ jobs:
           chmod +x "${ossutil}"
           "${ossutil}" config -e "${ALIYUN_OSS_ENDPOINT}" -i "${ALIYUN_ACCESS_KEY_ID}" -k "${ALIYUN_ACCESS_KEY_SECRET}"
           "${ossutil}" cp -r "${release_dir}/" "oss://${ALIYUN_OSS_BUCKET}/repositories/mcodex/releases/${RELEASE_VERSION}/"
-          "${ossutil}" cp "dist/install.sh" "oss://${ALIYUN_OSS_BUCKET}/install.sh"
-          "${ossutil}" cp "dist/install.ps1" "oss://${ALIYUN_OSS_BUCKET}/install.ps1"
           if [[ -n "${STABLE_RELEASE_VERSION}" ]]; then
+            "${ossutil}" cp "dist/install.sh" "oss://${ALIYUN_OSS_BUCKET}/install.sh"
+            "${ossutil}" cp "dist/install.ps1" "oss://${ALIYUN_OSS_BUCKET}/install.ps1"
             test -s "${channel_manifest}"
             "${ossutil}" cp "${channel_manifest}" "oss://${ALIYUN_OSS_BUCKET}/repositories/mcodex/channels/stable/latest.json"
+          else
+            echo "Skipping root installer and stable latest.json upload for prerelease ${RELEASE_VERSION}."
           fi
 
       - name: Append OSS install instructions to release notes
@@ -563,28 +565,28 @@ jobs:
           RELEASE_NOTES_PATH: ${{ steps.release_notes.outputs.path }}
         run: |
           set -euo pipefail
-          {
-            cat <<'EOF'
-            Install mcodex CLI from OSS:
+          cat <<'EOF' >> "${RELEASE_NOTES_PATH}"
+          Install mcodex CLI from OSS:
 
-            macOS/Linux:
-            curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
+          macOS/Linux:
+          curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
 
-            Windows PowerShell:
-            powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"
+          Windows PowerShell:
+          $installer = Join-Path $env:TEMP "mcodex-install.ps1"
+          iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer
+          & $installer
 
-            This release uses the script-managed OSS distribution channel. npm, bun, Homebrew, and WinGet are no longer advertised CLI install or update paths for mcodex.
+          This release uses the script-managed OSS distribution channel. npm, bun, Homebrew, and WinGet are no longer advertised CLI install or update paths for mcodex.
 
-            If you previously installed mcodex through npm, reinstall now with the OSS installer to move onto the supported update channel.
+          If you previously installed mcodex through npm, reinstall now with the OSS installer to move onto the supported update channel.
 
-            If this release is a prerelease, install it explicitly by passing the version to the installer script (for example `sh -s -- 0.96.0-alpha.1` on macOS/Linux or `mcodex-install.ps1 0.96.0-alpha.1` on PowerShell). `latest` remains the stable channel.
+          If this release is a prerelease, install it explicitly by passing the version to the installer script (for example `sh -s -- 0.96.0-alpha.1` on macOS/Linux or `& $installer 0.96.0-alpha.1` on PowerShell). `latest` remains the stable channel.
 
-            Checksum signature audit:
-            The public minisign key for SHA256SUMS.sig is committed at release/minisign.pub and is repeated below:
-            EOF
-            cat release/minisign.pub
-            echo
-          } >> "${RELEASE_NOTES_PATH}"
+          Checksum signature audit:
+          The public minisign key for SHA256SUMS.sig is committed at release/minisign.pub and is repeated below:
+          EOF
+          cat release/minisign.pub >> "${RELEASE_NOTES_PATH}"
+          echo >> "${RELEASE_NOTES_PATH}"
 
       - name: Create lightweight GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
