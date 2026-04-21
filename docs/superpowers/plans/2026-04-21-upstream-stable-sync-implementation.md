@@ -1460,7 +1460,7 @@ else
 fi
 ```
 
-Expected: PASS. If not approved locally, skip this step and document the reason.
+Expected: PASS. If not approved locally, skip this step, document the reason, and treat required CI green as a mandatory pre-merge broad gate.
 
 - [ ] **Step 6: Run explicit release/install/update contract checks**
 
@@ -1563,7 +1563,7 @@ Append:
 - cargo test -p codex-tui:
 - just fmt:
 - just fix -p results:
-- full workspace test or CI deferral:
+- full workspace test or required CI green:
 - release/install/update grep review:
 - product identity/home-dir/startup regressions:
 - migration/leased-auth/realtime/review/subagent regressions:
@@ -1670,7 +1670,13 @@ Use this structure:
 - None, or list only non-core deferred items.
 ```
 
-- [ ] **Step 6: Decide when to merge to main**
+- [ ] **Step 6: If the broad gate was deferred locally, wait for required CI before any merge decision**
+
+Check the pushed branch or PR in GitHub and confirm the required status checks are green.
+
+Expected: if Task 14 deferred the full workspace suite to CI, do not ask to merge and do not merge until required CI is green. Recording the deferral in the execution log is not sufficient by itself.
+
+- [ ] **Step 7: Decide when to merge to main**
 
 Because the user is developing on `main`, do not merge automatically. Ask:
 
@@ -1678,7 +1684,7 @@ Because the user is developing on `main`, do not merge automatically. Ask:
 The sync branch is ready. Do you want to merge it after current main development lands, or should I rebase/merge latest main into sync/rust-v0.122.0 first and re-run the final gate?
 ```
 
-Expected: wait for maintainer direction.
+Expected: ask this only after the broad gate is satisfied by either a local full-workspace pass or required CI green, then wait for maintainer direction.
 
 ## Task 16: Post-Merge Cleanup
 
