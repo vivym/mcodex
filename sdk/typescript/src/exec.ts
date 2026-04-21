@@ -55,7 +55,7 @@ const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
 
 const moduleRequire = createRequire(import.meta.url);
 const MCODEX_NAMES = ["mcodex"] as const;
-const WINDOWS_MCODEX_NAMES = ["mcodex.exe", "mcodex"] as const;
+const WINDOWS_MCODEX_NAMES = ["mcodex.exe", "mcodex.ps1", "mcodex"] as const;
 
 type FindCodexPathOptions = {
   envPath?: string;
@@ -172,7 +172,8 @@ export class CodexExec {
       env.CODEX_API_KEY = args.apiKey;
     }
 
-    const child = spawn(this.executablePath, commandArgs, {
+    const spawnCommand = getSpawnCommand(this.executablePath, commandArgs);
+    const child = spawn(spawnCommand.executablePath, spawnCommand.args, {
       env,
       signal: args.signal,
     });
@@ -325,6 +326,28 @@ function isPlainObject(value: unknown): value is CodexConfigObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function getSpawnCommand(
+  executablePath: string,
+  args: string[],
+): { executablePath: string; args: string[] } {
+  if (process.platform === "win32" && executablePath.toLowerCase().endsWith(".ps1")) {
+    return {
+      executablePath: "powershell.exe",
+      args: [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        executablePath,
+        ...args,
+      ],
+    };
+  }
+
+  return { executablePath, args };
+}
+
 function findCodexPath() {
   return _findCodexPathForTesting();
 }
@@ -339,8 +362,10 @@ export function _findCodexPathForTesting(options: FindCodexPathOptions = {}) {
   const delimiter = platform === "win32" ? ";" : ":";
   const executableNames = platform === "win32" ? WINDOWS_MCODEX_NAMES : MCODEX_NAMES;
 
-  for (const directory of envPath?.split(delimiter).filter(Boolean) ?? []) {
-    for (const executableName of executableNames) {
+  const pathDirectories = envPath?.split(delimiter).filter(Boolean) ?? [];
+
+  for (const executableName of executableNames) {
+    for (const directory of pathDirectories) {
       const candidate = pathModule.join(directory, executableName);
       if (pathExists(candidate)) {
         return candidate;
@@ -392,7 +417,7 @@ export function _findCodexPathForTesting(options: FindCodexPathOptions = {}) {
   }
 
   if (!targetTriple) {
-    throw new Error(getMissingCliErrorMessage());
+    throw new Error(getUnsupportedTargetErrorMessage(platform, arch));
   }
 
   const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
@@ -434,4 +459,8 @@ function getMissingCliErrorMessage(): string {
     "https://downloads.mcodex.sota.wiki/install.ps1 on Windows, " +
     "or pass an explicit executable path to the CodexExec constructor."
   );
+}
+
+function getUnsupportedTargetErrorMessage(platform: NodeJS.Platform, arch: string): string {
+  return `Unsupported platform or architecture for the mcodex CLI: ${platform}/${arch}.`;
 }
