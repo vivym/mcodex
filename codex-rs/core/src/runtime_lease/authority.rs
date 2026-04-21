@@ -6,6 +6,9 @@ use codex_login::auth::LeaseScopedAuthSession;
 use codex_protocol::protocol::RateLimitSnapshot;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::state::BridgedTurnPreview;
@@ -62,13 +65,54 @@ struct HostOwnedLeaseState {
 }
 
 enum AdmissionAttempt {
-    Admitted(LeaseAdmission),
+    Admitted(Box<LeaseAdmission>),
     Draining,
 }
 
 enum AdmissionPreview {
     Compatible,
     Draining,
+}
+
+struct LegacyBridgeLeaseHeartbeatGuard {
+    cancellation_token: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Drop for LegacyBridgeLeaseHeartbeatGuard {
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
+        self.task.abort();
+    }
+}
+
+fn start_legacy_bridge_heartbeat(
+    manager: Arc<Mutex<crate::state::AccountPoolManager>>,
+    heartbeat_interval: std::time::Duration,
+    cancellation_token: &CancellationToken,
+) -> LegacyBridgeLeaseHeartbeatGuard {
+    let heartbeat_cancellation_token = cancellation_token.child_token();
+    let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
+    let task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                () = heartbeat_task_cancellation.cancelled() => break,
+                _ = ticker.tick() => {
+                    let mut manager = manager.lock().await;
+                    if let Err(err) = manager.renew_active_lease().await {
+                        warn!("failed to renew runtime-lease bridge heartbeat: {err:#}");
+                    }
+                }
+            }
+        }
+    });
+    LegacyBridgeLeaseHeartbeatGuard {
+        cancellation_token: heartbeat_cancellation_token,
+        task,
+    }
 }
 
 #[allow(dead_code)]
@@ -113,9 +157,9 @@ impl RuntimeLeaseAuthority {
                         if let Some(generation) = host_owned.generation.as_ref()
                             && generation.accepting
                         {
-                            match self.inner.try_admit(&context, generation) {
+                            match self.inner.try_admit(&context, generation, Vec::new()) {
                                 AdmissionAttempt::Admitted(admission) => {
-                                    return Ok(admission);
+                                    return Ok(*admission);
                                 }
                                 AdmissionAttempt::Draining => {}
                             }
@@ -246,14 +290,16 @@ impl RuntimeLeaseAuthority {
         context: LeaseRequestContext,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     ) -> Result<LeaseAdmission, LeaseAdmissionError> {
-        let mut manager = tokio::select! {
+        let manager_for_lock = Arc::clone(&manager);
+        let mut manager_guard = tokio::select! {
             () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
-            manager = manager.lock_owned() => manager,
+            manager_guard = manager_for_lock.lock_owned() => manager_guard,
         };
         if context.cancel.is_cancelled() {
             return Err(LeaseAdmissionError::Cancelled);
         }
-        let preview = manager
+        let heartbeat_interval = manager_guard.heartbeat_interval();
+        let preview = manager_guard
             .preview_next_bridged_turn()
             .await
             .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
@@ -272,7 +318,7 @@ impl RuntimeLeaseAuthority {
         ) {
             return Err(LeaseAdmissionError::UnsupportedPooledPath);
         }
-        let selection = manager
+        let selection = manager_guard
             .prepare_turn()
             .await
             .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
@@ -289,8 +335,17 @@ impl RuntimeLeaseAuthority {
             allow_context_reuse: selection.allow_context_reuse,
             accepting: true,
         };
-        match self.inner.try_admit(&context, &generation) {
-            AdmissionAttempt::Admitted(admission) => Ok(admission),
+        drop(manager_guard);
+        if context.cancel.is_cancelled() {
+            return Err(LeaseAdmissionError::Cancelled);
+        }
+        let heartbeat_guard =
+            start_legacy_bridge_heartbeat(manager, heartbeat_interval, &context.cancel);
+        match self
+            .inner
+            .try_admit(&context, &generation, vec![Box::new(heartbeat_guard)])
+        {
+            AdmissionAttempt::Admitted(admission) => Ok(*admission),
             AdmissionAttempt::Draining => Err(LeaseAdmissionError::UnsupportedPooledPath),
         }
     }
@@ -372,6 +427,7 @@ impl AuthorityInner {
         self: &Arc<Self>,
         context: &LeaseRequestContext,
         generation: &GenerationState,
+        drop_guards: Vec<Box<dyn Send + Sync>>,
     ) -> AdmissionAttempt {
         if matches!(
             self.preview_admission(generation.generation),
@@ -413,10 +469,10 @@ impl AuthorityInner {
             inner.release_admission(released_admission_id);
         });
 
-        AdmissionAttempt::Admitted(LeaseAdmission {
+        AdmissionAttempt::Admitted(Box::new(LeaseAdmission {
             snapshot,
-            guard: LeaseAdmissionGuard::new(admission_id, release),
-        })
+            guard: LeaseAdmissionGuard::new(admission_id, release, drop_guards),
+        }))
     }
 
     fn release_admission(&self, admission_id: Uuid) {
@@ -477,8 +533,9 @@ impl TestLeaseScopedAuthSession {
 #[cfg(test)]
 impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
     fn leased_turn_auth(&self) -> anyhow::Result<codex_login::auth::LeasedTurnAuth> {
-        Ok(codex_login::auth::LeasedTurnAuth::new(
-            codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        Ok(codex_login::auth::LeasedTurnAuth::chatgpt(
+            self.binding.account_id.clone(),
+            fake_access_token(&self.binding.account_id),
         ))
     }
 
@@ -493,4 +550,28 @@ impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
     fn ensure_current(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn fake_access_token(chatgpt_account_id: &str) -> String {
+    use base64::Engine as _;
+
+    let header = serde_json::json!({
+        "alg": "none",
+        "typ": "JWT",
+    });
+    let payload = serde_json::json!({
+        "email": "user@example.com",
+        "email_verified": true,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_user_id": "user-12345",
+            "chatgpt_account_id": chatgpt_account_id,
+        },
+    });
+    let b64 = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&value).expect("serialize fake JWT part"))
+    };
+    format!("{}.{}.sig", b64(header), b64(payload))
 }

@@ -190,17 +190,17 @@ struct ModelClientState {
 ///
 /// Keeping this as a single bundle ensures prewarm and normal request paths
 /// share the same auth/provider setup flow.
-struct CurrentClientSetup {
-    auth: Option<CodexAuth>,
-    api_provider: codex_api::Provider,
-    api_auth: CoreAuthProvider,
+pub(crate) struct CurrentClientSetup {
+    pub(crate) auth: Option<CodexAuth>,
+    pub(crate) api_provider: codex_api::Provider,
+    pub(crate) api_auth: CoreAuthProvider,
 }
 
-struct AdmittedClientSetup {
-    setup: CurrentClientSetup,
-    reporter: Option<LeaseRequestReporter>,
-    auth_recovery: Option<Box<dyn AuthRecovery>>,
-    guard: Option<LeaseAdmissionGuard>,
+pub(crate) struct AdmittedClientSetup {
+    pub(crate) setup: CurrentClientSetup,
+    pub(crate) reporter: Option<LeaseRequestReporter>,
+    pub(crate) auth_recovery: Option<Box<dyn AuthRecovery>>,
+    pub(crate) guard: Option<LeaseAdmissionGuard>,
 }
 
 #[derive(Default)]
@@ -396,14 +396,15 @@ pub(crate) struct RealtimeWebrtcCallStart {
     pub(crate) sdp: String,
     pub(crate) call_id: String,
     pub(crate) sideband_headers: ApiHeaderMap,
+    pub(crate) lease_reporter: Option<LeaseRequestReporter>,
+    pub(crate) lease_guard: Option<LeaseAdmissionGuard>,
 }
 
-/// Reuses the API-auth material that created the WebRTC call for the sideband WebSocket join.
+/// Builds realtime websocket auth headers from the admitted provider identity.
 ///
 /// API-key sessions send that API bearer. ChatGPT-auth sessions send their bearer plus account id;
-/// transceiver is responsible for accepting that same call-create identity on the direct
-/// `api.openai.com` sideband path.
-fn sideband_websocket_auth_headers(api_auth: &CoreAuthProvider) -> ApiHeaderMap {
+/// transceiver is responsible for accepting that same identity on direct realtime websocket paths.
+pub(crate) fn realtime_websocket_auth_headers(api_auth: &CoreAuthProvider) -> ApiHeaderMap {
     let mut headers = ApiHeaderMap::new();
     if let Some(token) = api_auth.token.as_ref()
         && let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -624,7 +625,7 @@ impl ModelClient {
         Ok(SessionLeaseViewDecision::Continue)
     }
 
-    async fn admitted_client_setup(
+    pub(crate) async fn admitted_client_setup(
         &self,
         boundary: RequestBoundaryKind,
         turn_id: Option<&str>,
@@ -891,12 +892,12 @@ impl ModelClient {
             .await?;
         let AdmittedClientSetup {
             setup: client_setup,
-            reporter: _reporter,
+            reporter,
             auth_recovery: _auth_recovery,
-            guard: _guard,
+            guard,
         } = admitted_setup;
         let mut sideband_headers = extra_headers.clone();
-        sideband_headers.extend(sideband_websocket_auth_headers(&client_setup.api_auth));
+        sideband_headers.extend(realtime_websocket_auth_headers(&client_setup.api_auth));
         let transport = ReqwestTransport::new(build_reqwest_client());
         let response =
             ApiRealtimeCallClient::new(transport, client_setup.api_provider, client_setup.api_auth)
@@ -907,6 +908,8 @@ impl ModelClient {
             sdp: response.sdp,
             call_id: response.call_id,
             sideband_headers,
+            lease_reporter: reporter,
+            lease_guard: guard,
         })
     }
 
@@ -1075,6 +1078,14 @@ impl ModelClient {
         }
 
         true
+    }
+
+    pub(crate) fn pooled_runtime_authority_active(&self) -> bool {
+        self.state
+            .runtime_lease_host
+            .as_ref()
+            .and_then(RuntimeLeaseHost::pooled_authority)
+            .is_some()
     }
 
     /// Returns auth + provider configuration resolved from the current session auth state.

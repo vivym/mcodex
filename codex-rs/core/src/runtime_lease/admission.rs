@@ -234,6 +234,7 @@ impl fmt::Debug for LeaseAdmission {
 pub(crate) struct LeaseAdmissionGuard {
     admission_id: Uuid,
     release: Option<Arc<dyn Fn(Uuid) + Send + Sync>>,
+    drop_guards: Vec<Box<dyn Send + Sync>>,
 }
 
 impl fmt::Debug for LeaseAdmissionGuard {
@@ -241,22 +242,29 @@ impl fmt::Debug for LeaseAdmissionGuard {
         f.debug_struct("LeaseAdmissionGuard")
             .field("admission_id", &self.admission_id)
             .field("released", &self.release.is_none())
+            .field("drop_guard_count", &self.drop_guards.len())
             .finish()
     }
 }
 
 #[allow(dead_code)]
 impl LeaseAdmissionGuard {
-    pub(crate) fn new(admission_id: Uuid, release: Arc<dyn Fn(Uuid) + Send + Sync>) -> Self {
+    pub(crate) fn new(
+        admission_id: Uuid,
+        release: Arc<dyn Fn(Uuid) + Send + Sync>,
+        drop_guards: Vec<Box<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             admission_id,
             release: Some(release),
+            drop_guards,
         }
     }
 }
 
 impl Drop for LeaseAdmissionGuard {
     fn drop(&mut self) {
+        self.drop_guards.clear();
         if let Some(release) = self.release.take() {
             release(self.admission_id);
         }

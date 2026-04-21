@@ -1,7 +1,12 @@
+use crate::client::AdmittedClientSetup;
 use crate::client::ModelClient;
+use crate::client::realtime_websocket_auth_headers;
 use crate::codex::Session;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
+use crate::runtime_lease::LeaseAdmissionGuard;
+use crate::runtime_lease::LeaseRequestReporter;
+use crate::runtime_lease::RequestBoundaryKind;
 use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::RecvError;
@@ -54,6 +59,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -214,6 +220,8 @@ struct ConversationState {
     input_task: JoinHandle<()>,
     fanout_task: Option<JoinHandle<()>>,
     realtime_active: Arc<AtomicBool>,
+    _lease_reporter: Option<LeaseRequestReporter>,
+    _lease_guard: Option<LeaseAdmissionGuard>,
 }
 
 struct RealtimeStart {
@@ -272,7 +280,7 @@ impl RealtimeConversationManager {
         };
 
         let client = RealtimeWebsocketClient::new(api_provider);
-        let (connection, sdp) = if let Some(sdp) = sdp {
+        let (connection, sdp, lease_reporter, lease_guard) = if let Some(sdp) = sdp {
             let call = model_client
                 .create_realtime_call_with_headers(
                     sdp,
@@ -289,17 +297,39 @@ impl RealtimeConversationManager {
                 )
                 .await
                 .map_err(map_api_error)?;
-            (connection, Some(call.sdp))
+            (
+                connection,
+                Some(call.sdp),
+                call.lease_reporter,
+                call.lease_guard,
+            )
         } else {
+            let mut websocket_headers = extra_headers.unwrap_or_default();
+            let (reporter, guard) = if model_client.pooled_runtime_authority_active() {
+                let admitted_setup = model_client
+                    .admitted_client_setup(
+                        RequestBoundaryKind::Realtime,
+                        /*turn_id*/ None,
+                        "realtime-websocket",
+                        CancellationToken::new(),
+                    )
+                    .await?;
+                let AdmittedClientSetup {
+                    setup: client_setup,
+                    reporter,
+                    auth_recovery: _auth_recovery,
+                    guard,
+                } = admitted_setup;
+                websocket_headers.extend(realtime_websocket_auth_headers(&client_setup.api_auth));
+                (reporter, guard)
+            } else {
+                (None, None)
+            };
             let connection = client
-                .connect(
-                    session_config,
-                    extra_headers.unwrap_or_default(),
-                    default_headers(),
-                )
+                .connect(session_config, websocket_headers, default_headers())
                 .await
                 .map_err(map_api_error)?;
-            (connection, None)
+            (connection, None, reporter, guard)
         };
 
         let writer = connection.writer();
@@ -336,6 +366,8 @@ impl RealtimeConversationManager {
             input_task: task,
             fanout_task: None,
             realtime_active: Arc::clone(&realtime_active),
+            _lease_reporter: lease_reporter,
+            _lease_guard: lease_guard,
         });
         Ok(RealtimeStartOutput {
             realtime_active,
@@ -579,7 +611,6 @@ async fn prepare_realtime_start(
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
     let provider = sess.provider().await;
-    let auth = sess.current_auth().await;
     let config = sess.get_config().await;
     let transport = params
         .transport
@@ -598,18 +629,18 @@ async fn prepare_realtime_start(
     )
     .await?;
     let requested_session_id = session_config.session_id.clone();
-    let extra_headers = match transport {
-        ConversationStartTransport::Websocket => {
-            let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
-            realtime_request_headers(
-                requested_session_id.as_deref(),
-                Some(realtime_api_key.as_str()),
-            )?
-        }
-        ConversationStartTransport::Webrtc { .. } => {
-            realtime_request_headers(requested_session_id.as_deref(), /*api_key*/ None)?
-        }
+    let realtime_api_key = if matches!(transport, ConversationStartTransport::Websocket)
+        && !sess.services.model_client.pooled_runtime_authority_active()
+    {
+        // Non-pooled direct websocket sessions still rely on the configured API
+        // key. Pooled runtime sessions inject admitted auth in start_inner().
+        let auth = sess.current_auth().await;
+        Some(realtime_api_key(auth.as_ref(), &provider)?)
+    } else {
+        None
     };
+    let extra_headers =
+        realtime_request_headers(requested_session_id.as_deref(), realtime_api_key.as_deref())?;
     Ok(PreparedRealtimeConversationStart {
         api_provider,
         extra_headers,

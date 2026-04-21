@@ -12,10 +12,12 @@
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::runtime_lease::RequestBoundaryKind;
 use codex_api::CoreAuthProvider;
 use codex_api::upload_local_file;
 use codex_login::CodexAuth;
 use serde_json::Value as JsonValue;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     sess: &Session,
@@ -33,7 +35,31 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     let Some(arguments) = arguments_value.as_object() else {
         return Ok(Some(arguments_value));
     };
-    let auth = sess.current_auth().await;
+    let (auth, _reporter, _guard) = if sess.services.model_client.pooled_runtime_authority_active()
+    {
+        let admitted_setup = sess
+            .services
+            .model_client
+            .admitted_client_setup(
+                RequestBoundaryKind::BackgroundModelCall,
+                /*turn_id*/ None,
+                "openai-file-upload",
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| format!("failed to acquire auth for OpenAI file upload: {error}"))?;
+        let crate::client::AdmittedClientSetup {
+            setup,
+            reporter,
+            auth_recovery: _auth_recovery,
+            guard,
+        } = admitted_setup;
+        (setup.auth, reporter, guard)
+    } else {
+        // Non-pooled sessions retain the legacy auth source. When a pooled runtime
+        // authority is published, upload auth must come from admission above.
+        (sess.current_auth().await, None, None)
+    };
     let mut rewritten_arguments = arguments.clone();
 
     for field_name in openai_file_input_params {
@@ -142,82 +168,45 @@ async fn build_uploaded_local_argument_value(
 mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
-    use base64::Engine;
-    use codex_login::LeasedTurnAuth;
-    use codex_login::auth::LeaseAuthBinding;
-    use codex_login::auth::LeaseScopedAuthSession;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
-    use serde::Serialize;
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    struct TestLeaseScopedAuthSession {
-        binding: LeaseAuthBinding,
-    }
-
-    impl TestLeaseScopedAuthSession {
-        fn new(account_id: &str) -> Self {
-            Self {
-                binding: LeaseAuthBinding {
-                    account_id: account_id.to_string(),
-                    backend_account_handle: format!("handle-{account_id}"),
-                    lease_epoch: 1,
-                },
-            }
-        }
-    }
-
-    impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
-        fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
-            self.refresh_leased_turn_auth()
-        }
-
-        fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
-            Ok(LeasedTurnAuth::chatgpt(
-                self.binding.account_id.clone(),
-                fake_access_token(&self.binding.account_id),
-            ))
-        }
-
-        fn binding(&self) -> &LeaseAuthBinding {
-            &self.binding
-        }
-
-        fn ensure_current(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn fake_access_token(chatgpt_account_id: &str) -> String {
-        #[derive(Serialize)]
-        struct Header {
-            alg: &'static str,
-            typ: &'static str,
-        }
-
-        let header = Header {
-            alg: "none",
-            typ: "JWT",
-        };
-        let payload = serde_json::json!({
-            "email": "user@example.com",
-            "email_verified": true,
-            "https://api.openai.com/auth": {
-                "chatgpt_plan_type": "pro",
-                "chatgpt_user_id": "user-12345",
-                "chatgpt_account_id": chatgpt_account_id,
-            },
-        });
-        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let header_b64 = b64(&serde_json::to_vec(&header).unwrap_or_else(|err| {
-            panic!("serialize header: {err}");
-        }));
-        let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap_or_else(|err| {
-            panic!("serialize payload: {err}");
-        }));
-        let signature_b64 = b64(b"sig");
-        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    async fn install_runtime_lease_authority(
+        session: &mut crate::codex::Session,
+        authority: crate::runtime_lease::RuntimeLeaseAuthority,
+    ) {
+        let runtime_lease_host =
+            crate::runtime_lease::RuntimeLeaseHost::pooled_with_authority_for_test(
+                crate::runtime_lease::RuntimeLeaseHostId::new(
+                    "runtime-lease-mcp-openai-file-test".to_string(),
+                ),
+                authority,
+            );
+        let session_id = session.conversation_id.to_string();
+        let provider = session.provider().await;
+        session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+        session.services.model_client = crate::client::ModelClient::new_with_runtime_lease(
+            /*auth_manager*/ None,
+            /*lease_auth*/ None,
+            Some(runtime_lease_host),
+            Some(Arc::new(tokio::sync::Mutex::new(
+                crate::runtime_lease::SessionLeaseView::new(),
+            ))),
+            session_id.clone(),
+            Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
+                crate::runtime_lease::CollaborationTreeId::root_for_session(&session_id),
+            )),
+            session.conversation_id,
+            "11111111-1111-4111-8111-111111111111".to_string(),
+            provider,
+            codex_protocol::protocol::SessionSource::Exec,
+            /*model_verbosity*/ None,
+            /*enable_request_compression*/ false,
+            /*include_timing_metrics*/ false,
+            /*beta_features_header*/ None,
+        );
     }
 
     #[tokio::test]
@@ -526,9 +515,9 @@ mod tests {
     #[tokio::test]
     async fn rewrite_mcp_tool_arguments_for_openai_files_surfaces_upload_failures() {
         let (mut session, turn_context) = make_session_and_context().await;
-        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
-            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-        );
+        let authority =
+            crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+        install_runtime_lease_authority(&mut session, authority).await;
         let error = rewrite_mcp_tool_arguments_for_openai_files(
             &session,
             &turn_context,
@@ -545,7 +534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewrite_mcp_tool_arguments_for_openai_files_uses_leased_auth_when_available() {
+    async fn rewrite_mcp_tool_arguments_for_openai_files_uses_runtime_admission_for_upload_auth() {
         use wiremock::Mock;
         use wiremock::MockServer;
         use wiremock::ResponseTemplate;
@@ -584,12 +573,9 @@ mod tests {
             .await;
 
         let (mut session, mut turn_context) = make_session_and_context().await;
-        session.services.auth_manager = crate::test_support::auth_manager_from_auth(
-            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-        );
-        session.services.lease_auth.replace_current(Some(Arc::new(
-            TestLeaseScopedAuthSession::new("pooled-account"),
-        )));
+        let authority =
+            crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("pooled-account", 7);
+        install_runtime_lease_authority(&mut session, authority.clone()).await;
         let dir = tempdir().expect("temp dir");
         let local_path = dir.path().join("file_report.csv");
         tokio::fs::write(&local_path, b"hello")
@@ -625,6 +611,10 @@ mod tests {
                     "file_size_bytes": 5,
                 }
             })
+        );
+        assert_eq!(
+            authority.recorded_boundaries_for_test(),
+            vec![crate::runtime_lease::RequestBoundaryKind::BackgroundModelCall]
         );
     }
 }

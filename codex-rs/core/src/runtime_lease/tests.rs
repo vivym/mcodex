@@ -300,6 +300,86 @@ async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_adm
 }
 
 #[tokio::test]
+async fn legacy_bridge_admission_heartbeat_renews_active_lease_until_guard_drop()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let account_id = "acct-legacy-heartbeat";
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let holder_instance_id = "holder-legacy-heartbeat";
+    let mut accounts = test_accounts_config();
+    accounts.lease_ttl_secs = Some(4);
+    accounts.heartbeat_interval_secs = Some(1);
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db.clone()),
+        Some(accounts),
+        codex_home.path().to_path_buf(),
+        holder_instance_id.to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(manager);
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesCompact,
+        "session-heartbeat",
+        CollaborationTreeId::for_test("tree-heartbeat"),
+    );
+
+    let admission = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    let initial_lease = state_db
+        .read_active_holder_lease(holder_instance_id)
+        .await?
+        .expect("admission should acquire an active holder lease");
+
+    let renewed_lease = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let active_lease = state_db
+                .read_active_holder_lease(holder_instance_id)
+                .await?
+                .expect("heartbeat should keep the holder lease active");
+            if active_lease.expires_at > initial_lease.expires_at {
+                return Ok::<_, anyhow::Error>(active_lease);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await??;
+    assert!(renewed_lease.expires_at > initial_lease.expires_at);
+
+    drop(admission.guard);
+    assert_eq!(authority.admitted_count_for_test(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_bridge_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
