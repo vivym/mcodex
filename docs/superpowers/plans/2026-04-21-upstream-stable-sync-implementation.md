@@ -1787,7 +1787,24 @@ Check the pushed branch or PR in GitHub and confirm the required status checks a
 
 Expected: if Task 14 deferred the full workspace suite to CI, or if any sandbox-gated runtime regressions from Task 14 were marked CI-required, do not ask to merge and do not merge until required CI is green. Recording the deferral in the execution log is not sufficient by itself.
 
-- [ ] **Step 7: Decide when to merge to main**
+- [ ] **Step 7: Run the mainline merge-window checklist**
+
+Confirm all of the following before asking to merge into `main`:
+
+```text
+sync/rust-v0.122.0 has passed the full Task 14 gate
+required CI is green for every check that was deferred locally
+release/install/update contracts are still verified after the last sync-branch change
+current mainline development is at a reasonable checkpoint rather than in the middle of a shared-core rewrite
+latest main has been merged or rebased into sync/rust-v0.122.0 when needed, and the resulting conflicts stayed controllable
+the final gate was rerun after bringing latest main into the sync branch
+merging now will not force an unreasonable immediate rebase burden onto other active branches
+a deliberate merge window has been chosen so sync integration is the mainline change under review
+```
+
+Expected: every item is affirmatively true before any merge decision. If any item is false, keep the sync branch open, refresh from `main` later, and rerun the final gate.
+
+- [ ] **Step 8: Decide when to merge to main**
 
 Because the user is developing on `main`, do not merge automatically. Ask:
 
@@ -1814,7 +1831,22 @@ git merge-base --is-ancestor rust-v0.122.0 main
 
 Expected: command exits 0.
 
-- [ ] **Step 2: Delete ephemeral local worktrees only after review/bisect no longer needs them**
+- [ ] **Step 2: Run a short post-merge observation pass on high-risk fork surfaces**
+
+Confirm the merge aftermath on the highest-risk areas:
+
+```text
+CI remains green after the merge to main
+startup and login still behave correctly for fresh and existing mcodex homes
+lease-scoped pooled auth still works for request, compact, review/subagent, realtime, and websocket paths
+app-server pooled APIs and lease notifications still reflect live runtime state
+TUI pooled status rendering and update prompts still reflect the intended fork behavior
+installer and update entry points still point at the OSS mcodex distribution path
+```
+
+Expected: if any of these regress after the main merge, treat the sync as incomplete and fix forward immediately rather than waiting for a later upstream pull.
+
+- [ ] **Step 3: Delete ephemeral local worktrees only after review/bisect no longer needs them**
 
 Run only after maintainer approval:
 
@@ -1825,7 +1857,7 @@ git worktree remove .worktrees/sync-rust-v0.122.0
 
 Expected: worktrees removed.
 
-- [ ] **Step 3: Delete checkpoint branch only after approval**
+- [ ] **Step 4: Delete checkpoint branch only after approval**
 
 Run:
 
@@ -1835,7 +1867,7 @@ git branch -d sync/rust-v0.121.0-base
 
 Expected: branch deletion succeeds. Do not delete `sync/rust-v0.122.0` until the PR is merged and no longer needed.
 
-- [ ] **Step 4: Record final sync status**
+- [ ] **Step 5: Record final sync status**
 
 Append to the execution log on `main` if it is retained:
 
