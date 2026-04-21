@@ -520,7 +520,17 @@ For the 0.121 checkpoint only, keep the upstream 0.121 runtime behavior and pres
 - 0.122 is expected to delete or migrate this file into upstream's newer runtime/thread structure.
 ```
 
-- [ ] **Step 3: Resolve core state service conflict**
+- [ ] **Step 3: Resolve `codex_tests.rs` in lockstep with the temporary compatibility point**
+
+Edit `codex-rs/core/src/codex_tests.rs` so upstream `0.121` behavioral coverage for `codex.rs` remains present and fork pooled-account or lease-auth assertions that still apply to the checkpoint remain meaningful. Verify no conflict markers:
+
+```bash
+rg '<<<<<<<|=======|>>>>>>>' codex-rs/core/src/codex_tests.rs
+```
+
+Expected: no matches. Do not silently drop `codex.rs`-adjacent regression coverage just to get the checkpoint compiling.
+
+- [ ] **Step 4: Resolve core state service conflict**
 
 Edit `codex-rs/core/src/state/service.rs` so upstream state-service changes remain and fork account-pool state writes, lease updates, and fail-closed diagnostics remain. Verify no conflict markers:
 
@@ -530,7 +540,7 @@ rg '<<<<<<<|=======|>>>>>>>' codex-rs/core/src/state/service.rs
 
 Expected: no matches.
 
-- [ ] **Step 4: Resolve realtime and view-image test conflicts**
+- [ ] **Step 5: Resolve realtime and view-image test conflicts**
 
 Edit:
 
@@ -542,7 +552,7 @@ codex-rs/core/tests/suite/view_image.rs
 
 Preserve upstream realtime behavior and fork auth/session setup. Do not remove pooled-account fixtures from `codex-rs/core/tests/suite/account_pool.rs`.
 
-- [ ] **Step 5: Run core-focused tests**
+- [ ] **Step 6: Run core-focused tests**
 
 Run:
 
@@ -551,9 +561,9 @@ cd codex-rs
 cargo test -p codex-core
 ```
 
-Expected: no conflict-marker compilation failures. If semantic failures appear, use @superpowers:systematic-debugging and record root cause in the execution log.
+Expected: no conflict-marker compilation failures. This run must exercise the newly resolved `codex_tests.rs` coverage alongside the temporary `codex.rs` compatibility point. If semantic failures appear, use @superpowers:systematic-debugging and record root cause in the execution log.
 
-- [ ] **Step 6: Stage resolved core files**
+- [ ] **Step 7: Stage resolved core files**
 
 Run:
 
