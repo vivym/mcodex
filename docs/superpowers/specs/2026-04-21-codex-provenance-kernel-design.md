@@ -1,55 +1,66 @@
 # Codex Provenance Kernel Design
 
-This document defines an API-first provenance system for tracing how code at a
-given anchored file and line range was introduced and evolved across Codex
+This document defines the mcodex-side provenance system for tracing how code at
+an anchored file and line range was introduced and evolved across Codex
 activity.
 
-The intended primary consumers are machine systems, not end users inside the
-TUI. Codex should therefore provide a language-agnostic provenance kernel keyed
-by workspace or Git revision, file path, and line range. A dedicated postmortem
-or incident system can add symbol parsing, issue correlation, and higher-level
-analysis on top of that kernel.
+The primary job of mcodex is to be a local provenance kernel:
+
+- capture code mutation facts during Codex execution
+- build hunk-level lineage for workspace and Git revision queries
+- expose app-server APIs for local and external consumers
+- persist enough structured evidence to support future export into Forgeloop's
+  trace/evidence plane
+
+mcodex should not become the online postmortem platform. Forgeloop owns actor
+timelines, incident objects, repo-level SaaS aggregation, cross-user
+authorization, raw-content approval, retention policy, and postmortem
+snapshots.
 
 ## Summary
 
-Build a workspace-scoped provenance kernel with these properties:
+Build a workspace-scoped, hunk-based provenance kernel with these properties:
 
 1. Record structured mutation observations during a turn and group them into
-   turn-level change sets rather than relying on ad hoc `git blame` or
-   live-only turn diffs.
+   turn-level change sets.
 2. Use anchored code coordinates as the primary query surface:
    - `workspace anchor + file + line/range` for live workspace queries
    - `git code_ref + file + line/range` for historical revision queries
 3. Treat hunks, not symbols or individual lines, as the primary stored unit of
    provenance.
-4. Maintain a versioned live line-range projection for each tracked file so a
-   current range can be resolved to the latest hunk and walked back through its
+4. Maintain a versioned live segment projection for each tracked file so a
+   current range can resolve to terminal hunks and walk backward through
    lineage.
-5. Prefer explicit ambiguity and stale-workspace states over silent
-   misattribution when concurrent or external writers are involved.
-6. Expose provenance through new app-server v2 APIs, with no dedicated TUI
-   workflow in the first release.
+5. Prefer explicit `ambiguous`, `partial`, `stale`, or `unavailable` states
+   over silent misattribution.
+6. Persist canonical, exportable provenance observations so a future Forgeloop
+   collector can upload the same facts without reinterpreting local SQLite
+   internals.
+7. Expose provenance through app-server v2 APIs, with no dedicated TUI workflow
+   in the first release.
 
-The recommended implementation adds a new `codex-provenance` crate for lineage
-models and algorithms, persists normalized provenance into the existing SQLite
-state database, and integrates recording into the core runtime with a dedicated
-baseline snapshot flow that is independent of undo.
+Recommended implementation:
+
+- add a `codex-provenance` crate for models and lineage algorithms
+- persist normalized local state in the existing SQLite state database
+- add a local append-only provenance event stream for export compatibility
+- integrate recording into core via a dedicated baseline and observation flow
+- expose query APIs through app-server v2
 
 ## Goals
 
 - Answer: "How did the logic at this anchored code coordinate get here?"
-- Make anchored code coordinates the canonical provenance query surface.
-- Cover all turn-driven file mutations, including `apply_patch`, shell commands,
-  `js_repl`, and any other tool path that changes workspace files.
+- Cover all Codex-driven file mutations, including `apply_patch`, shell
+  commands, `js_repl`, and future mutating tools.
 - Preserve enough conversation and tool context for external systems to build a
-  full postmortem trail without reassembling raw rollout items by hand.
-- Keep the Codex side language-agnostic so external systems can own symbol and
-  incident semantics.
-- Prefer explicit `ambiguous` or `stale` provenance states over writing lineage
-  that might be wrong.
-- Support historical lookups for Git-backed workspaces by commit, branch, or
-  other Git ref when the selected revision can be mapped to a recorded
-  provenance state.
+  postmortem trail without reassembling raw rollout items by hand.
+- Keep the Codex side language-agnostic; external systems own symbol, issue,
+  incident, and actor semantics.
+- Support historical lookups for Git-backed workspaces when the selected
+  revision can be mapped exactly to a recorded provenance state.
+- Provide exportable canonical observations that can map cleanly into
+  Forgeloop's future `TraceEvent`, `TraceSpan`, `TraceBlobRef`,
+  `WorkspaceState`, and `CodeRangeProvenanceIndex` concepts.
 - Reuse existing app-server and state infrastructure where it improves
   operability and testability.
 
@@ -59,67 +70,110 @@ baseline snapshot flow that is independent of undo.
 - Do not require or implement symbol parsing inside Codex in the first release.
 - Do not build a dedicated TUI postmortem experience in the first release.
 - Do not backfill historical rollouts or pre-existing repository history.
-- Do not make incident, issue, or PR objects first-class provenance keys inside
-  Codex.
+- Do not make incident, issue, PR, employee, or performance objects first-class
+  provenance keys inside Codex.
+- Do not implement SaaS upload, tenant authorization, raw-content approvals, or
+  cloud retention policy inside mcodex v1.
 - Do not attempt repository-wide semantic equivalence tracking across refactors.
+
+## Relationship to Forgeloop
+
+Forgeloop's trace/evidence plane is the eventual cloud consumer. mcodex should
+produce high-fidelity local facts that Forgeloop can ingest later.
+
+### mcodex owns
+
+- local workspace stream identity
+- turn and tool source context
+- workspace baseline and post-state anchors
+- mutation observations
+- hunk lineage
+- live segment projection
+- revision alias mapping for exact historical lookups
+- local app-server query APIs
+- local export journal entries and blob/content digests
+
+### Forgeloop owns
+
+- SaaS tenant and repo enrollment
+- actor and actor identity mapping
+- ExecutionPackage / RunSession / Review / Release / Incident objects
+- cross-user repo aggregation
+- raw-content entitlement and audit
+- retention, legal hold, redaction, and cloud blob lifecycle
+- incident/postmortem snapshots
+- organization learning workflows
+
+### Compatibility Contract
+
+mcodex should not know Forgeloop object IDs in the core model. It should expose
+source context and stable content/revision anchors so a connector can later
+link facts to Forgeloop objects.
+
+Every exported provenance event must include:
+
+- stable event id
+- local workspace stream id
+- monotonically increasing local sequence
+- schema version
+- event hash and previous event hash
+- source context: thread, turn, item, tool call when available
+- workspace state anchors
+- content digests and blob references
+- hunk ids and lineage edges for code provenance facts
+
+This is an export compatibility contract, not a requirement to build SaaS sync
+inside mcodex v1.
 
 ## Why This Is Not a `git blame` Feature
 
-`git blame` operates at commit granularity and answers a different question:
-"Which commit last touched this line?" That is useful, but it loses the Codex
-turn context that matters for postmortems:
+`git blame` answers: "Which commit last touched this line?"
 
-- the user request that initiated the change
-- the assistant response that decided the change shape
-- the tool calls used to produce it
-- intermediate edits inside the same turn
-- subsequent Codex turns that reshaped the logic before any commit existed
+Postmortem-grade Codex provenance needs to answer:
 
-The correct primitive here is not commit blame. It is turn-aware hunk lineage.
+- which user request initiated the logic
+- which assistant response and tool calls produced it
+- which intermediate tool-level edits happened before any commit existed
+- which later Codex turns reshaped the logic
+- whether a concurrent or external writer made the attribution ambiguous
+
+The correct primitive is turn-aware hunk lineage, not commit blame.
 
 ## Why Git Still Matters
 
 Git is still required, but for a different job.
 
-- Git is the code coordinate system for historical queries.
+- Git is the historical code coordinate system.
 - Provenance is the causal record of how those bytes were produced.
 
-The right model is:
-
-- Git answers: "Which revision of the code are we talking about?"
-- Codex provenance answers: "How did that revision's code get there across
-  turns, tools, and external mutations?"
-
-That gives two valid coordinate forms:
+The valid coordinate forms are:
 
 - live workspace query:
   - `workspace_root + projection anchor + path + line/range`
 - historical query:
   - `git code_ref + path + line/range`
 
-Historical range queries therefore cannot be keyed by bare `file + line/range`.
-They must include a revision anchor.
+Historical range queries cannot be keyed by bare `file + line/range`. The same
+path and line numbers can refer to different logic on different branches or
+commits.
 
 ## Why Codex Should Not Parse Symbols in v1
 
 Symbol parsing is valuable for ergonomics, but it is not the right truth source
-for this system.
+for mcodex v1.
 
-- The future primary consumers are dedicated postmortem systems, not direct TUI
-  users.
-- Those systems can resolve symbols to ranges using their own language-aware
-  indexing stack.
-- Codex already has strong file and diff primitives but does not have a general
+- Dedicated systems can resolve symbols to ranges with language-aware indexes.
+- Codex already has strong file and diff primitives but no general
   multi-language symbol infrastructure.
-- Pushing symbol parsing into Codex would couple the kernel to parser and
-  grammar maintenance without improving the core provenance truth model.
+- Pushing symbol parsing into Codex couples the kernel to parser and grammar
+  maintenance without improving the provenance truth model.
 
 Codex should return high-fidelity range and hunk lineage. External systems can
 layer symbol semantics on top.
 
 ## Current Context
 
-The existing codebase already has several useful building blocks:
+Useful existing building blocks:
 
 - turn-scoped diff tracking in `core/src/turn_diff_tracker.rs`
 - live `TurnDiff` emission from `core/src/codex.rs`
@@ -129,216 +183,281 @@ The existing codebase already has several useful building blocks:
 - ghost snapshot machinery that can capture a turn baseline in a Git repo
 - existing git metadata and diff utilities in `codex-rs/git-utils`
 
-However, the current surfaces are not sufficient as the long-term provenance
-kernel:
+Current gaps:
 
-1. `TurnDiff` is currently emitted as a unified diff string and is not
-   persisted as structured lineage.
-2. `ThreadItem::FileChange` is a client-facing projection of file changes, not a
-   normalized provenance model.
-3. The current turn diff tracker is wired mainly through `apply_patch` events.
-   Shell and `js_repl` execution paths do not hand the tracker through the same
-   way, so a provenance system built on top of that tracker would miss mutating
-   turns from other tool paths.
-4. Existing history is thread-oriented, while the target query model must work
-   across multiple Codex threads operating on the same workspace.
-5. A single net `turn start -> turn end` diff cannot preserve tool-level
-   intermediate changes and cannot safely disambiguate concurrent or external
-   workspace mutations that land while a turn is in flight.
-6. Bare `file + line/range` is not a complete coordinate for historical code.
-   The same path and line numbers can refer to different logic on different
-   branches or commits.
+1. `TurnDiff` is a unified diff string and is not persisted as structured
+   lineage.
+2. `ThreadItem::FileChange` is a client-facing projection, not a normalized
+   provenance model.
+3. The current turn diff tracker is wired mainly through `apply_patch`; shell
+   and `js_repl` paths can mutate files without passing through the same
+   tracker.
+4. Existing history is thread-oriented, while provenance must aggregate across
+   multiple Codex threads operating on the same workspace.
+5. A single net `turn start -> turn end` diff loses tool-level intermediate
+   changes and cannot safely disambiguate external mutations while a turn is in
+   flight.
+6. Bare `file + line/range` is not a complete historical coordinate.
 
-The design therefore needs a lower, workspace-oriented recording layer that is
-separate from the current live diff presentation.
+## Architecture
 
-## Recommended Architecture
-
-### 1. Scope Provenance by Workspace, Not by Thread
+### 1. Scope Provenance by Workspace
 
 The primary query is not "what happened in this thread?" but "how did this code
-in this workspace evolve?" That requires provenance to aggregate across many
-threads.
+in this workspace evolve?"
 
 Define a workspace scope as:
 
-- the canonical Git worktree root when the current directory is inside a Git
-  worktree
+- the canonical Git worktree root when inside a Git worktree
 - otherwise, the canonical current working directory
 
-Each recorded change set is attached to exactly one workspace scope and may
-optionally reference a `thread_id` and `turn_id` when the source was a Codex
-turn.
+Each change set is attached to exactly one workspace scope and may reference a
+`thread_id` and `turn_id` when the source was a Codex turn.
 
-One Codex turn may emit more than one workspace-scoped change set if it mutates
-files that belong to more than one canonical workspace root. No single change
-set should span multiple workspaces.
+One Codex turn may emit multiple workspace-scoped change sets if it mutates
+files under multiple canonical workspace roots. A single change set must not
+span multiple workspaces.
 
-Each workspace also owns a monotonic `projection_version`. All updates to the
-workspace lineage graph and live segment projection must be applied through a
-single serialized workspace transaction:
+Each workspace owns:
 
-- read current projection state
-- verify the expected base projection version
-- apply new mutation observations
-- advance the projection version
+- a stable `workspace_id`
+- a stable local `workspace_stream_id`
+- a monotonic `projection_version`
+- a local append-only provenance sequence
+
+All lineage and live segment updates for a workspace must happen through a
+serialized workspace transaction:
+
+1. read current projection state
+2. verify expected base projection version
+3. apply mutation observation
+4. write normalized records and export event envelope
+5. advance projection version
 
 If the expected base version does not match, the recorder must not guess. It
-must write an explicit ambiguous result and mark the workspace stale until it is
+must write an explicit ambiguous result and mark the workspace stale until
 reconciled.
 
-For Git-backed workspaces, each recorded projected state must also carry a
-stable Git tree identity so historical revision queries can resolve to a
-specific recorded provenance state.
+### 2. Add `codex-provenance`
 
-This gives the system the right aggregation model:
+Do not grow `codex-core` for the provenance algorithms.
 
-- many threads can contribute to one workspace lineage graph
-- range queries do not need a thread id as the primary lookup key
-- postmortem systems can ask about code in the workspace directly
-- historical Git queries can resolve by revision instead of only current
-  workspace position
-
-### 2. Add a Dedicated Provenance Crate
-
-Do not grow `codex-core` for this.
-
-Add a new crate, recommended name `codex-provenance`, responsible for:
+Add `codex-provenance` with:
 
 - normalized provenance model types
+- canonical event payload types
 - diff and hunk normalization
 - lineage graph construction
 - live segment projection updates
 - query result assembly helpers
+- export event envelope helpers
 
 Recommended ownership split:
 
 - `codex-provenance`
   - pure models and lineage algorithms
-  - no app-server protocol knowledge
+  - canonical event payload schemas
+  - no app-server protocol dependency
 - `codex-core`
   - turn lifecycle integration
   - baseline capture orchestration
-  - invocation of provenance recording at turn completion
+  - mutation observation boundaries
 - `codex-state`
-  - SQLite schema, migrations, and indexed persistence
+  - SQLite schema, migrations, persistence, export journal
 - `codex-app-server-protocol`
-  - new v2 request and response types
+  - v2 request and response types
 - `codex-app-server`
   - query handlers and request routing
 
-This keeps the heavy logic out of `codex-core` and fits the existing workspace
-shape.
+### 3. Capture Provenance Baselines
 
-### 3. Introduce a Provenance Baseline Snapshot Flow
+The kernel needs a stable "before" view for every tracked turn. Ghost snapshots
+are good prior art, but provenance should not depend on undo being enabled.
 
-The provenance kernel needs a stable "before" view for every tracked turn.
-Current ghost snapshots are good prior art, but provenance should not depend on
-undo being enabled.
-
-Add a dedicated turn-start baseline capture flow:
+Add a provenance-specific baseline flow:
 
 - name: `ProvenanceBaselineTask` or equivalent
 - trigger: every turn when provenance is enabled
-- implementation: reuse the same Git snapshot machinery already used to produce
-  ghost commits, but under provenance-specific control
+- implementation: reuse Git snapshot machinery where possible
 - output:
   - workspace root
   - baseline snapshot identifier
   - baseline Git tree identity when available
   - base projection version
+  - baseline content digest manifest
   - capture status
 
-If the turn is inside a Git worktree, the baseline should be a snapshot commit
-or equivalent stable snapshot reference produced from the current worktree
-state.
+If inside a Git worktree, the baseline should be a snapshot commit or stable
+snapshot ref produced from the current worktree state.
 
-If the turn is outside Git, v1 should degrade cleanly:
+If outside Git, v1 should degrade cleanly:
 
 - mark provenance unavailable for that turn
 - do not fail the user turn
 - return an explicit availability reason from provenance APIs
 
-This keeps the first release focused on the intended code-repo use case.
+For Git-backed workspaces, each baseline and post-observation state should be a
+resolvable `WorkspaceStateRef`:
 
-For Git-backed workspaces, every baseline and post-observation state should be
-captured as a resolvable `WorkspaceStateRef` that can expose:
+- `workspace_state_id`
+- `projection_version`
+- `snapshot_ref`
+- `git_tree_oid`
+- `git_commit_oid` when the state corresponds exactly to a real commit
+- state content digest
 
-- provenance projection version
-- snapshot ref or equivalent
-- Git tree OID
-- exact commit OID when the state is known to correspond to a real commit
+### 4. Seed Bootstrap Prehistory
 
-The first successful baseline in a workspace must also seed bootstrap
-provenance for already-existing text files in that workspace. The system does
-not backfill historical turns, but it still needs a synthetic prehistory layer
-so that:
+The first successful baseline in a workspace must seed bootstrap provenance for
+already-existing text files.
+
+This does not backfill old turns. It creates a synthetic prehistory layer so:
 
 - unchanged legacy lines have a terminal segment
 - the first recorded replacement of legacy code has a parent
-- queries can distinguish "pre-provenance code" from "no data"
+- queries can distinguish `BootstrapPrehistory` from `NoData`
 
-This bootstrap applies only to the workspace state first seen after provenance
-is enabled. It does not create full historical lineage for arbitrary old Git
+Bootstrap applies only to the workspace state first seen after provenance is
+enabled. It does not create full historical lineage for arbitrary old Git
 revisions.
 
-### 4. Extract Changes From Baseline to Turn End
+### 5. Observe Mutations at Tool Boundaries
 
 The recorder must sit below the current live UI diff projection and must not
-depend on `TurnDiffTracker` being complete. It must also avoid attributing
-concurrent or external writes to the wrong Codex turn.
+depend on `TurnDiffTracker` being complete.
 
 Recommended flow:
 
-1. Capture turn baseline snapshot and `base_projection_version` at turn start.
-2. Before each mutating tool observation, reconcile the actual workspace state
-   against the projected workspace head for that workspace.
-   - If drift exists before the tool starts, synthesize an
-     `ExternalWorkspaceMutation` or mark the workspace stale before attributing
-     any new Codex change.
-3. Around each mutating tool boundary, capture a `MutationObservation` from the
-   pre-observation state to the post-observation state.
-4. Apply that observation inside a serialized workspace transaction.
-   - If the workspace projection version advanced unexpectedly, or if the
-     observed post-state cannot be reconciled with the projected head, record an
-     ambiguous observation and stop applying further lineage for that workspace
-     until repair occurs.
-5. At turn completion, persist a turn envelope that references the ordered
-   observations and a derived net summary for convenience.
-6. When a Git-backed post-state exactly matches a real commit or later resolves
-   to one, persist a revision alias so historical `code_ref` lookups can attach
-   to the recorded provenance state without heuristic matching.
+1. Capture turn baseline and `base_projection_version` at turn start.
+2. Before each mutating tool observation, reconcile actual workspace state
+   against the projected workspace head.
+3. If drift exists before the tool starts, synthesize
+   `ExternalWorkspaceMutation` or mark stale before attributing any new Codex
+   change.
+4. Around each mutating tool boundary, capture a `MutationObservation` from
+   pre-observation state to post-observation state.
+5. Apply that observation inside a serialized workspace transaction.
+6. If projection version advanced unexpectedly, or the post-state cannot be
+   reconciled, write an ambiguous observation and stop applying lineage for
+   that workspace until repair occurs.
+7. At turn completion, persist a turn envelope that references ordered
+   observations and a derived net summary.
+8. If a post-state exactly matches a real commit or later resolves to one,
+   persist a revision alias so historical `code_ref` lookups can attach to the
+   recorded state without heuristic matching.
 
-This gives a single truth source that covers:
+This covers:
 
 - `apply_patch`
 - shell commands that edit files
 - `js_repl` edits
 - future mutating tools
 
-without needing separate per-tool provenance logic, and it preserves
-tool-level intermediate changes rather than only a turn-end net diff.
+while preserving tool-level intermediate changes.
 
-### 5. Store Hunks as the Primary Provenance Unit
+## Canonical Local Event Model
 
-The stored truth model should be hunk-based, not line-based and not
-symbol-based.
+SQLite tables are the local query store. An append-only local event stream is
+the source of export compatibility and replayable projection updates.
 
-Reasoning:
+### LocalProvenanceEvent
 
-- line numbers drift too easily and encourage false precision
-- symbols are not available in a language-agnostic way
-- most meaningful logic changes happen in contiguous ranges, not isolated single
-  lines
+```text
+LocalProvenanceEvent
+- event_id
+- workspace_id
+- workspace_stream_id
+- sequence
+- schema_version
+- event_type
+- occurred_at
+- recorded_at
+- event_hash
+- previous_event_hash
+- source_context
+- payload
+- blob_refs
+```
 
-Recommended normalized model:
+Sequence rules:
 
-#### `WorkspaceProvenanceChangeSet`
+- sequence is gapless per `workspace_stream_id`
+- same sequence + same event hash is idempotent
+- same sequence + different event hash marks the stream conflicted
+- `previous_event_hash` detects local stream forks
+
+This is local correctness machinery. SaaS enrollment, stream token, tenant
+validation, raw access approval, and cloud retention remain Forgeloop concerns.
+
+### SourceContext
+
+```text
+SourceContext
+- source_system: codex
+- thread_id
+- turn_id
+- item_id
+- tool_call_id
+- tool_name
+- command_id
+- workspace_root
+- workspace_state_id
+- projection_version
+- git_commit_oid
+- git_tree_oid
+```
+
+### BlobRef
+
+Large content should be referenced by digest rather than inlined:
+
+```text
+BlobRef
+- blob_ref_id
+- digest_algorithm: sha256
+- expected_digest
+- byte_size
+- content_kind
+- local_storage_ref
+- availability: available | pending | missing | redacted | expired
+- required_for_reconstruction
+```
+
+In mcodex v1, blob lifecycle is local:
+
+- `available` means local state can read it
+- `pending` means event is recorded but content has not been persisted yet
+- `missing` means reconstruction/query must return `Partial` or `Unavailable`
+- `redacted` and `expired` are reserved for future export/cloud consumers
+
+### Canonical Event Types
+
+Required event types:
+
+- `workspace.bootstrap_seeded`
+- `workspace.state_created`
+- `mutation.observed`
+- `file.delta_observed`
+- `hunk.observed`
+- `revision.alias_created`
+- `projection.applied`
+- `projection.marked_stale`
+- `provenance.marked_ambiguous`
+- `external_mutation.observed`
+
+These event types must be stable enough to export. Internal SQLite table names
+may evolve, but event payload semantics should not churn casually.
+
+## Normalized Model
+
+### WorkspaceProvenanceChangeSet
 
 - `workspace_id`
+- `workspace_stream_id`
 - `source`
   - `CodexTurn`
-  - future: `ExternalWorkspaceMutation`
+  - `ExternalWorkspaceMutation`
+  - `BootstrapPrehistory`
 - `thread_id: Option<String>`
 - `turn_id: Option<String>`
 - `started_at`
@@ -353,10 +472,11 @@ Recommended normalized model:
 - `observations: Vec<MutationObservation>`
 - `derived_net_summary: Vec<FileNetSummary>`
 
-#### `MutationObservation`
+### MutationObservation
 
 - `observation_id`
 - `workspace_id`
+- `workspace_stream_id`
 - `thread_id: Option<String>`
 - `turn_id: Option<String>`
 - `tool_ref: Option<ToolRef>`
@@ -367,21 +487,55 @@ Recommended normalized model:
 - `attribution_status`
   - `Attributed`
   - `Ambiguous`
+  - `Partial`
   - `Unavailable`
 - `base_projection_version`
 - `applied_projection_version: Option<i64>`
 - `pre_state_ref: WorkspaceStateRef`
 - `post_state_ref: WorkspaceStateRef`
 - `files: Vec<FileChangeSet>`
+- `event_id`
 
-#### `WorkspaceStateRef`
+### WorkspaceStateRef
 
+- `workspace_state_id`
 - `projection_version: Option<i64>`
 - `snapshot_ref: Option<String>`
 - `git_tree_oid: Option<String>`
 - `git_commit_oid: Option<String>`
+- `content_digest: Option<String>`
+- `required_blob_refs: Vec<BlobRefId>`
 
-#### `FileChangeSet`
+### WorkspaceStateDelta
+
+- `workspace_state_id`
+- `parent_workspace_state_id: Option<String>`
+- `path_before: Option<PathBuf>`
+- `path_after: Option<PathBuf>`
+- `change_kind`
+  - `Add`
+  - `Update`
+  - `Delete`
+  - `Rename`
+  - `ModeChange`
+  - `Ambiguous`
+- `before_content_digest: Option<String>`
+- `after_content_digest: Option<String>`
+- `before_blob_ref: Option<BlobRefId>`
+- `after_blob_ref: Option<BlobRefId>`
+- `patch_blob_ref: Option<BlobRefId>`
+- `hunk_ids: Vec<HunkId>`
+
+State reconstruction rules:
+
+- every state must resolve to either a Git tree, a checkpoint blob, or a parent
+  state plus deltas
+- required missing blobs make the query `Unavailable` or `Partial`
+- ambiguous delete/recreate or rename boundaries must be surfaced as
+  `Ambiguous`, never guessed
+- checkpoints should be generated periodically so parent chains remain bounded
+
+### FileChangeSet
 
 - `observation_id`
 - `change_id`
@@ -401,26 +555,33 @@ Recommended normalized model:
 - `is_queryable`
 - `hunks: Vec<HunkRecord>`
 
-#### `HunkRecord`
+### HunkRecord
 
 - `hunk_id`
 - `change_id`
 - `file_id`
+- `path_before: Option<PathBuf>`
+- `path_after: Option<PathBuf>`
 - `before_start_line`
 - `before_line_count`
 - `after_start_line`
 - `after_line_count`
-- `context_before`
-- `context_after`
+- `context_before_digest`
+- `context_after_digest`
 - `content_fingerprint_before`
 - `content_fingerprint_after`
 - `parent_hunk_ids: Vec<HunkId>`
+- `origin_hunk_id: Option<HunkId>`
 - `operation`
   - `Add`
   - `Replace`
   - `Delete`
+- `observation_confidence`
+  - `Exact`
+  - `Partial`
+  - `Ambiguous`
 
-#### `LiveSegment`
+### LiveSegment
 
 - `workspace_id`
 - `file_id`
@@ -429,78 +590,73 @@ Recommended normalized model:
 - `projection_version`
 - `terminal_hunk_id`
 
-`LiveSegment` is the crucial projection structure. It maps the current file
-state to the latest hunk responsible for each contiguous line range.
+`LiveSegment` maps the projected file state to terminal hunks.
 
-#### `RevisionAlias`
+### RevisionAlias
 
 - `workspace_id`
 - `git_commit_oid`
 - `git_tree_oid`
 - `projection_version`
-- `state_ref`
+- `workspace_state_id`
+- `exact`
+- `source`
+  - `RecordedPostState`
+  - `GitResolution`
+  - `CommitMatch`
 
-`RevisionAlias` allows a historical Git revision to resolve to an exact
-recorded provenance state when that tree has already been observed by the
-provenance kernel.
+Historical queries must use exact aliases only. No fuzzy matching.
 
-### 6. Maintain a Live Segment Projection
+## Hunk and Segment Projection
 
-Range queries need to answer questions about the current workspace state, not
-just about a historical patch. That requires an index over the latest file
-state.
+The stored truth model is hunk-based.
 
-Maintain a per-file live segment map:
+When a normalized hunk is applied:
 
-- segments are contiguous
-- segments do not overlap
-- each segment points at the latest terminal hunk that wrote those lines
-
-When a new normalized hunk is applied:
-
-1. Resolve all affected parent segments that intersect the hunk's `before`
-   range.
-2. Create a child `HunkRecord` with `parent_hunk_ids` set to the terminal hunks
-   found in that range.
+1. Resolve all affected parent segments intersecting the hunk's before range.
+2. Create a child `HunkRecord` with parent hunk ids from those terminal
+   segments.
 3. Rewrite the affected segment map:
    - additions insert new segments
-   - replacements remove affected segments and insert new child segments
+   - replacements remove affected segments and insert child segments
    - deletions remove affected segments and create a tombstone hunk with parent
      references
+4. Write the canonical `hunk.observed` event with the same hunk ids and parent
+   edges.
 
-This is the heart of the system. It allows:
+This allows:
 
 - `file + line/range -> one or more terminal hunks`
 - `terminal hunk -> parent hunks`
-- repeated walking back to the turn that introduced the current logic
+- lineage walk back to origin turn or bootstrap prehistory
 
-### 7. Give Files Stable Identity Across Renames
+## File Identity
 
-The same logic may survive path changes. Querying only by path is not enough.
+Assign each tracked file a stable `file_id` only when continuity can be
+proven.
 
-Assign each tracked file a stable `file_id` when the recorder can prove
-continuity. The change model must support both path movement and content edits
-within the same observation:
+Rules:
 
 - rename-only and rename-plus-edit observations can preserve `file_id`
-- path changes update the current path alias history
+- path changes update path alias history
 - delete followed by later recreation at the same path creates a new `file_id`
   only when that boundary is observable
-- when the available evidence cannot distinguish preserve-vs-recreate safely,
-  set `identity_status = Ambiguous` and surface that ambiguity through the API
+- when evidence cannot distinguish preserve-vs-recreate safely, set
+  `identity_status = Ambiguous`
 
-This keeps lineage coherent across renames without over-promising certainty for
-delete/recreate or heavy rewrite edge cases.
+## Local Persistence in `codex-state`
 
-### 8. Use SQLite in `codex-state`, Not Rollout JSONL, as the Store
+Use SQLite in `codex-state` rather than rollout JSONL for normalized
+provenance.
 
-The existing `state` crate already owns local SQLite-backed state. Provenance is
-best persisted there rather than bloating rollout JSONL with analysis data.
-
-Recommended new SQLite tables:
+Recommended tables:
 
 - `provenance_workspaces`
+- `provenance_workspace_streams`
+- `provenance_local_events`
 - `provenance_workspace_heads`
+- `provenance_workspace_states`
+- `provenance_workspace_state_deltas`
 - `provenance_revision_aliases`
 - `provenance_turns`
 - `provenance_observations`
@@ -508,7 +664,8 @@ Recommended new SQLite tables:
 - `provenance_files`
 - `provenance_path_aliases`
 - `provenance_file_heads`
-- `provenance_text_blobs`
+- `provenance_blobs`
+- `provenance_blob_refs`
 - `provenance_changes`
 - `provenance_hunks`
 - `provenance_hunk_parents`
@@ -517,37 +674,30 @@ Recommended new SQLite tables:
 Recommended indexes:
 
 - by `workspace_id` and current path
-- by `workspace_id` and `projection_version`
-- by `workspace_id` and `git_tree_oid`
-- by `git_commit_oid`
-- by `hunk_id`
-- by `thread_id` and `turn_id`
-- by `file_id`, `projection_version`, `start_line`, and `end_line`
+- by `workspace_stream_id` and sequence
+- by `workspace_id` and projection version
+- by `workspace_id` and Git tree OID
+- by Git commit OID
+- by hunk id
+- by thread id and turn id
+- by file id, projection version, start line, and end line
 - by parent and child hunk edges
 
-Why SQLite is the right default:
-
-- there is already migration and runtime infrastructure in `codex-state`
-- indexed range lookups are easier and safer than scanning JSONL side files
-- app-server query handlers can stay simple and fast
-- future external consumers can evolve without changing the storage contract
-
 Rollouts remain the source of conversational history. SQLite becomes the
-normalized provenance index. For queryable text files, the store must also keep
-enough projected file state to make repair and overlap queries implementable:
+normalized provenance index and local export journal.
 
-- latest projected file content, directly or through a content-addressed text
-  blob table
+For queryable text files, the store must keep enough projected file state to
+make repair and overlap queries implementable:
+
+- latest projected file content through content-addressed blobs or equivalent
 - workspace and file head refs keyed by projection version
-- revision aliases keyed by commit OID and tree OID for historical resolution
+- exact revision aliases keyed by commit OID and tree OID
 
-### 9. Keep the Query Surface API-First
+## App-Server API
 
 The first release should add app-server v2 APIs and skip dedicated TUI work.
 
-Recommended methods and shapes:
-
-#### `provenance/readRange`
+### `provenance/readRange`
 
 Primary entry point for anchored code coordinates.
 
@@ -559,7 +709,7 @@ Primary entry point for anchored code coordinates.
 - `end_line: Option<u32>`
 - `expected_content_fingerprint: Option<String>`
 
-#### `ProvenanceRangeSelector`
+`ProvenanceRangeSelector`
 
 - `WorkspaceAnchor`
   - `workspace_root: PathBuf`
@@ -578,20 +728,24 @@ Primary entry point for anchored code coordinates.
 - requested range
 - `matched_segments: Vec<RangeSegmentProvenance>`
 - optional collapsed summary when every segment shares the same lineage root
-- availability or failure status
+- completeness:
+  - `Complete`
+  - `Partial`
+  - `Unavailable`
+  - `Ambiguous`
+- availability or failure reason
 
-Live and historical queries share the same response model, but they resolve from
-different anchors:
+Live and historical queries share the same response model:
 
 - `WorkspaceAnchor` resolves against the current projected workspace head
-- `GitRevision` resolves `code_ref` to a commit/tree first, then maps that tree
-  to an exact recorded `WorkspaceStateRef`
+- `GitRevision` resolves `code_ref` to commit/tree, then maps that tree to an
+  exact recorded `WorkspaceStateRef`
 
 The server must not use fuzzy matching for historical Git queries. If the
 selected revision cannot be mapped exactly to a recorded provenance state, it
-must return `Unavailable` rather than guessing.
+must return `Unavailable`.
 
-#### `provenance/readHunk`
+### `provenance/readHunk`
 
 Deep hunk inspection.
 
@@ -606,8 +760,9 @@ Deep hunk inspection.
 - parent hunk metadata
 - child hunk metadata when needed
 - attached turn and tool references
+- content/blob availability state
 
-#### `provenance/readTurn`
+### `provenance/readTurn`
 
 Turn-centric inspection.
 
@@ -621,39 +776,52 @@ Turn-centric inspection.
 - normalized turn change set
 - file and hunk summaries
 - excerpts and tool refs
+- observation attribution and ambiguity status
 
-These methods match the actual consumer model:
+### `provenance/exportEvents`
 
-- a postmortem system identifies a suspect range
-- it asks Codex for the terminal hunk and lineage
-- it optionally drills into a specific hunk or turn
+Local export compatibility API.
 
-### 10. Return Machine-Friendly Evidence, Not Just Blame Labels
+This API is optional for v1 but the storage model must support it.
 
-The API should not stop at "this turn last touched the line."
+`ProvenanceExportEventsParams`
 
-Each lineage response should include enough evidence for a dedicated postmortem
-system to build a narrative:
+- `workspace_root: PathBuf`
+- `after_sequence: Option<i64>`
+- `limit: Option<u32>`
 
-- `hunk_id`
+`ProvenanceExportEventsResponse`
+
+- `workspace_stream_id`
+- `events`
+- `next_sequence`
+- missing blob refs, if any
+
+This is for future collectors. It is not a SaaS upload implementation.
+
+## Evidence Returned by Queries
+
+Responses should include machine-friendly evidence, not only "last touched by."
+
+Each lineage response should include:
+
+- hunk id
 - file identity and current path
-- current range and, when relevant, prior range
+- current range and prior range when relevant
 - origin and intermediate turn refs
 - observation refs and attribution status
 - user and assistant excerpts
 - tool refs
-- context snippets and content fingerprints
+- context digests and content fingerprints
+- blob refs and availability
+- resolved Git revision identity for historical queries
 
-This lets the external system assemble rich review surfaces without parsing raw
-rollout files on every lookup.
-
-For historical Git queries, the response must also return the resolved Git
-revision identity so downstream systems can cache or correlate by exact commit.
+External systems can use this to assemble review and postmortem surfaces
+without parsing raw rollout files for every lookup.
 
 ## External Mutations and Divergence
 
-Long-term correctness requires acknowledging that not every workspace mutation
-comes from a Codex turn.
+Not every workspace mutation comes from a Codex turn.
 
 Examples:
 
@@ -661,32 +829,26 @@ Examples:
 - Git checkout or branch switching changes the working tree
 - another tool rewrites files between Codex turns
 
-The architecture must support a second change source:
+Support `ExternalWorkspaceMutation`.
 
-- `ExternalWorkspaceMutation`
+Recommended behavior:
 
-Recommended end state:
-
-1. Before a mutating Codex observation starts, compare the current workspace
-   state with the projected workspace head for that workspace.
-2. If they differ, synthesize and persist an `ExternalWorkspaceMutation`
-   observation before attributing the Codex mutation.
-3. After the Codex observation ends, revalidate the resulting post-state against
-   the expected projected head before advancing the projection version.
+1. Before a mutating Codex observation starts, compare current workspace state
+   with projected workspace head.
+2. If they differ, synthesize and persist `ExternalWorkspaceMutation` before
+   attributing the Codex mutation.
+3. After the Codex observation ends, revalidate post-state against expected
+   projected head.
 4. If drift is detected inside an active Codex observation and cannot be
    separated safely, write an ambiguous observation and mark the workspace
-   stale instead of attributing the mixed result to Codex.
+   stale.
 
-This keeps the lineage graph honest even when the workspace changes outside
-Codex.
+Fallback if full repair is not ready:
 
-If this full repair path is too much for the first increment, the fallback
-behavior should be explicit:
-
-- mark the workspace projection stale
-- mark the affected observation or turn as ambiguous
-- return a structured availability reason from query APIs
-- do not silently answer with invalid lineage
+- mark projection stale
+- mark affected observation or turn ambiguous
+- return structured availability reason from query APIs
+- never silently answer with invalid lineage
 
 ## Operational Behavior
 
@@ -703,11 +865,11 @@ If recording fails:
 
 ### Ambiguity model
 
-The system must distinguish unavailable provenance from ambiguous provenance.
+The system must distinguish unavailable from ambiguous provenance.
 
 - `Unavailable` means the recorder lacks enough data to answer.
-- This includes historical Git revisions that do not map exactly to a recorded
-  provenance state.
+- `Partial` means some evidence is usable but required content or lineage is
+  missing.
 - `Ambiguous` means the recorder observed conflicting or concurrent mutations
   and intentionally refused to guess.
 
@@ -716,7 +878,8 @@ Common ambiguity triggers:
 - projection version mismatch during workspace apply
 - drift detected inside an active Codex mutation window
 - identity boundaries that cannot be proven safely
-- range queries that are anchored to stale content expectations
+- stale content expectations in range queries
+- missing required blob refs for state reconstruction
 
 ### Text-only scope
 
@@ -729,18 +892,21 @@ For binary or oversized files:
 
 ### No TUI requirement
 
-The first release does not need a TUI viewer. At most, later work may add a
-thin TUI or IDE consumer that calls the same app-server APIs.
+The first release does not need a TUI viewer. Later work may add a thin TUI or
+IDE consumer calling the same app-server APIs.
 
 ## Testing Strategy
 
 ### Unit tests in `codex-provenance`
 
 - hunk normalization from baseline diffs
+- canonical event payload generation
+- event hash and sequence validation
 - parent hunk selection
 - live segment rewrites for add, replace, delete
 - rename-only handling
 - delete and recreate at the same path
+- blob availability and partial query behavior
 
 ### Core integration tests
 
@@ -749,13 +915,16 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - turn with `js_repl` mutation
 - turn with no file change
 - provenance unavailable outside Git
+- provenance baseline independent of undo
 
 ### State and migration tests
 
 - schema migration correctness
+- local event stream gap/hash behavior
 - indexed range lookup behavior
 - projected file head reconstruction
 - workspace and path alias updates
+- exact revision alias lookup
 
 ### App-server tests
 
@@ -766,6 +935,7 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - exact historical Git revision resolution
 - unavailable historical Git revision responses
 - availability and stale-projection responses
+- optional export event pagination
 
 ### Concurrency and drift tests
 
@@ -780,45 +950,59 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 
 ## Incremental Delivery
 
-### Phase 1: Foundation
+### Phase 0: Model and Store Contracts
 
-- add `codex-provenance`
+- add `codex-provenance` models
+- define canonical local event envelope and payloads
+- add SQLite migrations for workspace, event stream, blobs, observations, and
+  hunks
+- add event hash and gapless sequence checks
+
+### Phase 1: Turn Recording Foundation
+
 - add provenance baseline capture independent of undo
 - seed bootstrap prehistory for existing queryable files
 - add projection versioning and serialized workspace apply semantics
-- persist mutation observations, file heads, and live segments into SQLite
+- persist mutation observations, file heads, and live segments
 - expose `provenance/readTurn`
 
 ### Phase 2: Range Queries
 
 - implement `provenance/readRange`
 - implement `provenance/readHunk`
+- implement stable `file_id`, path aliases, and ambiguity semantics
+- implement multi-segment range responses
+
+### Phase 3: Git Revision Queries
+
 - implement exact Git revision resolution for recorded workspace states
-- add stable `file_id`, path alias, and ambiguity semantics
-- harden rename, delete, recreate, and multi-segment range behavior
+- persist revision aliases for observed commit/tree states
+- return `Unavailable` for unobserved historical revisions
 
-### Phase 3: Divergence Handling
+### Phase 4: Divergence Handling
 
-- add external mutation repair path and drift revalidation at observation
-  boundaries
+- add external mutation observation and repair path
+- add drift revalidation at observation boundaries
 - support stale workspace detection and explicit repair semantics
 
-### Phase 4: External Consumer Integration
+### Phase 5: Export Compatibility
 
-- wire the dedicated postmortem system to the provenance APIs
-- add higher-level semantic overlays outside Codex
+- expose local `provenance/exportEvents`
+- document mapping from mcodex local events to Forgeloop TraceEvent concepts
+- keep cloud upload, enrollment, raw access approval, and retention out of
+  mcodex
 
 ## Key Decisions
 
 - Primary truth model: `workspace -> file -> hunk lineage`
-- Primary query input: anchored code coordinates, not bare `file + line/range`
-- Primary storage: normalized SQLite state, not rollout JSONL
+- Primary query input: anchored code coordinates
+- Primary storage: normalized SQLite state plus append-only local event stream
 - Workspace projection updates are versioned and serialized
 - Explicit ambiguity is better than silent misattribution
 - Git is the historical code selector, not the provenance truth source
-- Codex responsibility: provenance kernel
-- External system responsibility: symbols, incidents, higher-level postmortem
-  views
+- Codex responsibility: local provenance kernel and exportable facts
+- Forgeloop responsibility: cloud trace/evidence plane, incidents, actors,
+  permissions, retention, and organization learning
 - No historical backfill in the first release
 
 ## Recommendation
@@ -826,10 +1010,11 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 Proceed with a workspace-scoped, hunk-based provenance kernel implemented as a
 new `codex-provenance` crate plus SQLite-backed indexing in `codex-state`.
 
-This is the best balance of correctness, extensibility, and operational
-simplicity:
+Revise implementation planning around this sharper boundary:
 
-- more accurate than `git blame`
-- more durable than per-turn unified diffs
-- simpler and more stable than embedding symbol analysis into Codex
-- directly usable by a dedicated postmortem system
+- mcodex builds the local kernel, app-server APIs, and export-compatible
+  canonical observations
+- Forgeloop consumes those observations later and owns the online product layer
+
+This avoids building cloud product concerns into mcodex while still preventing
+future rework when Forgeloop needs to ingest provenance at scale.
