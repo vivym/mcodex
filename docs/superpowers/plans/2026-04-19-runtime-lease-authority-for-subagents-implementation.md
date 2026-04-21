@@ -16,7 +16,7 @@ This plan assumes `account-pool-quota-aware-selection` continues through Task 3 
 
 Do not execute the quota-aware plan's original Task 4 while this plan is in progress. That original Task 4 modifies `codex-rs/core/src/state/service.rs`, `codex-rs/core/tests/suite/account_pool.rs`, and `codex-rs/account-pool/src/backend.rs`, which are exactly the runtime control-plane integration points this plan changes. In this plan, Task 7 replaces that original Task 4 by wiring the quota-aware selector into the new `RuntimeLeaseHost` boundary.
 
-Post Task 6 anti-regression rule: pooled production code must not reintroduce a session-local bridge path around `RuntimeLeaseHost`. Root pooled sessions install exactly one manager-owned runtime authority with `RuntimeLeaseHost::install_manager_owner(...)`; children and delegates use request-boundary admission from the inherited host. Do not add APIs named or shaped like `legacy_manager_bridge`, `attach_legacy_manager_bridge`, `has_legacy_manager_bridge`, or `account_pool_manager_for_turn`.
+Post Task 6 anti-regression rule: pooled production code must not reintroduce a session-local bridge path around `RuntimeLeaseHost`. Root pooled sessions build exactly one owned `RuntimeLeaseAuthority` and publish it with `RuntimeLeaseHost::install_authority(...)`; children and delegates use request-boundary admission from the inherited host. Do not add APIs named or shaped like `legacy_manager_bridge`, `attach_legacy_manager_bridge`, `has_legacy_manager_bridge`, `account_pool_manager_for_turn`, or `install_manager_owner`.
 
 Safe parallel work while this plan is active:
 
@@ -344,7 +344,7 @@ git commit -m "feat(core): add runtime lease host seam"
 
 - [ ] **Step 1: Write failing tests for the inherited-child no-dual-manager invariant**
 
-Add tests that verify an inherited child session with a runtime host does not build a second session-local `AccountPoolManager` while the root session can still keep the temporary manager owner until Task 6:
+Add tests that verify an inherited child session with a runtime host does not build a second session-local `AccountPoolManager` while the root session can still keep the temporary owned authority until Task 6:
 
 ```rust
 #[tokio::test]
@@ -382,7 +382,7 @@ Expected: FAIL because sessions still decide account-pool ownership only from `i
 
 In `Codex::spawn`, derive a host before account-pool manager construction. The host may be `Pooled` or `NonPooled`; host presence alone must not mean provider requests require pooled admission. Only `host.pooled_authority()` / `host.is_pooled()` drives pooled request admission.
 
-During Tasks 2-5, root pooled sessions keep the existing `account_pool_manager` as a temporary manager owner so startup selection, compact gating, live snapshots, and shutdown behavior keep working until Task 6 migrates ownership into `RuntimeLeaseAuthority`. Inherited child sessions sharing that host must not create their own manager.
+During Tasks 2-5, root pooled sessions keep the existing `account_pool_manager` as a temporary owned authority so startup selection, compact gating, live snapshots, and shutdown behavior keep working until Task 6 migrates ownership into `RuntimeLeaseAuthority`. Inherited child sessions sharing that host must not create their own manager.
 
 ```rust
 let runtime_lease_host = runtime_lease_host.or_else(|| {
@@ -409,18 +409,18 @@ let account_pool_manager = if runtime_lease_host
 };
 ```
 
-Do not keep this exact `new_from_config` shape if a clearer constructor emerges, but preserve the invariant: inherited child sessions must not create a second pooled manager. Root pooled sessions may temporarily keep exactly one manager owner until Task 6 replaces it with the host-owned authority.
+Do not keep this exact `new_from_config` shape if a clearer constructor emerges, but preserve the invariant: inherited child sessions must not create a second pooled manager. Root pooled sessions may temporarily keep exactly one owned authority until Task 6 replaces it with the host-owned authority.
 
 For non-pooled hosts, `account_pool_manager` can remain available as the existing non-pooled compatibility path until Task 6 finishes separating pooled and non-pooled host behavior. Do not remove working root-session behavior before the host-backed control plane exists.
 
-At the same time, register the root manager with the host so later tasks have a real production authority target:
+At the same time, register the root authority with the host so later tasks have a real production authority target:
 
 ```rust
-if let (Some(host), Some(account_pool_manager)) = (
+if let (Some(host), Some(authority)) = (
     runtime_lease_host.as_ref(),
-    account_pool_manager.as_ref(),
+    authority_owned_runtime_lease.as_ref(),
 ) {
-    host.install_manager_owner(Arc::clone(account_pool_manager))?;
+    host.install_authority(authority.clone())?;
 }
 ```
 
@@ -1466,7 +1466,7 @@ async fn normal_pooled_codex_session_routes_provider_request_through_runtime_hos
     harness.submit_one_user_turn("hello").await?;
 
     assert_eq!(harness.recorded_request_admissions(), 1);
-    assert!(harness.runtime_host_has_manager_owner_authority());
+    assert!(harness.runtime_host_has_owned_authority());
     Ok(())
 }
 ```

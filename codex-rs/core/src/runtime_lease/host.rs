@@ -207,27 +207,24 @@ impl RuntimeLeaseHost {
         self.mode() == RuntimeLeaseHostMode::Pooled
     }
 
-    pub(crate) fn install_manager_owner(
-        &self,
-        manager: Arc<Mutex<crate::state::AccountPoolManager>>,
-    ) -> anyhow::Result<()> {
+    pub(crate) fn install_authority(&self, authority: RuntimeLeaseAuthority) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.is_pooled(),
-            "runtime lease host {} cannot install a pooled manager owner in non-pooled mode",
+            "runtime lease host {} cannot install a pooled authority in non-pooled mode",
             self.id()
         );
-        let mut authority = self
+        let mut stored_authority = self
             .0
             .authority
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if authority.is_some() {
+        if stored_authority.is_some() {
             anyhow::bail!(
                 "runtime lease host {} already has published pooled authority",
                 self.id()
             );
         }
-        *authority = Some(RuntimeLeaseAuthority::manager_owner(manager));
+        *stored_authority = Some(authority);
         Ok(())
     }
 

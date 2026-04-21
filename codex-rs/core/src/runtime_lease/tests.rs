@@ -44,6 +44,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
+use codex_state::QuotaExhaustedWindows;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::Path;
@@ -146,7 +147,7 @@ async fn pooled_host_snapshot_uses_authority_state_without_session_local_manager
 }
 
 #[tokio::test]
-async fn pooled_host_release_for_shutdown_releases_manager_owner_lease() -> anyhow::Result<()> {
+async fn pooled_host_release_for_shutdown_releases_authority_owned_lease() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
         codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
@@ -190,7 +191,7 @@ async fn pooled_host_release_for_shutdown_releases_manager_owner_lease() -> anyh
     )
     .await?
     .expect("test manager should build");
-    host.install_manager_owner(Arc::clone(&manager))?;
+    host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
 
     {
         let mut manager = manager.lock().await;
@@ -229,7 +230,7 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_republishes_authorit
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&first_manager)))?;
     runtime_lease_host.attach_session("session-old").await;
     runtime_lease_host.detach_session("session-old").await?;
 
@@ -248,7 +249,7 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_republishes_authorit
     .await?
     .expect("replacement manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&second_manager)))?;
     runtime_lease_host.attach_session("session-new").await;
 
     assert!(runtime_lease_host.pooled_authority().is_some());
@@ -313,7 +314,7 @@ async fn draining_acquire_waits_until_replacement_generation() {
 }
 
 #[tokio::test]
-async fn manager_owner_rotations_produce_new_generation_and_gate_replacement_admission()
+async fn owned_authority_rotations_produce_new_generation_and_gate_replacement_admission()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -353,7 +354,7 @@ async fn manager_owner_rotations_produce_new_generation_and_gate_replacement_adm
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -398,7 +399,7 @@ async fn manager_owner_rotations_produce_new_generation_and_gate_replacement_adm
 }
 
 #[tokio::test]
-async fn manager_owner_admission_heartbeat_renews_active_lease_until_guard_drop()
+async fn owned_authority_admission_heartbeat_renews_active_lease_until_guard_drop()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -441,7 +442,7 @@ async fn manager_owner_admission_heartbeat_renews_active_lease_until_guard_drop(
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(manager);
+    let authority = RuntimeLeaseAuthority::owned_manager(manager);
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesCompact,
         "session-heartbeat",
@@ -478,7 +479,7 @@ async fn manager_owner_admission_heartbeat_renews_active_lease_until_guard_drop(
 }
 
 #[tokio::test]
-async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
+async fn owned_authority_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -518,7 +519,7 @@ async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_unt
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -593,7 +594,7 @@ async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_unt
 }
 
 #[tokio::test]
-async fn manager_owner_ignores_stale_reporting_after_rotation() -> anyhow::Result<()> {
+async fn owned_authority_ignores_stale_reporting_after_rotation() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
         codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
@@ -632,7 +633,7 @@ async fn manager_owner_ignores_stale_reporting_after_rotation() -> anyhow::Resul
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -690,7 +691,87 @@ async fn manager_owner_ignores_stale_reporting_after_rotation() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn manager_owner_usage_limit_report_rotates_legacy_default_turn() -> anyhow::Result<()> {
+async fn owned_authority_reports_quota_against_admitted_snapshot_family() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let account_id = "acct-snapshot-family";
+    state_db
+        .import_legacy_default_account(codex_state::LegacyAccountImport {
+            account_id: account_id.to_string(),
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(Arc::clone(&state_db)),
+        Some(legacy_default_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-snapshot-family".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::owned_manager(manager);
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-snapshot-family",
+        CollaborationTreeId::for_test("tree-snapshot-family"),
+    );
+
+    let admission = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    let snapshot = admission.snapshot.clone();
+    assert_eq!(snapshot.selection_family, "chatgpt");
+
+    authority
+        .report_rate_limits(
+            &snapshot,
+            &RateLimitSnapshot {
+                limit_id: Some("chatgpt".to_string()),
+                limit_name: Some("ChatGPT".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 42.0,
+                    window_minutes: Some(60),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            },
+        )
+        .await?;
+    let chatgpt_quota = state_db
+        .read_account_quota_state(account_id, "chatgpt")
+        .await?
+        .expect("snapshot family quota row should be written");
+    assert_eq!(chatgpt_quota.primary_used_percent, Some(42.0));
+    assert_eq!(
+        state_db
+            .read_account_quota_state(account_id, "codex")
+            .await?,
+        None
+    );
+
+    authority.report_usage_limit_reached(&snapshot).await?;
+    let chatgpt_quota = state_db
+        .read_account_quota_state(account_id, "chatgpt")
+        .await?
+        .expect("snapshot family quota row should be updated after usage-limit");
+    assert_eq!(
+        chatgpt_quota.exhausted_windows,
+        QuotaExhaustedWindows::Unknown
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_authority_usage_limit_report_rotates_legacy_default_turn() -> anyhow::Result<()> {
     const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 
     let codex_home = tempfile::tempdir()?;
@@ -734,7 +815,7 @@ async fn manager_owner_usage_limit_report_rotates_legacy_default_turn() -> anyho
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let turn_selection = {
         let mut manager = manager.lock().await;
         manager
@@ -774,7 +855,7 @@ async fn manager_owner_usage_limit_report_rotates_legacy_default_turn() -> anyho
 }
 
 #[tokio::test]
-async fn manager_owner_terminal_unauthorized_report_rotates_legacy_default_turn()
+async fn owned_authority_terminal_unauthorized_report_rotates_legacy_default_turn()
 -> anyhow::Result<()> {
     const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 
@@ -819,7 +900,7 @@ async fn manager_owner_terminal_unauthorized_report_rotates_legacy_default_turn(
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let turn_selection = {
         let mut manager = manager.lock().await;
         manager
@@ -859,7 +940,7 @@ async fn manager_owner_terminal_unauthorized_report_rotates_legacy_default_turn(
 }
 
 #[tokio::test]
-async fn manager_owner_acquire_honors_cancellation_while_waiting_for_manager_lock()
+async fn owned_authority_acquire_honors_cancellation_while_waiting_for_manager_lock()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -873,7 +954,7 @@ async fn manager_owner_acquire_honors_cancellation_while_waiting_for_manager_loc
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
     let token = CancellationToken::new();
     let request_context = LeaseRequestContext::for_test_with_cancel(
         RequestBoundaryKind::ResponsesHttp,
@@ -952,12 +1033,12 @@ async fn runtime_lease_host_rejects_republishing_authority_until_stale_sessions_
     .await?
     .expect("replacement manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&first_manager)))?;
     runtime_lease_host.attach_session("session-root-old").await;
     runtime_lease_host.attach_session("session-child-old").await;
 
     let err = runtime_lease_host
-        .install_manager_owner(Arc::clone(&second_manager))
+        .install_authority(authority_from_manager(Arc::clone(&second_manager)))
         .expect_err("a later root must not silently replace published authority");
     assert!(
         err.to_string()
@@ -989,7 +1070,7 @@ async fn runtime_lease_host_rejects_republishing_authority_until_stale_sessions_
     );
     assert!(runtime_lease_host.pooled_authority().is_none());
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&second_manager)))?;
     runtime_lease_host.attach_session("session-root-new").await;
 
     assert!(runtime_lease_host.pooled_authority().is_some());
@@ -1054,7 +1135,7 @@ async fn runtime_lease_host_failed_final_release_stays_retryable_until_authority
 
     let runtime_lease_host =
         RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-retry".to_string()));
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     runtime_lease_host.attach_session("session-retry").await;
 
     let first_release = runtime_lease_host.detach_session("session-retry").await;
@@ -1144,7 +1225,7 @@ async fn runtime_lease_host_retries_transient_final_release_failure_before_shutd
     let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
         "runtime-retry-auto".to_string(),
     ));
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     runtime_lease_host
         .attach_session("session-retry-auto")
         .await;
@@ -1195,7 +1276,7 @@ async fn pending_inherited_child_startup_keeps_authority_until_success_or_rollba
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-startup")
@@ -1229,7 +1310,7 @@ async fn pending_inherited_child_startup_keeps_authority_until_success_or_rollba
     );
     assert!(runtime_lease_host.pooled_authority().is_none());
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     runtime_lease_host
         .attach_session("session-parent-rollback")
         .await;
@@ -1278,7 +1359,7 @@ async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     runtime_lease_host.attach_session("session-parent").await;
     runtime_lease_host.detach_session("session-parent").await?;
 
@@ -1361,7 +1442,7 @@ async fn startup_rollback_retries_transient_final_release_failure_before_clearin
     let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
         "runtime-startup-rollback-retry".to_string(),
     ));
-    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&manager)))?;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-rollback-retry")
         .await?;
@@ -1407,7 +1488,7 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_authority
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&first_manager)))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-dropped-startup")
@@ -1444,7 +1525,7 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_authority
     )
     .await?
     .expect("replacement manager should build");
-    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_authority(authority_from_manager(Arc::clone(&second_manager)))?;
     runtime_lease_host.attach_session("session-reused").await;
 
     assert!(runtime_lease_host.pooled_authority().is_some());
@@ -2468,6 +2549,34 @@ fn test_accounts_config() -> AccountsConfigToml {
         allocation_mode: None,
         pools: Some(pools),
     }
+}
+
+fn legacy_default_accounts_config() -> AccountsConfigToml {
+    let mut pools = HashMap::new();
+    pools.insert(
+        "legacy-default".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+
+    AccountsConfigToml {
+        backend: None,
+        default_pool: Some("legacy-default".to_string()),
+        proactive_switch_threshold_percent: Some(85),
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    }
+}
+
+fn authority_from_manager(
+    manager: Arc<tokio::sync::Mutex<crate::state::AccountPoolManager>>,
+) -> RuntimeLeaseAuthority {
+    RuntimeLeaseAuthority::owned_manager(manager)
 }
 
 fn pooled_auth_home(codex_home: &Path, account_id: &str) -> std::path::PathBuf {

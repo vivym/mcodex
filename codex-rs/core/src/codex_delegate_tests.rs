@@ -203,7 +203,7 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
     let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
         crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
     );
-    install_manager_owner_for_delegate_test(
+    install_authority_for_delegate_test(
         &runtime_lease_host,
         pooled_config.as_ref(),
         "holder-delegate-runtime-a",
@@ -248,7 +248,7 @@ async fn run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_ho
     let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
         crate::runtime_lease::RuntimeLeaseHostId::new("runtime-b".to_string()),
     );
-    install_manager_owner_for_delegate_test(
+    install_authority_for_delegate_test(
         &runtime_lease_host,
         pooled_config.as_ref(),
         "holder-delegate-runtime-b",
@@ -410,7 +410,7 @@ async fn build_test_config_with_pool(codex_home: &Path) -> Config {
     config
 }
 
-async fn install_manager_owner_for_delegate_test(
+async fn install_authority_for_delegate_test(
     runtime_lease_host: &crate::runtime_lease::RuntimeLeaseHost,
     config: &Config,
     holder_instance_id: &str,
@@ -418,15 +418,15 @@ async fn install_manager_owner_for_delegate_test(
     let state_db =
         codex_state::StateRuntime::init(config.codex_home.to_path_buf(), "mock_provider".into())
             .await?;
-    let manager = crate::state::SessionServices::build_account_pool_manager(
+    let authority = crate::state::SessionServices::build_root_runtime_lease_authority(
         Some(state_db),
         config.accounts.clone(),
         config.codex_home.to_path_buf(),
         holder_instance_id.to_string(),
     )
     .await?
-    .expect("delegate test pooled manager should build");
-    runtime_lease_host.install_manager_owner(manager)?;
+    .expect("delegate test pooled authority should build");
+    runtime_lease_host.install_authority(authority)?;
     Ok(())
 }
 

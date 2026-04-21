@@ -22,8 +22,10 @@ use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountPoolEventsListQuery;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
+use codex_state::QuotaExhaustedWindows;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -333,12 +335,22 @@ mod observability_event {
         );
 
         let events = list_account_pool_events(&test).await?;
-        assert!(
-            events.iter().any(|event| {
+        let selected_events = events
+            .iter()
+            .filter(|event| {
                 event.event_type == selected_event_type
                     && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
-            }),
-            "expected proactive-switch selection event in {events:#?}"
+                    && event_detail_str(event, "source") == Some("rotation")
+                    && event_detail_str(event, "intent") == Some("softRotation")
+                    && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                    && event_detail_str(event, "toAccountId") == Some(SECONDARY_ACCOUNT_ID)
+                    && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            selected_events,
+            1,
+            "expected exactly one proactive-switch selection event in {events:#?}"
         );
 
         Ok(())
@@ -438,12 +450,21 @@ mod observability_event {
         );
 
         let events = list_account_pool_events(&test).await?;
-        assert!(
-            events.iter().any(|event| {
+        let failure_events = events
+            .iter()
+            .filter(|event| {
                 event.event_type == failure_event_type
                     && event.reason_code.as_deref() == Some(no_eligible_account.as_str())
-            }),
-            "expected runtime-classified lease acquisition failure in {events:#?}"
+                    && event_detail_str(event, "source") == Some("rotation")
+                    && event_detail_str(event, "intent") == Some("softRotation")
+                    && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                    && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            failure_events,
+            1,
+            "expected exactly one runtime-classified lease acquisition failure in {events:#?}"
         );
         assert!(
             events
@@ -768,6 +789,139 @@ async fn usage_limit_reached_rotates_only_future_turns_on_responses_transport() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_failover_uses_active_limit_family_through_runtime_authority() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached",
+                        "resets_at": 1704067242
+                    }
+                })),
+            sse_with_primary_usage_percent("resp-2", 12.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            PRIMARY_ACCOUNT_ID,
+            "codex",
+            QuotaExhaustedWindows::None,
+            Some(5.0),
+        ),
+    )
+    .await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            SECONDARY_ACCOUNT_ID,
+            "codex",
+            QuotaExhaustedWindows::Primary,
+            Some(99.0),
+        ),
+    )
+    .await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            SECONDARY_ACCOUNT_ID,
+            "chatgpt",
+            QuotaExhaustedWindows::None,
+            Some(48.0),
+        ),
+    )
+    .await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "usage-limit active-family turn").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "expected usage-limit error on turn 1"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        1,
+        "usage-limit failure should not auto-replay the current turn"
+    );
+    let quota_exhausted_event_type = event_type_name(AccountPoolEventType::QuotaExhausted);
+    let usage_limit_events = list_account_pool_events(&test).await?;
+    let usage_limit_count = usage_limit_events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("usageLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_str(event, "exhaustedWindows") == Some("unknown")
+        })
+        .count();
+    assert!(
+        usage_limit_count == 1,
+        "expected exactly one usage-limit quota event in {usage_limit_events:#?}"
+    );
+
+    let second_turn_error = submit_turn_and_wait(&test, "follow-up active-family turn").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "current turn should not be auto-replayed"
+    );
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    let quota_observed_event_type = event_type_name(AccountPoolEventType::QuotaObserved);
+    let lease_acquired_event_type = event_type_name(AccountPoolEventType::LeaseAcquired);
+    let non_replayable_turn = reason_code_name(AccountPoolReasonCode::NonReplayableTurn);
+    let live_quota_events = list_account_pool_events(&test).await?;
+    let live_quota_count = live_quota_events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_observed_event_type
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_f64(event, "primaryUsedPercent") == Some(12.0)
+                && event_detail_str(event, "exhaustedWindows") == Some("none")
+        })
+        .count();
+    assert!(
+        live_quota_count == 1,
+        "expected exactly one live quota observation event in {live_quota_events:#?}"
+    );
+    let hard_failover_count = live_quota_events
+        .iter()
+        .filter(|event| {
+            event.event_type == lease_acquired_event_type
+                && event.reason_code.as_deref() == Some(non_replayable_turn.as_str())
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("rotation")
+                && event_detail_str(event, "intent") == Some("hardFailover")
+                && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "toAccountId") == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+        })
+        .count();
+    assert_eq!(
+        hard_failover_count, 1,
+        "expected exactly one hard-failover rotation event in {live_quota_events:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -995,6 +1149,50 @@ async fn rotation_without_context_reuse_mints_new_remote_session_id() -> Result<
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    let quota_observed_event_type = event_type_name(AccountPoolEventType::QuotaObserved);
+    let quota_exhausted_event_type = event_type_name(AccountPoolEventType::QuotaExhausted);
+    let events = list_account_pool_events(&test).await?;
+    let live_exhausted_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_f64(event, "primaryUsedPercent") == Some(100.0)
+                && event_detail_str(event, "exhaustedWindows") == Some("primary")
+        })
+        .count();
+    let duplicate_usage_limit_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("usageLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+        })
+        .count();
+    let live_quota_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_observed_event_type
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+        })
+        .count();
+    assert_eq!(
+        live_exhausted_count, 1,
+        "expected one primary live rate-limit exhaustion event under the effective pool: {events:#?}"
+    );
+    assert_eq!(
+        duplicate_usage_limit_count, 0,
+        "expected ambiguous usage-limit reporting not to duplicate a stronger live rate-limit exhaustion event: {events:#?}"
+    );
+    assert_eq!(
+        live_quota_count, 1,
+        "expected secondary live quota event to stay queryable under the effective pool: {events:#?}"
+    );
 
     let first_session_id = requests[0]
         .header("session_id")
@@ -1790,12 +1988,22 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
     let first_turn_error = submit_turn_and_wait(&first, "before manual compact").await?;
     assert!(first_turn_error.is_none());
 
-    first.codex.submit(Op::Compact).await?;
-    compact_request_seen_rx
+    let compact_turn_id = first.codex.submit(Op::Compact).await?;
+    tokio::time::timeout(Duration::from_secs(10), compact_request_seen_rx)
         .await
+        .expect("compact request should start within timeout")
         .expect("compact request should start");
+    let initial_active_lease =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let active_lease_after_heartbeat =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
+    assert!(
+        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
+        "expected manual remote compact heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
+    );
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -1809,10 +2017,19 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         contender_turn_error.message
     );
 
-    wait_for_event(&first.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    tokio::time::timeout(
+        Duration::from_secs(35),
+        wait_for_event_with_timeout(
+            &first.codex,
+            |event| match event {
+                EventMsg::TurnComplete(event) => event.turn_id == compact_turn_id,
+                _ => false,
+            },
+            Duration::from_secs(30),
+        ),
+    )
+    .await
+    .expect("compact turn should complete within timeout");
 
     assert_eq!(
         response_mock.requests().len(),
@@ -1820,8 +2037,12 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         "contender runtime should not issue /responses while compact lease remains active"
     );
 
-    second.codex.shutdown_and_wait().await?;
-    first.codex.shutdown_and_wait().await?;
+    tokio::time::timeout(Duration::from_secs(30), second.codex.shutdown_and_wait())
+        .await
+        .expect("second runtime shutdown should finish")?;
+    tokio::time::timeout(Duration::from_secs(30), first.codex.shutdown_and_wait())
+        .await
+        .expect("first runtime shutdown should finish")?;
 
     Ok(())
 }
@@ -1938,6 +2159,42 @@ async fn seed_account_health_state(
     Ok(())
 }
 
+async fn seed_account_quota(test: &TestCodex, quota: AccountQuotaStateRecord) -> Result<()> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db.upsert_account_quota_state(quota).await?;
+    Ok(())
+}
+
+fn quota_state(
+    account_id: &str,
+    limit_id: &str,
+    exhausted_windows: QuotaExhaustedWindows,
+    primary_used_percent: Option<f64>,
+) -> AccountQuotaStateRecord {
+    let now = Utc::now();
+    let blocked_until = exhausted_windows
+        .is_exhausted()
+        .then_some(now + chrono::Duration::minutes(30));
+    AccountQuotaStateRecord {
+        account_id: account_id.to_string(),
+        limit_id: limit_id.to_string(),
+        primary_used_percent,
+        primary_resets_at: None,
+        secondary_used_percent: None,
+        secondary_resets_at: None,
+        observed_at: now,
+        exhausted_windows,
+        predicted_blocked_until: blocked_until,
+        next_probe_after: blocked_until,
+        probe_backoff_level: 0,
+        last_probe_result: None,
+    }
+}
+
 async fn list_account_pool_events(test: &TestCodex) -> Result<Vec<AccountPoolEventRecord>> {
     let Some(state_db) = test.codex.state_db() else {
         return Err(anyhow::anyhow!(
@@ -1962,6 +2219,14 @@ fn event_type_name(value: AccountPoolEventType) -> String {
 
 fn reason_code_name(value: AccountPoolReasonCode) -> String {
     serialized_protocol_enum_name(&value)
+}
+
+fn event_detail_str<'a>(event: &'a AccountPoolEventRecord, key: &str) -> Option<&'a str> {
+    event.details_json.as_ref()?.get(key)?.as_str()
+}
+
+fn event_detail_f64(event: &AccountPoolEventRecord, key: &str) -> Option<f64> {
+    event.details_json.as_ref()?.get(key)?.as_f64()
 }
 
 fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {

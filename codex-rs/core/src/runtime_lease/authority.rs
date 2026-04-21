@@ -41,7 +41,7 @@ struct AuthorityState {
 
 #[allow(dead_code)]
 enum RuntimeLeaseAuthorityMode {
-    ManagerOwner(Arc<Mutex<crate::state::AccountPoolManager>>),
+    OwnedManager(Arc<Mutex<crate::state::AccountPoolManager>>),
     HostOwned(HostOwnedLeaseState),
 }
 
@@ -118,8 +118,8 @@ fn start_manager_heartbeat(
 
 #[allow(dead_code)]
 impl RuntimeLeaseAuthority {
-    pub(crate) fn manager_owner(manager: Arc<Mutex<crate::state::AccountPoolManager>>) -> Self {
-        Self::new(RuntimeLeaseAuthorityMode::ManagerOwner(manager))
+    pub(crate) fn owned_manager(manager: Arc<Mutex<crate::state::AccountPoolManager>>) -> Self {
+        Self::new(RuntimeLeaseAuthorityMode::OwnedManager(manager))
     }
 
     fn new(mode: RuntimeLeaseAuthorityMode) -> Self {
@@ -149,7 +149,7 @@ impl RuntimeLeaseAuthority {
             let manager = {
                 let state = self.inner.state.lock().await;
                 match &state.mode {
-                    RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                    RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                     RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
                         if let Some(generation) = host_owned.generation.as_ref()
                             && generation.accepting
@@ -207,7 +207,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -219,6 +219,7 @@ impl RuntimeLeaseAuthority {
                     snapshot.generation,
                     snapshot.account_id.as_str(),
                     snapshot.pool_id.as_str(),
+                    snapshot.selection_family.as_str(),
                     rate_limits,
                 )
                 .await?;
@@ -233,7 +234,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -245,6 +246,7 @@ impl RuntimeLeaseAuthority {
                     snapshot.generation,
                     snapshot.account_id.as_str(),
                     snapshot.pool_id.as_str(),
+                    snapshot.selection_family.as_str(),
                 )
                 .await?;
         }
@@ -258,7 +260,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -280,7 +282,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
                     return runtime_snapshot_for_generation(host_owned.generation.clone());
                 }
@@ -300,7 +302,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let mut state = self.inner.state.lock().await;
             match &mut state.mode {
-                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
                     host_owned.generation = None;
                     None

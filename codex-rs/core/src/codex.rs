@@ -2092,7 +2092,7 @@ impl Session {
         let pooled_runtime_host_active = runtime_lease_host
             .as_ref()
             .is_some_and(crate::runtime_lease::RuntimeLeaseHost::is_pooled);
-        let pooled_root_needs_manager_owner = pooled_runtime_host_active
+        let pooled_root_needs_authority = pooled_runtime_host_active
             && !inherited_pooled_runtime_host
             && runtime_lease_host
                 .as_ref()
@@ -2113,8 +2113,8 @@ impl Session {
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
         lease_auth.replace_current(inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let authority_owned_account_pool_manager = if pooled_root_needs_manager_owner {
-            SessionServices::build_account_pool_manager(
+        let authority_owned_runtime_lease = if pooled_root_needs_authority {
+            SessionServices::build_root_runtime_lease_authority(
                 state_db_ctx.clone(),
                 config.accounts.clone(),
                 config.codex_home.clone().to_path_buf(),
@@ -2355,10 +2355,10 @@ impl Session {
         if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
             && runtime_lease_host.is_pooled()
             && runtime_lease_host.pooled_authority().is_none()
-            && let Some(account_pool_manager) = authority_owned_account_pool_manager.as_ref()
+            && let Some(runtime_lease_authority) = authority_owned_runtime_lease.as_ref()
         {
             runtime_lease_host
-                .install_manager_owner(Arc::clone(account_pool_manager))
+                .install_authority(runtime_lease_authority.clone())
                 .with_context(|| {
                     format!(
                         "failed to publish runtime lease authority for session {}",

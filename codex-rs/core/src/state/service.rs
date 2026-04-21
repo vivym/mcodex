@@ -60,6 +60,9 @@ use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupEligibility;
 use codex_state::LeaseRenewal;
 use codex_state::QuotaExhaustedWindows;
+use codex_state::QuotaProbeResult;
+use serde_json::Value;
+use serde_json::json;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -173,14 +176,27 @@ impl SessionServices {
             None,
         )
         .await?;
-        // Mirror local manager ownership so top-level sessions keep one runtime
-        // control plane even when pooled mode can only activate after startup.
+        // Top-level sessions keep one runtime control plane even when pooled
+        // mode can only activate after startup.
         if accounts.is_none() && !shared_status.pooled_applicable {
             return Ok(None);
         }
         Ok(Some(crate::runtime_lease::RuntimeLeaseHost::pooled(
             crate::runtime_lease::RuntimeLeaseHostId::new(holder_instance_id.to_string()),
         )))
+    }
+
+    pub(crate) async fn build_root_runtime_lease_authority(
+        state_db: Option<StateDbHandle>,
+        accounts: Option<AccountsConfigToml>,
+        codex_home: PathBuf,
+        holder_instance_id: String,
+    ) -> anyhow::Result<Option<crate::runtime_lease::RuntimeLeaseAuthority>> {
+        Ok(
+            Self::build_account_pool_manager(state_db, accounts, codex_home, holder_instance_id)
+                .await?
+                .map(crate::runtime_lease::RuntimeLeaseAuthority::owned_manager),
+        )
     }
 
     pub(crate) async fn build_account_pool_manager(
@@ -718,6 +734,7 @@ impl AccountPoolManager {
             let mut request = SelectionRequest::for_intent(intent);
             request.now = Some(now);
             request.pool_id = Some(active_lease.record.pool_id.clone());
+            request.selection_family = Some(active_lease.selection_family.clone());
             request.current_account_id = Some(active_lease.record.account_id.clone());
             request.just_replaced_account_id = self.last_proactively_replaced_account_id.clone();
             request.proactive_threshold_percent = self.proactive_switch_threshold_percent;
@@ -797,12 +814,14 @@ impl AccountPoolManager {
             if let Some(pending_rotation) = self.pending_rotation.take() {
                 let current_account_id = active_lease.record.account_id.clone();
                 let current_pool_id = active_lease.record.pool_id.clone();
+                let current_selection_family = active_lease.selection_family.clone();
                 let mut request = SelectionRequest::for_intent(match pending_rotation {
                     PendingRotation::HardFailure => SelectionIntent::HardFailover,
                     PendingRotation::SoftProactive => SelectionIntent::SoftRotation,
                 });
                 request.now = Some(now);
                 request.pool_id = Some(current_pool_id.clone());
+                request.selection_family = Some(current_selection_family.clone());
                 request.current_account_id = Some(current_account_id.clone());
                 request.just_replaced_account_id =
                     self.last_proactively_replaced_account_id.clone();
@@ -814,6 +833,27 @@ impl AccountPoolManager {
                     Ok(next_lease) => {
                         if pending_rotation == PendingRotation::HardFailure {
                             self.last_proactively_replaced_account_id = None;
+                            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                                occurred_at: next_lease.record.acquired_at,
+                                pool_id: &current_pool_id,
+                                account_id: Some(next_lease.record.account_id.as_str()),
+                                lease_id: Some(next_lease.record.lease_id.as_str()),
+                                event_type: AccountPoolEventType::LeaseAcquired,
+                                reason_code: Some(AccountPoolReasonCode::NonReplayableTurn),
+                                message: format!(
+                                    "hard failover selected {} after non-replayable turn on {current_account_id}",
+                                    next_lease.record.account_id
+                                ),
+                                details_json: Some(json!({
+                                    "source": "rotation",
+                                    "outcome": "selected",
+                                    "intent": "hardFailover",
+                                    "fromAccountId": current_account_id,
+                                    "toAccountId": next_lease.record.account_id,
+                                    "selectionFamily": next_lease.selection_family,
+                                })),
+                            })
+                            .await?;
                         }
                         if pending_rotation == PendingRotation::SoftProactive
                             && next_lease.record.account_id != current_account_id
@@ -831,6 +871,14 @@ impl AccountPoolManager {
                                     "proactive switch selected {} after quota pressure",
                                     next_lease.record.account_id
                                 ),
+                                details_json: Some(json!({
+                                    "source": "rotation",
+                                    "outcome": "selected",
+                                    "intent": "softRotation",
+                                    "fromAccountId": current_account_id,
+                                    "toAccountId": next_lease.record.account_id,
+                                    "selectionFamily": next_lease.selection_family,
+                                })),
                             })
                             .await?;
                         } else if pending_rotation == PendingRotation::SoftProactive {
@@ -844,6 +892,13 @@ impl AccountPoolManager {
                                 message: format!(
                                     "proactive switch could not select an alternate eligible account for {current_account_id}"
                                 ),
+                                details_json: Some(json!({
+                                    "source": "rotation",
+                                    "outcome": "noEligibleAccount",
+                                    "intent": "softRotation",
+                                    "fromAccountId": current_account_id,
+                                    "selectionFamily": current_selection_family,
+                                })),
                             })
                             .await?;
                         }
@@ -852,6 +907,25 @@ impl AccountPoolManager {
                     Err(AccountLeaseError::NoEligibleAccount) => {
                         if pending_rotation == PendingRotation::HardFailure {
                             self.last_proactively_replaced_account_id = None;
+                            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                                occurred_at: now,
+                                pool_id: &current_pool_id,
+                                account_id: None,
+                                lease_id: None,
+                                event_type: AccountPoolEventType::LeaseAcquireFailed,
+                                reason_code: Some(AccountPoolReasonCode::NoEligibleAccount),
+                                message: format!(
+                                    "hard failover could not select an alternate eligible account for {current_account_id}"
+                                ),
+                                details_json: Some(json!({
+                                    "source": "rotation",
+                                    "outcome": "noEligibleAccount",
+                                    "intent": "hardFailover",
+                                    "fromAccountId": current_account_id,
+                                    "selectionFamily": current_selection_family,
+                                })),
+                            })
+                            .await?;
                         }
                         self.suppression_reason =
                             Some(AccountLeaseRuntimeReason::NoEligibleAccount);
@@ -1013,11 +1087,10 @@ impl AccountPoolManager {
         Ok(())
     }
 
-    pub(crate) async fn report_rate_limits(
+    async fn observe_rate_limits_for_rotation(
         &mut self,
         snapshot: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
-        self.record_live_quota_state(snapshot).await?;
         let Some(window) = snapshot.primary.as_ref() else {
             return Ok(());
         };
@@ -1061,6 +1134,7 @@ impl AccountPoolManager {
                         message: format!(
                             "proactive switch suppressed for {account_id} until the minimum switch interval elapses"
                         ),
+                        details_json: None,
                     })
                     .await?;
                 }
@@ -1080,18 +1154,15 @@ impl AccountPoolManager {
         generation: u64,
         account_id: &str,
         pool_id: &str,
+        selection_family: &str,
         snapshot: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
         if !self.generation_matches(generation, account_id, pool_id) {
             return Ok(());
         }
-        self.report_rate_limits(snapshot).await
-    }
-
-    pub(crate) async fn report_usage_limit_reached(&mut self) -> anyhow::Result<()> {
-        self.record_ambiguous_usage_limit_quota(Utc::now()).await?;
-        self.record_health_event(AccountHealthState::RateLimited, Utc::now())
-            .await
+        self.record_live_quota_state_for_family(account_id, pool_id, selection_family, snapshot)
+            .await?;
+        self.observe_rate_limits_for_rotation(snapshot).await
     }
 
     pub(crate) async fn report_usage_limit_reached_for_generation(
@@ -1099,11 +1170,20 @@ impl AccountPoolManager {
         generation: u64,
         account_id: &str,
         pool_id: &str,
+        selection_family: &str,
     ) -> anyhow::Result<()> {
         if !self.generation_matches(generation, account_id, pool_id) {
             return Ok(());
         }
-        self.report_usage_limit_reached().await
+        self.record_ambiguous_usage_limit_quota_for_family(
+            account_id,
+            pool_id,
+            selection_family,
+            Utc::now(),
+        )
+        .await?;
+        self.mark_non_replayable_turn_rotation();
+        Ok(())
     }
 
     pub(crate) async fn report_unauthorized(&mut self) -> anyhow::Result<()> {
@@ -1153,11 +1233,15 @@ impl AccountPoolManager {
                 observed_at,
             })
             .await?;
+        self.mark_non_replayable_turn_rotation();
+        Ok(())
+    }
+
+    fn mark_non_replayable_turn_rotation(&mut self) {
         self.proactive_switch_state.reset();
         self.pending_rotation = Some(PendingRotation::HardFailure);
         self.switch_reason = Some(AccountLeaseRuntimeReason::NonReplayableTurn);
         self.suppression_reason = None;
-        Ok(())
     }
 
     async fn build_runtime_selection_plan(
@@ -1195,13 +1279,11 @@ impl AccountPoolManager {
             return Ok("codex".to_string());
         }
         if let Some(current_account_id) = request.current_account_id.as_deref()
-            && let Some(registered_account) = self
-                .state_db
-                .read_registered_account(current_account_id)
-                .await?
+            && let Some(active_lease) = self.active_lease.as_ref()
+            && active_lease.record.account_id == current_account_id
         {
             return Ok(normalized_selection_family(
-                registered_account.backend_family.as_str(),
+                active_lease.selection_family.as_str(),
             ));
         }
 
@@ -1293,9 +1375,13 @@ impl AccountPoolManager {
                             .create_auth_session(&lease)
                             .await
                             .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                        let active_selection_family = self
+                            .active_selection_family(&lease, selection_family.as_str())
+                            .await
+                            .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
                         return Ok(ActiveAccountLease {
                             record: lease,
-                            selection_family,
+                            selection_family: active_selection_family,
                             auth_session,
                         });
                     }
@@ -1305,7 +1391,12 @@ impl AccountPoolManager {
                 SelectionAction::Probe(account_id) => {
                     let now = request.now.unwrap_or_else(Utc::now);
                     let Some(reservation) = self
-                        .reserve_quota_probe(account_id.as_str(), selection_family.as_str(), now)
+                        .reserve_quota_probe(
+                            pool_id,
+                            account_id.as_str(),
+                            selection_family.as_str(),
+                            now,
+                        )
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
                     else {
@@ -1388,9 +1479,13 @@ impl AccountPoolManager {
                                 .create_auth_session(&lease)
                                 .await
                                 .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                            let active_selection_family = self
+                                .active_selection_family(&lease, selection_family.as_str())
+                                .await
+                                .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
                             return Ok(ActiveAccountLease {
                                 record: lease,
-                                selection_family,
+                                selection_family: active_selection_family,
                                 auth_session,
                             });
                         }
@@ -1401,7 +1496,12 @@ impl AccountPoolManager {
                 SelectionAction::Probe(account_id) => {
                     let now = request.now.unwrap_or_else(Utc::now);
                     let Some(reservation) = self
-                        .reserve_quota_probe(account_id.as_str(), selection_family.as_str(), now)
+                        .reserve_quota_probe(
+                            pool_id,
+                            account_id.as_str(),
+                            selection_family.as_str(),
+                            now,
+                        )
                         .await
                         .map_err(|err| AccountLeaseError::Storage(err.to_string()))?
                     else {
@@ -1461,9 +1561,13 @@ impl AccountPoolManager {
                                     .create_auth_session(&lease)
                                     .await
                                     .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
+                                let active_selection_family = self
+                                    .active_selection_family(&lease, selection_family.as_str())
+                                    .await
+                                    .map_err(|err| AccountLeaseError::Storage(err.to_string()))?;
                                 return Ok(ActiveAccountLease {
                                     record: lease,
-                                    selection_family,
+                                    selection_family: active_selection_family,
                                     auth_session,
                                 });
                             }
@@ -1506,6 +1610,7 @@ impl AccountPoolManager {
 
     async fn reserve_quota_probe(
         &self,
+        pool_id: &str,
         account_id: &str,
         selection_family: &str,
         now: DateTime<Utc>,
@@ -1529,9 +1634,44 @@ impl AccountPoolManager {
             )
             .await?;
         if !reserved {
+            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                occurred_at: now,
+                pool_id,
+                account_id: Some(account_id),
+                lease_id: None,
+                event_type: AccountPoolEventType::QuotaObserved,
+                reason_code: None,
+                message: format!(
+                    "quota probe reservation skipped for {account_id} because another runtime reserved the slot"
+                ),
+                details_json: Some(json!({
+                    "source": "probeReservation",
+                    "outcome": "alreadyReserved",
+                    "limitId": reserved_limit_id,
+                    "selectionFamily": selection_family,
+                })),
+            })
+            .await?;
             return Ok(None);
         }
 
+        self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+            occurred_at: now,
+            pool_id,
+            account_id: Some(account_id),
+            lease_id: None,
+            event_type: AccountPoolEventType::QuotaObserved,
+            reason_code: None,
+            message: format!("quota probe reserved for {account_id}"),
+            details_json: Some(json!({
+                "source": "probeReservation",
+                "outcome": "reserved",
+                "limitId": reserved_limit_id,
+                "selectionFamily": selection_family,
+                "reservedUntil": reserved_until,
+            })),
+        })
+        .await?;
         Ok(Some(codex_account_pool::ProbeReservation {
             limit_id: reserved_limit_id,
             reserved_until,
@@ -1568,6 +1708,25 @@ impl AccountPoolManager {
                     )
                     .await?;
             }
+            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                occurred_at: observed_at,
+                pool_id: lease.pool_id.as_str(),
+                account_id: Some(lease.account_id.as_str()),
+                lease_id: Some(lease.lease_id.as_str()),
+                event_type: AccountPoolEventType::QuotaExhausted,
+                reason_code: Some(AccountPoolReasonCode::Unknown),
+                message: format!(
+                    "quota probe for {} could not refresh auth state",
+                    lease.account_id
+                ),
+                details_json: Some(json!({
+                    "source": "probeRefresh",
+                    "outcome": "ambiguous",
+                    "limitId": reservation.limit_id,
+                    "reservedUntil": reservation.reserved_until,
+                })),
+            })
+            .await?;
             return Ok(());
         }
 
@@ -1586,6 +1745,25 @@ impl AccountPoolManager {
                     },
                 )
                 .await?;
+            self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+                occurred_at: observed_at,
+                pool_id: lease.pool_id.as_str(),
+                account_id: Some(lease.account_id.as_str()),
+                lease_id: Some(lease.lease_id.as_str()),
+                event_type: AccountPoolEventType::QuotaObserved,
+                reason_code: None,
+                message: format!("quota probe recovered {}", lease.account_id),
+                details_json: Some(json!({
+                    "source": "probeRefresh",
+                    "outcome": "success",
+                    "limitId": quota_state.limit_id,
+                    "previousExhaustedWindows": quota_exhausted_windows_wire(
+                        quota_state.exhausted_windows
+                    ),
+                    "reservedUntil": reservation.reserved_until,
+                })),
+            })
+            .await?;
             return Ok(());
         }
 
@@ -1606,43 +1784,95 @@ impl AccountPoolManager {
                 },
             )
             .await?;
+        self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+            occurred_at: observed_at,
+            pool_id: lease.pool_id.as_str(),
+            account_id: Some(lease.account_id.as_str()),
+            lease_id: Some(lease.lease_id.as_str()),
+            event_type: AccountPoolEventType::QuotaExhausted,
+            reason_code: Some(AccountPoolReasonCode::QuotaExhausted),
+            message: format!("quota probe still blocked {}", lease.account_id),
+            details_json: Some(json!({
+                    "source": "probeRefresh",
+                    "outcome": "stillBlocked",
+                    "limitId": quota_state.limit_id,
+                    "exhaustedWindows": quota_exhausted_windows_wire(
+                        quota_state.exhausted_windows
+                    ),
+                    "predictedBlockedUntil": quota_state.predicted_blocked_until,
+                    "nextProbeAfter": next_probe_after,
+                    "reservedUntil": reservation.reserved_until,
+            })),
+        })
+        .await?;
         Ok(())
     }
 
-    async fn record_live_quota_state(
-        &mut self,
+    async fn record_live_quota_state_for_family(
+        &self,
+        account_id: &str,
+        pool_id: &str,
+        selection_family: &str,
         snapshot: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
-        let Some(active_lease) = self.active_lease.as_ref() else {
-            return Ok(());
-        };
         if snapshot.primary.is_none() && snapshot.secondary.is_none() {
             return Ok(());
         }
         let observed_at = Utc::now();
-        self.state_db
-            .upsert_account_quota_state(quota_state_from_rate_limits(
-                active_lease.record.account_id.as_str(),
-                active_lease.selection_family.as_str(),
-                snapshot,
-                observed_at,
-            ))
-            .await
-    }
-
-    async fn record_ambiguous_usage_limit_quota(
-        &mut self,
-        observed_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        let Some(active_lease) = self.active_lease.as_ref() else {
-            return Ok(());
-        };
         let existing = self
             .state_db
-            .read_account_quota_state(
-                active_lease.record.account_id.as_str(),
-                active_lease.selection_family.as_str(),
-            )
+            .read_account_quota_state(account_id, selection_family)
+            .await?;
+        let quota_state =
+            quota_state_from_rate_limits(account_id, selection_family, snapshot, observed_at);
+        self.state_db
+            .upsert_account_quota_state(quota_state.clone())
+            .await?;
+        if existing
+            .as_ref()
+            .is_some_and(|row| !quota_state_changed_for_event(row, &quota_state))
+        {
+            return Ok(());
+        }
+        self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+            occurred_at: observed_at,
+            pool_id,
+            account_id: Some(account_id),
+            lease_id: self
+                .active_lease
+                .as_ref()
+                .filter(|lease| lease.record.account_id == account_id)
+                .map(|lease| lease.record.lease_id.as_str()),
+            event_type: quota_event_type_for_state(
+                &quota_state,
+                self.proactive_switch_threshold_percent,
+            ),
+            reason_code: quota_event_reason_for_state(
+                &quota_state,
+                self.proactive_switch_threshold_percent,
+            ),
+            message: format!(
+                "quota observed for account {account_id} limit family {selection_family}"
+            ),
+            details_json: Some(quota_event_details(
+                "liveRateLimit",
+                &quota_state,
+                existing.as_ref().map(|row| row.exhausted_windows),
+            )),
+        })
+        .await
+    }
+
+    async fn record_ambiguous_usage_limit_quota_for_family(
+        &self,
+        account_id: &str,
+        pool_id: &str,
+        selection_family: &str,
+        observed_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let existing = self
+            .state_db
+            .read_account_quota_state(account_id, selection_family)
             .await?;
         if existing
             .as_ref()
@@ -1653,24 +1883,44 @@ impl AccountPoolManager {
         let predicted_blocked_until = existing
             .as_ref()
             .and_then(quota_reset_prediction_from_existing);
+        let quota_state = AccountQuotaStateRecord {
+            account_id: account_id.to_string(),
+            limit_id: selection_family.to_string(),
+            primary_used_percent: existing.as_ref().and_then(|row| row.primary_used_percent),
+            primary_resets_at: existing.as_ref().and_then(|row| row.primary_resets_at),
+            secondary_used_percent: existing.as_ref().and_then(|row| row.secondary_used_percent),
+            secondary_resets_at: existing.as_ref().and_then(|row| row.secondary_resets_at),
+            observed_at,
+            exhausted_windows: QuotaExhaustedWindows::Unknown,
+            predicted_blocked_until,
+            next_probe_after: Some(observed_at + self.probe_reservation_duration()),
+            probe_backoff_level: 0,
+            last_probe_result: None,
+        };
         self.state_db
-            .upsert_account_quota_state(AccountQuotaStateRecord {
-                account_id: active_lease.record.account_id.clone(),
-                limit_id: active_lease.selection_family.clone(),
-                primary_used_percent: existing.as_ref().and_then(|row| row.primary_used_percent),
-                primary_resets_at: existing.as_ref().and_then(|row| row.primary_resets_at),
-                secondary_used_percent: existing
-                    .as_ref()
-                    .and_then(|row| row.secondary_used_percent),
-                secondary_resets_at: existing.as_ref().and_then(|row| row.secondary_resets_at),
-                observed_at,
-                exhausted_windows: QuotaExhaustedWindows::Unknown,
-                predicted_blocked_until,
-                next_probe_after: Some(observed_at + self.probe_reservation_duration()),
-                probe_backoff_level: 0,
-                last_probe_result: None,
-            })
-            .await
+            .upsert_account_quota_state(quota_state.clone())
+            .await?;
+        self.append_runtime_account_pool_event(RuntimeAccountPoolEvent {
+            occurred_at: observed_at,
+            pool_id,
+            account_id: Some(account_id),
+            lease_id: self
+                .active_lease
+                .as_ref()
+                .filter(|lease| lease.record.account_id == account_id)
+                .map(|lease| lease.record.lease_id.as_str()),
+            event_type: AccountPoolEventType::QuotaExhausted,
+            reason_code: Some(AccountPoolReasonCode::QuotaExhausted),
+            message: format!(
+                "usage limit reached for account {account_id} limit family {selection_family}"
+            ),
+            details_json: Some(quota_event_details(
+                "usageLimit",
+                &quota_state,
+                existing.as_ref().map(|row| row.exhausted_windows),
+            )),
+        })
+        .await
     }
 
     async fn release_lease_record(&self, lease: &AccountLeaseRecord) -> anyhow::Result<()> {
@@ -1713,6 +1963,20 @@ impl AccountPoolManager {
         )))
     }
 
+    async fn active_selection_family(
+        &self,
+        lease: &AccountLeaseRecord,
+        requested_selection_family: &str,
+    ) -> anyhow::Result<String> {
+        Ok(self
+            .state_db
+            .read_registered_account(&lease.account_id)
+            .await?
+            .map(|account| normalized_selection_family(account.backend_family.as_str()))
+            .filter(|family| !family.is_empty())
+            .unwrap_or_else(|| normalized_selection_family(requested_selection_family)))
+    }
+
     async fn clear_auth_marker(&self, lease: &AccountLeaseRecord) -> anyhow::Result<()> {
         let Some(registered_account) = self
             .state_db
@@ -1747,7 +2011,7 @@ impl AccountPoolManager {
                     .map(serialized_protocol_enum_name)
                     .transpose()?,
                 message: event.message,
-                details_json: None,
+                details_json: event.details_json,
             })
             .await
     }
@@ -1795,6 +2059,7 @@ struct RuntimeAccountPoolEvent<'a> {
     event_type: AccountPoolEventType,
     reason_code: Option<AccountPoolReasonCode>,
     message: String,
+    details_json: Option<Value>,
 }
 
 fn normalized_selection_family(selection_family: &str) -> String {
@@ -1847,6 +2112,81 @@ fn quota_state_from_rate_limits(
     }
 }
 
+fn quota_event_type_for_state(
+    row: &AccountQuotaStateRecord,
+    proactive_switch_threshold_percent: u8,
+) -> AccountPoolEventType {
+    if row.exhausted_windows.is_exhausted() {
+        AccountPoolEventType::QuotaExhausted
+    } else if quota_state_near_threshold(row, proactive_switch_threshold_percent) {
+        AccountPoolEventType::QuotaNearExhausted
+    } else {
+        AccountPoolEventType::QuotaObserved
+    }
+}
+
+fn quota_state_changed_for_event(
+    previous: &AccountQuotaStateRecord,
+    current: &AccountQuotaStateRecord,
+) -> bool {
+    previous.limit_id != current.limit_id
+        || previous.primary_used_percent != current.primary_used_percent
+        || previous.primary_resets_at != current.primary_resets_at
+        || previous.secondary_used_percent != current.secondary_used_percent
+        || previous.secondary_resets_at != current.secondary_resets_at
+        || previous.exhausted_windows != current.exhausted_windows
+        || previous.predicted_blocked_until != current.predicted_blocked_until
+        || previous.next_probe_after != current.next_probe_after
+        || previous.probe_backoff_level != current.probe_backoff_level
+        || previous.last_probe_result != current.last_probe_result
+}
+
+fn quota_event_reason_for_state(
+    row: &AccountQuotaStateRecord,
+    proactive_switch_threshold_percent: u8,
+) -> Option<AccountPoolReasonCode> {
+    if row.exhausted_windows.is_exhausted() {
+        Some(AccountPoolReasonCode::QuotaExhausted)
+    } else if quota_state_near_threshold(row, proactive_switch_threshold_percent) {
+        Some(AccountPoolReasonCode::QuotaNearExhausted)
+    } else {
+        None
+    }
+}
+
+fn quota_state_near_threshold(
+    row: &AccountQuotaStateRecord,
+    proactive_switch_threshold_percent: u8,
+) -> bool {
+    let threshold = f64::from(proactive_switch_threshold_percent);
+    row.primary_used_percent
+        .is_some_and(|used| used >= threshold)
+        || row
+            .secondary_used_percent
+            .is_some_and(|used| used >= threshold)
+}
+
+fn quota_event_details(
+    source: &str,
+    row: &AccountQuotaStateRecord,
+    previous_exhausted_windows: Option<QuotaExhaustedWindows>,
+) -> Value {
+    json!({
+        "source": source,
+        "limitId": row.limit_id,
+        "primaryUsedPercent": row.primary_used_percent,
+        "primaryResetsAt": row.primary_resets_at,
+        "secondaryUsedPercent": row.secondary_used_percent,
+        "secondaryResetsAt": row.secondary_resets_at,
+        "exhaustedWindows": quota_exhausted_windows_wire(row.exhausted_windows),
+        "previousExhaustedWindows": previous_exhausted_windows.map(quota_exhausted_windows_wire),
+        "predictedBlockedUntil": row.predicted_blocked_until,
+        "nextProbeAfter": row.next_probe_after,
+        "probeBackoffLevel": row.probe_backoff_level,
+        "lastProbeResult": row.last_probe_result.map(quota_probe_result_wire),
+    })
+}
+
 fn quota_exhausted_windows(snapshot: &RateLimitSnapshot) -> QuotaExhaustedWindows {
     let primary_exhausted = snapshot
         .primary
@@ -1861,6 +2201,24 @@ fn quota_exhausted_windows(snapshot: &RateLimitSnapshot) -> QuotaExhaustedWindow
         (true, false) => QuotaExhaustedWindows::Primary,
         (false, true) => QuotaExhaustedWindows::Secondary,
         (false, false) => QuotaExhaustedWindows::None,
+    }
+}
+
+fn quota_exhausted_windows_wire(value: QuotaExhaustedWindows) -> &'static str {
+    match value {
+        QuotaExhaustedWindows::None => "none",
+        QuotaExhaustedWindows::Primary => "primary",
+        QuotaExhaustedWindows::Secondary => "secondary",
+        QuotaExhaustedWindows::Both => "both",
+        QuotaExhaustedWindows::Unknown => "unknown",
+    }
+}
+
+fn quota_probe_result_wire(value: QuotaProbeResult) -> &'static str {
+    match value {
+        QuotaProbeResult::Success => "success",
+        QuotaProbeResult::StillBlocked => "stillBlocked",
+        QuotaProbeResult::Ambiguous => "ambiguous",
     }
 }
 
