@@ -1,11 +1,11 @@
-<p align="center"><code>curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh</code><br />or<br /><code>powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"</code></p>
+<p align="center"><code>curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh</code><br />or<br /><code>$installer = Join-Path $env:TEMP 'mcodex-install.ps1'; iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer; & $installer</code></p>
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
 </p>
 </br>
 If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
+</br>If you want the desktop app experience, run <code>mcodex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
 </br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 
 ---
@@ -23,7 +23,9 @@ curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
 
 ```powershell
 # Windows PowerShell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"
+$installer = Join-Path $env:TEMP "mcodex-install.ps1"
+iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer
+& $installer
 ```
 
 Install a specific version by passing it to the installer:
@@ -33,7 +35,9 @@ curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh -s -- 0.96.0
 ```
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1 0.96.0"
+$installer = Join-Path $env:TEMP "mcodex-install.ps1"
+iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer
+& $installer 0.96.0
 ```
 
 Then run `mcodex` to get started. GitHub Releases are lightweight release records for the CLI, not the primary binary download path. Existing users who installed the CLI from npm should reinstall with the OSS installer to join the supported update channel.

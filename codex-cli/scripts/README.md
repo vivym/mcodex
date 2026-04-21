@@ -11,9 +11,17 @@ helper stages only `codex-responses-api-proxy` and `codex-sdk`.
   --package codex-sdk
 ```
 
-This downloads the native artifacts once, hydrates `vendor/` for each package,
-and writes tarballs to `dist/npm/`.
+This downloads native artifacts when a non-CLI package needs them and writes
+tarballs to `dist/npm/`.
 
-If you need to invoke `build_npm_package.py` directly, run
-`codex-cli/scripts/install_native_deps.py` first and pass `--vendor-src` pointing to the
-directory that contains the populated `vendor/` tree.
+If you need to invoke `build_npm_package.py` directly, pass an explicit
+non-CLI package:
+
+```bash
+codex-cli/scripts/build_npm_package.py \
+  --package codex-responses-api-proxy \
+  --release-version 0.6.0
+```
+
+Run `codex-cli/scripts/install_native_deps.py` first and pass `--vendor-src`
+only for non-CLI packages that bundle native components.

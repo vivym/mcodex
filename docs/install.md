@@ -19,7 +19,9 @@ curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
 
 ```powershell
 # Windows PowerShell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"
+$installer = Join-Path $env:TEMP "mcodex-install.ps1"
+iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer
+& $installer
 ```
 
 Install an explicit version by passing it to the installer:
@@ -29,7 +31,9 @@ curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh -s -- 0.96.0
 ```
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1 0.96.0"
+$installer = Join-Path $env:TEMP "mcodex-install.ps1"
+iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $installer
+& $installer 0.96.0
 ```
 
 Update by rerunning the same installer. Without a version argument it resolves the current stable version; with a version argument it switches the managed install to that version.
