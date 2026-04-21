@@ -153,11 +153,16 @@ Expected: current branch may be ahead with docs commits, but there are no unstag
 Run:
 
 ```bash
-git remote get-url upstream >/dev/null 2>&1 || \
+current_upstream="$(git remote get-url upstream 2>/dev/null || true)"
+if [ -z "${current_upstream}" ]; then
   git remote add upstream https://github.com/openai/codex.git
+else
+  test "${current_upstream}" = "https://github.com/openai/codex.git" || \
+    test "${current_upstream}" = "git@github.com:openai/codex.git"
+fi
 ```
 
-Expected: command exits 0.
+Expected: `upstream` exists and points to `openai/codex`. If it points elsewhere, stop and fix the remote before continuing.
 
 - [ ] **Step 3: Fetch upstream stable tags through the local proxy when needed**
 
@@ -167,23 +172,43 @@ Run:
 HTTPS_PROXY=http://127.0.0.1:7897 \
 HTTP_PROXY=http://127.0.0.1:7897 \
 ALL_PROXY=http://127.0.0.1:7897 \
-git fetch upstream --tags
+git fetch upstream --force --tags
 ```
 
 Expected: fetch succeeds. If the proxy is unavailable, retry with the user's current proxy settings.
 
-- [ ] **Step 4: Verify target tags exist and record merge bases**
+- [ ] **Step 4: Verify upstream tags match local tag objects and record merge bases**
 
 Run:
 
 ```bash
-git rev-parse --verify rust-v0.121.0^{}
-git rev-parse --verify rust-v0.122.0^{}
+test "$(git remote get-url upstream)" = "https://github.com/openai/codex.git" || \
+  test "$(git remote get-url upstream)" = "git@github.com:openai/codex.git"
+
+HTTPS_PROXY=http://127.0.0.1:7897 \
+HTTP_PROXY=http://127.0.0.1:7897 \
+ALL_PROXY=http://127.0.0.1:7897 \
+git ls-remote --tags upstream \
+  "refs/tags/rust-v0.121.0^{}" \
+  "refs/tags/rust-v0.122.0^{}"
+
+test "$(git rev-parse --verify rust-v0.121.0^{})" = "$(
+  HTTPS_PROXY=http://127.0.0.1:7897 \
+  HTTP_PROXY=http://127.0.0.1:7897 \
+  ALL_PROXY=http://127.0.0.1:7897 \
+  git ls-remote --tags upstream "refs/tags/rust-v0.121.0^{}" | awk 'NR==1 {print $1}'
+)"
+test "$(git rev-parse --verify rust-v0.122.0^{})" = "$(
+  HTTPS_PROXY=http://127.0.0.1:7897 \
+  HTTP_PROXY=http://127.0.0.1:7897 \
+  ALL_PROXY=http://127.0.0.1:7897 \
+  git ls-remote --tags upstream "refs/tags/rust-v0.122.0^{}" | awk 'NR==1 {print $1}'
+)"
 git merge-base HEAD rust-v0.121.0
 git merge-base HEAD rust-v0.122.0
 ```
 
-Expected: both tags resolve to commit objects and both merge-base commands print a commit hash.
+Expected: `upstream` still resolves to `openai/codex`, the local `rust-v0.121.0` and `rust-v0.122.0` tag objects exactly match upstream's tag objects, and both merge-base commands print a commit hash. If any tag mismatch appears, stop and repair local refs before continuing.
 
 - [ ] **Step 5: Prepare the execution log template outside the active checkout**
 
@@ -1404,7 +1429,7 @@ cargo test -p codex-app-server-protocol
 cargo test -p codex-tui
 ```
 
-Expected: PASS.
+Expected: PASS. This is only the baseline crate gate. Critical named runtime regressions in later steps still must actually execute locally or be satisfied by required CI.
 
 - [ ] **Step 2: Run formatting**
 
@@ -1445,7 +1470,7 @@ Ask the maintainer:
 The sync changed shared crates. Do you want me to run the full workspace test suite locally (`just test` if nextest is installed, otherwise `cargo test`), or rely on required CI for the final broad gate?
 ```
 
-Expected: either run the approved command or record CI deferral in the execution log.
+Expected: either run the approved command or record CI deferral in the execution log. If the local environment later proves unable to execute critical named runtime tests, required CI becomes mandatory for those checks too.
 
 - [ ] **Step 5: Run the full workspace suite if approved**
 
@@ -1462,18 +1487,20 @@ fi
 
 Expected: PASS. If not approved locally, skip this step, document the reason, and treat required CI green as a mandatory pre-merge broad gate.
 
-- [ ] **Step 6: Run explicit release/install/update contract checks**
+- [ ] **Step 6: Detect sandbox-limited environments and run explicit release/install/update contract checks**
 
 Run:
 
 ```bash
+printf 'CODEX_SANDBOX_NETWORK_DISABLED=%s\n' "${CODEX_SANDBOX_NETWORK_DISABLED:-not-set}"
+printf 'CODEX_SANDBOX=%s\n' "${CODEX_SANDBOX:-not-set}"
 rg -n 'openai/codex|api.github.com/repos/openai/codex|npm.*codex|@openai/codex' \
   scripts/install .github/workflows .github/actions codex-rs/tui/src codex-rs/cli/src README.md docs/install.md docs/release.md
 rg -n 'downloads\\.mcodex\\.sota\\.wiki|repositories/mcodex|install\\.sh|install\\.ps1' \
   scripts/install .github/workflows codex-rs/tui/src docs/release.md README.md
 ```
 
-Expected: upstream `openai/codex` references remain only where intentionally historical or non-CLI-package related. OSS references exist for installer/update/release paths.
+Expected: upstream `openai/codex` references remain only where intentionally historical or non-CLI-package related. OSS references exist for installer/update/release paths. If `CODEX_SANDBOX_NETWORK_DISABLED=1`, `CODEX_SANDBOX=seatbelt`, or a later named test reports `ignored`, `0 tests`, or `skipping test` because of those sandbox variables, do not count the critical runtime gate as satisfied locally; record the affected tests as CI-required and require required CI to execute them before merge.
 
 - [ ] **Step 7: Run targeted product-identity, home-dir, CLI identity, and startup regressions**
 
@@ -1526,7 +1553,7 @@ cargo test -p codex-core subagent_notification_is_included_without_wait
 cargo test -p codex-core responses_api_proxy_dumps_parent_and_subagent_identity_headers
 ```
 
-Expected: migration copy boundaries remain fail-closed, pooled request and compact flows keep lease-scoped auth, websocket and realtime paths stay wired, and review/subagent flows keep the fork contract. If this merge touches a pooled-auth path that is not directly covered by one of the named tests, add a focused regression before merging and run it here.
+Expected: migration copy boundaries remain fail-closed, pooled request and compact flows keep lease-scoped auth, websocket and realtime paths stay wired, and review/subagent flows keep the fork contract. Each named cargo invocation must actually execute its selected test locally; `ignored`, `0 tests`, or sandbox skip output does not satisfy this step and must roll over to required CI before merge. If this merge touches a pooled-auth path that is not directly covered by one of the named tests, add a focused regression before merging and run it here.
 
 - [ ] **Step 9: Run app-server lease-notification and TUI status/update regressions**
 
@@ -1545,7 +1572,7 @@ cargo test -p codex-tui account_lease_updated_adds_no_eligible_account_error_not
 cargo test -p codex-tui update_prompt_snapshot
 ```
 
-Expected: app-server pooled read/notification behavior stays coherent, TUI lease-status rendering still exposes fork-specific pool state, and update-prompt UI still points at the intended release metadata flow.
+Expected: app-server pooled read/notification behavior stays coherent, TUI lease-status rendering still exposes fork-specific pool state, and update-prompt UI still points at the intended release metadata flow. As above, treat `ignored`, `0 tests`, or sandbox skip output as unsatisfied locally and require CI execution before merge.
 
 - [ ] **Step 10: Update final verification log**
 
@@ -1564,6 +1591,7 @@ Append:
 - just fmt:
 - just fix -p results:
 - full workspace test or required CI green:
+- sandbox-gated runtime regressions executed locally or CI:
 - release/install/update grep review:
 - product identity/home-dir/startup regressions:
 - migration/leased-auth/realtime/review/subagent regressions:
@@ -1674,7 +1702,7 @@ Use this structure:
 
 Check the pushed branch or PR in GitHub and confirm the required status checks are green.
 
-Expected: if Task 14 deferred the full workspace suite to CI, do not ask to merge and do not merge until required CI is green. Recording the deferral in the execution log is not sufficient by itself.
+Expected: if Task 14 deferred the full workspace suite to CI, or if any sandbox-gated runtime regressions from Task 14 were marked CI-required, do not ask to merge and do not merge until required CI is green. Recording the deferral in the execution log is not sufficient by itself.
 
 - [ ] **Step 7: Decide when to merge to main**
 
