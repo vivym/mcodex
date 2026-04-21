@@ -4,13 +4,49 @@
 
 | Requirement                 | Details                                                         |
 | --------------------------- | --------------------------------------------------------------- |
-| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 **via WSL2** |
+| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11              |
 | Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
 | RAM                         | 4-GB minimum (8-GB recommended)                                 |
 
-### DotSlash
+### Script-managed CLI install
 
-The GitHub release can also include a [DotSlash](https://dotslash-cli.com/) file for the `mcodex` CLI. Using a DotSlash file makes it possible to make a lightweight commit to source control to ensure all contributors use the same version of an executable, regardless of what platform they use for development.
+Install the latest `mcodex` CLI with the OSS installer:
+
+```bash
+# macOS/Linux
+curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1"
+```
+
+Install an explicit version by passing it to the installer:
+
+```bash
+curl -fsSL https://downloads.mcodex.sota.wiki/install.sh | sh -s -- 0.96.0
+```
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://downloads.mcodex.sota.wiki/install.ps1 -OutFile $env:TEMP\mcodex-install.ps1; & $env:TEMP\mcodex-install.ps1 0.96.0"
+```
+
+Update by rerunning the same installer. Without a version argument it resolves the current stable version; with a version argument it switches the managed install to that version.
+
+The default install root is `~/.mcodex` on macOS/Linux and `%LOCALAPPDATA%\Mcodex` on Windows. The installer stores versioned payloads in `<root>/install/<version>`, points `<root>/current` at the active version, writes metadata to `<root>/install.json`, and expects the native binaries under `<root>/current/bin`.
+
+The default wrapper path is `~/.local/bin/mcodex` on macOS/Linux and `%LOCALAPPDATA%\Programs\Mcodex\bin\mcodex.ps1` on Windows. The wrapper adds `<root>/current/bin` to `PATH` for the launched process and exports:
+
+- `MCODEX_INSTALL_MANAGED=1`
+- `MCODEX_INSTALL_METHOD=script`
+- `MCODEX_INSTALL_ROOT=<root>`
+
+`MCODEX_INSTALL_ROOT` can also be set before running the installer to choose a different install root.
+
+Package-manager channels such as npm, Bun, Homebrew, and WinGet are not advertised update paths for `mcodex`. Existing users who installed the CLI from npm should reinstall with the OSS installer to join the supported update channel.
+
+DotSlash is no longer advertised for the `mcodex` CLI because lightweight GitHub Releases no longer carry native CLI assets. GitHub Releases remain release records; use the OSS installer and the `downloads.mcodex.sota.wiki` release repository as the primary binary delivery path.
 
 ### Build from source
 
