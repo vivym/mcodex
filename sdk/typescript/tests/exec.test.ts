@@ -102,7 +102,7 @@ describe("CodexExec", () => {
       const { _findCodexPathForTesting } = await import("../src/exec");
       const platform = "win32";
       const envPath = ["C:\\wrapper", "D:\\bin"].join(pathDelimiterFor(platform));
-      const expected = path.win32.join("D:\\bin", "mcodex.exe");
+      const expected = path.win32.join("C:\\wrapper", "mcodex.exe");
       const wrapperPath = path.win32.join("C:\\wrapper", "mcodex.ps1");
 
       const result = _findCodexPathForTesting({
@@ -134,6 +134,26 @@ describe("CodexExec", () => {
         platform,
         arch: "x64",
         pathExists: (candidate: string) => candidate === expected,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex.ps1");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("honors Windows PATH order before falling back to later executable names", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const platform = "win32";
+      const envPath = ["C:\\wrapper", "D:\\old-bin"].join(pathDelimiterFor(platform));
+      const expected = path.win32.join("C:\\wrapper", "mcodex.ps1");
+      const staleExe = path.win32.join("D:\\old-bin", "mcodex.exe");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform,
+        arch: "x64",
+        pathExists: (candidate: string) => candidate === expected || candidate === staleExe,
         resolvePackageJson: () => {
           throw new Error("npm fallback should not be used when PATH contains mcodex.ps1");
         },

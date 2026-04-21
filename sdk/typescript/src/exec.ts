@@ -364,8 +364,8 @@ export function _findCodexPathForTesting(options: FindCodexPathOptions = {}) {
 
   const pathDirectories = envPath?.split(delimiter).filter(Boolean) ?? [];
 
-  for (const executableName of executableNames) {
-    for (const directory of pathDirectories) {
+  for (const directory of pathDirectories) {
+    for (const executableName of executableNames) {
       const candidate = pathModule.join(directory, executableName);
       if (pathExists(candidate)) {
         return candidate;
