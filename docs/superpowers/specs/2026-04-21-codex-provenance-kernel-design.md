@@ -1,13 +1,14 @@
 # Codex Provenance Kernel Design
 
 This document defines an API-first provenance system for tracing how code at a
-given file and line range was introduced and evolved across Codex activity.
+given anchored file and line range was introduced and evolved across Codex
+activity.
 
 The intended primary consumers are machine systems, not end users inside the
 TUI. Codex should therefore provide a language-agnostic provenance kernel keyed
-by workspace, file path, and line range. A dedicated postmortem or incident
-system can add symbol parsing, issue correlation, and higher-level analysis on
-top of that kernel.
+by workspace or Git revision, file path, and line range. A dedicated postmortem
+or incident system can add symbol parsing, issue correlation, and higher-level
+analysis on top of that kernel.
 
 ## Summary
 
@@ -16,7 +17,9 @@ Build a workspace-scoped provenance kernel with these properties:
 1. Record structured mutation observations during a turn and group them into
    turn-level change sets rather than relying on ad hoc `git blame` or
    live-only turn diffs.
-2. Use `file + line/range` as the primary query surface.
+2. Use anchored code coordinates as the primary query surface:
+   - `workspace anchor + file + line/range` for live workspace queries
+   - `git code_ref + file + line/range` for historical revision queries
 3. Treat hunks, not symbols or individual lines, as the primary stored unit of
    provenance.
 4. Maintain a versioned live line-range projection for each tracked file so a
@@ -34,8 +37,8 @@ baseline snapshot flow that is independent of undo.
 
 ## Goals
 
-- Answer: "How did the logic currently at this file and range get here?"
-- Make `file + line/range` the canonical provenance query surface.
+- Answer: "How did the logic at this anchored code coordinate get here?"
+- Make anchored code coordinates the canonical provenance query surface.
 - Cover all turn-driven file mutations, including `apply_patch`, shell commands,
   `js_repl`, and any other tool path that changes workspace files.
 - Preserve enough conversation and tool context for external systems to build a
@@ -44,6 +47,9 @@ baseline snapshot flow that is independent of undo.
   incident semantics.
 - Prefer explicit `ambiguous` or `stale` provenance states over writing lineage
   that might be wrong.
+- Support historical lookups for Git-backed workspaces by commit, branch, or
+  other Git ref when the selected revision can be mapped to a recorded
+  provenance state.
 - Reuse existing app-server and state infrastructure where it improves
   operability and testability.
 
@@ -70,6 +76,29 @@ turn context that matters for postmortems:
 - subsequent Codex turns that reshaped the logic before any commit existed
 
 The correct primitive here is not commit blame. It is turn-aware hunk lineage.
+
+## Why Git Still Matters
+
+Git is still required, but for a different job.
+
+- Git is the code coordinate system for historical queries.
+- Provenance is the causal record of how those bytes were produced.
+
+The right model is:
+
+- Git answers: "Which revision of the code are we talking about?"
+- Codex provenance answers: "How did that revision's code get there across
+  turns, tools, and external mutations?"
+
+That gives two valid coordinate forms:
+
+- live workspace query:
+  - `workspace_root + projection anchor + path + line/range`
+- historical query:
+  - `git code_ref + path + line/range`
+
+Historical range queries therefore cannot be keyed by bare `file + line/range`.
+They must include a revision anchor.
 
 ## Why Codex Should Not Parse Symbols in v1
 
@@ -98,6 +127,7 @@ The existing codebase already has several useful building blocks:
 - existing `thread/read` surfaces for turn and item history
 - existing SQLite-backed local state infrastructure in `codex-rs/state`
 - ghost snapshot machinery that can capture a turn baseline in a Git repo
+- existing git metadata and diff utilities in `codex-rs/git-utils`
 
 However, the current surfaces are not sufficient as the long-term provenance
 kernel:
@@ -115,6 +145,9 @@ kernel:
 5. A single net `turn start -> turn end` diff cannot preserve tool-level
    intermediate changes and cannot safely disambiguate concurrent or external
    workspace mutations that land while a turn is in flight.
+6. Bare `file + line/range` is not a complete coordinate for historical code.
+   The same path and line numbers can refer to different logic on different
+   branches or commits.
 
 The design therefore needs a lower, workspace-oriented recording layer that is
 separate from the current live diff presentation.
@@ -154,11 +187,17 @@ If the expected base version does not match, the recorder must not guess. It
 must write an explicit ambiguous result and mark the workspace stale until it is
 reconciled.
 
+For Git-backed workspaces, each recorded projected state must also carry a
+stable Git tree identity so historical revision queries can resolve to a
+specific recorded provenance state.
+
 This gives the system the right aggregation model:
 
 - many threads can contribute to one workspace lineage graph
 - range queries do not need a thread id as the primary lookup key
 - postmortem systems can ask about code in the workspace directly
+- historical Git queries can resolve by revision instead of only current
+  workspace position
 
 ### 2. Add a Dedicated Provenance Crate
 
@@ -206,6 +245,7 @@ Add a dedicated turn-start baseline capture flow:
 - output:
   - workspace root
   - baseline snapshot identifier
+  - baseline Git tree identity when available
   - base projection version
   - capture status
 
@@ -221,6 +261,14 @@ If the turn is outside Git, v1 should degrade cleanly:
 
 This keeps the first release focused on the intended code-repo use case.
 
+For Git-backed workspaces, every baseline and post-observation state should be
+captured as a resolvable `WorkspaceStateRef` that can expose:
+
+- provenance projection version
+- snapshot ref or equivalent
+- Git tree OID
+- exact commit OID when the state is known to correspond to a real commit
+
 The first successful baseline in a workspace must also seed bootstrap
 provenance for already-existing text files in that workspace. The system does
 not backfill historical turns, but it still needs a synthetic prehistory layer
@@ -229,6 +277,10 @@ so that:
 - unchanged legacy lines have a terminal segment
 - the first recorded replacement of legacy code has a parent
 - queries can distinguish "pre-provenance code" from "no data"
+
+This bootstrap applies only to the workspace state first seen after provenance
+is enabled. It does not create full historical lineage for arbitrary old Git
+revisions.
 
 ### 4. Extract Changes From Baseline to Turn End
 
@@ -253,6 +305,9 @@ Recommended flow:
      until repair occurs.
 5. At turn completion, persist a turn envelope that references the ordered
    observations and a derived net summary for convenience.
+6. When a Git-backed post-state exactly matches a real commit or later resolves
+   to one, persist a revision alias so historical `code_ref` lookups can attach
+   to the recorded provenance state without heuristic matching.
 
 This gives a single truth source that covers:
 
@@ -289,7 +344,7 @@ Recommended normalized model:
 - `started_at`
 - `completed_at`
 - `workspace_root`
-- `turn_baseline_ref`
+- `turn_baseline_ref: WorkspaceStateRef`
 - `base_projection_version`
 - `final_projection_version: Option<i64>`
 - `user_excerpt: Option<String>`
@@ -315,9 +370,16 @@ Recommended normalized model:
   - `Unavailable`
 - `base_projection_version`
 - `applied_projection_version: Option<i64>`
-- `pre_state_ref`
-- `post_state_ref`
+- `pre_state_ref: WorkspaceStateRef`
+- `post_state_ref: WorkspaceStateRef`
 - `files: Vec<FileChangeSet>`
+
+#### `WorkspaceStateRef`
+
+- `projection_version: Option<i64>`
+- `snapshot_ref: Option<String>`
+- `git_tree_oid: Option<String>`
+- `git_commit_oid: Option<String>`
 
 #### `FileChangeSet`
 
@@ -369,6 +431,18 @@ Recommended normalized model:
 
 `LiveSegment` is the crucial projection structure. It maps the current file
 state to the latest hunk responsible for each contiguous line range.
+
+#### `RevisionAlias`
+
+- `workspace_id`
+- `git_commit_oid`
+- `git_tree_oid`
+- `projection_version`
+- `state_ref`
+
+`RevisionAlias` allows a historical Git revision to resolve to an exact
+recorded provenance state when that tree has already been observed by the
+provenance kernel.
 
 ### 6. Maintain a Live Segment Projection
 
@@ -427,6 +501,7 @@ Recommended new SQLite tables:
 
 - `provenance_workspaces`
 - `provenance_workspace_heads`
+- `provenance_revision_aliases`
 - `provenance_turns`
 - `provenance_observations`
 - `provenance_tool_refs`
@@ -443,6 +518,8 @@ Recommended indexes:
 
 - by `workspace_id` and current path
 - by `workspace_id` and `projection_version`
+- by `workspace_id` and `git_tree_oid`
+- by `git_commit_oid`
 - by `hunk_id`
 - by `thread_id` and `turn_id`
 - by `file_id`, `projection_version`, `start_line`, and `end_line`
@@ -462,6 +539,7 @@ enough projected file state to make repair and overlap queries implementable:
 - latest projected file content, directly or through a content-addressed text
   blob table
 - workspace and file head refs keyed by projection version
+- revision aliases keyed by commit OID and tree OID for historical resolution
 
 ### 9. Keep the Query Surface API-First
 
@@ -471,25 +549,47 @@ Recommended methods and shapes:
 
 #### `provenance/readRange`
 
-Primary entry point.
+Primary entry point for anchored code coordinates.
 
 `ProvenanceReadRangeParams`
 
-- `workspace_root: Option<PathBuf>`
+- `selector: ProvenanceRangeSelector`
 - `path: PathBuf`
 - `start_line: u32`
 - `end_line: Option<u32>`
-- `expected_projection_version: Option<i64>`
 - `expected_content_fingerprint: Option<String>`
+
+#### `ProvenanceRangeSelector`
+
+- `WorkspaceAnchor`
+  - `workspace_root: PathBuf`
+  - `expected_projection_version: Option<i64>`
+- `GitRevision`
+  - `workspace_root: Option<PathBuf>`
+  - `code_ref: String`
+  - `expected_commit_oid: Option<String>`
 
 `ProvenanceReadRangeResponse`
 
 - resolved workspace and file identity
-- actual projection version
+- resolved selector info
+  - live query: actual projection version
+  - revision query: resolved commit OID and tree OID
 - requested range
 - `matched_segments: Vec<RangeSegmentProvenance>`
 - optional collapsed summary when every segment shares the same lineage root
 - availability or failure status
+
+Live and historical queries share the same response model, but they resolve from
+different anchors:
+
+- `WorkspaceAnchor` resolves against the current projected workspace head
+- `GitRevision` resolves `code_ref` to a commit/tree first, then maps that tree
+  to an exact recorded `WorkspaceStateRef`
+
+The server must not use fuzzy matching for historical Git queries. If the
+selected revision cannot be mapped exactly to a recorded provenance state, it
+must return `Unavailable` rather than guessing.
 
 #### `provenance/readHunk`
 
@@ -547,6 +647,9 @@ system to build a narrative:
 This lets the external system assemble rich review surfaces without parsing raw
 rollout files on every lookup.
 
+For historical Git queries, the response must also return the resolved Git
+revision identity so downstream systems can cache or correlate by exact commit.
+
 ## External Mutations and Divergence
 
 Long-term correctness requires acknowledging that not every workspace mutation
@@ -603,6 +706,8 @@ If recording fails:
 The system must distinguish unavailable provenance from ambiguous provenance.
 
 - `Unavailable` means the recorder lacks enough data to answer.
+- This includes historical Git revisions that do not map exactly to a recorded
+  provenance state.
 - `Ambiguous` means the recorder observed conflicting or concurrent mutations
   and intentionally refused to guess.
 
@@ -658,6 +763,8 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - `provenance/readHunk`
 - `provenance/readTurn`
 - multi-segment `readRange` responses
+- exact historical Git revision resolution
+- unavailable historical Git revision responses
 - availability and stale-projection responses
 
 ### Concurrency and drift tests
@@ -668,6 +775,8 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - bootstrap prehistory for existing repos
 - rename-plus-edit and ambiguous delete/recreate cases
 - writes that touch files outside the primary workspace root
+- branch or commit selectors that point at different code for the same path and
+  range
 
 ## Incremental Delivery
 
@@ -684,6 +793,7 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 
 - implement `provenance/readRange`
 - implement `provenance/readHunk`
+- implement exact Git revision resolution for recorded workspace states
 - add stable `file_id`, path alias, and ambiguity semantics
 - harden rename, delete, recreate, and multi-segment range behavior
 
@@ -701,10 +811,11 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 ## Key Decisions
 
 - Primary truth model: `workspace -> file -> hunk lineage`
-- Primary query input: `file + line/range`
+- Primary query input: anchored code coordinates, not bare `file + line/range`
 - Primary storage: normalized SQLite state, not rollout JSONL
 - Workspace projection updates are versioned and serialized
 - Explicit ambiguity is better than silent misattribution
+- Git is the historical code selector, not the provenance truth source
 - Codex responsibility: provenance kernel
 - External system responsibility: symbols, incidents, higher-level postmortem
   views
