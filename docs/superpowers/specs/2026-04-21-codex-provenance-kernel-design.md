@@ -13,14 +13,18 @@ top of that kernel.
 
 Build a workspace-scoped provenance kernel with these properties:
 
-1. Record structured code change sets at turn completion rather than relying on
-   ad hoc `git blame` or live-only turn diffs.
+1. Record structured mutation observations during a turn and group them into
+   turn-level change sets rather than relying on ad hoc `git blame` or
+   live-only turn diffs.
 2. Use `file + line/range` as the primary query surface.
 3. Treat hunks, not symbols or individual lines, as the primary stored unit of
    provenance.
-4. Maintain a live line-range projection for each tracked file so a current
-   range can be resolved to the latest hunk and walked back through its lineage.
-5. Expose provenance through new app-server v2 APIs, with no dedicated TUI
+4. Maintain a versioned live line-range projection for each tracked file so a
+   current range can be resolved to the latest hunk and walked back through its
+   lineage.
+5. Prefer explicit ambiguity and stale-workspace states over silent
+   misattribution when concurrent or external writers are involved.
+6. Expose provenance through new app-server v2 APIs, with no dedicated TUI
    workflow in the first release.
 
 The recommended implementation adds a new `codex-provenance` crate for lineage
@@ -38,6 +42,8 @@ baseline snapshot flow that is independent of undo.
   full postmortem trail without reassembling raw rollout items by hand.
 - Keep the Codex side language-agnostic so external systems can own symbol and
   incident semantics.
+- Prefer explicit `ambiguous` or `stale` provenance states over writing lineage
+  that might be wrong.
 - Reuse existing app-server and state infrastructure where it improves
   operability and testability.
 
@@ -106,6 +112,9 @@ kernel:
    turns from other tool paths.
 4. Existing history is thread-oriented, while the target query model must work
    across multiple Codex threads operating on the same workspace.
+5. A single net `turn start -> turn end` diff cannot preserve tool-level
+   intermediate changes and cannot safely disambiguate concurrent or external
+   workspace mutations that land while a turn is in flight.
 
 The design therefore needs a lower, workspace-oriented recording layer that is
 separate from the current live diff presentation.
@@ -127,6 +136,23 @@ Define a workspace scope as:
 Each recorded change set is attached to exactly one workspace scope and may
 optionally reference a `thread_id` and `turn_id` when the source was a Codex
 turn.
+
+One Codex turn may emit more than one workspace-scoped change set if it mutates
+files that belong to more than one canonical workspace root. No single change
+set should span multiple workspaces.
+
+Each workspace also owns a monotonic `projection_version`. All updates to the
+workspace lineage graph and live segment projection must be applied through a
+single serialized workspace transaction:
+
+- read current projection state
+- verify the expected base projection version
+- apply new mutation observations
+- advance the projection version
+
+If the expected base version does not match, the recorder must not guess. It
+must write an explicit ambiguous result and mark the workspace stale until it is
+reconciled.
 
 This gives the system the right aggregation model:
 
@@ -180,6 +206,7 @@ Add a dedicated turn-start baseline capture flow:
 - output:
   - workspace root
   - baseline snapshot identifier
+  - base projection version
   - capture status
 
 If the turn is inside a Git worktree, the baseline should be a snapshot commit
@@ -194,27 +221,38 @@ If the turn is outside Git, v1 should degrade cleanly:
 
 This keeps the first release focused on the intended code-repo use case.
 
+The first successful baseline in a workspace must also seed bootstrap
+provenance for already-existing text files in that workspace. The system does
+not backfill historical turns, but it still needs a synthetic prehistory layer
+so that:
+
+- unchanged legacy lines have a terminal segment
+- the first recorded replacement of legacy code has a parent
+- queries can distinguish "pre-provenance code" from "no data"
+
 ### 4. Extract Changes From Baseline to Turn End
 
-At turn completion, the recorder should compute the actual workspace diff
-between the captured baseline and the current worktree state.
-
-This recorder must sit below the current live UI diff projection and must not
-depend on `TurnDiffTracker` being complete.
+The recorder must sit below the current live UI diff projection and must not
+depend on `TurnDiffTracker` being complete. It must also avoid attributing
+concurrent or external writes to the wrong Codex turn.
 
 Recommended flow:
 
-1. Capture baseline snapshot at turn start.
-2. At turn completion, diff `baseline -> current worktree` with rename
-   detection.
-3. Normalize the resulting patch into file changes and hunks.
-4. Attach turn metadata:
-   - `thread_id`
-   - `turn_id`
-   - timestamps
-   - short user and assistant excerpts
-   - tool item refs for commands, patches, and other relevant actions
-5. Persist the normalized change set and update the workspace projection.
+1. Capture turn baseline snapshot and `base_projection_version` at turn start.
+2. Before each mutating tool observation, reconcile the actual workspace state
+   against the projected workspace head for that workspace.
+   - If drift exists before the tool starts, synthesize an
+     `ExternalWorkspaceMutation` or mark the workspace stale before attributing
+     any new Codex change.
+3. Around each mutating tool boundary, capture a `MutationObservation` from the
+   pre-observation state to the post-observation state.
+4. Apply that observation inside a serialized workspace transaction.
+   - If the workspace projection version advanced unexpectedly, or if the
+     observed post-state cannot be reconciled with the projected head, record an
+     ambiguous observation and stop applying further lineage for that workspace
+     until repair occurs.
+5. At turn completion, persist a turn envelope that references the ordered
+   observations and a derived net summary for convenience.
 
 This gives a single truth source that covers:
 
@@ -223,7 +261,8 @@ This gives a single truth source that covers:
 - `js_repl` edits
 - future mutating tools
 
-without needing separate per-tool provenance logic.
+without needing separate per-tool provenance logic, and it preserves
+tool-level intermediate changes rather than only a turn-end net diff.
 
 ### 5. Store Hunks as the Primary Provenance Unit
 
@@ -250,24 +289,52 @@ Recommended normalized model:
 - `started_at`
 - `completed_at`
 - `workspace_root`
-- `baseline_ref`
+- `turn_baseline_ref`
+- `base_projection_version`
+- `final_projection_version: Option<i64>`
 - `user_excerpt: Option<String>`
 - `assistant_excerpt: Option<String>`
 - `tool_refs: Vec<ToolRef>`
+- `observations: Vec<MutationObservation>`
+- `derived_net_summary: Vec<FileNetSummary>`
+
+#### `MutationObservation`
+
+- `observation_id`
+- `workspace_id`
+- `thread_id: Option<String>`
+- `turn_id: Option<String>`
+- `tool_ref: Option<ToolRef>`
+- `source_kind`
+  - `CodexTool`
+  - `ExternalWorkspaceMutation`
+  - `BootstrapPrehistory`
+- `attribution_status`
+  - `Attributed`
+  - `Ambiguous`
+  - `Unavailable`
+- `base_projection_version`
+- `applied_projection_version: Option<i64>`
+- `pre_state_ref`
+- `post_state_ref`
 - `files: Vec<FileChangeSet>`
 
 #### `FileChangeSet`
 
+- `observation_id`
 - `change_id`
 - `workspace_id`
 - `file_id`
 - `path_before: Option<PathBuf>`
 - `path_after: Option<PathBuf>`
-- `change_kind`
-  - `Add`
-  - `Update`
-  - `Delete`
-  - `Rename`
+- `existed_before`
+- `existed_after`
+- `content_changed`
+- `identity_status`
+  - `Preserved`
+  - `Created`
+  - `Deleted`
+  - `Ambiguous`
 - `is_text`
 - `is_queryable`
 - `hunks: Vec<HunkRecord>`
@@ -296,7 +363,8 @@ Recommended normalized model:
 - `workspace_id`
 - `file_id`
 - `start_line`
-- `line_count`
+- `end_line`
+- `projection_version`
 - `terminal_hunk_id`
 
 `LiveSegment` is the crucial projection structure. It maps the current file
@@ -316,7 +384,8 @@ Maintain a per-file live segment map:
 
 When a new normalized hunk is applied:
 
-1. Resolve the affected parent segments using the hunk's `before` range.
+1. Resolve all affected parent segments that intersect the hunk's `before`
+   range.
 2. Create a child `HunkRecord` with `parent_hunk_ids` set to the terminal hunks
    found in that range.
 3. Rewrite the affected segment map:
@@ -327,7 +396,7 @@ When a new normalized hunk is applied:
 
 This is the heart of the system. It allows:
 
-- `file + line/range -> terminal hunk`
+- `file + line/range -> one or more terminal hunks`
 - `terminal hunk -> parent hunks`
 - repeated walking back to the turn that introduced the current logic
 
@@ -335,14 +404,19 @@ This is the heart of the system. It allows:
 
 The same logic may survive path changes. Querying only by path is not enough.
 
-Assign each tracked file a stable `file_id`:
+Assign each tracked file a stable `file_id` when the recorder can prove
+continuity. The change model must support both path movement and content edits
+within the same observation:
 
-- path changes update the file's current path alias
-- rename-only operations preserve `file_id`
+- rename-only and rename-plus-edit observations can preserve `file_id`
+- path changes update the current path alias history
 - delete followed by later recreation at the same path creates a new `file_id`
+  only when that boundary is observable
+- when the available evidence cannot distinguish preserve-vs-recreate safely,
+  set `identity_status = Ambiguous` and surface that ambiguity through the API
 
-This keeps lineage coherent across renames while avoiding false continuity when
-an unrelated file reuses the old path.
+This keeps lineage coherent across renames without over-promising certainty for
+delete/recreate or heavy rewrite edge cases.
 
 ### 8. Use SQLite in `codex-state`, Not Rollout JSONL, as the Store
 
@@ -352,10 +426,14 @@ best persisted there rather than bloating rollout JSONL with analysis data.
 Recommended new SQLite tables:
 
 - `provenance_workspaces`
+- `provenance_workspace_heads`
 - `provenance_turns`
+- `provenance_observations`
 - `provenance_tool_refs`
 - `provenance_files`
 - `provenance_path_aliases`
+- `provenance_file_heads`
+- `provenance_text_blobs`
 - `provenance_changes`
 - `provenance_hunks`
 - `provenance_hunk_parents`
@@ -364,9 +442,10 @@ Recommended new SQLite tables:
 Recommended indexes:
 
 - by `workspace_id` and current path
+- by `workspace_id` and `projection_version`
 - by `hunk_id`
 - by `thread_id` and `turn_id`
-- by `file_id`, `start_line`, and `line_count`
+- by `file_id`, `projection_version`, `start_line`, and `end_line`
 - by parent and child hunk edges
 
 Why SQLite is the right default:
@@ -377,7 +456,12 @@ Why SQLite is the right default:
 - future external consumers can evolve without changing the storage contract
 
 Rollouts remain the source of conversational history. SQLite becomes the
-normalized provenance index.
+normalized provenance index. For queryable text files, the store must also keep
+enough projected file state to make repair and overlap queries implementable:
+
+- latest projected file content, directly or through a content-addressed text
+  blob table
+- workspace and file head refs keyed by projection version
 
 ### 9. Keep the Query Surface API-First
 
@@ -395,14 +479,16 @@ Primary entry point.
 - `path: PathBuf`
 - `start_line: u32`
 - `end_line: Option<u32>`
+- `expected_projection_version: Option<i64>`
+- `expected_content_fingerprint: Option<String>`
 
 `ProvenanceReadRangeResponse`
 
 - resolved workspace and file identity
+- actual projection version
 - requested range
-- matching terminal segment or hunk
-- origin turn summary
-- lineage summaries ordered newest to oldest
+- `matched_segments: Vec<RangeSegmentProvenance>`
+- optional collapsed summary when every segment shares the same lineage root
 - availability or failure status
 
 #### `provenance/readHunk`
@@ -453,6 +539,7 @@ system to build a narrative:
 - file identity and current path
 - current range and, when relevant, prior range
 - origin and intermediate turn refs
+- observation refs and attribution status
 - user and assistant excerpts
 - tool refs
 - context snippets and content fingerprints
@@ -471,16 +558,21 @@ Examples:
 - Git checkout or branch switching changes the working tree
 - another tool rewrites files between Codex turns
 
-The architecture should support a second change source:
+The architecture must support a second change source:
 
 - `ExternalWorkspaceMutation`
 
 Recommended end state:
 
-1. Before applying a new Codex turn change set, compare the workspace baseline
-   snapshot with the last projected workspace state.
-2. If they differ, synthesize and persist an external mutation change set.
-3. Apply the Codex turn on top of that repaired projection.
+1. Before a mutating Codex observation starts, compare the current workspace
+   state with the projected workspace head for that workspace.
+2. If they differ, synthesize and persist an `ExternalWorkspaceMutation`
+   observation before attributing the Codex mutation.
+3. After the Codex observation ends, revalidate the resulting post-state against
+   the expected projected head before advancing the projection version.
+4. If drift is detected inside an active Codex observation and cannot be
+   separated safely, write an ambiguous observation and mark the workspace
+   stale instead of attributing the mixed result to Codex.
 
 This keeps the lineage graph honest even when the workspace changes outside
 Codex.
@@ -489,6 +581,7 @@ If this full repair path is too much for the first increment, the fallback
 behavior should be explicit:
 
 - mark the workspace projection stale
+- mark the affected observation or turn as ambiguous
 - return a structured availability reason from query APIs
 - do not silently answer with invalid lineage
 
@@ -504,6 +597,21 @@ If recording fails:
 - the failure is surfaced as a warning or background event
 - the workspace or turn is marked unavailable for provenance queries until the
   next successful baseline and projection update
+
+### Ambiguity model
+
+The system must distinguish unavailable provenance from ambiguous provenance.
+
+- `Unavailable` means the recorder lacks enough data to answer.
+- `Ambiguous` means the recorder observed conflicting or concurrent mutations
+  and intentionally refused to guess.
+
+Common ambiguity triggers:
+
+- projection version mismatch during workspace apply
+- drift detected inside an active Codex mutation window
+- identity boundaries that cannot be proven safely
+- range queries that are anchored to stale content expectations
 
 ### Text-only scope
 
@@ -541,6 +649,7 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 
 - schema migration correctness
 - indexed range lookup behavior
+- projected file head reconstruction
 - workspace and path alias updates
 
 ### App-server tests
@@ -548,7 +657,17 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - `provenance/readRange`
 - `provenance/readHunk`
 - `provenance/readTurn`
+- multi-segment `readRange` responses
 - availability and stale-projection responses
+
+### Concurrency and drift tests
+
+- overlapping turns in the same workspace
+- external edit before a mutating tool starts
+- external edit during an active mutating tool window
+- bootstrap prehistory for existing repos
+- rename-plus-edit and ambiguous delete/recreate cases
+- writes that touch files outside the primary workspace root
 
 ## Incremental Delivery
 
@@ -556,20 +675,22 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 
 - add `codex-provenance`
 - add provenance baseline capture independent of undo
-- normalize baseline-to-worktree diffs into file changes and hunks
-- persist turn change sets and live segments into SQLite
+- seed bootstrap prehistory for existing queryable files
+- add projection versioning and serialized workspace apply semantics
+- persist mutation observations, file heads, and live segments into SQLite
 - expose `provenance/readTurn`
 
 ### Phase 2: Range Queries
 
 - implement `provenance/readRange`
 - implement `provenance/readHunk`
-- add stable `file_id` and path alias support
-- harden rename, delete, and recreate behavior
+- add stable `file_id`, path alias, and ambiguity semantics
+- harden rename, delete, recreate, and multi-segment range behavior
 
 ### Phase 3: Divergence Handling
 
-- add external mutation repair path
+- add external mutation repair path and drift revalidation at observation
+  boundaries
 - support stale workspace detection and explicit repair semantics
 
 ### Phase 4: External Consumer Integration
@@ -582,6 +703,8 @@ thin TUI or IDE consumer that calls the same app-server APIs.
 - Primary truth model: `workspace -> file -> hunk lineage`
 - Primary query input: `file + line/range`
 - Primary storage: normalized SQLite state, not rollout JSONL
+- Workspace projection updates are versioned and serialized
+- Explicit ambiguity is better than silent misattribution
 - Codex responsibility: provenance kernel
 - External system responsibility: symbols, incidents, higher-level postmortem
   views
