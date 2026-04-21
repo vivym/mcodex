@@ -322,6 +322,13 @@ async fn thread_spawn_child_inherits_parent_runtime_lease_host() -> anyhow::Resu
         .as_ref()
         .expect("root runtime lease host")
         .clone();
+    let expected_tree_id = crate::runtime_lease::CollaborationTreeId::for_test("tree-threadspawn");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
 
     let child = manager
         .state
@@ -352,6 +359,16 @@ async fn thread_spawn_child_inherits_parent_runtime_lease_host() -> anyhow::Resu
         .expect("child runtime lease host");
 
     assert!(child_runtime_lease_host.ptr_eq_for_test(&root_runtime_lease_host));
+    assert_eq!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
     assert!(
         child
             .thread
@@ -360,6 +377,192 @@ async fn thread_spawn_child_inherits_parent_runtime_lease_host() -> anyhow::Resu
             .services
             .account_pool_manager
             .is_none()
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_threadspawn_child_with_explicit_runtime_parent_inherits_runtime_lease_host_and_tree()
+-> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(true),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let expected_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-memory-background");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
+    let root_runtime_lease_host = root
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host")
+        .clone();
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source_and_runtime_parent(
+            config,
+            root.thread.codex.session.services.agent_control.clone(),
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+            Some(root.thread_id),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn memory child");
+
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .runtime_lease_host
+            .as_ref()
+            .expect("child runtime lease host")
+            .ptr_eq_for_test(&root_runtime_lease_host)
+    );
+    assert_eq!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_threadspawn_child_without_runtime_parent_does_not_infer_root_runtime_lease_host_or_tree()
+-> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config();
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(true),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let root_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-memory-background");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(root_tree_id.clone());
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            root.thread.codex.session.services.agent_control.clone(),
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn memory child without runtime parent");
+
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .runtime_lease_host
+            .is_none()
+    );
+    assert_ne!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        root_tree_id
     );
 
     child.thread.shutdown_and_wait().await?;

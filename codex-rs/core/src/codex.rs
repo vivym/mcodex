@@ -2136,6 +2136,7 @@ impl Session {
             .await?
         };
         let session_id = conversation_id.to_string();
+        agent_control.register_session_root(conversation_id, &session_configuration.session_source);
         let root_collaboration_tree_binding =
             Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
                 crate::runtime_lease::CollaborationTreeId::root_for_session(&session_id),
@@ -2892,6 +2893,11 @@ impl Session {
             .session_configuration
             .original_config_do_not_use
             .clone()
+    }
+
+    pub(crate) async fn session_source(&self) -> SessionSource {
+        let state = self.state.lock().await;
+        state.session_configuration.session_source.clone()
     }
 
     pub(crate) async fn provider(&self) -> ModelProviderInfo {

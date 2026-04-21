@@ -7,6 +7,9 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 use super::authority::RuntimeLeaseAuthority;
+use super::collaboration_tree::CollaborationTreeId;
+use super::collaboration_tree::CollaborationTreeMembership;
+use super::collaboration_tree::CollaborationTreeRegistry;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RuntimeLeaseHostId(String);
@@ -53,6 +56,7 @@ struct RuntimeLeaseHostInner {
     id: RuntimeLeaseHostId,
     mode: RuntimeLeaseHostMode,
     authority: StdMutex<Option<RuntimeLeaseAuthority>>,
+    collaboration_registry: Arc<CollaborationTreeRegistry>,
     latest_remote_context_reset: StdMutex<Option<RemoteContextResetRecord>>,
     lifecycle: Mutex<RuntimeLeaseHostLifecycle>,
 }
@@ -180,6 +184,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
             authority: StdMutex::new(None),
+            collaboration_registry: Arc::new(CollaborationTreeRegistry::default()),
             latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
@@ -190,6 +195,7 @@ impl RuntimeLeaseHost {
             id,
             mode: RuntimeLeaseHostMode::NonPooled,
             authority: StdMutex::new(None),
+            collaboration_registry: Arc::new(CollaborationTreeRegistry::default()),
             latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
@@ -213,6 +219,7 @@ impl RuntimeLeaseHost {
             "runtime lease host {} cannot install a pooled authority in non-pooled mode",
             self.id()
         );
+        authority.set_collaboration_registry(Arc::clone(&self.0.collaboration_registry));
         let mut stored_authority = self
             .0
             .authority
@@ -226,6 +233,17 @@ impl RuntimeLeaseHost {
         }
         *stored_authority = Some(authority);
         Ok(())
+    }
+
+    pub(crate) fn register_collaboration_member(
+        &self,
+        tree_id: CollaborationTreeId,
+        member_id: String,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> CollaborationTreeMembership {
+        self.0
+            .collaboration_registry
+            .register_member(tree_id, member_id, cancellation_token)
     }
 
     pub(crate) fn pooled_authority(&self) -> Option<RuntimeLeaseAuthority> {
@@ -440,10 +458,13 @@ impl RuntimeLeaseHost {
         id: RuntimeLeaseHostId,
         authority: RuntimeLeaseAuthority,
     ) -> Self {
+        let collaboration_registry = Arc::new(CollaborationTreeRegistry::default());
+        authority.set_collaboration_registry(Arc::clone(&collaboration_registry));
         Self(Arc::new(RuntimeLeaseHostInner {
             id,
             mode: RuntimeLeaseHostMode::Pooled,
             authority: StdMutex::new(Some(authority)),
+            collaboration_registry,
             latest_remote_context_reset: StdMutex::new(None),
             lifecycle: Mutex::new(RuntimeLeaseHostLifecycle::default()),
         }))
@@ -457,6 +478,22 @@ impl RuntimeLeaseHost {
     #[cfg(test)]
     pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collaboration_member_count_for_test(
+        &self,
+        tree_id: &CollaborationTreeId,
+    ) -> usize {
+        self.0.collaboration_registry.member_count_for_test(tree_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collaboration_member_ids_for_test(
+        &self,
+        tree_id: &CollaborationTreeId,
+    ) -> Vec<String> {
+        self.0.collaboration_registry.member_ids_for_test(tree_id)
     }
 
     #[cfg(test)]

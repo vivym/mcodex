@@ -21,6 +21,8 @@ use super::admission::LeaseAuthHandle;
 use super::admission::LeaseRequestContext;
 use super::admission::LeaseSnapshot;
 use super::admission::RequestBoundaryKind;
+use super::collaboration_tree::CollaborationTreeMembership;
+use super::collaboration_tree::CollaborationTreeRegistry;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -30,6 +32,7 @@ pub(crate) struct RuntimeLeaseAuthority {
 
 struct AuthorityInner {
     state: Mutex<AuthorityState>,
+    collaboration_registry: StdMutex<Arc<CollaborationTreeRegistry>>,
     admissions: StdMutex<AdmissionTrackerState>,
     recorded_boundaries: StdMutex<Vec<RequestBoundaryKind>>,
     changed: Notify,
@@ -126,6 +129,9 @@ impl RuntimeLeaseAuthority {
         Self {
             inner: Arc::new(AuthorityInner {
                 state: Mutex::new(AuthorityState { mode }),
+                collaboration_registry: StdMutex::new(Arc::new(
+                    CollaborationTreeRegistry::default(),
+                )),
                 admissions: StdMutex::new(AdmissionTrackerState {
                     active_generation: None,
                     admissions: HashSet::new(),
@@ -134,6 +140,24 @@ impl RuntimeLeaseAuthority {
                 changed: Notify::new(),
             }),
         }
+    }
+
+    pub(crate) fn set_collaboration_registry(&self, registry: Arc<CollaborationTreeRegistry>) {
+        *self
+            .inner
+            .collaboration_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
+    }
+
+    fn collaboration_registry(&self) -> Arc<CollaborationTreeRegistry> {
+        Arc::clone(
+            &self
+                .inner
+                .collaboration_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(crate) async fn acquire_request_lease(
@@ -154,7 +178,12 @@ impl RuntimeLeaseAuthority {
                         if let Some(generation) = host_owned.generation.as_ref()
                             && generation.accepting
                         {
-                            match self.inner.try_admit(&context, generation, Vec::new()) {
+                            let membership = self.register_collaboration_membership(&context);
+                            match self.inner.try_admit(
+                                &context,
+                                generation,
+                                vec![Box::new(membership)],
+                            ) {
                                 AdmissionAttempt::Admitted(admission) => {
                                     return Ok(*admission);
                                 }
@@ -257,14 +286,32 @@ impl RuntimeLeaseAuthority {
         &self,
         snapshot: &LeaseSnapshot,
     ) -> anyhow::Result<()> {
-        let manager = {
-            let state = self.inner.state.lock().await;
-            match &state.mode {
-                RuntimeLeaseAuthorityMode::OwnedManager(manager) => Some(Arc::clone(manager)),
-                RuntimeLeaseAuthorityMode::HostOwned(_) => None,
+        let (manager, invalidated_host_owned) = {
+            let mut state = self.inner.state.lock().await;
+            match &mut state.mode {
+                RuntimeLeaseAuthorityMode::OwnedManager(manager) => {
+                    (Some(Arc::clone(manager)), false)
+                }
+                RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
+                    let should_invalidate =
+                        host_owned.generation.as_ref().is_some_and(|generation| {
+                            generation.generation == snapshot.generation
+                                && generation.account_id == snapshot.account_id
+                                && generation.pool_id == snapshot.pool_id
+                        });
+                    if should_invalidate {
+                        host_owned.generation = None;
+                    }
+                    (None, should_invalidate)
+                }
             }
         };
-        if let Some(manager) = manager {
+
+        if invalidated_host_owned {
+            self.inner.changed.notify_waiters();
+        }
+
+        let report_result = if let Some(manager) = manager {
             manager
                 .lock()
                 .await
@@ -273,9 +320,15 @@ impl RuntimeLeaseAuthority {
                     snapshot.account_id.as_str(),
                     snapshot.pool_id.as_str(),
                 )
-                .await?;
+                .await
+        } else {
+            Ok(invalidated_host_owned)
+        };
+        if report_result.as_ref().copied().unwrap_or(true) {
+            self.collaboration_registry()
+                .cancel_tree(&snapshot.collaboration_tree_id);
         }
-        Ok(())
+        report_result.map(|_| ())
     }
 
     pub(crate) async fn runtime_snapshot(&self) -> AccountLeaseRuntimeSnapshot {
@@ -379,10 +432,12 @@ impl RuntimeLeaseAuthority {
             }
             let heartbeat_guard =
                 start_manager_heartbeat(Arc::clone(&manager), heartbeat_interval, &context.cancel);
-            match self
-                .inner
-                .try_admit(&context, &generation, vec![Box::new(heartbeat_guard)])
-            {
+            let membership = self.register_collaboration_membership(&context);
+            match self.inner.try_admit(
+                &context,
+                &generation,
+                vec![Box::new(heartbeat_guard), Box::new(membership)],
+            ) {
                 AdmissionAttempt::Admitted(admission) => return Ok(*admission),
                 AdmissionAttempt::Draining => {
                     tokio::select! {
@@ -392,6 +447,17 @@ impl RuntimeLeaseAuthority {
                 }
             }
         }
+    }
+
+    fn register_collaboration_membership(
+        &self,
+        context: &LeaseRequestContext,
+    ) -> CollaborationTreeMembership {
+        self.collaboration_registry().register_member(
+            context.collaboration_tree_id.clone(),
+            format!("{}:{}", context.session_id, Uuid::now_v7()),
+            context.cancel.clone(),
+        )
     }
 
     #[cfg(test)]

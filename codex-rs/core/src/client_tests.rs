@@ -581,6 +581,36 @@ async fn responses_http_setup_acquires_admission_for_pooled_runtime_host() {
 }
 
 #[tokio::test]
+async fn admitted_setup_uses_rebound_collaboration_tree_id() {
+    let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
+    let client =
+        test_model_client_with_runtime_authority(authority.clone(), "https://example.com/v1");
+    let requested_tree_id = CollaborationTreeId::for_test("tree-review-turn");
+    client.set_collaboration_tree_for_test(requested_tree_id.clone());
+
+    let setup = client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            LeaseRequestPurpose::Standard,
+            Some("turn-1"),
+            "request-1",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("pooled runtime request should acquire admission");
+
+    assert_eq!(
+        setup
+            .reporter
+            .as_ref()
+            .expect("pooled setup should include lease reporter")
+            .snapshot()
+            .collaboration_tree_id,
+        requested_tree_id
+    );
+}
+
+#[tokio::test]
 async fn responses_http_stream_acquires_admission_per_provider_round_trip() {
     core_test_support::skip_if_no_network!();
 

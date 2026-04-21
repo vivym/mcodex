@@ -785,12 +785,38 @@ impl ThreadManagerState {
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<NewThread> {
+        Box::pin(self.spawn_new_thread_with_source_and_runtime_parent(
+            config,
+            agent_control,
+            session_source,
+            /*runtime_parent_thread_id*/ None,
+            persist_extended_history,
+            metrics_service_name,
+            inherited_shell_snapshot,
+            inherited_exec_policy,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_new_thread_with_source_and_runtime_parent(
+        &self,
+        config: Config,
+        agent_control: AgentControl,
+        session_source: SessionSource,
+        runtime_parent_thread_id: Option<ThreadId>,
+        persist_extended_history: bool,
+        metrics_service_name: Option<String>,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+    ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            runtime_parent_thread_id,
             Vec::new(),
             persist_extended_history,
             metrics_service_name,
@@ -818,6 +844,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            /*runtime_parent_thread_id*/ None,
             Vec::new(),
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
@@ -846,6 +873,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            /*runtime_parent_thread_id*/ None,
             Vec::new(),
             persist_extended_history,
             /*metrics_service_name*/ None,
@@ -877,6 +905,7 @@ impl ThreadManagerState {
             auth_manager,
             agent_control,
             self.session_source.clone(),
+            /*runtime_parent_thread_id*/ None,
             dynamic_tools,
             persist_extended_history,
             metrics_service_name,
@@ -896,6 +925,7 @@ impl ThreadManagerState {
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
+        runtime_parent_thread_id: Option<ThreadId>,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
@@ -912,19 +942,41 @@ impl ThreadManagerState {
                 self.plugins_manager.as_ref(),
             )
             .await;
-        let runtime_lease_host = if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id,
-            ..
-        }) = &session_source
-        {
-            self.threads
-                .read()
-                .await
-                .get(parent_thread_id)
-                .and_then(|thread| thread.codex.session.services.runtime_lease_host.clone())
-        } else {
-            None
+        let parent_runtime_thread_id = match &session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            SessionSource::SubAgent(_) => runtime_parent_thread_id,
+            SessionSource::Cli
+            | SessionSource::VSCode
+            | SessionSource::Exec
+            | SessionSource::Mcp
+            | SessionSource::Custom(_)
+            | SessionSource::Unknown => None,
         };
+        let (runtime_lease_host, initial_collaboration_tree_id) =
+            if let Some(parent_thread_id) = parent_runtime_thread_id {
+                self.threads
+                    .read()
+                    .await
+                    .get(&parent_thread_id)
+                    .map(|thread| {
+                        (
+                            thread.codex.session.services.runtime_lease_host.clone(),
+                            Some(
+                                thread
+                                    .codex
+                                    .session
+                                    .services
+                                    .model_client
+                                    .current_collaboration_tree_id(),
+                            ),
+                        )
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
         let mut runtime_lease_startup_reservation =
             if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
                 Some(
@@ -981,6 +1033,13 @@ impl ThreadManagerState {
                 return Err(err);
             }
         };
+        if let Some(tree_id) = initial_collaboration_tree_id {
+            codex
+                .session
+                .services
+                .model_client
+                .set_collaboration_tree_id(tree_id);
+        }
         if let Some(reservation) = runtime_lease_startup_reservation.take()
             && let Err(err) = reservation
                 .promote_to_session(&codex.session.conversation_id.to_string())

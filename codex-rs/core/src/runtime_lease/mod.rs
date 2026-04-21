@@ -30,9 +30,15 @@ pub(crate) use admission::RequestBoundaryKind;
 #[allow(unused_imports)]
 pub(crate) use authority::RuntimeLeaseAuthority;
 #[allow(unused_imports)]
+pub(crate) use collaboration_tree::CollaborationTreeBinding;
+#[allow(unused_imports)]
 pub(crate) use collaboration_tree::CollaborationTreeBindingHandle;
 #[allow(unused_imports)]
 pub(crate) use collaboration_tree::CollaborationTreeId;
+#[allow(unused_imports)]
+pub(crate) use collaboration_tree::CollaborationTreeMembership;
+#[allow(unused_imports)]
+pub(crate) use collaboration_tree::CollaborationTreeRegistry;
 pub(crate) use host::RemoteContextResetRecord;
 pub(crate) use host::RuntimeLeaseHost;
 #[cfg_attr(not(test), allow(unused_imports))]

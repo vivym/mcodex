@@ -1,4 +1,7 @@
+use super::CollaborationTreeBinding;
+use super::CollaborationTreeBindingHandle;
 use super::CollaborationTreeId;
+use super::CollaborationTreeRegistry;
 use super::LeaseAdmissionError;
 use super::LeaseRequestContext;
 use super::LeaseSnapshot;
@@ -51,6 +54,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 #[test]
 fn session_view_resets_only_when_account_changes_and_pool_disallows_reuse() {
@@ -276,6 +280,160 @@ async fn admission_guard_releases_exactly_once() {
 
     drop(admission.guard);
     assert_eq!(authority.admitted_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn terminal_401_cancels_reporting_tree_but_not_unrelated_tree() -> anyhow::Result<()> {
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-a".to_string()));
+    runtime_lease_host
+        .install_authority(RuntimeLeaseAuthority::for_test_accepting("acct-a", 11))?;
+    let authority = runtime_lease_host
+        .pooled_authority()
+        .expect("test host should publish authority");
+
+    let tree_a_cancel = CancellationToken::new();
+    let tree_b_cancel = CancellationToken::new();
+    let tree_a_request = LeaseRequestContext::for_test_with_cancel(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a",
+        CollaborationTreeId::for_test("tree-a"),
+        tree_a_cancel.clone(),
+    );
+    let tree_b_request = LeaseRequestContext::for_test_with_cancel(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-b",
+        CollaborationTreeId::for_test("tree-b"),
+        tree_b_cancel.clone(),
+    );
+
+    let tree_a_admission = authority
+        .acquire_request_lease_for_test(tree_a_request)
+        .await?;
+    let tree_b_admission = authority
+        .acquire_request_lease_for_test(tree_b_request)
+        .await?;
+
+    authority
+        .report_terminal_unauthorized(&tree_a_admission.snapshot)
+        .await?;
+
+    assert!(tree_a_cancel.is_cancelled());
+    assert!(!tree_b_cancel.is_cancelled());
+    assert!(!authority.runtime_snapshot().await.active);
+
+    drop(tree_a_admission.guard);
+    drop(tree_b_admission.guard);
+
+    Ok(())
+}
+
+#[test]
+fn guardian_reusable_session_rebinds_membership_per_invocation() {
+    let root_tree_id = CollaborationTreeId::root_for_session("guardian-session");
+    let handle = Arc::new(CollaborationTreeBindingHandle::new(root_tree_id.clone()));
+    let registry = Arc::new(CollaborationTreeRegistry::default());
+
+    let first_tree_id = CollaborationTreeId::for_test("guardian:turn-1");
+    let first_cancel = CancellationToken::new();
+    {
+        let first_membership = registry.register_member(
+            first_tree_id.clone(),
+            "guardian:member-1".to_string(),
+            first_cancel.clone(),
+        );
+        let _first_binding = CollaborationTreeBinding::new(
+            Arc::clone(&handle),
+            first_tree_id.clone(),
+            Some(first_membership),
+        );
+
+        assert_eq!(handle.current(), first_tree_id);
+        registry.cancel_tree(&first_tree_id);
+        assert!(first_cancel.is_cancelled());
+    }
+
+    assert_eq!(handle.current(), root_tree_id);
+
+    let second_tree_id = CollaborationTreeId::for_test("guardian:turn-2");
+    let second_cancel = CancellationToken::new();
+    {
+        let second_membership = registry.register_member(
+            second_tree_id.clone(),
+            "guardian:member-2".to_string(),
+            second_cancel.clone(),
+        );
+        let _second_binding = CollaborationTreeBinding::new(
+            Arc::clone(&handle),
+            second_tree_id.clone(),
+            Some(second_membership),
+        );
+
+        assert_eq!(handle.current(), second_tree_id);
+    }
+
+    assert_eq!(handle.current(), root_tree_id);
+    assert_ne!(first_tree_id, second_tree_id);
+
+    registry.cancel_tree(&second_tree_id);
+    assert!(!second_cancel.is_cancelled());
+}
+
+#[test]
+fn background_work_without_parent_uses_per_invocation_synthetic_tree() {
+    let root_tree_id = CollaborationTreeId::root_for_session("background-session");
+    let handle = Arc::new(CollaborationTreeBindingHandle::new(root_tree_id.clone()));
+    let runtime_host_id = RuntimeLeaseHostId::new("runtime-background".to_string());
+    let first_tree_id =
+        CollaborationTreeId::synthetic_background_tree_id(&runtime_host_id, Uuid::now_v7());
+    let second_tree_id =
+        CollaborationTreeId::synthetic_background_tree_id(&runtime_host_id, Uuid::now_v7());
+
+    assert_ne!(first_tree_id, second_tree_id);
+    assert!(
+        first_tree_id
+            .to_string()
+            .starts_with("background:runtime-background:")
+    );
+    assert!(
+        second_tree_id
+            .to_string()
+            .starts_with("background:runtime-background:")
+    );
+
+    {
+        let _first_binding =
+            CollaborationTreeBinding::new(Arc::clone(&handle), first_tree_id.clone(), None);
+        assert_eq!(handle.current(), first_tree_id);
+    }
+    {
+        let _second_binding =
+            CollaborationTreeBinding::new(Arc::clone(&handle), second_tree_id.clone(), None);
+        assert_eq!(handle.current(), second_tree_id);
+    }
+
+    assert_eq!(handle.current(), root_tree_id);
+}
+
+#[test]
+fn overlapping_collaboration_bindings_restore_to_latest_live_binding() {
+    let root_tree_id = CollaborationTreeId::root_for_session("overlap-session");
+    let handle = Arc::new(CollaborationTreeBindingHandle::new(root_tree_id.clone()));
+    let first_tree_id = CollaborationTreeId::for_test("tree-first");
+    let second_tree_id = CollaborationTreeId::for_test("tree-second");
+
+    let first_binding =
+        CollaborationTreeBinding::new(Arc::clone(&handle), first_tree_id.clone(), None);
+    assert_eq!(handle.current(), first_tree_id);
+    let second_binding =
+        CollaborationTreeBinding::new(Arc::clone(&handle), second_tree_id.clone(), None);
+    assert_eq!(handle.current(), second_tree_id);
+
+    drop(first_binding);
+    assert_eq!(handle.current(), second_tree_id);
+
+    drop(second_binding);
+    assert_eq!(handle.current(), root_tree_id);
 }
 
 #[tokio::test]

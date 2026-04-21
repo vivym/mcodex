@@ -1,10 +1,17 @@
+use super::SessionTask;
+use super::SessionTaskContext;
 use super::emit_turn_network_proxy_metric;
+use crate::codex::TurnContext;
+use crate::state::TaskKind;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::user_input::UserInput;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
@@ -13,6 +20,35 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::time::Duration;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+struct WaitForCancelTask;
+
+impl SessionTask for WaitForCancelTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.wait_for_cancel_test"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+        input: Vec<UserInput>,
+        cancellation_token: CancellationToken,
+    ) -> Option<String> {
+        let _ = (session, ctx, input);
+        cancellation_token.cancelled().await;
+        None
+    }
+}
 
 fn test_session_telemetry() -> SessionTelemetry {
     let exporter = InMemoryMetricExporter::default();
@@ -69,6 +105,42 @@ fn metric_point(resource_metrics: &ResourceMetrics) -> (BTreeMap<String, String>
         },
         _ => panic!("unexpected counter data type"),
     }
+}
+
+#[tokio::test]
+async fn externally_cancelled_task_clears_active_turn_and_emits_abort() {
+    let (session, turn_context, rx_events) = crate::codex::make_session_and_context_with_rx().await;
+
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), WaitForCancelTask)
+        .await;
+    let task_cancellation_token = {
+        let active_turn = session.active_turn.lock().await;
+        active_turn
+            .as_ref()
+            .expect("active turn")
+            .tasks
+            .get(&turn_context.sub_id)
+            .expect("running task")
+            .cancellation_token
+            .clone()
+    };
+
+    task_cancellation_token.cancel();
+
+    let aborted = timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx_events.recv().await.expect("session event");
+            if let EventMsg::TurnAborted(aborted) = event.msg {
+                return aborted;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for TurnAborted");
+
+    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
+    assert!(session.active_turn.lock().await.is_none());
 }
 
 #[test]

@@ -32,6 +32,7 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::Path;
@@ -213,6 +214,12 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
     parent_ctx.config = Arc::clone(&pooled_config);
 
     let parent_session = Arc::new(parent_session);
+    let expected_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-review-parent");
+    parent_session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
     let parent_ctx = Arc::new(parent_ctx);
     let child = run_codex_thread_interactive(
         pooled_config.as_ref().clone(),
@@ -234,6 +241,14 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
         .as_ref()
         .expect("child runtime lease host");
     assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
+    assert_eq!(
+        child
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
     assert!(child.session.services.account_pool_manager.is_none());
 
     child.shutdown_and_wait().await?;
@@ -292,6 +307,85 @@ async fn run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_ho
     assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
 
     child.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_codex_thread_one_shot_registers_invocation_collaboration_membership()
+-> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) = crate::codex::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_with_authority_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-c".to_string()),
+        crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("acct-c", 11),
+    );
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let parent_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-review-parent-one-shot");
+    parent_session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(parent_tree_id.clone());
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_one_shot(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        /*inherited_lease_auth_session*/ None,
+        Arc::clone(&parent_session.services.models_manager),
+        vec![UserInput::Text {
+            text: "keep the review idle".into(),
+            text_elements: Vec::new(),
+        }],
+        Arc::clone(&parent_session),
+        Arc::clone(&parent_ctx),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*final_output_json_schema*/ None,
+        /*initial_history*/ None,
+    )
+    .await?;
+    let child_session_loop_termination = child.session_loop_termination.clone();
+
+    assert!(
+        runtime_lease_host
+            .collaboration_member_ids_for_test(&parent_tree_id)
+            .iter()
+            .any(|member_id| member_id.contains(":delegate-one-shot:")),
+        "one-shot delegate should register an invocation-scoped collaboration membership before any provider request"
+    );
+
+    let authority = runtime_lease_host
+        .pooled_authority()
+        .expect("delegate test host should publish authority");
+    let reporting_request = crate::runtime_lease::LeaseRequestContext::for_test(
+        crate::runtime_lease::RequestBoundaryKind::ResponsesHttp,
+        "reporter-session",
+        parent_tree_id.clone(),
+    );
+    let reporting_admission = authority
+        .acquire_request_lease_for_test(reporting_request)
+        .await?;
+    authority
+        .report_terminal_unauthorized(&reporting_admission.snapshot)
+        .await?;
+    drop(reporting_admission.guard);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime_lease_host.collaboration_member_count_for_test(&parent_tree_id) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for one-shot membership cleanup");
+    timeout(Duration::from_secs(2), child_session_loop_termination)
+        .await
+        .expect("timed out waiting for one-shot delegate shutdown");
     Ok(())
 }
 

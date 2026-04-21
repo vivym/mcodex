@@ -148,6 +148,7 @@ impl AgentControl {
     }
 
     /// Spawn a new agent thread and submit the initial prompt.
+    #[cfg(test)]
     pub(crate) async fn spawn_agent(
         &self,
         config: crate::config::Config,
@@ -160,6 +161,26 @@ impl AgentControl {
                 initial_operation,
                 session_source,
                 SpawnAgentOptions::default(),
+                /*runtime_parent_thread_id*/ None,
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn spawn_agent_from_parent_thread(
+        &self,
+        parent_thread_id: ThreadId,
+        config: crate::config::Config,
+        initial_operation: Op,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .spawn_agent_internal(
+                config,
+                initial_operation,
+                session_source,
+                SpawnAgentOptions::default(),
+                Some(parent_thread_id),
             )
             .await?
             .thread_id)
@@ -173,8 +194,14 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions, // TODO(jif) drop with new fork.
     ) -> CodexResult<LiveAgent> {
-        self.spawn_agent_internal(config, initial_operation, session_source, options)
-            .await
+        self.spawn_agent_internal(
+            config,
+            initial_operation,
+            session_source,
+            options,
+            /*runtime_parent_thread_id*/ None,
+        )
+        .await
     }
 
     async fn spawn_agent_internal(
@@ -183,6 +210,7 @@ impl AgentControl {
         initial_operation: Op,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
+        runtime_parent_thread_id: Option<ThreadId>,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
         let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
@@ -230,10 +258,11 @@ impl AgentControl {
             }
             (Some(session_source), None) => {
                 state
-                    .spawn_new_thread_with_source(
+                    .spawn_new_thread_with_source_and_runtime_parent(
                         config,
                         self.clone(),
                         session_source,
+                        runtime_parent_thread_id,
                         /*persist_extended_history*/ false,
                         /*metrics_service_name*/ None,
                         inherited_shell_snapshot,

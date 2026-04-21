@@ -542,6 +542,24 @@ async fn run_review_on_session(
     params: &GuardianReviewSessionParams,
     deadline: tokio::time::Instant,
 ) -> (GuardianReviewSessionOutcome, bool) {
+    let _collaboration_binding = review_session
+        .codex
+        .session
+        .services
+        .bind_collaboration_tree(
+            params
+                .parent_session
+                .services
+                .model_client
+                .current_collaboration_tree_id(),
+            format!(
+                "{}:{}:{}",
+                review_session.codex.session.conversation_id,
+                params.parent_turn.sub_id,
+                uuid::Uuid::now_v7()
+            ),
+            review_session.cancel_token.clone(),
+        );
     let (send_followup_reminder, prompt_mode) = {
         let state = review_session.state.lock().await;
 

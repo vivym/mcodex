@@ -143,6 +143,16 @@ pub(crate) async fn run_codex_thread_interactive(
             return Err(err);
         }
     };
+    codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_id(
+            parent_session
+                .services
+                .model_client
+                .current_collaboration_tree_id(),
+        );
     if let Some(reservation) = runtime_lease_startup_reservation.take()
         && let Err(err) = reservation
             .promote_to_session(&codex.session.conversation_id.to_string())
@@ -227,6 +237,10 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
+    let parent_collaboration_tree_id = parent_session
+        .services
+        .model_client
+        .current_collaboration_tree_id();
     let io = run_codex_thread_interactive(
         config,
         auth_manager,
@@ -239,6 +253,15 @@ pub(crate) async fn run_codex_thread_one_shot(
         initial_history,
     )
     .await?;
+    let collaboration_binding = io.session.services.bind_collaboration_tree(
+        parent_collaboration_tree_id,
+        format!(
+            "{}:delegate-one-shot:{}",
+            io.session.conversation_id,
+            uuid::Uuid::now_v7()
+        ),
+        child_cancel.clone(),
+    );
 
     // Send the initial input to kick off the one-shot turn.
     io.submit(Op::UserInput {
@@ -256,6 +279,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
     tokio::spawn(async move {
+        let _collaboration_binding = collaboration_binding;
         while let Ok(event) = io_for_bridge.next_event().await {
             let should_shutdown = matches!(
                 event.msg,

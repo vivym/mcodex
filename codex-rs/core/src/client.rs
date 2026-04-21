@@ -107,8 +107,10 @@ use crate::client_common::ResponseStream;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::lease_auth::SessionLeaseAuth;
 use crate::lease_auth::leased_turn_auth_as_auth;
+use crate::runtime_lease::CollaborationTreeBinding;
 use crate::runtime_lease::CollaborationTreeBindingHandle;
 use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::CollaborationTreeMembership;
 use crate::runtime_lease::LeaseAdmission;
 use crate::runtime_lease::LeaseAdmissionError;
 use crate::runtime_lease::LeaseAdmissionGuard;
@@ -758,6 +760,48 @@ impl ModelClient {
     #[cfg(test)]
     pub(crate) fn session_id_for_test(&self) -> String {
         self.state.session_id.clone()
+    }
+
+    pub(crate) fn current_collaboration_tree_id(&self) -> CollaborationTreeId {
+        self.state.collaboration_tree_binding.current()
+    }
+
+    pub(crate) fn set_collaboration_tree_id(
+        &self,
+        tree_id: CollaborationTreeId,
+    ) -> CollaborationTreeId {
+        self.state.collaboration_tree_binding.set_current(tree_id)
+    }
+
+    pub(crate) fn bind_collaboration_tree(
+        &self,
+        membership: CollaborationTreeMembership,
+    ) -> CollaborationTreeBinding {
+        let tree_id = membership.tree_id().clone();
+        CollaborationTreeBinding::new(
+            Arc::clone(&self.state.collaboration_tree_binding),
+            tree_id,
+            Some(membership),
+        )
+    }
+
+    pub(crate) fn bind_collaboration_tree_id(
+        &self,
+        tree_id: CollaborationTreeId,
+    ) -> CollaborationTreeBinding {
+        CollaborationTreeBinding::new(
+            Arc::clone(&self.state.collaboration_tree_binding),
+            tree_id,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_collaboration_tree_for_test(
+        &self,
+        tree_id: CollaborationTreeId,
+    ) -> CollaborationTreeId {
+        self.set_collaboration_tree_id(tree_id)
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {

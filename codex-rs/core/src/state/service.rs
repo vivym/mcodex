@@ -11,6 +11,8 @@ use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GuardianRejection;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
+use crate::runtime_lease::CollaborationTreeBinding;
+use crate::runtime_lease::CollaborationTreeId;
 use crate::skills_watcher::SkillsWatcher;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::network_approval::NetworkApprovalService;
@@ -150,6 +152,53 @@ impl SessionServices {
             self.lease_auth.clear();
         }
         Ok(())
+    }
+
+    pub(crate) fn bind_collaboration_tree(
+        &self,
+        tree_id: CollaborationTreeId,
+        member_id: String,
+        cancellation_token: CancellationToken,
+    ) -> CollaborationTreeBinding {
+        if let Some(runtime_lease_host) = self
+            .runtime_lease_host
+            .as_ref()
+            .filter(|host| host.is_pooled())
+        {
+            let membership = runtime_lease_host.register_collaboration_member(
+                tree_id,
+                member_id,
+                cancellation_token,
+            );
+            return self.model_client.bind_collaboration_tree(membership);
+        }
+        self.model_client.bind_collaboration_tree_id(tree_id)
+    }
+
+    pub(crate) fn bind_synthetic_background_collaboration_tree(
+        &self,
+        member_id: String,
+        cancellation_token: CancellationToken,
+    ) -> CollaborationTreeBinding {
+        if let Some(runtime_lease_host) = self
+            .runtime_lease_host
+            .as_ref()
+            .filter(|host| host.is_pooled())
+        {
+            let tree_id = CollaborationTreeId::synthetic_background_tree_id(
+                &runtime_lease_host.id(),
+                Uuid::now_v7(),
+            );
+            let membership = runtime_lease_host.register_collaboration_member(
+                tree_id,
+                member_id,
+                cancellation_token,
+            );
+            return self.model_client.bind_collaboration_tree(membership);
+        }
+        self.model_client.bind_collaboration_tree_id(
+            CollaborationTreeId::synthetic_local_background_tree_id(Uuid::now_v7()),
+        )
     }
 
     pub(crate) async fn build_root_runtime_lease_host(
@@ -1196,11 +1245,12 @@ impl AccountPoolManager {
         generation: u64,
         account_id: &str,
         pool_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if !self.generation_matches(generation, account_id, pool_id) {
-            return Ok(());
+            return Ok(false);
         }
-        self.report_unauthorized().await
+        self.report_unauthorized().await?;
+        Ok(true)
     }
 
     async fn release_active_lease(&mut self) -> anyhow::Result<()> {
