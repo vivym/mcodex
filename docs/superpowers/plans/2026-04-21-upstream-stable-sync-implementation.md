@@ -330,11 +330,11 @@ Run from the repository root, not from another worktree:
 
 ```bash
 git worktree add .worktrees/sync-rust-v0.121.0-base \
-  -b sync/rust-v0.121.0-base plan/upstream-stable-sync
+  -b sync/rust-v0.121.0-base main
 cd .worktrees/sync-rust-v0.121.0-base
 ```
 
-Expected: new branch `sync/rust-v0.121.0-base` is checked out in the worktree.
+Expected: new branch `sync/rust-v0.121.0-base` is checked out in the worktree and starts from the current `main`.
 
 - [ ] **Step 2: Start the 0.121 merge**
 
@@ -1228,16 +1228,15 @@ Expected: these files are no longer unresolved.
 - Regenerate: `codex-rs/app-server-protocol/schema/typescript/**/*.ts`
 - Modify: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
 
-- [ ] **Step 1: Confirm no unresolved conflicts remain before regeneration**
+- [ ] **Step 1: Confirm only generated files remain unresolved before regeneration**
 
 Run:
 
 ```bash
 git diff --name-only --diff-filter=U
-rg '<<<<<<<|=======|>>>>>>>' .
 ```
 
-Expected: no unresolved conflicts. If generated files still have conflict markers, remove them by regeneration in the next steps, not by hand-picking final content.
+Expected: unresolved paths, if any, are limited to generated schema files that will be overwritten by the generator. If a source file is still unresolved here, stop and resolve it before continuing.
 
 - [ ] **Step 2: Regenerate app-server schemas**
 
@@ -1284,7 +1283,18 @@ just bazel-lock-check
 
 Expected: both commands pass and `MODULE.bazel.lock` is updated if needed.
 
-- [ ] **Step 6: Update execution log artifact checklist**
+- [ ] **Step 6: Confirm no unresolved conflicts remain after regeneration**
+
+Run:
+
+```bash
+git diff --name-only --diff-filter=U
+rg '<<<<<<<|=======|>>>>>>>' .
+```
+
+Expected: no unresolved conflicts and no conflict markers remain in generated outputs.
+
+- [ ] **Step 7: Update execution log artifact checklist**
 
 Mark applicable checklist items as complete:
 
@@ -1295,7 +1305,7 @@ Mark applicable checklist items as complete:
 - [x] app-server schemas regenerated when protocol changed
 ```
 
-- [ ] **Step 7: Stage generated artifacts**
+- [ ] **Step 8: Stage generated artifacts**
 
 Run:
 
@@ -1591,4 +1601,3 @@ Append to the execution log on `main` if it is retained:
 ```
 
 Expected: final project state is auditable.
-
