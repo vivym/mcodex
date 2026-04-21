@@ -42,6 +42,7 @@ Create during execution:
 
 - `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
   Responsibility: record merge bases, conflict counts, conflict-resolution decisions, commands run, deferred non-core follow-ups, and final artifact checklist.
+  Create this tracked file first inside `.worktrees/sync-rust-v0.121.0-base`; do not commit it from the maintainer's active checkout.
 
 Branches and worktrees:
 
@@ -132,7 +133,7 @@ codex-rs/tui/src/**/*.snap
 ## Task 1: Preflight and Isolated Workspace
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
+- Prepare scratch content for: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
 - Read: `docs/superpowers/specs/2026-04-21-upstream-stable-sync-design.md`
 - Read: `AGENTS.md`
 
@@ -184,9 +185,9 @@ git merge-base HEAD rust-v0.122.0
 
 Expected: both tags resolve to commit objects and both merge-base commands print a commit hash.
 
-- [ ] **Step 5: Create the sync execution log**
+- [ ] **Step 5: Prepare the execution log template outside the active checkout**
 
-Create `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`:
+Create `/tmp/mcodex-upstream-stable-sync-execution-log.md`:
 
 ```markdown
 # Upstream Stable Sync Execution Log
@@ -225,6 +226,8 @@ Plan: docs/superpowers/plans/2026-04-21-upstream-stable-sync-implementation.md
 - [ ] full workspace test run locally or deferred to required CI with approval
 ```
 
+Expected: the scratch template exists outside the repository so the maintainer's active checkout stays unchanged.
+
 - [ ] **Step 6: Fill the preflight section**
 
 Run:
@@ -240,23 +243,22 @@ Run:
 }
 ```
 
-Expected: copy these exact values into the execution log.
+Expected: record these exact values in `/tmp/mcodex-upstream-stable-sync-execution-log.md` or another scratch note so they can be copied into the tracked log after the sync worktree exists.
 
-- [ ] **Step 7: Commit the execution log**
+- [ ] **Step 7: Verify the active checkout remains untouched**
 
 Run:
 
 ```bash
-git add docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md
-git commit -m "docs: start upstream stable sync log"
+git status --short --branch
 ```
 
-Expected: commit succeeds.
+Expected: no new tracked sync commit is created on the active checkout. If a tracked execution-log file was created in the active checkout by mistake, remove it before continuing.
 
 ## Task 2: Dry-Run Conflict Manifests
 
 **Files:**
-- Modify: `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md`
+- Modify scratch notes only: `/tmp/mcodex-upstream-stable-sync-execution-log.md`
 
 - [ ] **Step 1: Record the 0.121 dry-run conflict manifest**
 
@@ -282,9 +284,9 @@ rg '^(CONFLICT|Auto-merging)' /tmp/mcodex-merge-tree-0.122.txt
 
 Expected: output includes the 0.121 conflict families plus app-server schemas, CLI entry points, core client/config/plugin/task files, login auth, state, TUI update files, docs, and install scripts.
 
-- [ ] **Step 3: Add a conflict summary to the execution log**
+- [ ] **Step 3: Add a conflict summary to the scratch execution log**
 
-Add a `## Dry-Run Conflict Summary` section:
+Add a `## Dry-Run Conflict Summary` section to `/tmp/mcodex-upstream-stable-sync-execution-log.md`:
 
 ```markdown
 ## Dry-Run Conflict Summary
@@ -307,16 +309,15 @@ rg '^CONFLICT' /tmp/mcodex-merge-tree-0.121.txt | wc -l
 rg '^CONFLICT' /tmp/mcodex-merge-tree-0.122.txt | wc -l
 ```
 
-- [ ] **Step 4: Commit the conflict manifest update**
+- [ ] **Step 4: Confirm dry-run prep did not dirty the active checkout**
 
 Run:
 
 ```bash
-git add docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md
-git commit -m "docs: record upstream sync conflict manifests"
+git status --short --branch
 ```
 
-Expected: commit succeeds.
+Expected: no tracked sync log commit exists on the maintainer's active checkout. Dry-run notes remain only in scratch space until the checkpoint worktree is created.
 
 ## Task 3: Create the 0.121 Checkpoint Worktree
 
@@ -356,9 +357,11 @@ git diff --name-only --diff-filter=U
 
 Expected: the unresolved list matches the 0.121 conflict families from the spec and Task 2.
 
-- [ ] **Step 4: Record the merge start in the execution log**
+- [ ] **Step 4: Create the tracked execution log inside the checkpoint worktree and record merge start**
 
-Append:
+Create or update `docs/superpowers/plans/2026-04-21-upstream-stable-sync-execution-log.md` inside `.worktrees/sync-rust-v0.121.0-base`.
+
+If `/tmp/mcodex-upstream-stable-sync-execution-log.md` exists, copy its contents first, then append:
 
 ```markdown
 ## rust-v0.121.0 Checkpoint
@@ -367,6 +370,8 @@ Append:
 - Merge started at:
 - Unresolved conflicts:
 ```
+
+Expected: the tracked execution log is created for the first time on `sync/rust-v0.121.0-base`, not on the maintainer's active checkout.
 
 - [ ] **Step 5: Stage the execution log update**
 
@@ -1107,6 +1112,19 @@ Expected: these files are no longer unresolved.
 - Modify: `docs/config.md`
 - Modify: `scripts/install/install.ps1`
 - Modify: `scripts/install/install.sh`
+- Review or modify if contract drift appears: `.github/workflows/rust-release.yml`
+- Review or modify if contract drift appears: `.github/workflows/rust-release-windows.yml`
+- Review or modify if contract drift appears: `.github/workflows/rust-release-prepare.yml`
+- Review or modify if contract drift appears: `.github/actions/linux-code-sign/action.yml`
+- Review or modify if contract drift appears: `.github/actions/macos-code-sign/action.yml`
+- Review or modify if contract drift appears: `.github/actions/windows-code-sign/action.yml`
+- Review or modify if contract drift appears: `scripts/stage_cli_archives.py`
+- Review or modify if contract drift appears: `scripts/stage_npm_packages.py`
+- Review or modify if contract drift appears: `scripts/test_stage_cli_archives.py`
+- Review or modify if contract drift appears: `scripts/test_stage_npm_packages.py`
+- Review or modify if contract drift appears: `docs/release.md`
+- Review or modify if contract drift appears: `README.md`
+- Review or modify if contract drift appears: `docs/install.md`
 
 - [ ] **Step 1: Resolve TUI app/session conflicts**
 
@@ -1165,7 +1183,39 @@ installers do not point to upstream GitHub native assets
 
 Keep upstream configuration documentation additions and fork `mcodex` home/config identity documentation.
 
-- [ ] **Step 5: Run TUI and installer tests**
+- [ ] **Step 5: Audit release workflow, code-sign, and staging contracts even without direct merge conflicts**
+
+Review:
+
+```text
+.github/workflows/rust-release.yml
+.github/workflows/rust-release-windows.yml
+.github/workflows/rust-release-prepare.yml
+.github/actions/linux-code-sign/action.yml
+.github/actions/macos-code-sign/action.yml
+.github/actions/windows-code-sign/action.yml
+scripts/stage_cli_archives.py
+scripts/stage_npm_packages.py
+scripts/test_stage_cli_archives.py
+scripts/test_stage_npm_packages.py
+docs/release.md
+README.md
+docs/install.md
+```
+
+Confirm this contract still holds after the merge:
+
+```text
+GitHub Releases remain lightweight release records and do not publish native CLI archives.
+OSS upload order stays: versioned release artifacts first, root install scripts second, channels/stable/latest.json last.
+stage_cli_archives emits mcodex-named native archives and the stable manifest.
+stage_npm_packages remains limited to npm package staging and does not reintroduce npm as the primary mcodex CLI distribution path.
+release workflows and code-sign actions still package/sign mcodex binaries rather than upstream codex names.
+```
+
+If any reviewed file violates this contract, fix it in this task rather than deferring to the final grep-only gate.
+
+- [ ] **Step 6: Run TUI and installer tests**
 
 Run:
 
@@ -1180,7 +1230,7 @@ python3 -m unittest scripts.test_stage_npm_packages
 
 Expected: PASS, except TUI snapshots may require intentional review.
 
-- [ ] **Step 6: Review TUI snapshots if needed**
+- [ ] **Step 7: Review TUI snapshots if needed**
 
 Run:
 
@@ -1195,12 +1245,18 @@ Expected: no pending snapshots unless intentional. For intentional changes, insp
 cargo insta accept -p codex-tui
 ```
 
-- [ ] **Step 7: Stage TUI, docs, and installer files**
+- [ ] **Step 8: Stage TUI, docs, installer, and release-contract files**
 
 Run:
 
 ```bash
 git add \
+  .github/workflows/rust-release.yml \
+  .github/workflows/rust-release-windows.yml \
+  .github/workflows/rust-release-prepare.yml \
+  .github/actions/linux-code-sign/action.yml \
+  .github/actions/macos-code-sign/action.yml \
+  .github/actions/windows-code-sign/action.yml \
   codex-rs/tui/src/app.rs \
   codex-rs/tui/src/app/app_server_adapter.rs \
   codex-rs/tui/src/app_server_session.rs \
@@ -1212,11 +1268,18 @@ git add \
   codex-rs/tui/src/tooltips.rs \
   codex-rs/tui/src/update_action.rs \
   docs/config.md \
+  docs/install.md \
+  docs/release.md \
+  README.md \
+  scripts/stage_cli_archives.py \
+  scripts/stage_npm_packages.py \
+  scripts/test_stage_cli_archives.py \
+  scripts/test_stage_npm_packages.py \
   scripts/install/install.ps1 \
   scripts/install/install.sh
 ```
 
-Expected: these files are no longer unresolved.
+Expected: unresolved files are staged, and any non-conflicted release-contract fixes from this task are staged too.
 
 ## Task 13: Regenerate Derived Artifacts
 
@@ -1360,7 +1423,11 @@ Run for each changed crate with code changes:
 
 ```bash
 cd codex-rs
+just fix -p codex-core-skills
+just fix -p codex-cli
 just fix -p codex-core
+just fix -p codex-rmcp-client
+just fix -p codex-exec-server
 just fix -p codex-login
 just fix -p codex-state
 just fix -p codex-app-server
@@ -1395,7 +1462,7 @@ fi
 
 Expected: PASS. If not approved locally, skip this step and document the reason.
 
-- [ ] **Step 6: Run release/install/update checks**
+- [ ] **Step 6: Run explicit release/install/update contract checks**
 
 Run:
 
@@ -1408,18 +1475,79 @@ rg -n 'downloads\\.mcodex\\.sota\\.wiki|repositories/mcodex|install\\.sh|install
 
 Expected: upstream `openai/codex` references remain only where intentionally historical or non-CLI-package related. OSS references exist for installer/update/release paths.
 
-- [ ] **Step 7: Run targeted identity checks**
+- [ ] **Step 7: Run targeted product-identity, home-dir, CLI identity, and startup regressions**
 
 Run:
 
 ```bash
+cd codex-rs
+cargo test -p codex-product-identity mcodex_identity_defines_active_and_legacy_roots
+cargo test -p codex-utils-home-dir find_codex_home_prefers_mcodex_home_env
+cargo test -p codex-utils-home-dir find_codex_home_without_env_uses_dot_mcodex
+cargo test -p codex-utils-home-dir find_codex_home_ignores_codex_home_when_mcodex_home_is_unset
+cargo test -p codex-cli runtime_display_identity_version_uses_mcodex_identity
+cargo test -p codex-cli runtime_display_identity_help_uses_mcodex_identity
+cargo test -p codex-tui startup_decision_uses_pooled_only_notice_when_pooled_access_exists
+cargo test -p codex-tui startup_probe_failure_falls_back_to_needs_login
+cargo test -p codex-tui pooled_only_notice_starts_hidden_auth_and_reveals_it_with_l
+cargo test -p codex-tui pooled_only_notice_enter_dismisses_notice_before_trust_step
+cargo test -p codex-tui pooled_only_notice_hide_failure_still_continues
 rg -n 'CODEX_HOME|~/.codex|MCODEX_HOME|~/.mcodex|mcodex' \
   codex-rs/core/src codex-rs/cli/src codex-rs/tui/src codex-rs/product-identity/src
 ```
 
-Expected: normal runtime paths use `MCODEX_HOME` and `~/.mcodex`; legacy `CODEX_HOME` and `~/.codex` references appear only in migration or compatibility contexts.
+Expected: fresh and existing `mcodex` startup paths still resolve `MCODEX_HOME` and `~/.mcodex` correctly, CLI identity remains forked, pooled-startup onboarding still works, and legacy `CODEX_HOME` and `~/.codex` references stay limited to migration or compatibility code.
 
-- [ ] **Step 8: Update final verification log**
+- [ ] **Step 8: Run targeted migration, leased-auth, realtime, review, and subagent regressions**
+
+Run:
+
+```bash
+cd codex-rs
+cargo test -p codex-core auth_import_failure_records_warning_without_blocking_migration
+cargo test -p codex-core pending_migration_resumes_auth_import_without_prompting
+cargo test -p codex-core pending_migration_resumes_config_import_without_prompting
+cargo test -p codex-core skips_when_user_declines_migration
+cargo test -p codex-app-server app_server_fails_noninteractively_when_product_identity_migration_needs_prompt
+cargo test -p codex-app-server app_server_resumes_pending_product_identity_migration_noninteractively
+cargo test -p codex-login auth_seams_leased_turn_auth_does_not_read_shared_auth_manager
+cargo test -p codex-login auth_seams_local_lease_scoped_session_refresh_fails_closed_on_account_rebind
+cargo test -p codex-login auth_seams_local_lease_scoped_session_refresh_fails_closed_on_lease_epoch_supersession
+cargo test -p codex-login pooled_registration_browser_returns_tokens_without_writing_shared_auth
+cargo test -p codex-login pooled_registration_failure_completes_without_hanging
+cargo test -p codex-core pooled_request_uses_lease_scoped_auth_session_not_shared_auth_snapshot
+cargo test -p codex-core pooled_manual_remote_compact_uses_leased_account_for_compact_and_follow_up
+cargo test -p codex-core pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_follow_up
+cargo test -p codex-core websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt
+cargo test -p codex-core conversation_start_defaults_to_v2_and_gpt_realtime_1_5
+cargo test -p codex-core conversation_user_text_turn_is_sent_to_realtime_when_active
+cargo test -p codex-core review_op_emits_lifecycle_and_review_output
+cargo test -p codex-core subagent_notification_is_included_without_wait
+cargo test -p codex-core responses_api_proxy_dumps_parent_and_subagent_identity_headers
+```
+
+Expected: migration copy boundaries remain fail-closed, pooled request and compact flows keep lease-scoped auth, websocket and realtime paths stay wired, and review/subagent flows keep the fork contract. If this merge touches a pooled-auth path that is not directly covered by one of the named tests, add a focused regression before merging and run it here.
+
+- [ ] **Step 9: Run app-server lease-notification and TUI status/update regressions**
+
+Run:
+
+```bash
+cd codex-rs
+cargo test -p codex-app-server account_lease_updated_emits_on_resume
+cargo test -p codex-app-server account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
+cargo test -p codex-tui status_account_lease_display_from_response_formats_pool_details
+cargo test -p codex-tui status_account_lease_display_from_response_formats_damped_proactive_switch
+cargo test -p codex-tui status_account_lease_display_from_response_formats_non_replayable_turn_reason
+cargo test -p codex-tui account_lease_updated_adds_automatic_switch_notice_when_account_changes
+cargo test -p codex-tui account_lease_updated_adds_non_replayable_turn_notice
+cargo test -p codex-tui account_lease_updated_adds_no_eligible_account_error_notice
+cargo test -p codex-tui update_prompt_snapshot
+```
+
+Expected: app-server pooled read/notification behavior stays coherent, TUI lease-status rendering still exposes fork-specific pool state, and update-prompt UI still points at the intended release metadata flow.
+
+- [ ] **Step 10: Update final verification log**
 
 Append:
 
@@ -1437,11 +1565,14 @@ Append:
 - just fix -p results:
 - full workspace test or CI deferral:
 - release/install/update grep review:
+- product identity/home-dir/startup regressions:
+- migration/leased-auth/realtime/review/subagent regressions:
+- app-server lease/TUI status regressions:
 - identity grep review:
 - remaining non-core follow-ups:
 ```
 
-- [ ] **Step 9: Stage final verification log**
+- [ ] **Step 11: Stage final verification log**
 
 Run:
 
