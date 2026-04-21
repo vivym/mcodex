@@ -23,10 +23,14 @@ use crate::model::RegisteredAccountRecord;
 use crate::model::account_datetime_to_epoch_seconds;
 use crate::model::account_epoch_seconds_to_datetime;
 use sqlx::Executor;
+use sqlx::Sqlite;
+use sqlx::Transaction;
 use uuid::Uuid;
 
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 const ACTIVE_HOLDER_INDEX_MIGRATION_VERSION: i64 = 26;
+const ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS: usize = 5;
+const ACCOUNT_POOL_WRITE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 enum RequestedLeaseQuotaCheck<'a> {
@@ -48,6 +52,28 @@ impl RequestedLeaseQuotaCheck<'_> {
             Self::ReservedProbe { .. } => "probe account is not eligible for lease acquisition",
         }
     }
+}
+
+async fn begin_account_pool_write_transaction<'a>(
+    pool: &'a SqlitePool,
+    operation_name: &'static str,
+) -> anyhow::Result<Transaction<'a, Sqlite>> {
+    for attempt in 0..ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS {
+        match pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => return Ok(tx),
+            Err(err)
+                if account_pool_is_locked_sqlx_error(&err)
+                    && attempt + 1 < ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(ACCOUNT_POOL_WRITE_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "{operation_name} exceeded retry budget after {ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS} attempts"
+    ))
 }
 
 pub(super) async fn clean_up_duplicate_active_holder_leases_before_0026(
@@ -438,7 +464,8 @@ impl StateRuntime {
         lease_ttl: chrono::Duration,
     ) -> anyhow::Result<LeaseRenewal> {
         let expires_at = now + lease_ttl;
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            begin_account_pool_write_transaction(self.pool.as_ref(), "renew_account_lease").await?;
         let result = sqlx::query(
             r#"
 UPDATE account_leases
@@ -500,7 +527,9 @@ WHERE lease_id = ?
         lease: &LeaseKey,
         now: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            begin_account_pool_write_transaction(self.pool.as_ref(), "release_account_lease")
+                .await?;
         let result = sqlx::query(
             r#"
 UPDATE account_leases
@@ -907,14 +936,22 @@ WHERE account_id = ?
         // This transaction reads membership state and then writes runtime health state. Starting
         // with BEGIN IMMEDIATE avoids deferred read->write upgrade races, and the bounded retry
         // lets us recover if another writer holds the lock longer than SQLite's busy timeout.
-        for attempt in 0..5 {
-            let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+        for attempt in 0..ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS {
+            let mut tx = match begin_account_pool_write_transaction(
+                self.pool.as_ref(),
+                "record_account_health_event",
+            )
+            .await
+            {
                 Ok(tx) => tx,
-                Err(err) if err.to_string().contains("database is locked") && attempt < 4 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Err(err)
+                    if account_pool_is_locked_anyhow_error(&err)
+                        && attempt + 1 < ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(ACCOUNT_POOL_WRITE_RETRY_DELAY).await;
                     continue;
                 }
-                Err(err) => return Err(err.into()),
+                Err(err) => return Err(err),
             };
             let updated_at = account_datetime_to_epoch_seconds(Utc::now());
             let observed_at = account_datetime_to_epoch_seconds(event.observed_at);
@@ -1080,8 +1117,11 @@ WHERE account_id = ?
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(err) if err.to_string().contains("database is locked") && attempt < 4 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Err(err)
+                    if account_pool_is_locked_anyhow_error(&err)
+                        && attempt + 1 < ACCOUNT_POOL_WRITE_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(ACCOUNT_POOL_WRITE_RETRY_DELAY).await;
                 }
                 Err(err) => return Err(err),
             }
@@ -1097,7 +1137,11 @@ WHERE account_id = ?
         legacy_account: LegacyAccountImport,
     ) -> anyhow::Result<()> {
         let now = account_datetime_to_epoch_seconds(Utc::now());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_account_pool_write_transaction(
+            self.pool.as_ref(),
+            "import_legacy_default_account",
+        )
+        .await?;
         let existing_membership = super::account_pool_control::read_account_pool_membership_row(
             &mut *tx,
             &legacy_account.account_id,
@@ -1390,7 +1434,11 @@ WHERE account_id = ?
         entry: AccountRegistryEntryUpdate,
     ) -> anyhow::Result<()> {
         let now = account_datetime_to_epoch_seconds(Utc::now());
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_account_pool_write_transaction(
+            self.pool.as_ref(),
+            "upsert_account_registry_entry",
+        )
+        .await?;
         let previous_pool_id = super::account_pool_control::read_effective_account_pool_id(
             &mut *tx,
             &entry.account_id,
@@ -1506,7 +1554,8 @@ WHERE account_id = ?
         enabled: bool,
     ) -> anyhow::Result<bool> {
         let updated_at = account_datetime_to_epoch_seconds(Utc::now());
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            begin_account_pool_write_transaction(self.pool.as_ref(), "set_account_enabled").await?;
         let result = sqlx::query(
             r#"
 UPDATE account_registry
@@ -1529,8 +1578,12 @@ WHERE account_id = ?
     }
 
     pub async fn remove_account_registry_entry(&self, account_id: &str) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
         let updated_at = account_datetime_to_epoch_seconds(Utc::now());
+        let mut tx = begin_account_pool_write_transaction(
+            self.pool.as_ref(),
+            "remove_account_registry_entry",
+        )
+        .await?;
         let result = sqlx::query(
             r#"
 DELETE FROM account_registry
@@ -1594,7 +1647,11 @@ WHERE preferred_account_id = ?
         &self,
         update: AccountStartupSelectionUpdate,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_account_pool_write_transaction(
+            self.pool.as_ref(),
+            "write_account_startup_selection",
+        )
+        .await?;
         let previous_selection = sqlx::query(
             r#"
 SELECT default_pool_id, preferred_account_id
@@ -1748,6 +1805,21 @@ WHERE account_id = ?
 
 fn account_lease_storage_error(err: sqlx::Error) -> AccountLeaseError {
     AccountLeaseError::Storage(err.to_string())
+}
+
+fn account_pool_is_locked_error_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("database is locked")
+}
+
+fn account_pool_is_locked_anyhow_error(err: &anyhow::Error) -> bool {
+    account_pool_is_locked_error_message(&err.to_string())
+}
+
+fn account_pool_is_locked_sqlx_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => account_pool_is_locked_error_message(db_err.message()),
+        _ => account_pool_is_locked_error_message(&err.to_string()),
+    }
 }
 
 struct AccountPoolEventSubject<'a> {

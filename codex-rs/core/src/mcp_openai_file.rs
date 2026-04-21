@@ -42,6 +42,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
             .model_client
             .admitted_client_setup(
                 RequestBoundaryKind::BackgroundModelCall,
+                crate::client::LeaseRequestPurpose::Standard,
                 /*turn_id*/ None,
                 "openai-file-upload",
                 CancellationToken::new(),

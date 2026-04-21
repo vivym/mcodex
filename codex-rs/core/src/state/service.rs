@@ -766,6 +766,12 @@ impl AccountPoolManager {
         let mut request = SelectionRequest::for_intent(SelectionIntent::Startup);
         request.now = Some(now);
         request.pool_id = Some(pool_id.clone());
+        if matches!(
+            startup_preview.eligibility,
+            AccountStartupEligibility::PreferredAccountSelected
+        ) {
+            request.preferred_account_id = startup_preview.predicted_account_id.clone();
+        }
         request.proactive_threshold_percent = self.proactive_switch_threshold_percent;
         let (_, plan) = self.build_runtime_selection_plan(&request).await?;
         let account_id = match plan.terminal_action {
@@ -885,6 +891,12 @@ impl AccountPoolManager {
             let mut request = SelectionRequest::for_intent(SelectionIntent::Startup);
             request.now = Some(now);
             request.pool_id = Some(pool_id);
+            if matches!(
+                startup_preview.eligibility,
+                AccountStartupEligibility::PreferredAccountSelected
+            ) {
+                request.preferred_account_id = startup_preview.predicted_account_id.clone();
+            }
             request.proactive_threshold_percent = self.proactive_switch_threshold_percent;
             match self.acquire_selected_lease(request).await {
                 Ok(lease) => {
@@ -1070,7 +1082,9 @@ impl AccountPoolManager {
         pool_id: &str,
         snapshot: &RateLimitSnapshot,
     ) -> anyhow::Result<()> {
-        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        if !self.generation_matches(generation, account_id, pool_id) {
+            return Ok(());
+        }
         self.report_rate_limits(snapshot).await
     }
 
@@ -1086,7 +1100,9 @@ impl AccountPoolManager {
         account_id: &str,
         pool_id: &str,
     ) -> anyhow::Result<()> {
-        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        if !self.generation_matches(generation, account_id, pool_id) {
+            return Ok(());
+        }
         self.report_usage_limit_reached().await
     }
 
@@ -1101,7 +1117,9 @@ impl AccountPoolManager {
         account_id: &str,
         pool_id: &str,
     ) -> anyhow::Result<()> {
-        self.ensure_generation_matches(generation, account_id, pool_id)?;
+        if !self.generation_matches(generation, account_id, pool_id) {
+            return Ok(());
+        }
         self.report_unauthorized().await
     }
 
@@ -1734,29 +1752,13 @@ impl AccountPoolManager {
             .await
     }
 
-    fn ensure_generation_matches(
-        &self,
-        generation: u64,
-        account_id: &str,
-        pool_id: &str,
-    ) -> anyhow::Result<()> {
+    fn generation_matches(&self, generation: u64, account_id: &str, pool_id: &str) -> bool {
         let Some(active_lease) = self.active_lease.as_ref() else {
-            anyhow::bail!(
-                "stale bridged lease snapshot generation {generation} for account {account_id} in pool {pool_id}: no active bridged lease"
-            );
+            return false;
         };
-        if self.active_lease_generation != generation
-            || active_lease.record.account_id != account_id
-            || active_lease.record.pool_id != pool_id
-        {
-            anyhow::bail!(
-                "stale bridged lease snapshot generation {generation} for account {account_id} in pool {pool_id}: current bridged lease is generation {} for account {} in pool {}",
-                self.active_lease_generation,
-                active_lease.record.account_id,
-                active_lease.record.pool_id,
-            );
-        }
-        Ok(())
+        self.active_lease_generation == generation
+            && active_lease.record.account_id == account_id
+            && active_lease.record.pool_id == pool_id
     }
 
     fn observe_active_lease_generation(&mut self, lease: &AccountLeaseRecord) -> u64 {

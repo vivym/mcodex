@@ -371,20 +371,26 @@ async fn manager_owner_rotations_produce_new_generation_and_gate_replacement_adm
         manager.report_unauthorized().await?;
     }
 
-    let err = authority
-        .acquire_request_lease_for_test(request_context.clone())
-        .await
-        .expect_err(
-            "rotated replacement lease must not admit while the prior generation is active",
-        );
-    assert_eq!(err, LeaseAdmissionError::UnsupportedPooledPath);
-
     let first_generation = first.snapshot.generation();
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        let request_context = request_context.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "replacement request should wait for the prior generation to drain"
+    );
+
     drop(first.guard);
 
-    let second = authority
-        .acquire_request_lease_for_test(request_context)
-        .await?;
+    let second = waiter.await.expect("replacement waiter should not panic")?;
     assert_eq!(second.snapshot.account_id(), "acct-legacy-b");
     assert!(second.snapshot.generation() > first_generation);
 
@@ -529,13 +535,21 @@ async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_unt
         manager.report_unauthorized().await?;
     }
 
-    let err = authority
-        .acquire_request_lease_for_test(request_context.clone())
-        .await
-        .expect_err(
-            "rotated replacement lease must not mutate the active bridged generation while the prior admission is active",
-        );
-    assert_eq!(err, LeaseAdmissionError::UnsupportedPooledPath);
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        let request_context = request_context.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "replacement request should wait without mutating the active generation"
+    );
 
     let active_holder_lease = state_db
         .read_active_holder_lease("holder-preserve-first-snapshot")
@@ -572,16 +586,14 @@ async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_unt
 
     drop(first.guard);
 
-    let second = authority
-        .acquire_request_lease_for_test(request_context)
-        .await?;
+    let second = waiter.await.expect("replacement waiter should not panic")?;
     assert_eq!(second.snapshot.account_id(), "acct-preserve-b");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn manager_owner_rejects_stale_reporting_after_rotation() -> anyhow::Result<()> {
+async fn manager_owner_ignores_stale_reporting_after_rotation() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
         codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
@@ -655,30 +667,15 @@ async fn manager_owner_rejects_stale_reporting_after_rotation() -> anyhow::Resul
         credits: None,
         plan_type: None,
     };
-    let rate_limit_err = authority
+    authority
         .report_rate_limits(&first_snapshot, &rate_limits)
-        .await
-        .expect_err("stale rate-limit reports must be rejected");
-    assert!(
-        rate_limit_err.to_string().contains("stale"),
-        "unexpected stale rate-limit error: {rate_limit_err:#}"
-    );
-    let usage_limit_err = authority
+        .await?;
+    authority
         .report_usage_limit_reached(&first_snapshot)
-        .await
-        .expect_err("stale usage-limit reports must be rejected");
-    assert!(
-        usage_limit_err.to_string().contains("stale"),
-        "unexpected stale usage-limit error: {usage_limit_err:#}"
-    );
-    let unauthorized_err = authority
+        .await?;
+    authority
         .report_terminal_unauthorized(&first_snapshot)
-        .await
-        .expect_err("stale unauthorized reports must be rejected");
-    assert!(
-        unauthorized_err.to_string().contains("stale"),
-        "unexpected stale unauthorized error: {unauthorized_err:#}"
-    );
+        .await?;
 
     let second_generation = second.snapshot.generation();
     drop(second.guard);
@@ -1676,17 +1673,50 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
             .is_some_and(|auth| auth.is_api_key_auth()),
         "child fallback AuthManager should remain non-pooled"
     );
+    let parent_admitted = root
+        .session
+        .services
+        .model_client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            crate::client::LeaseRequestPurpose::Standard,
+            None,
+            "runtime-lease-parent-request",
+            CancellationToken::new(),
+        )
+        .await?;
     let child_admitted = child
         .session
         .services
         .model_client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
+            crate::client::LeaseRequestPurpose::Standard,
             None,
             "runtime-lease-child-request",
             CancellationToken::new(),
         )
         .await?;
+    assert_eq!(
+        child_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+        parent_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+    );
+    assert_eq!(
+        child_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().generation()),
+        parent_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().generation()),
+    );
     assert_eq!(
         child_admitted
             .reporter
@@ -1904,6 +1934,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         .model_client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
+            crate::client::LeaseRequestPurpose::Standard,
             None,
             "runtime-lease-child-lifecycle-request",
             CancellationToken::new(),
@@ -1974,6 +2005,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         .model_client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
+            crate::client::LeaseRequestPurpose::Standard,
             None,
             "runtime-lease-contender-request",
             CancellationToken::new(),
@@ -2358,6 +2390,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         .model_client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
+            crate::client::LeaseRequestPurpose::Standard,
             None,
             "runtime-lease-config-only-child-request",
             CancellationToken::new(),

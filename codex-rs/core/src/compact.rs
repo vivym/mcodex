@@ -537,13 +537,14 @@ async fn drain_to_completed(
     prompt: &Prompt,
 ) -> CodexResult<()> {
     let mut stream = client_session
-        .stream(
+        .stream_inline_compaction(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
             turn_context.config.service_tier,
+            Some(&turn_context.sub_id),
             turn_metadata_header,
         )
         .await?;

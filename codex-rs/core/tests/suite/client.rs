@@ -909,6 +909,7 @@ async fn send_provider_auth_request(server: &MockServer, auth: ModelProviderAuth
             effort,
             summary.unwrap_or(ReasoningSummary::Auto),
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -2262,6 +2263,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
             effort,
             summary.unwrap_or(ReasoningSummary::Auto),
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await

@@ -251,7 +251,11 @@ async fn responses_websocket_preconnect_does_not_replace_turn_trace_payload() {
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &harness.model_info)
+        .preconnect_websocket(
+            &harness.session_telemetry,
+            &harness.model_info,
+            /*turn_id*/ None,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -287,7 +291,11 @@ async fn responses_websocket_preconnect_reuses_connection() {
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &harness.model_info)
+        .preconnect_websocket(
+            &harness.session_telemetry,
+            &harness.model_info,
+            /*turn_id*/ None,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -320,6 +328,7 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -820,7 +829,11 @@ async fn responses_websocket_preconnect_is_reused_even_with_header_changes() {
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &harness.model_info)
+        .preconnect_websocket(
+            &harness.session_telemetry,
+            &harness.model_info,
+            /*turn_id*/ None,
+        )
         .await
         .expect("websocket preconnect failed");
     let prompt = prompt_with_input(vec![message_item("hello")]);
@@ -832,6 +845,7 @@ async fn responses_websocket_preconnect_is_reused_even_with_header_changes() {
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -870,6 +884,7 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -882,6 +897,7 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -935,6 +951,7 @@ async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -984,7 +1001,11 @@ async fn responses_websocket_preconnect_runs_when_only_v2_feature_enabled() {
     let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ true).await;
     let mut client_session = harness.client.new_session();
     client_session
-        .preconnect_websocket(&harness.session_telemetry, &harness.model_info)
+        .preconnect_websocket(
+            &harness.session_telemetry,
+            &harness.model_info,
+            /*turn_id*/ None,
+        )
         .await
         .expect("websocket preconnect failed");
 
@@ -1284,6 +1305,7 @@ async fn responses_websocket_emits_reasoning_included_event() {
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1357,6 +1379,7 @@ async fn responses_websocket_emits_rate_limit_events() {
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1989,6 +2012,7 @@ async fn responses_websocket_v2_after_error_uses_full_create_without_previous_re
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -2076,6 +2100,7 @@ async fn responses_websocket_v2_surfaces_terminal_error_without_close_handshake(
             harness.effort,
             harness.summary,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -2398,6 +2423,7 @@ async fn stream_until_complete_with_request_metadata(
             harness.effort,
             harness.summary,
             service_tier,
+            /*turn_id*/ None,
             turn_metadata_header,
         )
         .await

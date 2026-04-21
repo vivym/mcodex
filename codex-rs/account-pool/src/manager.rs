@@ -376,6 +376,7 @@ impl<B: AccountPoolExecutionBackend, L: LegacyAuthBootstrap> AccountPoolManager<
                     pool_id: Some(pool_id),
                     intent,
                     selection_family: None,
+                    preferred_account_id: None,
                     current_account_id: Some(current_account_id.clone()),
                     just_replaced_account_id: self.last_proactively_replaced_account_id.clone(),
                     reserved_probe_target_account_id: None,

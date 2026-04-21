@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Prompt;
+use crate::client::CompactConversationHistoryRequest;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::built_tools;
@@ -173,14 +174,15 @@ async fn run_remote_compact_task_inner_impl(
     let mut new_history = sess
         .services
         .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_context.reasoning_effort,
-            turn_context.reasoning_summary,
-            &turn_context.session_telemetry,
+        .compact_conversation_history(CompactConversationHistoryRequest {
+            prompt: &prompt,
+            model_info: &turn_context.model_info,
+            effort: turn_context.reasoning_effort,
+            summary: turn_context.reasoning_summary,
+            session_telemetry: &turn_context.session_telemetry,
+            turn_id: Some(&turn_context.sub_id),
             account_id_override,
-        )
+        })
         .or_else(|err| async {
             match &err {
                 CodexErr::UsageLimitReached(e) => {

@@ -202,6 +202,22 @@ pub(crate) struct AdmittedClientSetup {
     pub(crate) guard: Option<LeaseAdmissionGuard>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseRequestPurpose {
+    Standard,
+    InlineCompaction,
+}
+
+pub(crate) struct CompactConversationHistoryRequest<'a> {
+    pub(crate) prompt: &'a Prompt,
+    pub(crate) model_info: &'a ModelInfo,
+    pub(crate) effort: Option<ReasoningEffortConfig>,
+    pub(crate) summary: ReasoningSummaryConfig,
+    pub(crate) session_telemetry: &'a SessionTelemetry,
+    pub(crate) turn_id: Option<&'a str>,
+    pub(crate) account_id_override: Option<String>,
+}
+
 #[derive(Default)]
 struct ActiveStreamingRequest {
     reporter: Option<LeaseRequestReporter>,
@@ -628,6 +644,7 @@ impl ModelClient {
     pub(crate) async fn admitted_client_setup(
         &self,
         boundary: RequestBoundaryKind,
+        purpose: LeaseRequestPurpose,
         turn_id: Option<&str>,
         request_id: &str,
         cancellation_token: CancellationToken,
@@ -656,10 +673,21 @@ impl ModelClient {
         };
 
         let request_context = self.build_lease_request_context(boundary, cancellation_token);
-        let admission = authority
-            .acquire_request_lease(request_context)
-            .await
-            .map_err(map_lease_admission_error)?;
+        let admission = match authority.acquire_request_lease(request_context).await {
+            Ok(admission) => admission,
+            Err(LeaseAdmissionError::NoEligibleAccount)
+                if purpose == LeaseRequestPurpose::InlineCompaction
+                    && !self.state.provider.is_openai() =>
+            {
+                return Ok(AdmittedClientSetup {
+                    setup: self.current_client_setup_legacy().await?,
+                    reporter: None,
+                    auth_recovery: self.current_auth_recovery_legacy(),
+                    guard: None,
+                });
+            }
+            Err(err) => return Err(map_lease_admission_error(err)),
+        };
         self.apply_lease_snapshot_before_request(&admission.snapshot, turn_id, request_id)
             .await?;
         let setup = self.current_client_setup_from_admission(&admission).await?;
@@ -777,15 +805,19 @@ impl ModelClient {
     ///
     /// The model selection and telemetry context are passed explicitly to keep `ModelClient`
     /// session-scoped.
-    pub async fn compact_conversation_history(
+    pub(crate) async fn compact_conversation_history(
         &self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        effort: Option<ReasoningEffortConfig>,
-        summary: ReasoningSummaryConfig,
-        session_telemetry: &SessionTelemetry,
-        account_id_override: Option<String>,
+        request: CompactConversationHistoryRequest<'_>,
     ) -> Result<Vec<ResponseItem>> {
+        let CompactConversationHistoryRequest {
+            prompt,
+            model_info,
+            effort,
+            summary,
+            session_telemetry,
+            turn_id,
+            account_id_override,
+        } = request;
         if prompt.input.is_empty() {
             return Ok(Vec::new());
         }
@@ -826,7 +858,8 @@ impl ModelClient {
             let admitted_setup = self
                 .admitted_client_setup(
                     RequestBoundaryKind::ResponsesCompact,
-                    /*turn_id*/ None,
+                    LeaseRequestPurpose::Standard,
+                    turn_id,
                     "responses-compact",
                     CancellationToken::new(),
                 )
@@ -919,6 +952,7 @@ impl ModelClient {
         let admitted_setup = self
             .admitted_client_setup(
                 RequestBoundaryKind::Realtime,
+                LeaseRequestPurpose::Standard,
                 /*turn_id*/ None,
                 "realtime-call",
                 CancellationToken::new(),
@@ -967,6 +1001,7 @@ impl ModelClient {
         let admitted_setup = self
             .admitted_client_setup(
                 RequestBoundaryKind::MemorySummary,
+                LeaseRequestPurpose::Standard,
                 /*turn_id*/ None,
                 "memory-summary",
                 CancellationToken::new(),
@@ -1338,18 +1373,15 @@ impl ModelClientSession {
     async fn admitted_client_setup(
         &mut self,
         boundary: RequestBoundaryKind,
+        purpose: LeaseRequestPurpose,
+        turn_id: Option<&str>,
         request_id: &str,
         cancellation_token: CancellationToken,
     ) -> Result<AdmittedClientSetup> {
         let previous_window_generation = self.client.current_window_generation();
         let admitted_setup = self
             .client
-            .admitted_client_setup(
-                boundary,
-                /*turn_id*/ None,
-                request_id,
-                cancellation_token,
-            )
+            .admitted_client_setup(boundary, purpose, turn_id, request_id, cancellation_token)
             .await?;
         if previous_window_generation != self.client.current_window_generation() {
             self.reset_websocket_session();
@@ -1568,6 +1600,7 @@ impl ModelClientSession {
         &mut self,
         session_telemetry: &SessionTelemetry,
         _model_info: &ModelInfo,
+        turn_id: Option<&str>,
     ) -> std::result::Result<(), ApiError> {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
@@ -1576,6 +1609,8 @@ impl ModelClientSession {
         let admitted_setup = self
             .admitted_client_setup(
                 RequestBoundaryKind::ResponsesWebSocketPrewarm,
+                LeaseRequestPurpose::Standard,
+                turn_id,
                 "responses-websocket-preconnect",
                 CancellationToken::new(),
             )
@@ -1748,6 +1783,8 @@ impl ModelClientSession {
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
+        purpose: LeaseRequestPurpose,
+        turn_id: Option<&str>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
@@ -1771,6 +1808,8 @@ impl ModelClientSession {
             let admitted_setup = self
                 .admitted_client_setup(
                     RequestBoundaryKind::ResponsesHttp,
+                    purpose,
+                    turn_id,
                     "responses-http",
                     CancellationToken::new(),
                 )
@@ -1875,6 +1914,8 @@ impl ModelClientSession {
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
+        purpose: LeaseRequestPurpose,
+        turn_id: Option<&str>,
         turn_metadata_header: Option<&str>,
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
@@ -1889,6 +1930,8 @@ impl ModelClientSession {
                     } else {
                         RequestBoundaryKind::ResponsesWebSocket
                     },
+                    purpose,
+                    turn_id,
                     if warmup {
                         "responses-websocket-prewarm"
                     } else {
@@ -2045,6 +2088,34 @@ impl ModelClientSession {
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
+        turn_id: Option<&str>,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<()> {
+        self.prewarm_websocket_with_purpose(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            LeaseRequestPurpose::Standard,
+            turn_id,
+            turn_metadata_header,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prewarm_websocket_with_purpose(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
+        purpose: LeaseRequestPurpose,
+        turn_id: Option<&str>,
         turn_metadata_header: Option<&str>,
     ) -> Result<()> {
         if !self.client.responses_websocket_enabled() {
@@ -2062,6 +2133,8 @@ impl ModelClientSession {
                 effort,
                 summary,
                 service_tier,
+                purpose,
+                turn_id,
                 turn_metadata_header,
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
@@ -2102,6 +2175,60 @@ impl ModelClientSession {
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<ServiceTier>,
+        turn_id: Option<&str>,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        self.stream_with_purpose(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            LeaseRequestPurpose::Standard,
+            turn_id,
+            turn_metadata_header,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_inline_compaction(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
+        turn_id: Option<&str>,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        self.stream_with_purpose(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            LeaseRequestPurpose::InlineCompaction,
+            turn_id,
+            turn_metadata_header,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_with_purpose(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<ServiceTier>,
+        purpose: LeaseRequestPurpose,
+        turn_id: Option<&str>,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.wire_api;
@@ -2117,6 +2244,8 @@ impl ModelClientSession {
                             effort,
                             summary,
                             service_tier,
+                            purpose,
+                            turn_id,
                             turn_metadata_header,
                             /*warmup*/ false,
                             request_trace,
@@ -2137,6 +2266,8 @@ impl ModelClientSession {
                     effort,
                     summary,
                     service_tier,
+                    purpose,
+                    turn_id,
                     turn_metadata_header,
                 )
                 .await

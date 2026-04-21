@@ -309,6 +309,7 @@ impl RealtimeConversationManager {
                 let admitted_setup = model_client
                     .admitted_client_setup(
                         RequestBoundaryKind::Realtime,
+                        crate::client::LeaseRequestPurpose::Standard,
                         /*turn_id*/ None,
                         "realtime-websocket",
                         CancellationToken::new(),

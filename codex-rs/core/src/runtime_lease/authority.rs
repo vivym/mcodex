@@ -320,62 +320,75 @@ impl RuntimeLeaseAuthority {
         context: LeaseRequestContext,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     ) -> Result<LeaseAdmission, LeaseAdmissionError> {
-        let manager_for_lock = Arc::clone(&manager);
-        let mut manager_guard = tokio::select! {
-            () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
-            manager_guard = manager_for_lock.lock_owned() => manager_guard,
-        };
-        if context.cancel.is_cancelled() {
-            return Err(LeaseAdmissionError::Cancelled);
-        }
-        let heartbeat_interval = manager_guard.heartbeat_interval();
-        let preview = manager_guard
-            .preview_next_bridged_turn()
-            .await
-            .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
-            .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
-        if context.cancel.is_cancelled() {
-            return Err(LeaseAdmissionError::Cancelled);
-        }
-        let previewed_generation = match &preview {
-            BridgedTurnPreview::ReuseCurrent(preview) | BridgedTurnPreview::Rotate(preview) => {
-                preview.generation
+        loop {
+            let changed = self.inner.changed.notified();
+            let manager_for_lock = Arc::clone(&manager);
+            let mut manager_guard = tokio::select! {
+                () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
+                manager_guard = manager_for_lock.lock_owned() => manager_guard,
+            };
+            if context.cancel.is_cancelled() {
+                return Err(LeaseAdmissionError::Cancelled);
             }
-        };
-        if matches!(
-            self.inner.preview_admission(previewed_generation),
-            AdmissionPreview::Draining
-        ) {
-            return Err(LeaseAdmissionError::UnsupportedPooledPath);
-        }
-        let selection = manager_guard
-            .prepare_turn()
-            .await
-            .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
-            .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
-        if context.cancel.is_cancelled() {
-            return Err(LeaseAdmissionError::Cancelled);
-        }
-        let generation = GenerationState {
-            pool_id: selection.pool_id,
-            account_id: selection.account_id,
-            selection_family: selection.selection_family,
-            generation: selection.generation,
-            auth_session: selection.auth_session,
-            allow_context_reuse: selection.allow_context_reuse,
-            accepting: true,
-        };
-        drop(manager_guard);
-        if context.cancel.is_cancelled() {
-            return Err(LeaseAdmissionError::Cancelled);
-        }
-        let heartbeat_guard = start_manager_heartbeat(manager, heartbeat_interval, &context.cancel);
-        match self
-            .inner
-            .try_admit(&context, &generation, vec![Box::new(heartbeat_guard)])
-        {
-            AdmissionAttempt::Admitted(admission) => Ok(*admission),
-            AdmissionAttempt::Draining => Err(LeaseAdmissionError::UnsupportedPooledPath),
+            let heartbeat_interval = manager_guard.heartbeat_interval();
+            let preview = manager_guard
+                .preview_next_bridged_turn()
+                .await
+                .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
+                .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
+            if context.cancel.is_cancelled() {
+                return Err(LeaseAdmissionError::Cancelled);
+            }
+            let previewed_generation = match &preview {
+                BridgedTurnPreview::ReuseCurrent(preview) | BridgedTurnPreview::Rotate(preview) => {
+                    preview.generation
+                }
+            };
+            if matches!(
+                self.inner.preview_admission(previewed_generation),
+                AdmissionPreview::Draining
+            ) {
+                drop(manager_guard);
+                tokio::select! {
+                    () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
+                    () = changed => continue,
+                }
+            }
+            let selection = manager_guard
+                .prepare_turn()
+                .await
+                .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
+                .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
+            if context.cancel.is_cancelled() {
+                return Err(LeaseAdmissionError::Cancelled);
+            }
+            let generation = GenerationState {
+                pool_id: selection.pool_id,
+                account_id: selection.account_id,
+                selection_family: selection.selection_family,
+                generation: selection.generation,
+                auth_session: selection.auth_session,
+                allow_context_reuse: selection.allow_context_reuse,
+                accepting: true,
+            };
+            drop(manager_guard);
+            if context.cancel.is_cancelled() {
+                return Err(LeaseAdmissionError::Cancelled);
+            }
+            let heartbeat_guard =
+                start_manager_heartbeat(Arc::clone(&manager), heartbeat_interval, &context.cancel);
+            match self
+                .inner
+                .try_admit(&context, &generation, vec![Box::new(heartbeat_guard)])
+            {
+                AdmissionAttempt::Admitted(admission) => return Ok(*admission),
+                AdmissionAttempt::Draining => {
+                    tokio::select! {
+                        () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
+                        () = changed => {}
+                    }
+                }
+            }
         }
     }
 

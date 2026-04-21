@@ -24,7 +24,6 @@ use codex_state::AccountPoolEventRecord;
 use codex_state::AccountPoolEventsListQuery;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
-use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -1487,7 +1486,7 @@ async fn pooled_request_ignores_shared_external_auth_when_lease_is_active() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() -> Result<()> {
+async fn lease_rotation_updates_live_snapshot_to_the_new_lease() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1554,15 +1553,16 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
         first_snapshot.switch_reason,
         Some(AccountLeaseRuntimeReason::NonReplayableTurn)
     );
-    assert_eq!(
-        test.codex.current_auth_account_id().await.as_deref(),
-        Some(PRIMARY_ACCOUNT_ID)
-    );
 
     let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
     assert!(second_turn_error.is_none());
+    let second_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
     assert_eq!(
-        test.codex.current_auth_account_id().await.as_deref(),
+        second_snapshot.account_id.as_deref(),
         Some(SECONDARY_ACCOUNT_ID)
     );
 
@@ -1598,7 +1598,7 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
             responses: vec![
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
-                    .set_delay(Duration::from_secs(8))
+                    .set_delay(Duration::from_secs(20))
                     .set_body_raw(
                         sse(vec![
                             ev_response_created("resp-1"),
@@ -1663,7 +1663,17 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     })
     .await;
 
+    let initial_active_lease =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
+
     tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let active_lease_after_heartbeat =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
+    assert!(
+        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
+        "expected streaming request heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
+    );
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -1699,12 +1709,41 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
         "contender runtime should not issue /responses while lease remains active"
     );
 
+    second.codex.shutdown_and_wait().await?;
+    first.codex.shutdown_and_wait().await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    struct CompactResponder {
+        request_seen: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl Respond for CompactResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if let Some(sender) = self
+                .request_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_delay(Duration::from_secs(20))
+                .set_body_json(json!({
+                    "output": [{
+                        "type": "compaction",
+                        "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                    }]
+                }))
+        }
+    }
 
     let server = start_mock_server().await;
     let response_mock = mount_sse_once(
@@ -1716,19 +1755,15 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         ]),
     )
     .await;
-    let compact_mock = core_test_support::responses::mount_compact_response_once(
-        &server,
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/json")
-            .set_delay(Duration::from_secs(8))
-            .set_body_json(json!({
-                "output": [{
-                    "type": "compaction",
-                    "encrypted_content": "REMOTE_COMPACT_SUMMARY"
-                }]
-            })),
-    )
-    .await;
+    let (compact_request_seen_tx, compact_request_seen_rx) = tokio::sync::oneshot::channel();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(CompactResponder {
+            request_seen: std::sync::Mutex::new(Some(compact_request_seen_tx)),
+        })
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
 
     let shared_home = Arc::new(TempDir::new()?);
     let mut first_builder = pooled_accounts_builder()
@@ -1756,7 +1791,9 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
     assert!(first_turn_error.is_none());
 
     first.codex.submit(Op::Compact).await?;
-    wait_for_compact_request(&compact_mock).await;
+    compact_request_seen_rx
+        .await
+        .expect("compact request should start");
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -1782,6 +1819,9 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         1,
         "contender runtime should not issue /responses while compact lease remains active"
     );
+
+    second.codex.shutdown_and_wait().await?;
+    first.codex.shutdown_and_wait().await?;
 
     Ok(())
 }
@@ -1932,15 +1972,38 @@ fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
-async fn wait_for_compact_request(mock_response: &ResponseMock) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+async fn active_pool_leases(test: &TestCodex) -> Result<Vec<codex_state::AccountLeaseRecord>> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    let rows = state_db
+        .read_account_lease_selection_candidates(LEGACY_DEFAULT_POOL_ID)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(_, _, active_lease, _)| active_lease)
+        .collect())
+}
+
+async fn wait_for_active_pool_lease(
+    test: &TestCodex,
+    expected_account_id: &str,
+    timeout: Duration,
+) -> Result<codex_state::AccountLeaseRecord> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !mock_response.requests().is_empty() {
-            return;
+        let active_leases = active_pool_leases(test).await?;
+        if let Some(lease) = active_leases
+            .into_iter()
+            .find(|lease| lease.account_id == expected_account_id)
+        {
+            return Ok(lease);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for compact request"
+            "timed out waiting for active lease for {expected_account_id}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

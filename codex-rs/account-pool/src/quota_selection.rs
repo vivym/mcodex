@@ -91,6 +91,22 @@ pub fn evaluate_selection(
         .collect::<Vec<_>>();
     eligible_candidates.sort_by(|left, right| compare_ordinary(left, right, &request, now));
 
+    if let Some(preferred_account_id) = request.preferred_account_id.as_deref()
+        && let Some(index) = eligible_candidates
+            .iter()
+            .position(|candidate| candidate.account_id == preferred_account_id)
+    {
+        let selected = eligible_candidates.remove(index);
+        eligible_candidates.insert(0, selected.clone());
+        return SelectionPlan {
+            terminal_action: SelectionAction::Select(selected.account_id),
+            eligible_candidates,
+            probe_candidate: None,
+            rejected_candidates,
+            decision_reason: SelectionDecisionReason::OrdinaryRanking,
+        };
+    }
+
     if let Some(selected) = eligible_candidates.first() {
         let decision_reason = if request.intent.allows_just_replaced_reuse()
             && request.just_replaced_account_id.as_deref() == Some(selected.account_id.as_str())

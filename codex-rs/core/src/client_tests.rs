@@ -9,6 +9,8 @@ use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::ResponseEvent;
 use crate::ResponseStream;
+use crate::client::CompactConversationHistoryRequest;
+use crate::client::LeaseRequestPurpose;
 use crate::client_common::Prompt;
 use crate::lease_auth::SessionLeaseAuth;
 use crate::runtime_lease::CollaborationTreeBindingHandle;
@@ -555,6 +557,7 @@ async fn responses_http_setup_acquires_admission_for_pooled_runtime_host() {
     let setup = client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
+            LeaseRequestPurpose::Standard,
             Some("turn-1"),
             "request-1",
             CancellationToken::new(),
@@ -610,6 +613,7 @@ async fn responses_http_stream_acquires_admission_per_provider_round_trip() {
                 /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
                 /*service_tier*/ None,
+                /*turn_id*/ None,
                 /*turn_metadata_header*/ None,
             )
             .await
@@ -660,6 +664,7 @@ async fn responses_http_streaming_admission_is_held_until_completion_then_releas
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -709,6 +714,7 @@ async fn responses_http_streaming_admission_releases_once_on_drop() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -734,6 +740,7 @@ async fn admitted_client_setup_requires_pooled_authority_when_runtime_host_is_po
     let err = match client
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesCompact,
+            LeaseRequestPurpose::Standard,
             /*turn_id*/ None,
             "responses-compact",
             CancellationToken::new(),
@@ -783,14 +790,15 @@ async fn compact_conversation_history_uses_responses_compact_admission() {
     };
 
     let output = client
-        .compact_conversation_history(
-            &prompt,
-            &test_model_info(),
-            /*effort*/ None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            &test_session_telemetry(),
-            /*account_id_override*/ None,
-        )
+        .compact_conversation_history(CompactConversationHistoryRequest {
+            prompt: &prompt,
+            model_info: &test_model_info(),
+            effort: /*effort*/ None,
+            summary: codex_protocol::config_types::ReasoningSummary::None,
+            session_telemetry: &test_session_telemetry(),
+            turn_id: /*turn_id*/ None,
+            account_id_override: /*account_id_override*/ None,
+        })
         .await
         .expect("compact request should succeed");
 
@@ -842,14 +850,15 @@ async fn compact_conversation_history_ignores_mismatched_account_override_for_po
     };
 
     let output = client
-        .compact_conversation_history(
-            &prompt,
-            &test_model_info(),
-            /*effort*/ None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            &test_session_telemetry(),
-            Some("acct-turn-override".to_string()),
-        )
+        .compact_conversation_history(CompactConversationHistoryRequest {
+            prompt: &prompt,
+            model_info: &test_model_info(),
+            effort: /*effort*/ None,
+            summary: codex_protocol::config_types::ReasoningSummary::None,
+            session_telemetry: &test_session_telemetry(),
+            turn_id: /*turn_id*/ None,
+            account_id_override: Some("acct-turn-override".to_string()),
+        })
         .await?;
 
     assert_eq!(output, Vec::<ResponseItem>::new());
@@ -1004,6 +1013,7 @@ async fn websocket_prewarm_releases_handshake_admission_when_idle_websocket_is_c
                 /*effort*/ None,
                 codex_protocol::config_types::ReasoningSummary::None,
                 /*service_tier*/ None,
+                /*turn_id*/ None,
                 /*turn_metadata_header*/ None,
             )
             .await
@@ -1035,7 +1045,11 @@ async fn websocket_preconnect_releases_handshake_admission_when_idle_websocket_i
     {
         let mut session = client.new_session();
         session
-            .preconnect_websocket(&test_session_telemetry(), &test_model_info())
+            .preconnect_websocket(
+                &test_session_telemetry(),
+                &test_model_info(),
+                /*turn_id*/ None,
+            )
             .await
             .expect("websocket preconnect should succeed");
         wait_for_admitted_count(&authority, 0).await;
@@ -1068,7 +1082,11 @@ async fn cached_websocket_is_discarded_when_admitted_generation_changes() {
     {
         let mut session = client.new_session();
         session
-            .preconnect_websocket(&test_session_telemetry(), &test_model_info())
+            .preconnect_websocket(
+                &test_session_telemetry(),
+                &test_model_info(),
+                /*turn_id*/ None,
+            )
             .await
             .expect("first preconnect should succeed");
     }
@@ -1083,7 +1101,11 @@ async fn cached_websocket_is_discarded_when_admitted_generation_changes() {
     {
         let mut session = client.new_session();
         session
-            .preconnect_websocket(&test_session_telemetry(), &test_model_info())
+            .preconnect_websocket(
+                &test_session_telemetry(),
+                &test_model_info(),
+                /*turn_id*/ None,
+            )
             .await
             .expect("replacement preconnect should succeed");
     }
@@ -1113,7 +1135,11 @@ async fn websocket_session_is_discarded_when_transport_reset_generation_changes(
     let mut session = client.new_session();
 
     session
-        .preconnect_websocket(&test_session_telemetry(), &test_model_info())
+        .preconnect_websocket(
+            &test_session_telemetry(),
+            &test_model_info(),
+            /*turn_id*/ None,
+        )
         .await
         .expect("first preconnect should succeed");
     assert_eq!(session.websocket_session.lease_generation, Some(7));
@@ -1125,7 +1151,11 @@ async fn websocket_session_is_discarded_when_transport_reset_generation_changes(
     client.advance_window_generation();
 
     session
-        .preconnect_websocket(&test_session_telemetry(), &test_model_info())
+        .preconnect_websocket(
+            &test_session_telemetry(),
+            &test_model_info(),
+            /*turn_id*/ None,
+        )
         .await
         .expect("replacement preconnect should succeed");
 
@@ -1163,6 +1193,7 @@ async fn websocket_streaming_admission_is_held_until_completion_then_released_on
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1209,6 +1240,7 @@ async fn websocket_streaming_admission_releases_once_on_drop() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1264,6 +1296,7 @@ async fn dropped_websocket_stream_forces_fresh_handshake_before_reuse() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1284,6 +1317,7 @@ async fn dropped_websocket_stream_forces_fresh_handshake_before_reuse() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1330,6 +1364,7 @@ async fn websocket_streaming_admission_releases_once_on_transport_failure() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
@@ -1379,6 +1414,7 @@ async fn auth_recovery_retry_reacquires_fresh_admission_and_reporter() {
             /*effort*/ None,
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
+            /*turn_id*/ None,
             /*turn_metadata_header*/ None,
         )
         .await
