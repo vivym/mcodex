@@ -925,10 +925,9 @@ impl ThreadManagerState {
         } else {
             None
         };
-        let mut runtime_lease_startup_reservation = if let Some(host) =
-            runtime_lease_host.as_ref().filter(|host| host.is_pooled())
-        {
-            Some(
+        let mut runtime_lease_startup_reservation =
+            if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
+                Some(
                 host.try_reserve_startup_for_child(format!(
                     "threadspawn-subagent-startup-{}",
                     uuid::Uuid::now_v7()
@@ -940,9 +939,9 @@ impl ThreadManagerState {
                     ))
                 })?,
             )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let spawn_result = Codex::spawn(CodexSpawnArgs {
             config,
             auth_manager,

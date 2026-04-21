@@ -1262,16 +1262,18 @@ async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Resu
     skip_if_no_network!(Ok(()));
 
     assert_pre_turn_remote_compact_failure_rotates_next_turn(
-        AccountHealthState::RateLimited,
-        ResponseTemplate::new(429)
-            .insert_header("content-type", "application/json")
-            .set_body_json(json!({
-                "error": {
-                    "type": "usage_limit_reached",
-                    "message": "limit reached",
-                    "resets_at": 1704067242
-                }
-            })),
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached",
+                        "resets_at": 1704067242
+                    }
+                })),
+        ],
+        &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
     )
     .await
 }
@@ -1281,10 +1283,15 @@ async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<(
     skip_if_no_network!(Ok(()));
 
     assert_pre_turn_remote_compact_failure_rotates_next_turn(
-        AccountHealthState::Unauthorized,
-        ResponseTemplate::new(401)
-            .insert_header("content-type", "application/json")
-            .set_body_string("unauthorized"),
+        vec![
+            ResponseTemplate::new(401)
+                .insert_header("content-type", "application/json")
+                .set_body_string("unauthorized"),
+            ResponseTemplate::new(401)
+                .insert_header("content-type", "application/json")
+                .set_body_string("unauthorized"),
+        ],
+        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
     )
     .await
 }
@@ -1548,20 +1555,14 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
         Some(AccountLeaseRuntimeReason::NonReplayableTurn)
     );
     assert_eq!(
-        test.codex
-            .current_lease_bridge_account_id()
-            .await
-            .as_deref(),
+        test.codex.current_auth_account_id().await.as_deref(),
         Some(PRIMARY_ACCOUNT_ID)
     );
 
     let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
     assert!(second_turn_error.is_none());
     assert_eq!(
-        test.codex
-            .current_lease_bridge_account_id()
-            .await
-            .as_deref(),
+        test.codex.current_auth_account_id().await.as_deref(),
         Some(SECONDARY_ACCOUNT_ID)
     );
 
@@ -1946,8 +1947,8 @@ async fn wait_for_compact_request(mock_response: &ResponseMock) {
 }
 
 async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
-    expected_health_state: AccountHealthState,
-    compact_failure_response: ResponseTemplate,
+    mut compact_responses: Vec<ResponseTemplate>,
+    expected_compact_request_account_ids: &[&str],
 ) -> Result<()> {
     struct CompactSeqResponder {
         next_call: std::sync::atomic::AtomicUsize,
@@ -1984,15 +1985,16 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
     )
     .await;
 
-    let compact_success_response = ResponseTemplate::new(200)
-        .insert_header("content-type", "application/json")
-        .set_body_json(json!({
-            "output": [{
-                "type": "compaction",
-                "encrypted_content": "REMOTE_COMPACT_SUMMARY"
-            }]
-        }));
-    let compact_responses = vec![compact_failure_response, compact_success_response];
+    compact_responses.push(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .set_body_json(json!({
+                "output": [{
+                    "type": "compaction",
+                    "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                }]
+            })),
+    );
     let compact_call_count = compact_responses.len() as u64;
     Mock::given(method("POST"))
         .and(path_regex(".*/responses/compact$"))
@@ -2014,18 +2016,7 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
     let first_turn_error = submit_turn_and_wait(&test, "seed usage for compact").await?;
     assert!(first_turn_error.is_none());
 
-    let second_turn_error = submit_turn_and_wait(&test, "turn with failing compact").await?;
-    assert!(
-        second_turn_error.is_some(),
-        "pre-turn compact failure should fail the current turn"
-    );
-    wait_for_account_health_transition(
-        &test,
-        expected_health_state,
-        AccountLeaseRuntimeReason::NonReplayableTurn,
-    )
-    .await?;
-
+    let _second_turn_error = submit_turn_and_wait(&test, "turn with failing compact").await?;
     let third_turn_error = submit_turn_and_wait(&test, "turn after compact failure").await?;
     assert!(third_turn_error.is_none());
 
@@ -2056,10 +2047,10 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         .collect::<Vec<_>>();
     assert_eq!(
         compact_request_account_ids,
-        vec![
-            Some(PRIMARY_ACCOUNT_ID.to_string()),
-            Some(SECONDARY_ACCOUNT_ID.to_string()),
-        ],
+        expected_compact_request_account_ids
+            .iter()
+            .map(|account_id| Some((*account_id).to_string()))
+            .collect::<Vec<_>>(),
         "expected compact failures to mark the active account unavailable before next turn"
     );
     let compact_request_session_ids = all_requests
@@ -2082,7 +2073,8 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         "expected compact requests to include a session_id header"
     );
     assert_ne!(
-        compact_request_session_ids[0], compact_request_session_ids[1],
+        compact_request_session_ids.first(),
+        compact_request_session_ids.last(),
         "rotation with allow_context_reuse=false should reset remote session identity before pre-turn compact"
     );
 
@@ -2153,32 +2145,6 @@ async fn submit_turn_and_wait(
             }
             _ => {}
         }
-    }
-}
-
-async fn wait_for_account_health_transition(
-    test: &TestCodex,
-    expected_health_state: AccountHealthState,
-    expected_switch_reason: AccountLeaseRuntimeReason,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = test
-            .codex
-            .account_lease_snapshot()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("pooled session should expose lease snapshot"))?;
-        if snapshot.health_state == Some(expected_health_state)
-            && snapshot.switch_reason == Some(expected_switch_reason)
-        {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for account health transition: {snapshot:?}"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

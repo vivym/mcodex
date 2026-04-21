@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::state::AccountLeaseRuntimeSnapshot;
 use crate::state::BridgedTurnPreview;
 
 use super::admission::LeaseAdmission;
@@ -40,7 +41,7 @@ struct AuthorityState {
 
 #[allow(dead_code)]
 enum RuntimeLeaseAuthorityMode {
-    LegacyManagerBridge(Arc<Mutex<crate::state::AccountPoolManager>>),
+    ManagerOwner(Arc<Mutex<crate::state::AccountPoolManager>>),
     HostOwned(HostOwnedLeaseState),
 }
 
@@ -74,23 +75,23 @@ enum AdmissionPreview {
     Draining,
 }
 
-struct LegacyBridgeLeaseHeartbeatGuard {
+struct ManagerLeaseHeartbeatGuard {
     cancellation_token: CancellationToken,
     task: JoinHandle<()>,
 }
 
-impl Drop for LegacyBridgeLeaseHeartbeatGuard {
+impl Drop for ManagerLeaseHeartbeatGuard {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
         self.task.abort();
     }
 }
 
-fn start_legacy_bridge_heartbeat(
+fn start_manager_heartbeat(
     manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     heartbeat_interval: std::time::Duration,
     cancellation_token: &CancellationToken,
-) -> LegacyBridgeLeaseHeartbeatGuard {
+) -> ManagerLeaseHeartbeatGuard {
     let heartbeat_cancellation_token = cancellation_token.child_token();
     let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
     let task = tokio::spawn(async move {
@@ -103,13 +104,13 @@ fn start_legacy_bridge_heartbeat(
                 _ = ticker.tick() => {
                     let mut manager = manager.lock().await;
                     if let Err(err) = manager.renew_active_lease().await {
-                        warn!("failed to renew runtime-lease bridge heartbeat: {err:#}");
+                        warn!("failed to renew runtime-lease manager heartbeat: {err:#}");
                     }
                 }
             }
         }
     });
-    LegacyBridgeLeaseHeartbeatGuard {
+    ManagerLeaseHeartbeatGuard {
         cancellation_token: heartbeat_cancellation_token,
         task,
     }
@@ -117,10 +118,8 @@ fn start_legacy_bridge_heartbeat(
 
 #[allow(dead_code)]
 impl RuntimeLeaseAuthority {
-    pub(crate) fn legacy_manager_bridge(
-        manager: Arc<Mutex<crate::state::AccountPoolManager>>,
-    ) -> Self {
-        Self::new(RuntimeLeaseAuthorityMode::LegacyManagerBridge(manager))
+    pub(crate) fn manager_owner(manager: Arc<Mutex<crate::state::AccountPoolManager>>) -> Self {
+        Self::new(RuntimeLeaseAuthorityMode::ManagerOwner(manager))
     }
 
     fn new(mode: RuntimeLeaseAuthorityMode) -> Self {
@@ -147,12 +146,10 @@ impl RuntimeLeaseAuthority {
                 return Err(LeaseAdmissionError::Cancelled);
             }
 
-            let legacy_manager = {
+            let manager = {
                 let state = self.inner.state.lock().await;
                 match &state.mode {
-                    RuntimeLeaseAuthorityMode::LegacyManagerBridge(manager) => {
-                        Some(Arc::clone(manager))
-                    }
+                    RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
                     RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
                         if let Some(generation) = host_owned.generation.as_ref()
                             && generation.accepting
@@ -169,8 +166,8 @@ impl RuntimeLeaseAuthority {
                 }
             };
 
-            if let Some(manager) = legacy_manager {
-                return self.acquire_from_legacy_manager(context, manager).await;
+            if let Some(manager) = manager {
+                return self.acquire_from_manager(context, manager).await;
             }
 
             tokio::select! {
@@ -210,9 +207,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::LegacyManagerBridge(manager) => {
-                    Some(Arc::clone(manager))
-                }
+                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -238,9 +233,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::LegacyManagerBridge(manager) => {
-                    Some(Arc::clone(manager))
-                }
+                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -265,9 +258,7 @@ impl RuntimeLeaseAuthority {
         let manager = {
             let state = self.inner.state.lock().await;
             match &state.mode {
-                RuntimeLeaseAuthorityMode::LegacyManagerBridge(manager) => {
-                    Some(Arc::clone(manager))
-                }
+                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
                 RuntimeLeaseAuthorityMode::HostOwned(_) => None,
             }
         };
@@ -285,7 +276,46 @@ impl RuntimeLeaseAuthority {
         Ok(())
     }
 
-    async fn acquire_from_legacy_manager(
+    pub(crate) async fn runtime_snapshot(&self) -> AccountLeaseRuntimeSnapshot {
+        let manager = {
+            let state = self.inner.state.lock().await;
+            match &state.mode {
+                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
+                    return runtime_snapshot_for_generation(host_owned.generation.clone());
+                }
+            }
+        };
+        let Some(manager) = manager else {
+            return runtime_snapshot_for_generation(None);
+        };
+        let snapshot_seed = {
+            let manager = manager.lock().await;
+            manager.snapshot_seed()
+        };
+        snapshot_seed.snapshot().await
+    }
+
+    pub(crate) async fn release_for_shutdown(&self) -> anyhow::Result<()> {
+        let manager = {
+            let mut state = self.inner.state.lock().await;
+            match &mut state.mode {
+                RuntimeLeaseAuthorityMode::ManagerOwner(manager) => Some(Arc::clone(manager)),
+                RuntimeLeaseAuthorityMode::HostOwned(host_owned) => {
+                    host_owned.generation = None;
+                    None
+                }
+            }
+        };
+        if let Some(manager) = manager {
+            manager.lock().await.release_for_shutdown().await?;
+        } else {
+            self.inner.changed.notify_waiters();
+        }
+        Ok(())
+    }
+
+    async fn acquire_from_manager(
         &self,
         context: LeaseRequestContext,
         manager: Arc<Mutex<crate::state::AccountPoolManager>>,
@@ -329,7 +359,7 @@ impl RuntimeLeaseAuthority {
         let generation = GenerationState {
             pool_id: selection.pool_id,
             account_id: selection.account_id,
-            selection_family: "codex".to_string(),
+            selection_family: selection.selection_family,
             generation: selection.generation,
             auth_session: selection.auth_session,
             allow_context_reuse: selection.allow_context_reuse,
@@ -339,8 +369,7 @@ impl RuntimeLeaseAuthority {
         if context.cancel.is_cancelled() {
             return Err(LeaseAdmissionError::Cancelled);
         }
-        let heartbeat_guard =
-            start_legacy_bridge_heartbeat(manager, heartbeat_interval, &context.cancel);
+        let heartbeat_guard = start_manager_heartbeat(manager, heartbeat_interval, &context.cancel);
         match self
             .inner
             .try_admit(&context, &generation, vec![Box::new(heartbeat_guard)])
@@ -406,6 +435,11 @@ impl RuntimeLeaseAuthority {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -574,4 +608,49 @@ fn fake_access_token(chatgpt_account_id: &str) -> String {
             .encode(serde_json::to_vec(&value).expect("serialize fake JWT part"))
     };
     format!("{}.{}.sig", b64(header), b64(payload))
+}
+
+fn runtime_snapshot_for_generation(
+    generation: Option<GenerationState>,
+) -> AccountLeaseRuntimeSnapshot {
+    let Some(generation) = generation else {
+        return AccountLeaseRuntimeSnapshot {
+            active: false,
+            suppressed: false,
+            account_id: None,
+            pool_id: None,
+            lease_id: None,
+            lease_epoch: None,
+            lease_acquired_at: None,
+            health_state: None,
+            switch_reason: None,
+            suppression_reason: None,
+            transport_reset_generation: None,
+            last_remote_context_reset_turn_id: None,
+            min_switch_interval_secs: None,
+            proactive_switch_pending: None,
+            proactive_switch_suppressed: None,
+            proactive_switch_allowed_at: None,
+            next_eligible_at: None,
+        };
+    };
+    AccountLeaseRuntimeSnapshot {
+        active: true,
+        suppressed: false,
+        account_id: Some(generation.account_id),
+        pool_id: Some(generation.pool_id),
+        lease_id: None,
+        lease_epoch: Some(generation.auth_session.binding().lease_epoch as i64),
+        lease_acquired_at: None,
+        health_state: None,
+        switch_reason: None,
+        suppression_reason: None,
+        transport_reset_generation: None,
+        last_remote_context_reset_turn_id: None,
+        min_switch_interval_secs: None,
+        proactive_switch_pending: None,
+        proactive_switch_suppressed: None,
+        proactive_switch_allowed_at: None,
+        next_eligible_at: None,
+    }
 }

@@ -211,7 +211,7 @@ fn test_websocket_model_client_with_runtime_authority(
     )
 }
 
-async fn test_pooled_runtime_host_with_attached_legacy_bridge(
+async fn test_pooled_runtime_host_with_manager_owner(
     account_id: &str,
 ) -> anyhow::Result<(RuntimeLeaseHost, tempfile::TempDir)> {
     let codex_home = tempfile::tempdir()?;
@@ -253,7 +253,7 @@ async fn test_pooled_runtime_host_with_attached_legacy_bridge(
     let host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(format!(
         "runtime-lease-{account_id}"
     )));
-    host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    host.install_manager_owner(Arc::clone(&manager))?;
     Ok((host, codex_home))
 }
 
@@ -820,7 +820,7 @@ async fn compact_conversation_history_ignores_mismatched_account_override_for_po
     )
     .await;
     let (runtime_host, _codex_home) =
-        test_pooled_runtime_host_with_attached_legacy_bridge("acct-compact-a").await?;
+        test_pooled_runtime_host_with_manager_owner("acct-compact-a").await?;
     let client = test_model_client_with_runtime_host(runtime_host, &server.uri());
     let prompt = Prompt {
         input: vec![ResponseItem::Message {

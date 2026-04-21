@@ -31,7 +31,6 @@ use http::StatusCode;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
-use tracing::warn;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
@@ -188,35 +187,12 @@ async fn run_remote_compact_task_inner_impl(
                     if let Some(rate_limits) = e.rate_limits.clone() {
                         sess.update_rate_limits(turn_context, *rate_limits).await;
                     }
-                    if let Some(account_pool_manager) =
-                        sess.services.account_pool_manager_for_turn()
-                    {
-                        let mut account_pool_manager = account_pool_manager.lock().await;
-                        if let Err(report_err) =
-                            account_pool_manager.report_usage_limit_reached().await
-                        {
-                            warn!(
-                                "failed to record account-pool usage-limit event: {report_err:#}"
-                            );
-                        }
-                    }
                 }
                 CodexErr::RefreshTokenFailed(_)
                 | CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
                     status: StatusCode::UNAUTHORIZED,
                     ..
-                }) => {
-                    if let Some(account_pool_manager) =
-                        sess.services.account_pool_manager_for_turn()
-                    {
-                        let mut account_pool_manager = account_pool_manager.lock().await;
-                        if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                            warn!(
-                                "failed to record account-pool unauthorized event after refresh failure: {report_err:#}"
-                            );
-                        }
-                    }
-                }
+                }) => {}
                 _ => {}
             }
             let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;

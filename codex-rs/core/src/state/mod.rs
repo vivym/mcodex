@@ -6,6 +6,7 @@ pub use service::AccountLeaseRuntimeReason;
 pub use service::AccountLeaseRuntimeSnapshot;
 pub(crate) use service::AccountPoolManager;
 pub(crate) use service::BridgedTurnPreview;
+#[cfg(test)]
 pub(crate) use service::SessionLeaseContinuity;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;

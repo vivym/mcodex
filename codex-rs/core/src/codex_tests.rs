@@ -2949,7 +2949,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         account_pool_manager: None,
         runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
-        lease_continuity: Mutex::new(crate::state::SessionLeaseContinuity::default()),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
             None,
@@ -3800,7 +3799,6 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         account_pool_manager: None,
         runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
-        lease_continuity: Mutex::new(crate::state::SessionLeaseContinuity::default()),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             None,

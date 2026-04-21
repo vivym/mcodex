@@ -2,6 +2,7 @@ use super::CollaborationTreeId;
 use super::LeaseAdmissionError;
 use super::LeaseRequestContext;
 use super::LeaseSnapshot;
+use super::RemoteContextResetRecord;
 use super::RequestBoundaryKind;
 use super::RuntimeLeaseAuthority;
 use super::RuntimeLeaseHost;
@@ -115,7 +116,103 @@ fn cloned_host_shares_one_runtime_handle() {
 }
 
 #[tokio::test]
-async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_new_bridge_manager()
+async fn pooled_host_snapshot_uses_authority_state_without_session_local_manager() {
+    let host = RuntimeLeaseHost::pooled_with_authority_for_test(
+        RuntimeLeaseHostId::new("runtime-snapshot".to_string()),
+        RuntimeLeaseAuthority::for_test_accepting("acct-a", 11),
+    );
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-a".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        request_id: "req-1".to_string(),
+        lease_generation: 11,
+        transport_reset_generation: 7,
+    });
+
+    let snapshot = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should expose a live authority snapshot");
+
+    assert!(snapshot.active);
+    assert_eq!(snapshot.account_id.as_deref(), Some("acct-a"));
+    assert_eq!(snapshot.pool_id.as_deref(), Some("pool-main"));
+    assert_eq!(snapshot.lease_epoch, Some(11));
+    assert_eq!(snapshot.transport_reset_generation, Some(7));
+    assert_eq!(
+        snapshot.last_remote_context_reset_turn_id.as_deref(),
+        Some("turn-1")
+    );
+}
+
+#[tokio::test]
+async fn pooled_host_release_for_shutdown_releases_manager_owner_lease() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    let account_id = "acct-shutdown";
+    state_db
+        .import_legacy_default_account(codex_state::LegacyAccountImport {
+            account_id: account_id.to_string(),
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-shutdown".to_string()));
+    let mut pools = HashMap::new();
+    pools.insert(
+        "legacy-default".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(AccountsConfigToml {
+            backend: None,
+            default_pool: Some("legacy-default".to_string()),
+            proactive_switch_threshold_percent: None,
+            lease_ttl_secs: None,
+            heartbeat_interval_secs: None,
+            min_switch_interval_secs: None,
+            allocation_mode: None,
+            pools: Some(pools),
+        }),
+        codex_home.path().to_path_buf(),
+        "holder-shutdown".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    host.install_manager_owner(Arc::clone(&manager))?;
+
+    {
+        let mut manager = manager.lock().await;
+        manager
+            .prepare_turn()
+            .await?
+            .expect("manager should acquire an active lease before shutdown");
+    }
+
+    host.release_for_shutdown().await?;
+
+    let snapshot = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should still expose an inactive snapshot after shutdown release");
+    assert!(!snapshot.active);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_lease_host_reuse_after_successful_shutdown_republishes_authority()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -132,7 +229,7 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_ne
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
     runtime_lease_host.attach_session("session-old").await;
     runtime_lease_host.detach_session("session-old").await?;
 
@@ -140,10 +237,7 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_ne
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "final successful detach should clear the old bridge"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
     let second_manager = SessionServices::build_account_pool_manager(
         Some(state_db),
@@ -154,14 +248,12 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_binds_children_to_ne
     .await?
     .expect("replacement manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
     runtime_lease_host.attach_session("session-new").await;
 
-    let rebound_manager = runtime_lease_host
-        .legacy_manager_bridge_for_test()
-        .expect("replacement manager should be visible to child sessions");
-    assert!(Arc::ptr_eq(&rebound_manager, &second_manager));
-    assert!(!Arc::ptr_eq(&rebound_manager, &first_manager));
+    assert!(runtime_lease_host.pooled_authority().is_some());
+    let _ = first_manager;
+    let _ = second_manager;
 
     Ok(())
 }
@@ -221,7 +313,7 @@ async fn draining_acquire_waits_until_replacement_generation() {
 }
 
 #[tokio::test]
-async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_admission()
+async fn manager_owner_rotations_produce_new_generation_and_gate_replacement_admission()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -261,7 +353,7 @@ async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_adm
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -300,7 +392,7 @@ async fn legacy_bridge_rotations_produce_new_generation_and_gate_replacement_adm
 }
 
 #[tokio::test]
-async fn legacy_bridge_admission_heartbeat_renews_active_lease_until_guard_drop()
+async fn manager_owner_admission_heartbeat_renews_active_lease_until_guard_drop()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -343,7 +435,7 @@ async fn legacy_bridge_admission_heartbeat_renews_active_lease_until_guard_drop(
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(manager);
+    let authority = RuntimeLeaseAuthority::manager_owner(manager);
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesCompact,
         "session-heartbeat",
@@ -380,7 +472,7 @@ async fn legacy_bridge_admission_heartbeat_renews_active_lease_until_guard_drop(
 }
 
 #[tokio::test]
-async fn legacy_bridge_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
+async fn manager_owner_rejected_replacement_acquire_preserves_first_snapshot_until_guard_drop()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -420,7 +512,7 @@ async fn legacy_bridge_rejected_replacement_acquire_preserves_first_snapshot_unt
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -489,7 +581,7 @@ async fn legacy_bridge_rejected_replacement_acquire_preserves_first_snapshot_unt
 }
 
 #[tokio::test]
-async fn legacy_bridge_rejects_stale_reporting_after_rotation() -> anyhow::Result<()> {
+async fn manager_owner_rejects_stale_reporting_after_rotation() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
         codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
@@ -528,7 +620,7 @@ async fn legacy_bridge_rejects_stale_reporting_after_rotation() -> anyhow::Resul
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
     let request_context = LeaseRequestContext::for_test(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
@@ -601,7 +693,176 @@ async fn legacy_bridge_rejects_stale_reporting_after_rotation() -> anyhow::Resul
 }
 
 #[tokio::test]
-async fn legacy_bridge_acquire_honors_cancellation_while_waiting_for_manager_lock()
+async fn manager_owner_usage_limit_report_rotates_legacy_default_turn() -> anyhow::Result<()> {
+    const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
+
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-turn-a", "acct-turn-b"] {
+        state_db
+            .import_legacy_default_account(codex_state::LegacyAccountImport {
+                account_id: account_id.to_string(),
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    let mut pools = HashMap::new();
+    pools.insert(
+        LEGACY_DEFAULT_POOL_ID.to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(AccountsConfigToml {
+            backend: None,
+            default_pool: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+            proactive_switch_threshold_percent: Some(85),
+            lease_ttl_secs: None,
+            heartbeat_interval_secs: None,
+            min_switch_interval_secs: None,
+            allocation_mode: None,
+            pools: Some(pools),
+        }),
+        codex_home.path().to_path_buf(),
+        "holder-turn-report".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let turn_selection = {
+        let mut manager = manager.lock().await;
+        manager
+            .prepare_turn()
+            .await?
+            .expect("outer turn should acquire a pooled lease")
+    };
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesCompact,
+        "session-turn-report",
+        CollaborationTreeId::for_test("tree-turn-report"),
+    );
+
+    let admission = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(admission.snapshot.account_id(), "acct-turn-a");
+    assert_eq!(admission.snapshot.generation(), turn_selection.generation);
+
+    authority
+        .report_usage_limit_reached(&admission.snapshot)
+        .await?;
+
+    drop(admission.guard);
+
+    let next_selection = {
+        let mut manager = manager.lock().await;
+        manager
+            .prepare_turn()
+            .await?
+            .expect("next turn should rotate after the reported usage limit")
+    };
+    assert_eq!(next_selection.account_id, "acct-turn-b");
+    assert!(next_selection.generation > turn_selection.generation);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_owner_terminal_unauthorized_report_rotates_legacy_default_turn()
+-> anyhow::Result<()> {
+    const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
+
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-turn-a", "acct-turn-b"] {
+        state_db
+            .import_legacy_default_account(codex_state::LegacyAccountImport {
+                account_id: account_id.to_string(),
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    let mut pools = HashMap::new();
+    pools.insert(
+        LEGACY_DEFAULT_POOL_ID.to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(AccountsConfigToml {
+            backend: None,
+            default_pool: Some(LEGACY_DEFAULT_POOL_ID.to_string()),
+            proactive_switch_threshold_percent: Some(85),
+            lease_ttl_secs: None,
+            heartbeat_interval_secs: None,
+            min_switch_interval_secs: None,
+            allocation_mode: None,
+            pools: Some(pools),
+        }),
+        codex_home.path().to_path_buf(),
+        "holder-turn-unauthorized-report".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
+    let turn_selection = {
+        let mut manager = manager.lock().await;
+        manager
+            .prepare_turn()
+            .await?
+            .expect("outer turn should acquire a pooled lease")
+    };
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesCompact,
+        "session-turn-unauthorized-report",
+        CollaborationTreeId::for_test("tree-turn-unauthorized-report"),
+    );
+
+    let admission = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(admission.snapshot.account_id(), "acct-turn-a");
+    assert_eq!(admission.snapshot.generation(), turn_selection.generation);
+
+    authority
+        .report_terminal_unauthorized(&admission.snapshot)
+        .await?;
+
+    drop(admission.guard);
+
+    let next_selection = {
+        let mut manager = manager.lock().await;
+        manager
+            .prepare_turn()
+            .await?
+            .expect("next turn should rotate after terminal unauthorized")
+    };
+    assert_eq!(next_selection.account_id, "acct-turn-b");
+    assert!(next_selection.generation > turn_selection.generation);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_owner_acquire_honors_cancellation_while_waiting_for_manager_lock()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -615,7 +876,7 @@ async fn legacy_bridge_acquire_honors_cancellation_while_waiting_for_manager_loc
     )
     .await?
     .expect("test manager should build");
-    let authority = RuntimeLeaseAuthority::legacy_manager_bridge(Arc::clone(&manager));
+    let authority = RuntimeLeaseAuthority::manager_owner(Arc::clone(&manager));
     let token = CancellationToken::new();
     let request_context = LeaseRequestContext::for_test_with_cancel(
         RequestBoundaryKind::ResponsesHttp,
@@ -669,7 +930,7 @@ async fn cancelled_draining_acquire_returns_typed_cancellation() {
 }
 
 #[tokio::test]
-async fn runtime_lease_host_rejects_different_bridge_manager_until_stale_sessions_detach()
+async fn runtime_lease_host_rejects_republishing_authority_until_stale_sessions_detach()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -694,27 +955,24 @@ async fn runtime_lease_host_rejects_different_bridge_manager_until_stale_session
     .await?
     .expect("replacement manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
     runtime_lease_host.attach_session("session-root-old").await;
     runtime_lease_host.attach_session("session-child-old").await;
 
     let err = runtime_lease_host
-        .attach_legacy_manager_bridge(Arc::clone(&second_manager))
-        .expect_err("a later root must not silently keep using a stale bridge");
+        .install_manager_owner(Arc::clone(&second_manager))
+        .expect_err("a later root must not silently replace published authority");
     assert!(
-        err.to_string().contains("different legacy manager bridge"),
+        err.to_string()
+            .contains("already has published pooled authority"),
         "unexpected error: {err:#}"
     );
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
         2
     );
-    assert!(Arc::ptr_eq(
-        &runtime_lease_host
-            .legacy_manager_bridge_for_test()
-            .expect("stale bridge should still point at the old manager"),
-        &first_manager,
-    ));
+    assert!(runtime_lease_host.pooled_authority().is_some());
+    let _ = first_manager;
 
     runtime_lease_host
         .detach_session("session-root-old")
@@ -723,7 +981,7 @@ async fn runtime_lease_host_rejects_different_bridge_manager_until_stale_session
         runtime_lease_host.attached_session_count_for_test().await,
         1
     );
-    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     runtime_lease_host
         .detach_session("session-child-old")
@@ -732,26 +990,18 @@ async fn runtime_lease_host_rejects_different_bridge_manager_until_stale_session
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "the stale bridge must clear once the old sessions are gone"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
     runtime_lease_host.attach_session("session-root-new").await;
 
-    assert!(Arc::ptr_eq(
-        &runtime_lease_host
-            .legacy_manager_bridge_for_test()
-            .expect("successful reuse should install the new bridge"),
-        &second_manager,
-    ));
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     Ok(())
 }
 
 #[tokio::test]
-async fn runtime_lease_host_failed_final_release_stays_retryable_until_bridge_clears()
+async fn runtime_lease_host_failed_final_release_stays_retryable_until_authority_clears()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
@@ -807,7 +1057,7 @@ async fn runtime_lease_host_failed_final_release_stays_retryable_until_bridge_cl
 
     let runtime_lease_host =
         RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-retry".to_string()));
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     runtime_lease_host.attach_session("session-retry").await;
 
     let first_release = runtime_lease_host.detach_session("session-retry").await;
@@ -817,10 +1067,7 @@ async fn runtime_lease_host_failed_final_release_stays_retryable_until_bridge_cl
         1,
         "the final session must remain attached when release fails"
     );
-    assert!(
-        runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "the bridge must remain installed for a later retry"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     std::fs::remove_dir(&lease_epoch_marker)?;
 
@@ -830,10 +1077,7 @@ async fn runtime_lease_host_failed_final_release_stays_retryable_until_bridge_cl
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "a later successful retry should clear the bridge"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
     assert!(
         state_db
             .read_active_holder_lease("holder-release-retry")
@@ -903,7 +1147,7 @@ async fn runtime_lease_host_retries_transient_final_release_failure_before_shutd
     let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
         "runtime-retry-auto".to_string(),
     ));
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     runtime_lease_host
         .attach_session("session-retry-auto")
         .await;
@@ -923,10 +1167,7 @@ async fn runtime_lease_host_retries_transient_final_release_failure_before_shutd
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "shutdown retries should clear the bridge before returning"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
     assert!(
         state_db
             .read_active_holder_lease("holder-release-retry-auto")
@@ -939,7 +1180,7 @@ async fn runtime_lease_host_retries_transient_final_release_failure_before_shutd
 }
 
 #[tokio::test]
-async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback()
+async fn pending_inherited_child_startup_keeps_authority_until_success_or_rollback()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -957,7 +1198,7 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-startup")
@@ -970,10 +1211,7 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
         0
     );
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
-    assert!(
-        runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "parent shutdown must not clear the bridge while child startup is reserved"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     child_startup
         .promote_to_session("session-child")
@@ -985,19 +1223,16 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
         1
     );
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
-    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     runtime_lease_host.detach_session("session-child").await?;
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "final child detach should release the bridge after successful startup"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     runtime_lease_host
         .attach_session("session-parent-rollback")
         .await;
@@ -1014,24 +1249,21 @@ async fn pending_inherited_child_startup_keeps_bridge_until_success_or_rollback(
         0
     );
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
-    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     child_startup
         .rollback()
         .await
-        .expect("failed child startup should release the last reserved bridge");
+        .expect("failed child startup should release the last reserved authority");
 
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "rollback of the last pending startup should release the bridge"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
     Ok(())
 }
 
 #[tokio::test]
-async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears_bridge()
+async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears_authority()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -1049,7 +1281,7 @@ async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     runtime_lease_host.attach_session("session-parent").await;
     runtime_lease_host.detach_session("session-parent").await?;
 
@@ -1057,10 +1289,7 @@ async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "parent final detach should clear the bridge before child startup reservation"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
     let err = runtime_lease_host
         .try_reserve_startup_for_child("session-child-after-parent-detach")
@@ -1069,7 +1298,7 @@ async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears
 
     assert!(
         err.to_string()
-            .contains("legacy manager bridge is not attached"),
+            .contains("has no published pooled authority"),
         "unexpected error: {err:#}"
     );
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
@@ -1078,7 +1307,7 @@ async fn child_startup_reservation_rejects_host_after_parent_final_detach_clears
 }
 
 #[tokio::test]
-async fn startup_rollback_retries_transient_final_release_failure_before_clearing_bridge()
+async fn startup_rollback_retries_transient_final_release_failure_before_clearing_authority()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
@@ -1135,7 +1364,7 @@ async fn startup_rollback_retries_transient_final_release_failure_before_clearin
     let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
         "runtime-startup-rollback-retry".to_string(),
     ));
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&manager))?;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-rollback-retry")
         .await?;
@@ -1150,10 +1379,7 @@ async fn startup_rollback_retries_transient_final_release_failure_before_clearin
     unblock_release.await??;
 
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 0);
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "startup rollback should retry transient shutdown release and clear the bridge"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
     assert!(
         state_db
             .read_active_holder_lease("holder-startup-rollback-retry")
@@ -1166,7 +1392,7 @@ async fn startup_rollback_retries_transient_final_release_failure_before_clearin
 }
 
 #[tokio::test]
-async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_reuse()
+async fn dropped_startup_reservation_cleans_pending_startup_and_allows_authority_reuse()
 -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
@@ -1184,7 +1410,7 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_re
     .await?
     .expect("test manager should build");
 
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&first_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&first_manager))?;
     runtime_lease_host.attach_session("session-parent").await;
     let child_startup = runtime_lease_host
         .try_reserve_startup_for_child("session-child-dropped-startup")
@@ -1196,14 +1422,14 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_re
         0
     );
     assert_eq!(runtime_lease_host.pending_startup_count_for_test().await, 1);
-    assert!(runtime_lease_host.has_legacy_manager_bridge_for_test());
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     drop(child_startup);
 
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if runtime_lease_host.pending_startup_count_for_test().await == 0
-                && !runtime_lease_host.has_legacy_manager_bridge_for_test()
+                && runtime_lease_host.pooled_authority().is_none()
             {
                 break;
             }
@@ -1221,22 +1447,17 @@ async fn dropped_startup_reservation_cleans_pending_startup_and_allows_bridge_re
     )
     .await?
     .expect("replacement manager should build");
-    runtime_lease_host.attach_legacy_manager_bridge(Arc::clone(&second_manager))?;
+    runtime_lease_host.install_manager_owner(Arc::clone(&second_manager))?;
     runtime_lease_host.attach_session("session-reused").await;
 
-    assert!(Arc::ptr_eq(
-        &runtime_lease_host
-            .legacy_manager_bridge_for_test()
-            .expect("cleanup should allow a fresh bridge to attach"),
-        &second_manager,
-    ));
+    assert!(runtime_lease_host.pooled_authority().is_some());
 
     runtime_lease_host.detach_session("session-reused").await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn bridged_sessions_keep_remote_context_continuity_independent() -> anyhow::Result<()> {
+async fn pooled_sessions_keep_remote_context_continuity_independent() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =
         codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
@@ -1398,30 +1619,14 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
     .codex;
 
     assert!(root.session.services.runtime_lease_host.is_some());
-    assert!(root.session.services.account_pool_manager.is_some());
-    assert!(
-        root.session
-            .services
-            .runtime_lease_host
-            .as_ref()
-            .expect("root runtime lease host")
-            .has_legacy_manager_bridge_for_test()
-    );
-    assert!(Arc::ptr_eq(
-        root.session
-            .services
-            .account_pool_manager
-            .as_ref()
-            .expect("root account pool manager"),
-        &root
-            .session
-            .services
-            .runtime_lease_host
-            .as_ref()
-            .expect("root runtime lease host")
-            .legacy_manager_bridge_for_test()
-            .expect("registered legacy manager bridge"),
-    ));
+    assert!(root.session.services.account_pool_manager.is_none());
+    let root_runtime_lease_host = root
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host");
+    assert!(root_runtime_lease_host.pooled_authority().is_some());
     assert!(child.session.services.runtime_lease_host.is_some());
     assert!(child.session.services.account_pool_manager.is_none());
     assert!(
@@ -1471,46 +1676,30 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
             .is_some_and(|auth| auth.is_api_key_auth()),
         "child fallback AuthManager should remain non-pooled"
     );
-    let child_turn_manager = child
-        .session
-        .services
-        .account_pool_manager_for_turn()
-        .expect("pooled child should use root bridge manager for turns");
-    let root_bridge_manager = root
-        .session
-        .services
-        .runtime_lease_host
-        .as_ref()
-        .expect("root runtime lease host")
-        .legacy_manager_bridge()
-        .expect("registered root legacy bridge manager");
-    assert!(Arc::ptr_eq(&child_turn_manager, &root_bridge_manager));
-    let selection = {
-        let mut manager = child_turn_manager.lock().await;
-        manager.prepare_turn().await?
-    }
-    .expect("bridge manager should select a pooled account");
-    let leased_auth = selection.auth_session.leased_turn_auth()?;
-    assert_eq!(selection.account_id, account_id);
-    assert_eq!(
-        leased_auth.auth().get_account_id().as_deref(),
-        Some(account_id)
-    );
-    child
-        .session
-        .services
-        .lease_auth
-        .replace_current(Some(Arc::clone(&selection.auth_session)));
-    let child_model_auth = child
+    let child_admitted = child
         .session
         .services
         .model_client
-        .new_session()
-        .current_auth_provider_for_test()
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            None,
+            "runtime-lease-child-request",
+            CancellationToken::new(),
+        )
         .await?;
-    assert_eq!(child_model_auth.account_id.as_deref(), Some(account_id));
     assert_eq!(
-        child_model_auth.token.as_deref(),
+        child_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+        Some(account_id.to_string())
+    );
+    assert_eq!(
+        child_admitted.setup.api_auth.account_id.as_deref(),
+        Some(account_id)
+    );
+    assert_eq!(
+        child_admitted.setup.api_auth.token.as_deref(),
         Some(fake_access_token(account_id).as_str())
     );
 
@@ -1520,7 +1709,8 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
 }
 
 #[tokio::test]
-async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_bridge() -> anyhow::Result<()> {
+async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_authority()
+-> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
     let config_codex_home = config.codex_home.clone();
@@ -1540,7 +1730,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_bridge() -> a
     ));
     let skills_watcher = Arc::new(SkillsWatcher::noop());
     let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
-        "runtime-unbridged-child".to_string(),
+        "runtime-missing-authority-child".to_string(),
     ));
 
     let spawn_result = Codex::spawn(CodexSpawnArgs {
@@ -1576,7 +1766,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_bridge() -> a
     let err = match spawn_result {
         Ok(spawned) => {
             spawned.codex.shutdown_and_wait().await?;
-            panic!("unbridged inherited pooled runtime host should fail child spawn");
+            panic!("inherited pooled runtime host without authority should fail child spawn");
         }
         Err(err) => err,
     };
@@ -1596,8 +1786,8 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_bridge() -> a
 }
 
 #[tokio::test]
-async fn pooled_host_child_keeps_bridge_manager_until_last_session_shutdown() -> anyhow::Result<()>
-{
+async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdown()
+-> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
     let config_codex_home = config.codex_home.clone();
@@ -1708,33 +1898,29 @@ async fn pooled_host_child_keeps_bridge_manager_until_last_session_shutdown() ->
         AuthCredentialsStoreMode::File,
     )?;
 
-    let child_turn_manager = child
+    let child_admitted = child
         .session
         .services
-        .account_pool_manager_for_turn()
-        .expect("pooled child should resolve the bridge manager");
-    {
-        let mut manager = child_turn_manager.lock().await;
-        let selection = manager
-            .prepare_turn()
-            .await?
-            .expect("pooled child should acquire a bridge-backed lease");
-        assert_eq!(selection.account_id, account_id);
-    }
-
-    let turn_cancellation = CancellationToken::new();
-    let _child_heartbeat = crate::codex::start_account_pool_lease_heartbeat(
-        &child.session,
-        /*lease_selected_for_turn*/ true,
-        &turn_cancellation,
-    )
-    .await
-    .expect("pooled child should start a heartbeat from the bridge manager");
+        .model_client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            None,
+            "runtime-lease-child-lifecycle-request",
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        child_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+        Some(account_id.to_string())
+    );
 
     let snapshot_before_parent_shutdown = child
         .account_lease_snapshot()
         .await
-        .expect("child should expose bridge-backed lease snapshot before parent shutdown");
+        .expect("child should expose pooled lease snapshot before parent shutdown");
     assert!(snapshot_before_parent_shutdown.active);
     assert_eq!(
         snapshot_before_parent_shutdown.account_id.as_deref(),
@@ -1746,7 +1932,7 @@ async fn pooled_host_child_keeps_bridge_manager_until_last_session_shutdown() ->
     let snapshot_after_parent_shutdown = child
         .account_lease_snapshot()
         .await
-        .expect("child should keep the bridge-backed lease after parent shutdown");
+        .expect("child should keep the pooled lease after parent shutdown");
     assert!(snapshot_after_parent_shutdown.active);
     assert_eq!(
         snapshot_after_parent_shutdown.account_id.as_deref(),
@@ -1782,17 +1968,24 @@ async fn pooled_host_child_keeps_bridge_manager_until_last_session_shutdown() ->
     })
     .await?
     .codex;
-    let contender_turn_manager = contender
+    let contender_admitted = contender
         .session
         .services
-        .account_pool_manager_for_turn()
-        .expect("contender root should build a local pooled manager");
-    let contender_selection = {
-        let mut manager = contender_turn_manager.lock().await;
-        manager.prepare_turn().await?
-    }
-    .expect("last pooled child shutdown should release the bridge lease for immediate reuse");
-    assert_eq!(contender_selection.account_id, account_id);
+        .model_client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            None,
+            "runtime-lease-contender-request",
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        contender_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+        Some(account_id.to_string())
+    );
 
     contender.shutdown_and_wait().await?;
     Ok(())
@@ -1882,10 +2075,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "failed startup must not leave a stale legacy bridge on the supplied host"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_none());
 
     let recovered = Codex::spawn(CodexSpawnArgs {
         config: build_test_config_with_pool(codex_home.path()).await,
@@ -1921,33 +2111,20 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
     .await?
     .codex;
 
-    assert!(
-        runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "a later successful startup should still attach the legacy bridge"
-    );
+    assert!(runtime_lease_host.pooled_authority().is_some());
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
         1
     );
-    assert!(Arc::ptr_eq(
-        &runtime_lease_host
-            .legacy_manager_bridge_for_test()
-            .expect("successful startup should register a legacy bridge"),
-        recovered
-            .session
-            .services
-            .account_pool_manager
-            .as_ref()
-            .expect("successful pooled root should keep a local manager"),
-    ));
+    assert!(recovered.session.services.account_pool_manager.is_none());
 
     recovered.shutdown_and_wait().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn root_startup_rejects_stale_runtime_bridge_without_attaching_session() -> anyhow::Result<()>
-{
+async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_shared()
+-> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let config = build_test_config_with_pool(codex_home.path()).await;
     let config_codex_home = config.codex_home.clone();
@@ -1995,9 +2172,8 @@ async fn root_startup_rejects_stale_runtime_bridge_without_attaching_session() -
     })
     .await?
     .codex;
-    let first_bridge = runtime_lease_host
-        .legacy_manager_bridge_for_test()
-        .expect("first root should install a bridge");
+    assert!(runtime_lease_host.pooled_authority().is_some());
+    assert!(first_root.session.services.account_pool_manager.is_none());
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
         1
@@ -2026,79 +2202,29 @@ async fn root_startup_rejects_stale_runtime_bridge_without_attaching_session() -
         parent_trace: None,
         analytics_events_client: None,
     })
-    .await;
-    let err = match second_root {
-        Ok(spawned) => {
-            spawned.codex.shutdown_and_wait().await?;
-            panic!("startup with a stale runtime bridge should fail");
-        }
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("failed to attach runtime lease bridge"),
-        "unexpected error: {err:#}"
-    );
+    .await?
+    .codex;
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
-        1,
-        "failed startup must not commit a new runtime attachment"
+        2,
+        "shared pooled host should track both attached sessions"
     );
-    assert!(Arc::ptr_eq(
-        &runtime_lease_host
-            .legacy_manager_bridge_for_test()
-            .expect("stale bridge should still point at the first root"),
-        &first_bridge,
-    ));
+    assert!(runtime_lease_host.pooled_authority().is_some());
+    assert!(second_root.session.services.account_pool_manager.is_none());
 
     first_root.shutdown_and_wait().await?;
     assert_eq!(
         runtime_lease_host.attached_session_count_for_test().await,
+        1
+    );
+    assert!(runtime_lease_host.pooled_authority().is_some());
+
+    second_root.shutdown_and_wait().await?;
+    assert_eq!(
+        runtime_lease_host.attached_session_count_for_test().await,
         0
     );
-    assert!(
-        !runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "successful shutdown should clear the stale bridge before reuse"
-    );
-
-    let recovered_root = Codex::spawn(CodexSpawnArgs {
-        config,
-        auth_manager,
-        models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
-        skills_manager,
-        plugins_manager,
-        mcp_manager,
-        skills_watcher,
-        conversation_history: InitialHistory::New,
-        session_source: SessionSource::Exec,
-        agent_control: AgentControl::default(),
-        dynamic_tools: Vec::new(),
-        persist_extended_history: false,
-        metrics_service_name: None,
-        inherited_shell_snapshot: None,
-        inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
-        runtime_lease_host: Some(runtime_lease_host.clone()),
-        user_shell_override: None,
-        parent_trace: None,
-        analytics_events_client: None,
-    })
-    .await?
-    .codex;
-    let rebound_bridge = runtime_lease_host
-        .legacy_manager_bridge_for_test()
-        .expect("recovered root should install a fresh bridge");
-    let recovered_manager = recovered_root
-        .session
-        .services
-        .account_pool_manager
-        .as_ref()
-        .expect("recovered root should keep its local manager");
-    assert!(Arc::ptr_eq(&rebound_bridge, recovered_manager));
-    assert!(!Arc::ptr_eq(&rebound_bridge, &first_bridge));
-
-    recovered_root.shutdown_and_wait().await?;
+    assert!(runtime_lease_host.pooled_authority().is_none());
     Ok(())
 }
 
@@ -2156,10 +2282,8 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         .as_ref()
         .expect("config-only pooled roots should still install a runtime host")
         .clone();
-    assert!(
-        root_runtime_lease_host.has_legacy_manager_bridge_for_test(),
-        "top-level root should bridge its local manager into the runtime host"
-    );
+    assert!(root.session.services.account_pool_manager.is_none());
+    assert!(root_runtime_lease_host.pooled_authority().is_some());
 
     let account_id = "acct-config-only-root";
     let state_db = root
@@ -2225,22 +2349,31 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
     .await?
     .codex;
 
+    assert!(root.session.services.account_pool_manager.is_none());
+    assert!(root_runtime_lease_host.pooled_authority().is_some());
     assert!(child.session.services.account_pool_manager.is_none());
-    let child_turn_manager = child
+    let child_admitted = child
         .session
         .services
-        .account_pool_manager_for_turn()
-        .expect("threadspawn child should resolve the root bridge manager");
-    let root_bridge_manager = root_runtime_lease_host
-        .legacy_manager_bridge_for_test()
-        .expect("root runtime host should expose its bridged manager");
-    assert!(Arc::ptr_eq(&child_turn_manager, &root_bridge_manager));
-    let selection = {
-        let mut manager = child_turn_manager.lock().await;
-        manager.prepare_turn().await?
-    }
-    .expect("child should use the bridged root manager for future pooled activation");
-    assert_eq!(selection.account_id, account_id);
+        .model_client
+        .admitted_client_setup(
+            RequestBoundaryKind::ResponsesHttp,
+            None,
+            "runtime-lease-config-only-child-request",
+            CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(
+        child_admitted
+            .reporter
+            .as_ref()
+            .map(|reporter| reporter.snapshot().account_id().to_string()),
+        Some(account_id.to_string())
+    );
+    assert_eq!(
+        child_admitted.setup.api_auth.account_id.as_deref(),
+        Some(account_id)
+    );
 
     child.shutdown_and_wait().await?;
     root.shutdown_and_wait().await?;

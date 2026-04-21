@@ -236,8 +236,8 @@ impl CodexThread {
     }
 
     #[doc(hidden)]
-    pub async fn current_lease_bridge_account_id(&self) -> Option<String> {
-        self.codex.current_lease_bridge_account_id().await
+    pub async fn current_auth_account_id(&self) -> Option<String> {
+        self.codex.current_auth_account_id().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {

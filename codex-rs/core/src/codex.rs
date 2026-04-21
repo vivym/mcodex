@@ -823,7 +823,12 @@ impl Codex {
     }
 
     pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
-        let account_pool_manager = self.session.services.account_pool_manager_for_turn()?;
+        if let Some(runtime_lease_host) = self.session.services.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+        {
+            return runtime_lease_host.account_lease_snapshot().await;
+        }
+        let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
         let snapshot_seed = {
             let account_pool_manager = account_pool_manager.lock().await;
             account_pool_manager.snapshot_seed()
@@ -835,7 +840,7 @@ impl Codex {
         self.session.current_auth().await
     }
 
-    pub(crate) async fn current_lease_bridge_account_id(&self) -> Option<String> {
+    pub(crate) async fn current_auth_account_id(&self) -> Option<String> {
         self.current_auth()
             .await
             .and_then(|auth| auth.get_account_id())
@@ -2084,24 +2089,42 @@ impl Session {
                 Some(host)
             ) if host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
         );
+        let pooled_runtime_host_active = runtime_lease_host
+            .as_ref()
+            .is_some_and(crate::runtime_lease::RuntimeLeaseHost::is_pooled);
+        let pooled_root_needs_manager_owner = pooled_runtime_host_active
+            && !inherited_pooled_runtime_host
+            && runtime_lease_host
+                .as_ref()
+                .is_some_and(|host| host.pooled_authority().is_none());
         debug_assert!(
             !(inherited_pooled_runtime_host && inherited_lease_auth_session.is_some()),
             "inherited pooled runtime host must not be combined with static inherited lease auth"
         );
         if inherited_pooled_runtime_host && let Some(host) = runtime_lease_host.as_ref() {
-            host.ensure_legacy_manager_bridge_attached_for_child()
-                .map_err(|err| {
-                    CodexErr::Fatal(format!(
-                        "inherited pooled runtime host is not usable for child session: {err:#}"
-                    ))
-                })?;
+            host.ensure_child_startup_ready().map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "inherited pooled runtime host is not usable for child session: {err:#}"
+                ))
+            })?;
         }
         // Static lease inheritance remains as compatibility for children that do
         // not receive a pooled runtime host.
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
         lease_auth.replace_current(inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let account_pool_manager = if inherited_pooled_runtime_host {
+        let authority_owned_account_pool_manager = if pooled_root_needs_manager_owner {
+            SessionServices::build_account_pool_manager(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                config.codex_home.clone().to_path_buf(),
+                account_pool_holder_instance_id.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
+        let account_pool_manager = if pooled_runtime_host_active {
             None
         } else {
             SessionServices::build_account_pool_manager(
@@ -2165,7 +2188,6 @@ impl Session {
             account_pool_manager,
             runtime_lease_host: runtime_lease_host.clone(),
             lease_auth: Arc::clone(&lease_auth),
-            lease_continuity: Mutex::new(crate::state::SessionLeaseContinuity::default()),
             model_client: ModelClient::new_with_runtime_lease(
                 Some(Arc::clone(&auth_manager)),
                 Some(lease_auth),
@@ -2331,13 +2353,15 @@ impl Session {
             }
         }
         if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
-            && let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref()
+            && runtime_lease_host.is_pooled()
+            && runtime_lease_host.pooled_authority().is_none()
+            && let Some(account_pool_manager) = authority_owned_account_pool_manager.as_ref()
         {
             runtime_lease_host
-                .attach_legacy_manager_bridge(Arc::clone(account_pool_manager))
+                .install_manager_owner(Arc::clone(account_pool_manager))
                 .with_context(|| {
                     format!(
-                        "failed to attach runtime lease bridge for session {}",
+                        "failed to publish runtime lease authority for session {}",
                         sess.conversation_id
                     )
                 })?;
@@ -4162,15 +4186,6 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
-        if let Some(account_pool_manager) = self.services.account_pool_manager_for_turn() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            if let Err(err) = account_pool_manager
-                .report_rate_limits(&new_rate_limits)
-                .await
-            {
-                warn!("failed to record account-pool rate-limit snapshot: {err:#}");
-            }
-        }
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
@@ -6255,55 +6270,6 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
-pub(crate) struct AccountLeaseHeartbeatGuard {
-    cancellation_token: CancellationToken,
-    task: JoinHandle<()>,
-}
-
-impl Drop for AccountLeaseHeartbeatGuard {
-    fn drop(&mut self) {
-        self.cancellation_token.cancel();
-        self.task.abort();
-    }
-}
-
-pub(crate) async fn start_account_pool_lease_heartbeat(
-    sess: &Arc<Session>,
-    lease_selected_for_turn: bool,
-    cancellation_token: &CancellationToken,
-) -> Option<AccountLeaseHeartbeatGuard> {
-    if !lease_selected_for_turn {
-        return None;
-    }
-    let account_pool_manager = sess.services.account_pool_manager_for_turn()?;
-    let heartbeat_interval = {
-        let account_pool_manager = account_pool_manager.lock().await;
-        account_pool_manager.heartbeat_interval()
-    };
-    let heartbeat_cancellation_token = cancellation_token.child_token();
-    let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
-    let task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(heartbeat_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = heartbeat_task_cancellation.cancelled() => break,
-                _ = ticker.tick() => {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(err) = account_pool_manager.renew_active_lease().await {
-                        warn!("failed to renew account-pool lease heartbeat: {err:#}");
-                    }
-                }
-            }
-        }
-    });
-    Some(AccountLeaseHeartbeatGuard {
-        cancellation_token: heartbeat_cancellation_token,
-        task,
-    })
-}
-
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -6332,77 +6298,11 @@ pub(crate) async fn run_turn(
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut prewarmed_client_session = prewarmed_client_session;
-    let pooled_mode_enabled = sess.services.pooled_runtime_active();
-    let turn_account_pool_manager = sess.services.account_pool_manager_for_turn();
-    let turn_account_selection =
-        if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            match account_pool_manager.prepare_turn().await {
-                Ok(selection) => {
-                    sess.services.lease_auth.replace_current(
-                        selection
-                            .as_ref()
-                            .map(|selection| Arc::clone(&selection.auth_session)),
-                    );
-                    selection
-                }
-                Err(err) => {
-                    warn!("failed to prepare account-pool lease for turn: {err:#}");
-                    sess.services.lease_auth.clear();
-                    None
-                }
-            }
-        } else {
-            None
-        };
-    if pooled_mode_enabled && turn_account_selection.is_none() {
-        if let Some(mut client_session) = prewarmed_client_session.take() {
-            client_session.reset_websocket_session();
-        }
-        sess.send_event(
-            &turn_context,
-            EventMsg::Error(ErrorEvent {
-                message: "No eligible pooled account is available for this turn.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        )
-        .await;
-        return None;
-    }
-    let _account_pool_lease_heartbeat = start_account_pool_lease_heartbeat(
-        &sess,
-        turn_account_selection.is_some(),
-        &cancellation_token,
-    )
-    .await;
-    let turn_account_id_override = turn_account_selection
-        .as_ref()
-        .map(|selection| selection.account_id.clone());
-    let reset_remote_context_for_turn = if let Some(selection) = turn_account_selection.as_ref() {
-        sess.services
-            .reset_remote_context_for_selection(selection)
-            .await
-    } else {
-        false
-    };
-    if reset_remote_context_for_turn {
-        sess.services.model_client.reset_remote_session_identity();
-        if let Some(account_pool_manager) = turn_account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.record_remote_context_reset(&turn_context.sub_id);
-        }
-    }
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    let pre_sampling_compacted = match run_pre_sampling_compact(
-        &sess,
-        &turn_context,
-        turn_account_id_override.clone(),
-    )
-    .await
-    {
+    let pre_sampling_compacted = match run_pre_sampling_compact(&sess, &turn_context, None).await {
         Ok(pre_sampling_compacted) => pre_sampling_compacted,
         Err(_) => {
             error!("Failed to run pre-sampling compact");
@@ -6607,21 +6507,11 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
-    if turn_account_selection.is_some()
-        && let Some(mut client_session) = prewarmed_client_session.take()
-    {
-        // Startup prewarm happens before turn lease selection, so reset websocket state before
-        // dropping the prewarmed session to avoid caching stale auth/routing context.
-        client_session.reset_websocket_session();
-    }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    if let Some(turn_account_selection) = turn_account_selection {
-        client_session.set_account_id_override(Some(turn_account_selection.account_id));
-    }
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
@@ -6744,7 +6634,7 @@ pub(crate) async fn run_turn(
                         &sess,
                         &turn_context,
                         InitialContextInjection::BeforeLastUserMessage,
-                        turn_account_id_override.clone(),
+                        None,
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
                     )
@@ -7321,41 +7211,15 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(err) = account_pool_manager.report_usage_limit_reached().await {
-                        warn!("failed to record account-pool usage-limit event: {err:#}");
-                    }
-                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err @ CodexErr::RefreshTokenFailed(_)) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                        warn!(
-                            "failed to record account-pool unauthorized event after refresh failure: {report_err:#}"
-                        );
-                    }
-                }
-                return Err(err);
-            }
+            Err(err @ CodexErr::RefreshTokenFailed(_)) => return Err(err),
             Err(
                 err @ CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
                     status: http::StatusCode::UNAUTHORIZED,
                     ..
                 }),
-            ) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager_for_turn() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                        warn!(
-                            "failed to record account-pool unauthorized event after 401 response: {report_err:#}"
-                        );
-                    }
-                }
-                return Err(err);
-            }
+            ) => return Err(err),
             Err(err) => err,
         };
 
