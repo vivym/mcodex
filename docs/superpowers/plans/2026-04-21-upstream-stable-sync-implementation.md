@@ -809,6 +809,9 @@ Expected: log update is staged for the eventual merge commit.
 - Modify: `codex-rs/core/Cargo.toml`
 - Modify: `codex-rs/app-server/README.md`
 - Modify: `codex-rs/app-server/src/message_processor.rs`
+- Review or modify if contract drift appears: `codex-rs/app-server/src/codex_message_processor.rs`
+- Review or modify if contract drift appears: `codex-rs/app-server-protocol/src/protocol/common.rs`
+- Review or modify if contract drift appears: `codex-rs/app-server-protocol/src/protocol/v2.rs`
 - Modify: `codex-rs/app-server/tests/common/mcp_process.rs`
 - Modify: `codex-rs/app-server/tests/suite/v2/command_exec.rs`
 - Modify: `codex-rs/app-server/tests/suite/v2/realtime_conversation.rs`
@@ -828,9 +831,9 @@ codex-rs/core/Cargo.toml
 
 Preserve upstream dependency/version changes and keep fork crates such as `codex-account-pool` and `codex-product-identity` wired into the workspace. Do not delete fork crates to make dependency conflicts disappear.
 
-- [ ] **Step 2: Resolve app-server code conflicts**
+- [ ] **Step 2: Resolve app-server code conflicts and review pooled routing seams**
 
-Edit `codex-rs/app-server/src/message_processor.rs` so upstream `rust-v0.122.0` APIs remain and fork pooled lease/API behavior remains. Do not use whole-file `ours` or `theirs`.
+Edit `codex-rs/app-server/src/message_processor.rs` so upstream `rust-v0.122.0` APIs remain and fork pooled lease/API behavior remains. Review `codex-rs/app-server/src/codex_message_processor.rs` at the same time and merge any required pooled-runtime or request-routing adjustments there as well. Do not use whole-file `ours` or `theirs`.
 
 - [ ] **Step 3: Resolve app-server test conflicts**
 
@@ -845,11 +848,22 @@ codex-rs/app-server/tests/suite/v2/turn_start.rs
 
 Preserve upstream test coverage for new 0.122 behavior and fork pooled-mode fixtures.
 
-- [ ] **Step 4: Resolve docs without dropping fork API documentation**
+- [ ] **Step 4: Review protocol source definitions before regenerating schemas**
+
+Review:
+
+```text
+codex-rs/app-server-protocol/src/protocol/common.rs
+codex-rs/app-server-protocol/src/protocol/v2.rs
+```
+
+Preserve upstream `0.122` protocol source changes and keep the fork's shipped pooled API semantics intact before any schema regeneration. Do not rely on generated JSON or TypeScript diffs to catch semantic protocol regressions after the fact.
+
+- [ ] **Step 5: Resolve docs without dropping fork API documentation**
 
 Edit `codex-rs/app-server/README.md`. Keep upstream 0.122 API documentation and preserve shipped pooled API documentation.
 
-- [ ] **Step 5: Defer generated protocol files until source compiles**
+- [ ] **Step 6: Defer generated protocol files until source compiles**
 
 For conflicted generated files, prefer removing conflict markers by regenerating later. Do not hand-select final JSON/TypeScript chunks as the final solution. Leave a note in the execution log:
 
@@ -857,7 +871,7 @@ For conflicted generated files, prefer removing conflict markers by regenerating
 - App-server generated schema conflicts deferred until after protocol source resolution.
 ```
 
-- [ ] **Step 6: Stage resolved non-generated app-server files**
+- [ ] **Step 7: Stage resolved non-generated app-server files**
 
 Run:
 
@@ -866,7 +880,10 @@ git add \
   codex-rs/Cargo.toml \
   codex-rs/core/Cargo.toml \
   codex-rs/app-server/README.md \
+  codex-rs/app-server/src/codex_message_processor.rs \
   codex-rs/app-server/src/message_processor.rs \
+  codex-rs/app-server-protocol/src/protocol/common.rs \
+  codex-rs/app-server-protocol/src/protocol/v2.rs \
   codex-rs/app-server/tests/common/mcp_process.rs \
   codex-rs/app-server/tests/suite/v2/command_exec.rs \
   codex-rs/app-server/tests/suite/v2/realtime_conversation.rs \
@@ -1142,6 +1159,13 @@ Expected: these files are no longer unresolved.
 - Modify: `codex-rs/tui/src/history_cell.rs`
 - Modify: `codex-rs/tui/src/onboarding/onboarding_screen.rs`
 - Modify: `codex-rs/tui/src/slash_command.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/mod.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/account.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/helpers.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/format.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/rate_limits.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/card.rs`
+- Review or modify if contract drift appears: `codex-rs/tui/src/status/tests.rs`
 - Modify: `codex-rs/tui/src/tooltips.rs`
 - Modify: `codex-rs/tui/src/update_action.rs`
 - Modify: `docs/config.md`
@@ -1161,7 +1185,7 @@ Expected: these files are no longer unresolved.
 - Review or modify if contract drift appears: `README.md`
 - Review or modify if contract drift appears: `docs/install.md`
 
-- [ ] **Step 1: Resolve TUI app/session conflicts**
+- [ ] **Step 1: Resolve TUI app/session conflicts and review status integration surfaces**
 
 Edit:
 
@@ -1170,9 +1194,16 @@ codex-rs/tui/src/app.rs
 codex-rs/tui/src/app/app_server_adapter.rs
 codex-rs/tui/src/app_server_session.rs
 codex-rs/tui/src/chatwidget.rs
+codex-rs/tui/src/status/mod.rs
+codex-rs/tui/src/status/account.rs
+codex-rs/tui/src/status/helpers.rs
+codex-rs/tui/src/status/format.rs
+codex-rs/tui/src/status/rate_limits.rs
+codex-rs/tui/src/status/card.rs
+codex-rs/tui/src/status/tests.rs
 ```
 
-Keep upstream 0.122 side conversation, queueing, plan mode, plugin, and permission behavior. Preserve fork pooled status, startup access, and `mcodex` identity surfaces. Avoid adding unrelated logic to `chatwidget.rs`.
+Keep upstream 0.122 side conversation, queueing, plan mode, plugin, and permission behavior. Preserve fork pooled status, startup access, and `mcodex` identity surfaces. Review `codex-rs/tui/src/status/*` semantically even if they are not direct conflicts so pooled lease rendering, unavailable-account messaging, damping notes, and next-eligible-time displays remain correct. Avoid adding unrelated logic to `chatwidget.rs`.
 
 - [ ] **Step 2: Resolve TUI identity/update/onboarding conflicts**
 
@@ -1300,6 +1331,13 @@ git add \
   codex-rs/tui/src/history_cell.rs \
   codex-rs/tui/src/onboarding/onboarding_screen.rs \
   codex-rs/tui/src/slash_command.rs \
+  codex-rs/tui/src/status/mod.rs \
+  codex-rs/tui/src/status/account.rs \
+  codex-rs/tui/src/status/helpers.rs \
+  codex-rs/tui/src/status/format.rs \
+  codex-rs/tui/src/status/rate_limits.rs \
+  codex-rs/tui/src/status/card.rs \
+  codex-rs/tui/src/status/tests.rs \
   codex-rs/tui/src/tooltips.rs \
   codex-rs/tui/src/update_action.rs \
   docs/config.md \
