@@ -920,6 +920,7 @@ Expected: these files are no longer unresolved.
 
 **Files:**
 - Modify or delete: `codex-rs/core/src/codex.rs`
+- Modify or delete: `codex-rs/core/src/codex_tests.rs`
 - Modify: `codex-rs/core/src/client.rs`
 - Modify: `codex-rs/core/src/client_tests.rs`
 - Modify: `codex-rs/core/src/codex_delegate.rs`
@@ -940,22 +941,23 @@ Expected: these files are no longer unresolved.
 Run:
 
 ```bash
-git status --short codex-rs/core/src/codex.rs
-git ls-tree --name-only rust-v0.122.0:codex-rs/core/src | rg 'codex|thread|delegate|session'
+git status --short codex-rs/core/src/codex.rs codex-rs/core/src/codex_tests.rs
+git ls-tree --name-only rust-v0.122.0:codex-rs/core/src | rg 'codex|thread|delegate|session|client_tests'
 ```
 
-Expected: upstream has no `codex.rs` and uses newer runtime/thread/delegate/session files.
+Expected: upstream has no `codex.rs` compatibility point and instead uses newer runtime/thread/delegate/session files plus their corresponding test surfaces.
 
-- [ ] **Step 2: List fork semantics currently in `codex.rs`**
+- [ ] **Step 2: List fork semantics and coupled assertions currently in `codex.rs` and `codex_tests.rs`**
 
 Run:
 
 ```bash
 rg -n 'account_pool|pooled|lease|Leased|auth|compact|review|realtime|websocket' \
-  codex-rs/core/src/codex.rs
+  codex-rs/core/src/codex.rs \
+  codex-rs/core/src/codex_tests.rs
 ```
 
-Expected: output identifies fork runtime semantics that must be ported, not blindly kept in the deleted file.
+Expected: output identifies fork runtime semantics and old-shape assertions that must be ported, not blindly kept in obsolete files.
 
 - [ ] **Step 3: Port fork semantics into upstream runtime structure**
 
@@ -965,6 +967,9 @@ Move or adapt the identified semantics into the upstream 0.122 structure:
 codex-rs/core/src/codex_thread.rs
 codex-rs/core/src/codex_delegate.rs
 codex-rs/core/src/client.rs
+codex-rs/core/src/client_tests.rs
+codex-rs/core/src/session/tests.rs
+codex-rs/core/tests/suite/realtime_conversation.rs
 codex-rs/core/src/tasks/compact.rs
 codex-rs/core/src/state/service.rs
 ```
@@ -979,7 +984,13 @@ realtime/websocket paths do not bypass pooled auth
 unavailable pooled accounts fail closed
 ```
 
-- [ ] **Step 4: Accept upstream deletion of `codex.rs` when port is complete**
+- [ ] **Step 4: Resolve `codex_tests.rs` for the final 0.122 runtime shape**
+
+Edit or remove `codex-rs/core/src/codex_tests.rs`. Port still-valid assertions into the upstream-owned test surfaces listed above, and remove assertions that only make sense for the deleted `codex.rs` compatibility shape. If upstream no longer keeps `codex_tests.rs`, delete it only after the surviving coverage lives elsewhere.
+
+Expected: there is an explicit final-state owner for every still-relevant `codex.rs`-adjacent test, and no obsolete compatibility-shape tests linger silently.
+
+- [ ] **Step 5: Accept upstream deletion of `codex.rs` when port is complete**
 
 Run:
 
@@ -989,7 +1000,7 @@ git rm codex-rs/core/src/codex.rs
 
 Expected: `codex.rs` is removed only after required fork semantics are present in upstream replacement files. If there is a documented architectural reason to keep it, record that reason in the execution log before not deleting it.
 
-- [ ] **Step 5: Resolve core config-loader conflicts**
+- [ ] **Step 6: Resolve core config-loader conflicts**
 
 Edit:
 
@@ -1000,7 +1011,7 @@ codex-rs/core/src/config_loader/mod.rs
 
 Keep upstream managed config changes and preserve fork active `mcodex` roots. Normal runtime must not read live `CODEX_HOME` or `~/.codex`.
 
-- [ ] **Step 6: Resolve plugin, MCP, guardian, and session test conflicts**
+- [ ] **Step 7: Resolve plugin, MCP, guardian, and session test conflicts**
 
 Edit:
 
@@ -1014,7 +1025,7 @@ codex-rs/core/tests/suite/view_image.rs
 
 Preserve upstream 0.122 filesystem/plugin/MCP behavior and fork product identity expectations.
 
-- [ ] **Step 7: Resolve core request path tests**
+- [ ] **Step 8: Resolve core request path tests**
 
 Edit:
 
@@ -1025,7 +1036,7 @@ codex-rs/core/tests/suite/realtime_conversation.rs
 
 Keep upstream 0.122 tests and ensure fork account-pool tests still assert lease-scoped request auth. If existing tests no longer cover compact/review/realtime leased auth after the port, add focused tests in `codex-rs/core/tests/suite/account_pool.rs`.
 
-- [ ] **Step 8: Run core tests**
+- [ ] **Step 9: Run core tests**
 
 Run:
 
@@ -1036,7 +1047,7 @@ cargo test -p codex-core
 
 Expected: PASS. If failures occur, use @superpowers:systematic-debugging and record the failing test name and root cause.
 
-- [ ] **Step 9: Stage core runtime migration files**
+- [ ] **Step 10: Stage core runtime migration files**
 
 Run:
 
@@ -1045,6 +1056,7 @@ git add \
   codex-rs/core/src/client.rs \
   codex-rs/core/src/client_tests.rs \
   codex-rs/core/src/codex.rs \
+  codex-rs/core/src/codex_tests.rs \
   codex-rs/core/src/codex_delegate.rs \
   codex-rs/core/src/codex_thread.rs \
   codex-rs/core/src/config_loader/layer_io.rs \
