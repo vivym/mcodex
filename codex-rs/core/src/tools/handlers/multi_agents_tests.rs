@@ -85,10 +85,10 @@ fn parse_agent_id(id: &str) -> ThreadId {
 }
 
 fn thread_manager() -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
-    )
+    let mut model_provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
+    model_provider.supports_websockets = false;
+    ThreadManager::with_models_provider_for_tests(CodexAuth::from_api_key("dummy"), model_provider)
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
@@ -209,11 +209,24 @@ async fn wait_for_redirected_envelope_in_history(
                 );
                 break;
             }
+            // When a redirected followup wakes an idle replacement turn, the message may sit in
+            // the new turn's pending input briefly before the turn records it into history. In
+            // this test, that pending input can only come from the redirected envelope we just
+            // submitted, so treat "moved out of the mailbox and into pending input" as success.
+            if thread.codex.session.has_pending_input().await
+                && !thread.codex.session.has_trigger_turn_mailbox_items().await
+            {
+                assert!(
+                    !saw_user_message,
+                    "redirected followup should never downgrade into a plain user message"
+                );
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("redirected followup envelope should appear in history");
+    .expect("redirected followup envelope should appear in history or remain queued for the replacement turn");
 }
 
 #[derive(Clone, Copy)]
@@ -1492,24 +1505,25 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    SpawnAgentHandlerV2
-        .handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "boot worker",
-                "task_name": "worker"
-            })),
-        ))
-        .await
-        .expect("spawn worker");
+    let worker_path = AgentPath::try_from("/root/worker").expect("worker path");
     let agent_id = session
         .services
         .agent_control
-        .resolve_agent_reference(session.conversation_id, &turn.session_source, "worker")
+        .spawn_agent_with_metadata(
+            (*turn.config).clone(),
+            Op::CleanBackgroundTerminals,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(worker_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions::default(),
+        )
         .await
-        .expect("worker should resolve");
+        .expect("worker spawn should succeed")
+        .thread_id;
     let thread = manager
         .get_thread(agent_id)
         .await
@@ -1566,7 +1580,7 @@ async fn multi_agent_v2_followup_task_interrupts_busy_child_without_losing_messa
         &thread,
         &InterAgentCommunication::new(
             AgentPath::root(),
-            AgentPath::try_from("/root/worker").expect("agent path"),
+            worker_path,
             Vec::new(),
             "continue".to_string(),
             /*trigger_turn*/ true,

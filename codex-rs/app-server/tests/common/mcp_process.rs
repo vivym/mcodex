@@ -155,12 +155,19 @@ impl McpProcess {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
+        // Keep mcodex's canonical home while preserving the legacy CODEX_HOME
+        // baseline that command/exec and related subprocess tests inherit.
         cmd.env("MCODEX_HOME", codex_home);
-        cmd.env_remove("CODEX_HOME");
+        cmd.env("CODEX_HOME", codex_home);
         // The app-server integration suite spawns many child processes in parallel. Keeping the
         // default child log level at `warn` avoids stderr backpressure and harness capture
         // contention that can otherwise starve the JSON-RPC control flow and make tests flaky.
         cmd.env("RUST_LOG", "warn");
+        // Keep integration tests isolated from host managed configuration.
+        cmd.env(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            codex_home.join("managed_config.toml"),
+        );
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
         cmd.args(args);
 

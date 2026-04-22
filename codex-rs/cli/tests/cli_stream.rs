@@ -18,7 +18,8 @@ fn repo_root() -> std::path::PathBuf {
 
 fn cli_responses_fixture() -> std::path::PathBuf {
     #[expect(clippy::expect_used)]
-    find_resource!("tests/cli_responses_fixture.sse").expect("failed to resolve fixture path")
+    find_resource!("../core/tests/cli_responses_fixture.sse")
+        .expect("failed to resolve fixture path")
 }
 
 /// Tests streaming the Responses API through the CLI using a mock server.
@@ -52,7 +53,7 @@ async fn responses_mode_stream_cli() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy");
 
     let output = cmd.output().unwrap();
@@ -114,7 +115,7 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy");
 
     let output = cmd.output().unwrap();
@@ -170,7 +171,7 @@ async fn exec_cli_applies_model_instructions_file() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?\n");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy");
 
     let output = cmd.output().unwrap();
@@ -240,7 +241,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?\n");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy");
 
     let output = cmd.output().unwrap();
@@ -285,7 +286,7 @@ async fn responses_api_stream_cli() {
         .arg("-C")
         .arg(&repo_root)
         .arg("hello?");
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("CODEX_RS_SSE_FIXTURE", fixture);
 
@@ -322,7 +323,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .arg("-C")
         .arg(&repo_root)
         .arg(&prompt);
-    cmd.env("CODEX_HOME", home.path())
+    cmd.env("MCODEX_HOME", home.path())
         .env(CODEX_API_KEY_ENV_VAR, "dummy")
         .env("CODEX_RS_SSE_FIXTURE", &fixture);
 
@@ -445,7 +446,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .arg(&prompt2)
         .arg("resume")
         .arg("--last");
-    cmd2.env("CODEX_HOME", home.path())
+    cmd2.env("MCODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("CODEX_RS_SSE_FIXTURE", &fixture);
 

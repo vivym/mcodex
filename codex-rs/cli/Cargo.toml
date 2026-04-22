@@ -29,6 +29,7 @@ codex-app-server = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-app-server-test-client = { workspace = true }
 codex-arg0 = { workspace = true }
+codex-api = { workspace = true }
 codex-chatgpt = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
 codex-utils-cli = { workspace = true }
@@ -50,6 +51,7 @@ codex-state = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-tui = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 codex-utils-path = { workspace = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
@@ -75,7 +77,11 @@ codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
+codex-git-utils = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
+core_test_support = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
 sqlx = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+wiremock = { workspace = true }

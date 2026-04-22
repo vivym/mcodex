@@ -17,6 +17,7 @@ pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
 use regex_lite::Regex;
 use std::path::PathBuf;
+use std::process::Command;
 
 pub mod apps_test_server;
 pub mod context_snapshot;
@@ -118,6 +119,33 @@ impl TempDirExt for TempDir {
 
 pub fn test_tmp_path() -> AbsolutePathBuf {
     test_absolute_path_with_windows("/tmp", Some(r"C:\Users\codex\AppData\Local\Temp"))
+}
+
+pub fn resolved_python_executable() -> Option<PathBuf> {
+    for candidate in ["python3", "python"] {
+        let output = match Command::new(candidate)
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let resolved = String::from_utf8(output.stdout).ok()?;
+        let executable = resolved.lines().next()?.trim();
+        if executable.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(executable);
+        return path.canonicalize().ok().or(Some(path));
+    }
+
+    None
 }
 
 pub fn test_tmp_path_buf() -> PathBuf {

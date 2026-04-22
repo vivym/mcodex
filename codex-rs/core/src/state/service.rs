@@ -5,6 +5,7 @@ use std::time::Duration as StdDuration;
 use crate::RolloutRecorder;
 use crate::SkillsManager;
 use crate::agent::AgentControl;
+use crate::agent_identity::AgentIdentityManager;
 use crate::client::ModelClient;
 use crate::config::StartedNetworkProxy;
 use crate::exec_policy::ExecPolicyManager;
@@ -46,8 +47,11 @@ use codex_state::AccountHealthState;
 use codex_state::AccountLeaseError;
 use codex_state::AccountLeaseRecord;
 use codex_state::AccountPoolEventRecord;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupEligibility;
 use codex_state::LeaseRenewal;
+use codex_state::QuotaExhaustedWindows;
+use codex_thread_store::LocalThreadStore;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -67,6 +71,7 @@ pub(crate) struct SessionServices {
     pub(crate) hooks: Hooks,
     pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
+    pub(crate) agent_identity_manager: Arc<AgentIdentityManager>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
@@ -85,6 +90,7 @@ pub(crate) struct SessionServices {
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) account_pool_manager: Option<Arc<Mutex<AccountPoolManager>>>,
     pub(crate) lease_auth: Arc<crate::lease_auth::SessionLeaseAuth>,
+    pub(crate) thread_store: LocalThreadStore,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
@@ -146,6 +152,7 @@ impl SessionServices {
 mod tests {
     use super::*;
     use codex_config::types::AccountPoolDefinitionToml;
+    use codex_protocol::protocol::RateLimitWindow;
     use codex_state::AccountQuotaStateRecord;
     use codex_state::AccountRegistryEntryUpdate;
     use codex_state::AccountStartupSelectionUpdate;
@@ -301,6 +308,93 @@ mod tests {
                 next_eligible_at: None,
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn report_usage_limit_reached_records_exhausted_quota_for_rotation() -> anyhow::Result<()>
+    {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        state_db
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-primary".to_string(),
+            })
+            .await?;
+        state_db
+            .import_legacy_default_account(LegacyAccountImport {
+                account_id: "acct-secondary".to_string(),
+            })
+            .await?;
+        let mut manager = AccountPoolManager::new(
+            Arc::clone(&state_db),
+            AccountsConfigToml {
+                backend: None,
+                default_pool: Some("legacy-default".to_string()),
+                proactive_switch_threshold_percent: None,
+                lease_ttl_secs: None,
+                heartbeat_interval_secs: None,
+                min_switch_interval_secs: None,
+                allocation_mode: None,
+                pools: None,
+            },
+            home.path().to_path_buf(),
+            "holder-usage-limit".to_string(),
+        );
+
+        let first_selection = manager
+            .prepare_turn()
+            .await?
+            .expect("first turn should acquire primary account");
+        assert_eq!(first_selection.account_id, "acct-primary");
+
+        let reset_at = DateTime::<Utc>::from_timestamp(1_704_067_242, 0)
+            .expect("fixed reset timestamp should be valid");
+        let snapshot = RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(15),
+                resets_at: Some(reset_at.timestamp()),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+        };
+        manager
+            .report_usage_limit_reached(Some(&snapshot), Some(reset_at))
+            .await?;
+
+        let quota = state_db
+            .read_account_quota_state("acct-primary", "codex")
+            .await?
+            .expect("usage-limit should persist exhausted quota state");
+        assert_eq!(
+            quota,
+            AccountQuotaStateRecord {
+                account_id: "acct-primary".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: Some(100.0),
+                primary_resets_at: Some(reset_at),
+                secondary_used_percent: None,
+                secondary_resets_at: None,
+                observed_at: quota.observed_at,
+                exhausted_windows: QuotaExhaustedWindows::Primary,
+                predicted_blocked_until: Some(reset_at),
+                next_probe_after: Some(reset_at),
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            }
+        );
+
+        let second_selection = manager
+            .prepare_turn()
+            .await?
+            .expect("second turn should rotate to the next eligible account");
+        assert_eq!(second_selection.account_id, "acct-secondary");
         Ok(())
     }
 }
@@ -775,9 +869,23 @@ impl AccountPoolManager {
         Ok(())
     }
 
-    pub(crate) async fn report_usage_limit_reached(&mut self) -> anyhow::Result<()> {
-        self.record_health_event(AccountHealthState::RateLimited, Utc::now())
-            .await
+    pub(crate) async fn report_usage_limit_reached(
+        &mut self,
+        rate_limits: Option<&RateLimitSnapshot>,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let observed_at = Utc::now();
+        let active_account_id = self
+            .active_lease
+            .as_ref()
+            .map(|lease| lease.record.account_id.clone());
+        self.record_health_event(AccountHealthState::RateLimited, observed_at)
+            .await?;
+        if let Some(account_id) = active_account_id {
+            self.record_usage_limit_quota_state(&account_id, rate_limits, resets_at, observed_at)
+                .await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn report_unauthorized(&mut self) -> anyhow::Result<()> {
@@ -822,6 +930,69 @@ impl AccountPoolManager {
         self.switch_reason = Some(AccountLeaseRuntimeReason::NonReplayableTurn);
         self.suppression_reason = None;
         Ok(())
+    }
+
+    async fn record_usage_limit_quota_state(
+        &self,
+        account_id: &str,
+        rate_limits: Option<&RateLimitSnapshot>,
+        resets_at: Option<DateTime<Utc>>,
+        observed_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let to_datetime =
+            |seconds| DateTime::<Utc>::from_timestamp(seconds, 0).filter(|_| seconds >= 0);
+        let primary = rate_limits.and_then(|snapshot| snapshot.primary.as_ref());
+        let secondary = rate_limits.and_then(|snapshot| snapshot.secondary.as_ref());
+        let primary_resets_at = primary
+            .and_then(|window| window.resets_at)
+            .and_then(to_datetime);
+        let secondary_resets_at = secondary
+            .and_then(|window| window.resets_at)
+            .and_then(to_datetime);
+        let primary_exhausted = primary.is_some_and(|window| window.used_percent >= 100.0);
+        let secondary_exhausted = secondary.is_some_and(|window| window.used_percent >= 100.0);
+        let exhausted_windows = match (primary_exhausted, secondary_exhausted) {
+            (true, true) => QuotaExhaustedWindows::Both,
+            (true, false) => QuotaExhaustedWindows::Primary,
+            (false, true) => QuotaExhaustedWindows::Secondary,
+            (false, false) => QuotaExhaustedWindows::Unknown,
+        };
+        let window_reset = match exhausted_windows {
+            QuotaExhaustedWindows::Primary => primary_resets_at,
+            QuotaExhaustedWindows::Secondary => secondary_resets_at,
+            QuotaExhaustedWindows::Both => match (primary_resets_at, secondary_resets_at) {
+                (Some(primary), Some(secondary)) => Some(primary.max(secondary)),
+                (Some(primary), None) => Some(primary),
+                (None, Some(secondary)) => Some(secondary),
+                (None, None) => None,
+            },
+            QuotaExhaustedWindows::Unknown => primary_resets_at.or(secondary_resets_at),
+            QuotaExhaustedWindows::None => None,
+        };
+        let predicted_blocked_until = resets_at.or(window_reset);
+        let limit_id = rate_limits
+            .and_then(|snapshot| snapshot.limit_id.as_deref())
+            .map(str::trim)
+            .filter(|limit_id| !limit_id.is_empty())
+            .unwrap_or("codex")
+            .to_string();
+
+        self.state_db
+            .upsert_account_quota_state(AccountQuotaStateRecord {
+                account_id: account_id.to_string(),
+                limit_id,
+                primary_used_percent: primary.map(|window| window.used_percent),
+                primary_resets_at,
+                secondary_used_percent: secondary.map(|window| window.used_percent),
+                secondary_resets_at,
+                observed_at,
+                exhausted_windows,
+                predicted_blocked_until,
+                next_probe_after: predicted_blocked_until,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
     }
 
     async fn acquire_proactively_rotated_lease(

@@ -742,6 +742,7 @@ fn write_pooled_auth(
                 account_id: Some(account_id.to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         codex_login::AuthCredentialsStoreMode::File,
     )?;
@@ -1652,8 +1653,9 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 
     let harness = websocket_harness(&server).await;
     let mut client_session = harness.client.new_session();
-    let first_turn_metadata = r#"{"turn_id":"turn-123","sandbox":"workspace-write"}"#;
-    let enriched_turn_metadata = r#"{"turn_id":"turn-123","sandbox":"workspace-write","workspaces":[{"root_path":"/tmp/repo","latest_git_commit_hash":"abc123","associated_remote_urls":["git@github.com:openai/codex.git"],"has_changes":true}]}"#;
+    let first_turn_metadata =
+        r#"{"turn_id":"turn-123","thread_source":"user","sandbox":"workspace-write"}"#;
+    let enriched_turn_metadata = r#"{"turn_id":"turn-123","thread_source":"user","sandbox":"workspace-write","workspaces":[{"root_path":"/tmp/repo","latest_git_commit_hash":"abc123","associated_remote_urls":["git@github.com:openai/codex.git"],"has_changes":true}]}"#;
     let prompt_one = prompt_with_input(vec![message_item("hello")]);
     let prompt_two = prompt_with_input(vec![
         message_item("hello"),
@@ -1702,6 +1704,8 @@ async fn responses_websocket_forwards_turn_metadata_on_initial_and_incremental_c
 
     assert_eq!(first_metadata["turn_id"].as_str(), Some("turn-123"));
     assert_eq!(second_metadata["turn_id"].as_str(), Some("turn-123"));
+    assert_eq!(first_metadata["thread_source"].as_str(), Some("user"));
+    assert_eq!(second_metadata["thread_source"].as_str(), Some("user"));
     assert_eq!(
         second_metadata["workspaces"][0]["has_changes"].as_bool(),
         Some(true)

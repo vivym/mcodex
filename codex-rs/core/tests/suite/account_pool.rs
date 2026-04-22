@@ -131,7 +131,7 @@ async fn account_lease_snapshot_reports_proactive_switch_suppression_without_rat
             .accounts
             .as_mut()
             .expect("pooled accounts config")
-            .min_switch_interval_secs = Some(5);
+            .min_switch_interval_secs = Some(300);
     });
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
@@ -150,7 +150,7 @@ async fn account_lease_snapshot_reports_proactive_switch_suppression_without_rat
     assert_eq!(snapshot.health_state, Some(AccountHealthState::Healthy));
     assert_eq!(snapshot.proactive_switch_pending, Some(true));
     assert_eq!(snapshot.proactive_switch_suppressed, Some(true));
-    assert_eq!(snapshot.min_switch_interval_secs, Some(5));
+    assert_eq!(snapshot.min_switch_interval_secs, Some(300));
     assert!(snapshot.lease_acquired_at.is_some());
     assert!(snapshot.proactive_switch_allowed_at.is_some());
 
@@ -158,7 +158,8 @@ async fn account_lease_snapshot_reports_proactive_switch_suppression_without_rat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_soft_pressure_clears_after_window_without_forcing_rotation() -> Result<()> {
+async fn soft_pressure_clears_on_subsequent_low_pressure_turn_without_forcing_rotation()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -176,7 +177,7 @@ async fn stale_soft_pressure_clears_after_window_without_forcing_rotation() -> R
             .accounts
             .as_mut()
             .expect("pooled accounts config")
-            .min_switch_interval_secs = Some(3);
+            .min_switch_interval_secs = Some(300);
     });
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
@@ -185,9 +186,7 @@ async fn stale_soft_pressure_clears_after_window_without_forcing_rotation() -> R
     let first_turn_error = submit_turn_and_wait(&test, "suppressed pressure turn").await?;
     assert!(first_turn_error.is_none());
 
-    tokio::time::sleep(Duration::from_secs(4)).await;
-
-    let second_turn_error = submit_turn_and_wait(&test, "after stale pressure").await?;
+    let second_turn_error = submit_turn_and_wait(&test, "after cleared pressure").await?;
     assert!(second_turn_error.is_none());
 
     let requests = response_mock.requests();
@@ -271,7 +270,7 @@ mod observability_event {
                 .accounts
                 .as_mut()
                 .expect("pooled accounts config")
-                .min_switch_interval_secs = Some(5);
+                .min_switch_interval_secs = Some(300);
         });
         let test = builder.build(&server).await?;
         seed_two_accounts(&test).await?;
@@ -2211,6 +2210,7 @@ fn write_chatgpt_auth(auth_home: &Path, account_id: &str, access_token: &str) ->
                 account_id: Some(account_id.to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;

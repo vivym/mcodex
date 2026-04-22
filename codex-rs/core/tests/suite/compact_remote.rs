@@ -163,6 +163,7 @@ fn write_pooled_auth(
                 account_id: Some(account_id.to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;

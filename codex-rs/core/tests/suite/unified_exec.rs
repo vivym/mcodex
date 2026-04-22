@@ -17,6 +17,7 @@ use core_test_support::assert_regex_match;
 use core_test_support::process::process_is_alive;
 use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
+use core_test_support::resolved_python_executable;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -384,7 +385,7 @@ async fn unified_exec_emits_exec_command_begin_event() -> Result<()> {
 
     assert_command(&begin_event.command, "-lc", "/bin/echo hello unified exec");
 
-    assert_eq!(begin_event.cwd, cwd);
+    assert_eq!(begin_event.cwd.as_path(), cwd.as_path());
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -449,7 +450,8 @@ async fn unified_exec_resolves_relative_workdir() -> Result<()> {
     .await;
 
     assert_eq!(
-        begin_event.cwd, workdir,
+        begin_event.cwd.as_path(),
+        workdir.as_path(),
         "exec_command cwd should resolve relative workdir against turn cwd",
     );
 
@@ -511,7 +513,8 @@ async fn unified_exec_respects_workdir_override() -> Result<()> {
     .await;
 
     assert_eq!(
-        begin_event.cwd, workdir,
+        begin_event.cwd.as_path(),
+        workdir.as_path(),
         "exec_command cwd should reflect the requested workdir override"
     );
 
@@ -2341,9 +2344,9 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
 async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let python = match which::which("python").or_else(|_| which::which("python3")) {
-        Ok(path) => path,
-        Err(_) => {
+    let python = match resolved_python_executable() {
+        Some(path) => path,
+        None => {
             eprintln!("python not found in PATH, skipping test.");
             return Ok(());
         }
@@ -2367,7 +2370,7 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
 
     let startup_call_id = "uexec-python-seatbelt";
     let startup_args = serde_json::json!({
-        "cmd": format!("{} -i", python.display()),
+        "cmd": shlex::try_join([python.to_string_lossy().as_ref(), "-i"])?,
         "yield_time_ms": 1_500,
         "tty": true,
     });

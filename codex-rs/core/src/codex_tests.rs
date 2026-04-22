@@ -110,7 +110,14 @@ use opentelemetry::trace::TraceId;
 use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use codex_protocol::mcp::CallToolResult as McpCallToolResult;
 use pretty_assertions::assert_eq;
@@ -590,77 +597,11 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
 }
 
 #[tokio::test]
-async fn managed_network_proxy_refreshes_when_sandbox_policy_changes() -> anyhow::Result<()> {
-    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
-        NetworkProxyConfig::default(),
-        Some(NetworkConstraints {
-            domains: Some(NetworkDomainPermissionsToml {
-                entries: std::collections::BTreeMap::from([(
-                    "blocked.example.com".to_string(),
-                    NetworkDomainPermissionToml::Deny,
-                )]),
-            }),
-            danger_full_access_denylist_only: Some(true),
-            allow_local_binding: Some(false),
-            ..Default::default()
-        }),
-        &SandboxPolicy::new_workspace_write_policy(),
-    )?;
-    let exec_policy = Policy::empty();
-
-    let (started_proxy, _) = Session::start_managed_network_proxy(
-        &spec,
-        &exec_policy,
-        &SandboxPolicy::new_workspace_write_policy(),
-        /*network_policy_decider*/ None,
-        /*blocked_request_observer*/ None,
-        /*managed_network_requirements_enabled*/ false,
-        crate::config::NetworkProxyAuditMetadata::default(),
-    )
-    .await?;
-
-    assert!(!started_proxy.proxy().allow_local_binding());
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
-    assert_eq!(current_cfg.network.allowed_domains(), None);
-    assert_eq!(
-        current_cfg.network.denied_domains(),
-        Some(vec!["blocked.example.com".to_string()])
-    );
-
-    let spec = spec.recompute_for_sandbox_policy(&SandboxPolicy::DangerFullAccess)?;
-    spec.apply_to_started_proxy(&started_proxy).await?;
-
-    assert!(started_proxy.proxy().allow_local_binding());
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
-    assert_eq!(
-        current_cfg.network.allowed_domains(),
-        Some(vec!["*".to_string()])
-    );
-    assert_eq!(
-        current_cfg.network.denied_domains(),
-        Some(vec!["blocked.example.com".to_string()])
-    );
-
-    let spec = spec.recompute_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy())?;
-    spec.apply_to_started_proxy(&started_proxy).await?;
-
-    assert!(!started_proxy.proxy().allow_local_binding());
-    let current_cfg = started_proxy.proxy().current_cfg().await?;
-    assert_eq!(current_cfg.network.allowed_domains(), None);
-    assert_eq!(
-        current_cfg.network.denied_domains(),
-        Some(vec!["blocked.example.com".to_string()])
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::Result<()> {
     let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
         Some(NetworkConstraints {
             enabled: Some(true),
-            danger_full_access_denylist_only: Some(true),
             ..Default::default()
         }),
         &SandboxPolicy::DangerFullAccess,
@@ -719,6 +660,89 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
         1,
         "unexpected proxy response: {response}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow::Result<()> {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let initial_policy = SandboxPolicy::new_workspace_write_policy();
+
+    let mut network_config = NetworkProxyConfig::default();
+    network_config
+        .network
+        .set_allowed_domains(vec!["evil.com".to_string()]);
+    let requirements = NetworkConstraints {
+        domains: Some(NetworkDomainPermissionsToml {
+            entries: std::collections::BTreeMap::from([(
+                "*.example.com".to_string(),
+                NetworkDomainPermissionToml::Allow,
+            )]),
+        }),
+        ..Default::default()
+    };
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        network_config,
+        Some(requirements),
+        &initial_policy,
+    )?;
+    let (started_proxy, _) = Session::start_managed_network_proxy(
+        &spec,
+        &Policy::empty(),
+        &initial_policy,
+        /*network_policy_decider*/ None,
+        /*blocked_request_observer*/ None,
+        /*managed_network_requirements_enabled*/ false,
+        crate::config::NetworkProxyAuditMetadata::default(),
+    )
+    .await?;
+    assert_eq!(
+        started_proxy
+            .proxy()
+            .current_cfg()
+            .await?
+            .network
+            .allowed_domains(),
+        Some(vec!["*.example.com".to_string(), "evil.com".to_string()])
+    );
+
+    {
+        let mut state = session.state.lock().await;
+        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+        config.permissions.network = Some(spec);
+        config.permissions.sandbox_policy =
+            codex_config::Constrained::allow_any(initial_policy.clone());
+        state.session_configuration.original_config_do_not_use = Arc::new(config);
+        state.session_configuration.sandbox_policy =
+            codex_config::Constrained::allow_any(initial_policy);
+    }
+    session.services.network_proxy = Some(started_proxy);
+
+    session
+        .new_turn_with_sub_id(
+            "sandbox-policy-change".to_string(),
+            SessionSettingsUpdate {
+                sandbox_policy: Some(SandboxPolicy::DangerFullAccess),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let started_proxy = session
+        .services
+        .network_proxy
+        .as_ref()
+        .expect("managed network proxy should be present");
+    assert_eq!(
+        started_proxy
+            .proxy()
+            .current_cfg()
+            .await?
+            .network
+            .allowed_domains(),
+        Some(vec!["*.example.com".to_string()])
+    );
+
     Ok(())
 }
 
@@ -971,7 +995,7 @@ fn mcp_tool_exposure_searches_large_effective_tool_sets() {
 }
 
 #[test]
-fn mcp_tool_exposure_directly_exposes_explicit_apps_in_large_search_sets() {
+fn mcp_tool_exposure_directly_exposes_explicit_apps_without_deferred_overlap() {
     let config = test_config();
     let tools_config = tools_config_for_mcp_tool_exposure(/*search_tool*/ true);
     let mut mcp_tools = numbered_mcp_tools(DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD - 1);
@@ -1002,13 +1026,19 @@ fn mcp_tool_exposure_directly_exposes_explicit_apps_in_large_search_sets() {
     );
     assert_eq!(
         exposure.deferred_tools.as_ref().map(HashMap::len),
-        Some(DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD)
+        Some(DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD - 1)
     );
     let deferred_tools = exposure
         .deferred_tools
         .as_ref()
         .expect("large tool sets should be discoverable through tool_search");
-    assert!(deferred_tools.contains_key("mcp__codex_apps__calendar_create_event"));
+    assert!(
+        tool_names
+            .iter()
+            .all(|direct_tool_name| !deferred_tools.contains_key(direct_tool_name)),
+        "direct tools should not also be deferred: {tool_names:?}"
+    );
+    assert!(!deferred_tools.contains_key("mcp__codex_apps__calendar_create_event"));
     assert!(deferred_tools.contains_key("mcp__rmcp__tool_0"));
 }
 
@@ -1986,7 +2016,7 @@ async fn set_rate_limits_retains_previous_credits() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -2088,7 +2118,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -2440,7 +2470,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -2517,12 +2547,19 @@ async fn new_default_turn_uses_config_aware_skills_for_role_overrides() {
     )
     .expect("write skill");
 
+    let skill_fs = session
+        .services
+        .environment
+        .as_ref()
+        .map(|environment| environment.get_filesystem())
+        .unwrap_or_else(|| std::sync::Arc::clone(&codex_exec_server::LOCAL_FS));
     let parent_outcome = session
         .services
         .skills_manager
         .skills_for_cwd(
             &crate::skills_load_input_from_config(&parent_config, Vec::new()),
             /*force_reload*/ true,
+            Some(Arc::clone(&skill_fs)),
         )
         .await;
     let parent_skill = parent_outcome
@@ -2703,7 +2740,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -2757,6 +2794,353 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
     assert!(msg.contains("zsh fork feature enabled, but `zsh_path` is not configured"));
 }
 
+#[tokio::test]
+async fn session_new_fails_before_emitting_events_when_initial_agent_identity_registration_fails() {
+    let server = MockServer::start().await;
+    let chatgpt_base_url = server.uri();
+    let target_url = format!("{chatgpt_base_url}/v1/agent/register");
+    Mock::given(method("GET"))
+        .and(path("/authenticate_app_v2"))
+        .and(header("authorization", "Bearer Access Token"))
+        .and(header("x-original-method", "POST"))
+        .and(header("x-original-url", target_url))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-openai-authorization", "human-biscuit"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/register"))
+        .and(header("x-openai-authorization", "human-biscuit"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("registration down"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    config
+        .features
+        .enable(Feature::UseAgentIdentity)
+        .expect("test config should allow agent identity");
+    config.chatgpt_base_url = chatgpt_base_url;
+    let config = Arc::new(config);
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager.clone(),
+        /*model_catalog*/ None,
+        CollaborationModesConfig::default(),
+    ));
+    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let model_info = ModelsManager::construct_model_info_offline_for_tests(
+        model.as_str(),
+        &config.to_models_manager_config(),
+    );
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model,
+            reasoning_effort: config.model_reasoning_effort,
+            developer_instructions: None,
+        },
+    };
+    let session_configuration = SessionConfiguration {
+        provider: config.model_provider.clone(),
+        collaboration_mode,
+        model_reasoning_summary: config.model_reasoning_summary,
+        developer_instructions: config.developer_instructions.clone(),
+        user_instructions: config.user_instructions.clone(),
+        service_tier: None,
+        personality: config.personality,
+        base_instructions: config
+            .base_instructions
+            .clone()
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+        compact_prompt: config.compact_prompt.clone(),
+        approval_policy: config.permissions.approval_policy.clone(),
+        approvals_reviewer: config.approvals_reviewer,
+        sandbox_policy: config.permissions.sandbox_policy.clone(),
+        file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
+        network_sandbox_policy: config.permissions.network_sandbox_policy,
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        cwd: config.cwd.clone(),
+        codex_home: config.codex_home.clone(),
+        thread_name: None,
+        original_config_do_not_use: Arc::clone(&config),
+        metrics_service_name: None,
+        app_server_client_name: None,
+        app_server_client_version: None,
+        session_source: SessionSource::Exec,
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        inherited_shell_snapshot: None,
+        user_shell_override: None,
+    };
+
+    let (tx_event, rx_event) = async_channel::unbounded();
+    let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ true,
+    ));
+    let result = Session::new(
+        session_configuration,
+        Arc::clone(&config),
+        auth_manager,
+        models_manager,
+        Arc::new(ExecPolicyManager::default()),
+        tx_event,
+        agent_status_tx,
+        InitialHistory::New,
+        SessionSource::Exec,
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        Arc::new(SkillsWatcher::noop()),
+        AgentControl::default(),
+        None,
+        Some(Arc::new(
+            codex_exec_server::Environment::create(/*exec_server_url*/ None)
+                .await
+                .expect("create environment"),
+        )),
+        /*analytics_events_client*/ None,
+    )
+    .await;
+
+    let err = match result {
+        Ok(_) => panic!("expected startup to fail"),
+        Err(err) => err,
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains(
+        "Agent identity registration failed. Codex cannot continue while `features.use_agent_identity` is enabled"
+    ));
+    assert!(msg.contains("agent identity registration failed with status 500"));
+    assert!(matches!(
+        rx_event.try_recv(),
+        Err(async_channel::TryRecvError::Empty | async_channel::TryRecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn session_new_emits_session_configured_before_async_agent_identity_failure_after_auth_reload()
+ {
+    fn fake_id_token(account_id: &str, user_id: Option<&str>) -> String {
+        use base64::Engine as _;
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": user_id,
+                "chatgpt_account_id": account_id,
+            }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{payload}.signature")
+    }
+
+    let server = MockServer::start().await;
+    let chatgpt_base_url = server.uri();
+    let target_url = format!("{chatgpt_base_url}/v1/agent/register");
+    Mock::given(method("GET"))
+        .and(path("/authenticate_app_v2"))
+        .and(header("authorization", "Bearer Access Token"))
+        .and(header("x-original-method", "POST"))
+        .and(header("x-original-url", target_url))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-openai-authorization", "human-biscuit"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/register"))
+        .and(header("x-openai-authorization", "human-biscuit"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("registration down"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let mut config = build_test_config(codex_home.path()).await;
+    config
+        .features
+        .enable(Feature::UseAgentIdentity)
+        .expect("test config should allow agent identity");
+    config.chatgpt_base_url = chatgpt_base_url;
+    let config = Arc::new(config);
+
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("Test API Key"),
+        config.codex_home.to_path_buf(),
+    );
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager.clone(),
+        /*model_catalog*/ None,
+        CollaborationModesConfig::default(),
+    ));
+    let model = ModelsManager::get_model_offline_for_tests(config.model.as_deref());
+    let model_info = ModelsManager::construct_model_info_offline_for_tests(
+        model.as_str(),
+        &config.to_models_manager_config(),
+    );
+    let collaboration_mode = CollaborationMode {
+        mode: ModeKind::Default,
+        settings: Settings {
+            model,
+            reasoning_effort: config.model_reasoning_effort,
+            developer_instructions: None,
+        },
+    };
+    let session_configuration = SessionConfiguration {
+        provider: config.model_provider.clone(),
+        collaboration_mode,
+        model_reasoning_summary: config.model_reasoning_summary,
+        developer_instructions: config.developer_instructions.clone(),
+        user_instructions: config.user_instructions.clone(),
+        service_tier: None,
+        personality: config.personality,
+        base_instructions: config
+            .base_instructions
+            .clone()
+            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+        compact_prompt: config.compact_prompt.clone(),
+        approval_policy: config.permissions.approval_policy.clone(),
+        approvals_reviewer: config.approvals_reviewer,
+        sandbox_policy: config.permissions.sandbox_policy.clone(),
+        file_system_sandbox_policy: config.permissions.file_system_sandbox_policy.clone(),
+        network_sandbox_policy: config.permissions.network_sandbox_policy,
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        cwd: config.cwd.clone(),
+        codex_home: config.codex_home.clone(),
+        thread_name: None,
+        original_config_do_not_use: Arc::clone(&config),
+        metrics_service_name: None,
+        app_server_client_name: None,
+        app_server_client_version: None,
+        session_source: SessionSource::Exec,
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        inherited_shell_snapshot: None,
+        user_shell_override: None,
+    };
+
+    let (tx_event, rx_event) = async_channel::unbounded();
+    let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ true,
+    ));
+    let _session = Session::new(
+        session_configuration,
+        Arc::clone(&config),
+        auth_manager.clone(),
+        models_manager,
+        Arc::new(ExecPolicyManager::default()),
+        tx_event,
+        agent_status_tx,
+        InitialHistory::New,
+        SessionSource::Exec,
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        Arc::new(SkillsWatcher::noop()),
+        AgentControl::default(),
+        None,
+        Some(Arc::new(
+            codex_exec_server::Environment::create(/*exec_server_url*/ None)
+                .await
+                .expect("create environment"),
+        )),
+        /*analytics_events_client*/ None,
+    )
+    .await
+    .expect("startup should succeed before ChatGPT auth appears");
+
+    let configured_event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("session configured event should arrive")
+        .expect("session configured event should be readable");
+    assert!(matches!(
+        configured_event.msg,
+        EventMsg::SessionConfigured(_)
+    ));
+
+    let auth_json = codex_login::AuthDotJson {
+        auth_mode: Some(codex_app_server_protocol::AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(codex_login::token_data::TokenData {
+            id_token: codex_login::token_data::IdTokenInfo {
+                email: None,
+                chatgpt_plan_type: None,
+                chatgpt_user_id: Some("user-123".to_string()),
+                chatgpt_account_id: Some("account_id".to_string()),
+                raw_jwt: fake_id_token("account_id", Some("user-123")),
+            },
+            access_token: "Access Token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            account_id: Some("account_id".to_string()),
+        }),
+        last_refresh: Some(chrono::Utc::now()),
+        agent_identity: None,
+    };
+    codex_login::save_auth(
+        config.codex_home.as_path(),
+        &auth_json,
+        codex_login::AuthCredentialsStoreMode::File,
+    )
+    .expect("save chatgpt auth");
+    assert!(auth_manager.reload(), "auth reload should trigger watcher");
+
+    let (message, codex_error_info) = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("error event stream should stay open");
+            if let EventMsg::Error(ErrorEvent {
+                message,
+                codex_error_info,
+            }) = event.msg
+            {
+                return (message, codex_error_info);
+            }
+        }
+    })
+    .await
+    .expect("error event should arrive after auth reload");
+    assert!(message.contains(
+        "Agent identity registration failed. Codex cannot continue while `features.use_agent_identity` is enabled"
+    ));
+    assert!(message.contains("agent identity registration failed with status 500"));
+    assert_eq!(codex_error_info, Some(CodexErrorInfo::Other));
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("shutdown event stream should stay open");
+            if matches!(event.msg, EventMsg::ShutdownComplete) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("shutdown event should arrive after async registration failure");
+}
+
 // todo: use online model info
 pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let (tx_event, _rx_event) = async_channel::unbounded();
@@ -2808,7 +3192,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -2869,6 +3253,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
+        agent_identity_manager: Arc::new(crate::agent_identity::AgentIdentityManager::new(
+            config.as_ref(),
+            Arc::clone(&auth_manager),
+            session_configuration.session_source.clone(),
+        )),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
@@ -2887,6 +3276,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         state_db: None,
         account_pool_manager: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
+        thread_store: codex_thread_store::LocalThreadStore::new(
+            codex_rollout::RolloutConfig::from_view(config.as_ref()),
+        ),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
             None,
@@ -2916,7 +3308,13 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let effective_skill_roots = plugin_outcome.effective_skill_roots();
     let skills_input =
         crate::skills_load_input_from_config(&per_turn_config, effective_skill_roots);
-    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&skills_input));
+    let skill_fs = environment.get_filesystem();
+    let skills_outcome = Arc::new(
+        services
+            .skills_manager
+            .skills_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
+            .await,
+    );
     let turn_context = Session::make_turn_context(
         conversation_id,
         Some(Arc::clone(&auth_manager)),
@@ -2952,6 +3350,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mailbox_rx: Mutex::new(mailbox_rx),
         idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        shutdown_requested: CancellationToken::new(),
+        shutdown_complete: CancellationToken::new(),
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
@@ -3487,6 +3887,148 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         .expect("shutdown waiter");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_and_wait_waits_for_fatal_shutdown_complete_event() {
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+
+    let (tx_sub, _rx_sub) = async_channel::bounded(4);
+    let (_codex_tx_event, codex_rx_event) = async_channel::unbounded();
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let shutdown_requested = session.shutdown_requested.clone();
+    let session_loop_handle = tokio::spawn(async move {
+        shutdown_requested.cancelled().await;
+    });
+    let codex = Arc::new(Codex {
+        tx_sub,
+        rx_event: codex_rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    });
+
+    let shutdown_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .fail_agent_identity_registration(anyhow::anyhow!("registration exploded"))
+                .await;
+        }
+    });
+
+    let error_event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("error event should arrive")
+        .expect("error event should be readable");
+    assert!(matches!(error_event.msg, EventMsg::Error(_)));
+
+    let waiter = tokio::spawn({
+        let codex = Arc::clone(&codex);
+        async move { codex.shutdown_and_wait().await }
+    });
+    tokio::time::sleep(StdDuration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "shutdown_and_wait returned before ShutdownComplete was emitted"
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx_event
+                .recv()
+                .await
+                .expect("shutdown event stream should stay open");
+            if matches!(event.msg, EventMsg::ShutdownComplete) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("shutdown event should arrive");
+
+    waiter
+        .await
+        .expect("shutdown waiter join")
+        .expect("shutdown waiter");
+    shutdown_task
+        .await
+        .expect("fatal shutdown task should finish");
+}
+
+#[tokio::test]
+async fn submit_with_id_returns_agent_died_when_shutdown_cancels_pending_send() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    tx_sub
+        .send(Submission {
+            id: "queued".to_string(),
+            op: Op::Interrupt,
+            trace: None,
+        })
+        .await
+        .expect("queue initial submission");
+
+    let codex = Arc::new(Codex {
+        tx_sub,
+        rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: completed_session_loop_termination(),
+    });
+    let submitter = tokio::spawn({
+        let codex = Arc::clone(&codex);
+        async move {
+            codex
+                .submit_with_id(Submission {
+                    id: "after-shutdown".to_string(),
+                    op: Op::Interrupt,
+                    trace: None,
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(StdDuration::from_millis(10)).await;
+    assert!(!submitter.is_finished());
+
+    session.shutdown_requested.cancel();
+
+    match timeout(Duration::from_secs(1), submitter)
+        .await
+        .expect("pending submit should unblock after shutdown")
+        .expect("submit task should not panic")
+    {
+        Err(CodexErr::InternalAgentDied) => {}
+        other => panic!("expected InternalAgentDied, got {other:?}"),
+    }
+    let queued = rx_sub
+        .try_recv()
+        .expect("initial queued submission remains");
+    assert_eq!(queued.id, "queued");
+    assert!(rx_sub.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn dropping_session_cancels_shutdown_requested() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let shutdown_requested = session.shutdown_requested.clone();
+
+    drop(session);
+
+    assert!(shutdown_requested.is_cancelled());
+}
+
 #[tokio::test]
 async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (parent_session, parent_turn_context) = make_session_and_context().await;
@@ -3657,7 +4199,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_sandbox_policy: config.permissions.network_sandbox_policy,
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         cwd: config.cwd.clone(),
-        codex_home: config.codex_home.to_path_buf(),
+        codex_home: config.codex_home.clone(),
         thread_name: None,
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
@@ -3718,6 +4260,11 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         }),
         rollout: Mutex::new(None),
         user_shell: Arc::new(default_user_shell()),
+        agent_identity_manager: Arc::new(crate::agent_identity::AgentIdentityManager::new(
+            config.as_ref(),
+            Arc::clone(&auth_manager),
+            session_configuration.session_source.clone(),
+        )),
         shell_snapshot_tx: watch::channel(None).0,
         show_raw_agent_reasoning: config.show_raw_agent_reasoning,
         exec_policy,
@@ -3736,6 +4283,9 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         state_db: None,
         account_pool_manager: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
+        thread_store: codex_thread_store::LocalThreadStore::new(
+            codex_rollout::RolloutConfig::from_view(config.as_ref()),
+        ),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             None,
@@ -3765,7 +4315,13 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     let effective_skill_roots = plugin_outcome.effective_skill_roots();
     let skills_input =
         crate::skills_load_input_from_config(&per_turn_config, effective_skill_roots);
-    let skills_outcome = Arc::new(services.skills_manager.skills_for_config(&skills_input));
+    let skill_fs = environment.get_filesystem();
+    let skills_outcome = Arc::new(
+        services
+            .skills_manager
+            .skills_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
+            .await,
+    );
     let turn_context = Arc::new(Session::make_turn_context(
         conversation_id,
         Some(Arc::clone(&auth_manager)),
@@ -3801,6 +4357,8 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         mailbox_rx: Mutex::new(mailbox_rx),
         idle_pending_input: Mutex::new(Vec::new()),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        shutdown_requested: CancellationToken::new(),
+        shutdown_complete: CancellationToken::new(),
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
@@ -3817,6 +4375,93 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+#[tokio::test]
+async fn fail_agent_identity_registration_emits_error_and_shutdown() {
+    let (session, _turn_context, rx_event) = make_session_and_context_with_rx().await;
+
+    session
+        .fail_agent_identity_registration(anyhow::anyhow!("registration exploded"))
+        .await;
+
+    let error_event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("error event should arrive")
+        .expect("error event should be readable");
+    match error_event.msg {
+        EventMsg::Error(ErrorEvent {
+            message,
+            codex_error_info,
+        }) => {
+            assert_eq!(
+                message,
+                "Agent identity registration failed. Codex cannot continue while `features.use_agent_identity` is enabled: registration exploded".to_string()
+            );
+            assert_eq!(codex_error_info, Some(CodexErrorInfo::Other));
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
+
+    let shutdown_event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("shutdown event should arrive")
+        .expect("shutdown event should be readable");
+    match shutdown_event.msg {
+        EventMsg::ShutdownComplete => {}
+        other => panic!("expected shutdown event, got {other:?}"),
+    }
+    assert!(session.shutdown_requested.is_cancelled());
+}
+
+#[tokio::test]
+async fn submission_loop_exits_when_shutdown_requested_is_cancelled() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let config = Arc::clone(&turn_context.config);
+    let (_tx_sub, rx_sub) = async_channel::bounded(1);
+    let handle = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            submission_loop(session, config, rx_sub).await;
+        }
+    });
+
+    session.shutdown_requested.cancel();
+
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("submission loop should exit after shutdown_requested is cancelled")
+        .expect("submission loop should not panic");
+}
+
+#[tokio::test]
+async fn submission_loop_shutdown_op_cancels_shutdown_requested() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let config = Arc::clone(&turn_context.config);
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let handle = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            submission_loop(session, config, rx_sub).await;
+        }
+    });
+
+    tx_sub
+        .send(Submission {
+            id: "shutdown".to_string(),
+            op: Op::Shutdown,
+            trace: None,
+        })
+        .await
+        .expect("send shutdown op");
+
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("submission loop should exit after shutdown op")
+        .expect("submission loop should not panic");
+    assert!(session.shutdown_requested.is_cancelled());
 }
 
 #[tokio::test]
@@ -4195,7 +4840,7 @@ async fn handle_output_item_done_records_image_save_history_message() {
     let turn_context = Arc::new(turn_context);
     let call_id = "ig_history_records_message";
     let expected_saved_path = crate::stream_events_utils::image_generation_artifact_path(
-        turn_context.config.codex_home.as_path(),
+        &turn_context.config.codex_home,
         &session.conversation_id.to_string(),
         call_id,
     );
@@ -4219,7 +4864,7 @@ async fn handle_output_item_done_records_image_save_history_message() {
 
     let history = session.clone_history().await;
     let image_output_path = crate::stream_events_utils::image_generation_artifact_path(
-        turn_context.config.codex_home.as_path(),
+        &turn_context.config.codex_home,
         &session.conversation_id.to_string(),
         "<image_id>",
     );
@@ -4247,7 +4892,7 @@ async fn handle_output_item_done_skips_image_save_message_when_save_fails() {
     let turn_context = Arc::new(turn_context);
     let call_id = "ig_history_no_message";
     let expected_saved_path = crate::stream_events_utils::image_generation_artifact_path(
-        turn_context.config.codex_home.as_path(),
+        &turn_context.config.codex_home,
         &session.conversation_id.to_string(),
         call_id,
     );

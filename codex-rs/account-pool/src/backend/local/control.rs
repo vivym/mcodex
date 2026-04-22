@@ -325,6 +325,7 @@ impl LocalAccountPoolBackend {
                 account_id: Some(tokens.account_id.clone()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         })
     }
 }

@@ -1167,12 +1167,15 @@ pub(crate) async fn register_account_persists_backend_private_auth_for_pooled_ac
         .join(expected_backend_account_handle.as_str());
     let auth = CodexAuth::from_auth_storage(&auth_home, AuthCredentialsStoreMode::File)?
         .expect("pooled auth should be persisted");
+    let persisted_auth: AuthDotJson =
+        serde_json::from_str(&fs::read_to_string(auth_home.join("auth.json"))?)?;
 
     assert_eq!(
         record.backend_account_handle,
         expected_backend_account_handle
     );
     assert_eq!(auth.get_account_id(), Some("acct-1".to_string()));
+    assert_eq!(persisted_auth.agent_identity, None);
     Ok(())
 }
 
@@ -1291,6 +1294,7 @@ pub(crate) async fn register_account_removes_legacy_raw_backend_private_auth_on_
                 account_id: Some("acct-existing".to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;
@@ -1369,6 +1373,7 @@ pub(crate) async fn register_account_preserves_existing_backend_private_auth_on_
                 account_id: Some("acct-existing".to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;

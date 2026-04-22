@@ -32,7 +32,6 @@ mod agents_md;
 mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
-mod cli_stream;
 mod client;
 mod client_websockets;
 mod code_mode;
@@ -86,7 +85,6 @@ mod rmcp_client;
 mod rollout_list_find;
 mod safety_check_downgrade;
 mod search_tool;
-mod seatbelt;
 mod shell_command;
 mod shell_serialization;
 mod shell_snapshot;

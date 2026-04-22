@@ -4,14 +4,30 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
+use codex_exec_server::CopyOptions;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileMetadata;
+use codex_exec_server::FileSystemResult;
+use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::LOCAL_FS;
+use codex_exec_server::ReadDirectoryEntry;
+use codex_exec_server::RemoveOptions;
 use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::PathExt;
+use dunce::canonicalize as canonicalize_path;
 use pretty_assertions::assert_eq;
+use std::collections::HashMap;
+use std::fs;
+use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 use tempfile::TempDir;
 use toml::Value as TomlValue;
 
@@ -113,14 +129,18 @@ async fn make_config_for_cwd(codex_home: &TempDir, cwd: PathBuf) -> TestConfig {
     }
 }
 
-fn load_skills_for_test(config: &TestConfig) -> SkillLoadOutcome {
+async fn load_skills_for_test(config: &TestConfig) -> SkillLoadOutcome {
     // Keep unit tests hermetic by never scanning the real `$HOME/.agents/skills`.
-    super::load_skills_from_roots(super::skill_roots_with_home_dir(
-        &config.config_layer_stack,
-        &config.cwd,
-        /*home_dir*/ None,
-        Vec::new(),
-    ))
+    super::load_skills_from_roots(
+        super::skill_roots_from_layer_stack(
+            Arc::clone(&LOCAL_FS),
+            &config.config_layer_stack,
+            &config.cwd,
+            /*home_dir*/ None,
+        )
+        .await,
+    )
+    .await
 }
 
 fn mark_as_git_repo(dir: &Path) {
@@ -135,7 +155,7 @@ fn normalized(path: &Path) -> AbsolutePathBuf {
         .abs()
 }
 
-fn load_skill_roots_for_test(mcodex_home: &str) -> Vec<SkillRoot> {
+async fn load_skill_roots_for_test(mcodex_home: &str) -> Vec<SkillRoot> {
     let codex_home = Path::new(mcodex_home);
     let user_file = codex_home.join(CONFIG_TOML_FILE).abs();
     let home_dir = codex_home
@@ -153,7 +173,7 @@ fn load_skill_roots_for_test(mcodex_home: &str) -> Vec<SkillRoot> {
     )
     .expect("valid config layer stack");
 
-    skill_roots_from_layer_stack(&stack, &home_dir, Some(&home_dir))
+    skill_roots_from_layer_stack(Arc::clone(&LOCAL_FS), &stack, &home_dir, Some(&home_dir)).await
 }
 
 #[cfg(unix)]
@@ -165,9 +185,9 @@ fn admin_skills_root_uses_active_mcodex_system_root() {
     );
 }
 
-#[test]
-fn user_agents_skills_root_is_preserved_with_mcodex_home() {
-    let roots = load_skill_roots_for_test("/tmp/home/.mcodex");
+#[tokio::test]
+async fn user_agents_skills_root_is_preserved_with_mcodex_home() {
+    let roots = load_skill_roots_for_test("/tmp/home/.mcodex").await;
     assert!(
         roots
             .iter()
@@ -180,8 +200,8 @@ fn user_agents_skills_root_is_preserved_with_mcodex_home() {
     );
 }
 
-#[test]
-fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_system_to_admin()
+#[tokio::test]
+async fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_system_to_admin()
 -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
 
@@ -212,10 +232,16 @@ fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_system_to
     )?;
 
     let home_folder_abs = home_folder.abs();
-    let got = skill_roots_from_layer_stack(&stack, &home_folder_abs, Some(&home_folder_abs))
-        .into_iter()
-        .map(|root| (root.scope, root.path.to_path_buf()))
-        .collect::<Vec<_>>();
+    let got = skill_roots_from_layer_stack(
+        Arc::clone(&LOCAL_FS),
+        &stack,
+        &home_folder_abs,
+        Some(&home_folder_abs),
+    )
+    .await
+    .into_iter()
+    .map(|root| (root.scope, root.path.to_path_buf()))
+    .collect::<Vec<_>>();
 
     assert_eq!(
         got,
@@ -236,8 +262,8 @@ fn skill_roots_from_layer_stack_maps_user_to_user_and_system_cache_and_system_to
     Ok(())
 }
 
-#[test]
-fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyhow::Result<()> {
+#[tokio::test]
+async fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
 
     let home_folder = tmp.path().join("home");
@@ -272,10 +298,16 @@ fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyhow::Re
 
     let home_folder_abs = home_folder.abs();
     let project_root_abs = project_root.abs();
-    let got = skill_roots_from_layer_stack(&stack, &project_root_abs, Some(&home_folder_abs))
-        .into_iter()
-        .map(|root| (root.scope, root.path.to_path_buf()))
-        .collect::<Vec<_>>();
+    let got = skill_roots_from_layer_stack(
+        Arc::clone(&LOCAL_FS),
+        &stack,
+        &project_root_abs,
+        Some(&home_folder_abs),
+    )
+    .await
+    .into_iter()
+    .map(|root| (root.scope, root.path.to_path_buf()))
+    .collect::<Vec<_>>();
 
     assert_eq!(
         got,
@@ -296,8 +328,8 @@ fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyhow::Re
     Ok(())
 }
 
-#[test]
-fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()> {
+#[tokio::test]
+async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
 
     let home_folder = tmp.path().join("home");
@@ -323,11 +355,14 @@ fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()> {
     );
 
     let home_folder_abs = home_folder.abs();
-    let outcome = load_skills_from_roots(skill_roots_from_layer_stack(
+    let roots = skill_roots_from_layer_stack(
+        Arc::clone(&LOCAL_FS),
         &stack,
         &home_folder_abs,
         Some(&home_folder_abs),
-    ));
+    )
+    .await;
+    let outcome = load_skills_from_roots(roots).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -441,7 +476,7 @@ async fn loads_skill_dependencies_metadata_from_yaml() {
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -519,7 +554,7 @@ interface:
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -540,16 +575,8 @@ interface:
             interface: Some(SkillInterface {
                 display_name: Some("UI Skill".to_string()),
                 short_description: Some("short desc".to_string()),
-                icon_small: Some(
-                    normalized_skill_dir
-                        .join("assets/small-400px.png")
-                        .to_path_buf()
-                ),
-                icon_large: Some(
-                    normalized_skill_dir
-                        .join("assets/large-logo.svg")
-                        .to_path_buf()
-                ),
+                icon_small: Some(normalized_skill_dir.join("assets/small-400px.png")),
+                icon_large: Some(normalized_skill_dir.join("assets/large-logo.svg")),
                 brand_color: Some("#3B82F6".to_string()),
                 default_prompt: Some("default prompt".to_string()),
             }),
@@ -576,7 +603,7 @@ policy:
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -608,7 +635,7 @@ policy: {}
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -647,7 +674,7 @@ policy:
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -685,7 +712,7 @@ async fn accepts_icon_paths_under_assets_dir() {
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -701,8 +728,8 @@ async fn accepts_icon_paths_under_assets_dir() {
             interface: Some(SkillInterface {
                 display_name: Some("UI Skill".to_string()),
                 short_description: None,
-                icon_small: Some(normalized_skill_dir.join("assets/icon.png").to_path_buf()),
-                icon_large: Some(normalized_skill_dir.join("assets/logo.svg").to_path_buf()),
+                icon_small: Some(normalized_skill_dir.join("assets/icon.png")),
+                icon_large: Some(normalized_skill_dir.join("assets/logo.svg")),
                 brand_color: None,
                 default_prompt: None,
             }),
@@ -732,7 +759,7 @@ async fn ignores_invalid_brand_color() {
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -778,7 +805,7 @@ async fn ignores_default_prompt_over_max_length() {
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -794,11 +821,7 @@ async fn ignores_default_prompt_over_max_length() {
             interface: Some(SkillInterface {
                 display_name: Some("UI Skill".to_string()),
                 short_description: None,
-                icon_small: Some(
-                    normalized_skill_dir
-                        .join("assets/small-400px.png")
-                        .to_path_buf()
-                ),
+                icon_small: Some(normalized_skill_dir.join("assets/small-400px.png")),
                 icon_large: None,
                 brand_color: None,
                 default_prompt: None,
@@ -830,7 +853,7 @@ async fn drops_interface_when_icons_are_invalid() {
     );
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -862,6 +885,304 @@ fn symlink_file(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).unwrap();
 }
 
+#[derive(Clone)]
+enum FakeRemoteNode {
+    Directory(Vec<ReadDirectoryEntry>),
+    File(String),
+    SymlinkDirectory(Vec<ReadDirectoryEntry>),
+}
+
+#[derive(Clone)]
+struct FakeRemoteFileSystem {
+    nodes: Arc<HashMap<AbsolutePathBuf, FakeRemoteNode>>,
+}
+
+impl FakeRemoteFileSystem {
+    fn new(nodes: HashMap<AbsolutePathBuf, FakeRemoteNode>) -> Self {
+        Self {
+            nodes: Arc::new(nodes),
+        }
+    }
+
+    fn directory_entry(file_name: &str, is_directory: bool, is_file: bool) -> ReadDirectoryEntry {
+        ReadDirectoryEntry {
+            file_name: file_name.to_string(),
+            is_directory,
+            is_file,
+        }
+    }
+
+    fn node(&self, path: &AbsolutePathBuf) -> FileSystemResult<&FakeRemoteNode> {
+        self.nodes.get(path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("fake remote path not found: {}", path.display()),
+            )
+        })
+    }
+
+    fn read_file_result(&self, path: &AbsolutePathBuf) -> FileSystemResult<Vec<u8>> {
+        match self.node(path)? {
+            FakeRemoteNode::File(contents) => Ok(contents.clone().into_bytes()),
+            FakeRemoteNode::Directory(_) | FakeRemoteNode::SymlinkDirectory(_) => Err(
+                io::Error::new(io::ErrorKind::IsADirectory, path.display().to_string()),
+            ),
+        }
+    }
+
+    fn metadata_result(&self, path: &AbsolutePathBuf) -> FileSystemResult<FileMetadata> {
+        let (is_directory, is_file, is_symlink) = match self.node(path)? {
+            FakeRemoteNode::Directory(_) => (true, false, false),
+            FakeRemoteNode::File(_) => (false, true, false),
+            FakeRemoteNode::SymlinkDirectory(_) => (true, false, true),
+        };
+        Ok(FileMetadata {
+            is_directory,
+            is_file,
+            is_symlink,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+        })
+    }
+
+    fn read_directory_result(
+        &self,
+        path: &AbsolutePathBuf,
+    ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
+        match self.node(path)? {
+            FakeRemoteNode::Directory(entries) | FakeRemoteNode::SymlinkDirectory(entries) => {
+                Ok(entries.clone())
+            }
+            FakeRemoteNode::File(_) => Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                path.display().to_string(),
+            )),
+        }
+    }
+
+    fn read_only_error<T>() -> FileSystemResult<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fake remote fs is read-only",
+        ))
+    }
+}
+
+fn boxed_fs_result<'a, T: Send + 'a>(
+    result: FileSystemResult<T>,
+) -> Pin<Box<dyn Future<Output = FileSystemResult<T>> + Send + 'a>> {
+    Box::pin(std::future::ready(result))
+}
+
+impl ExecutorFileSystem for FakeRemoteFileSystem {
+    fn read_file<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        path: &'life1 AbsolutePathBuf,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<Vec<u8>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(self.read_file_result(path))
+    }
+
+    fn write_file<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 AbsolutePathBuf,
+        _contents: Vec<u8>,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(Self::read_only_error())
+    }
+
+    fn create_directory<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 AbsolutePathBuf,
+        _create_directory_options: CreateDirectoryOptions,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(Self::read_only_error())
+    }
+
+    fn get_metadata<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        path: &'life1 AbsolutePathBuf,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<FileMetadata>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(self.metadata_result(path))
+    }
+
+    fn read_directory<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        path: &'life1 AbsolutePathBuf,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<
+        Box<dyn Future<Output = FileSystemResult<Vec<ReadDirectoryEntry>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(self.read_directory_result(path))
+    }
+
+    fn remove<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _path: &'life1 AbsolutePathBuf,
+        _remove_options: RemoveOptions,
+        _sandbox: Option<&'life2 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(Self::read_only_error())
+    }
+
+    fn copy<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        _source_path: &'life1 AbsolutePathBuf,
+        _destination_path: &'life2 AbsolutePathBuf,
+        _copy_options: CopyOptions,
+        _sandbox: Option<&'life3 FileSystemSandboxContext>,
+    ) -> Pin<Box<dyn Future<Output = FileSystemResult<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        boxed_fs_result(Self::read_only_error())
+    }
+}
+
+#[tokio::test]
+async fn remote_fs_skips_symlinked_subdir_when_local_canonicalize_is_unavailable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let remote_root = tmp.path().join("remote-skills").abs();
+    let shared = remote_root.join("shared");
+    let shared_demo = shared.join("demo");
+    let shared_skill = shared_demo.join(SKILLS_FILENAME);
+    let alias_a = remote_root.join("alias-a");
+    let alias_a_demo = alias_a.join("demo");
+    let alias_a_skill = alias_a_demo.join(SKILLS_FILENAME);
+    let alias_b = remote_root.join("alias-b");
+    let alias_b_demo = alias_b.join("demo");
+    let alias_b_skill = alias_b_demo.join(SKILLS_FILENAME);
+    let skill_contents = "---\nname: remote-skill\ndescription: from remote\n---\n";
+    let root_entries = vec![
+        FakeRemoteFileSystem::directory_entry(
+            "shared", /*is_directory*/ true, /*is_file*/ false,
+        ),
+        FakeRemoteFileSystem::directory_entry(
+            "alias-a", /*is_directory*/ true, /*is_file*/ false,
+        ),
+        FakeRemoteFileSystem::directory_entry(
+            "alias-b", /*is_directory*/ true, /*is_file*/ false,
+        ),
+    ];
+    let skill_parent_entries = vec![FakeRemoteFileSystem::directory_entry(
+        "demo", /*is_directory*/ true, /*is_file*/ false,
+    )];
+    let skill_dir_entries = vec![FakeRemoteFileSystem::directory_entry(
+        SKILLS_FILENAME,
+        /*is_directory*/ false,
+        /*is_file*/ true,
+    )];
+    let nodes = HashMap::from([
+        (remote_root.clone(), FakeRemoteNode::Directory(root_entries)),
+        (
+            shared.clone(),
+            FakeRemoteNode::Directory(skill_parent_entries.clone()),
+        ),
+        (
+            shared_demo.clone(),
+            FakeRemoteNode::Directory(skill_dir_entries.clone()),
+        ),
+        (
+            shared_skill.clone(),
+            FakeRemoteNode::File(skill_contents.to_string()),
+        ),
+        (
+            alias_a.clone(),
+            FakeRemoteNode::SymlinkDirectory(skill_parent_entries.clone()),
+        ),
+        (
+            alias_a_demo.clone(),
+            FakeRemoteNode::Directory(skill_dir_entries.clone()),
+        ),
+        (
+            alias_a_skill,
+            FakeRemoteNode::File(skill_contents.to_string()),
+        ),
+        (
+            alias_b.clone(),
+            FakeRemoteNode::SymlinkDirectory(skill_parent_entries),
+        ),
+        (
+            alias_b_demo.clone(),
+            FakeRemoteNode::Directory(skill_dir_entries),
+        ),
+        (
+            alias_b_skill,
+            FakeRemoteNode::File(skill_contents.to_string()),
+        ),
+    ]);
+    let fs = Arc::new(FakeRemoteFileSystem::new(nodes));
+
+    let outcome = load_skills_from_roots([SkillRoot {
+        path: remote_root,
+        scope: SkillScope::Repo,
+        file_system: fs,
+    }])
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "unexpected errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(
+        outcome.skills,
+        vec![SkillMetadata {
+            name: "remote-skill".to_string(),
+            description: "from remote".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: shared_skill,
+            scope: SkillScope::Repo,
+        }]
+    );
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn loads_skills_via_symlinked_subdir_for_user_scope() {
@@ -874,7 +1195,7 @@ async fn loads_skills_via_symlinked_subdir_for_user_scope() {
     symlink_dir(shared.path(), &codex_home.path().join("skills/shared"));
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -909,7 +1230,7 @@ async fn ignores_symlinked_skill_file_for_user_scope() {
     symlink_file(&shared_skill_path, &skill_dir.join(SKILLS_FILENAME));
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -933,7 +1254,7 @@ async fn does_not_loop_on_symlink_cycle_for_user_scope() {
     let skill_path = write_skill_at(&cycle_dir, "demo", "cycle-skill", "still loads");
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -955,9 +1276,9 @@ async fn does_not_loop_on_symlink_cycle_for_user_scope() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[cfg(unix)]
-fn loads_skills_via_symlinked_subdir_for_admin_scope() {
+async fn loads_skills_via_symlinked_subdir_for_admin_scope() {
     let admin_root = tempfile::tempdir().expect("tempdir");
     let shared = tempfile::tempdir().expect("tempdir");
 
@@ -969,7 +1290,9 @@ fn loads_skills_via_symlinked_subdir_for_admin_scope() {
     let outcome = load_skills_from_roots([SkillRoot {
         path: admin_root.path().abs(),
         scope: SkillScope::Admin,
-    }]);
+        file_system: Arc::clone(&LOCAL_FS),
+    }])
+    .await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1008,7 +1331,7 @@ async fn loads_skills_via_symlinked_subdir_for_repo_scope() {
     symlink_dir(shared.path(), &repo_skills_root.join("shared"));
 
     let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1045,7 +1368,9 @@ async fn system_scope_ignores_symlinked_subdir() {
     let outcome = load_skills_from_roots([SkillRoot {
         path: system_root.abs(),
         scope: SkillScope::System,
-    }]);
+        file_system: Arc::clone(&LOCAL_FS),
+    }])
+    .await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1075,7 +1400,9 @@ async fn respects_max_scan_depth_for_user_scope() {
     let outcome = load_skills_from_roots([SkillRoot {
         path: skills_root.abs(),
         scope: SkillScope::User,
-    }]);
+        file_system: Arc::clone(&LOCAL_FS),
+    }])
+    .await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1103,7 +1430,7 @@ async fn loads_valid_skill() {
     let skill_path = write_skill(&codex_home, "demo", "demo-skill", "does things\ncarefully");
     let cfg = make_config(&codex_home).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1134,7 +1461,7 @@ async fn falls_back_to_directory_name_when_skill_name_is_missing() {
     );
     let cfg = make_config(&codex_home).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1175,7 +1502,9 @@ async fn namespaces_plugin_skills_using_plugin_name() {
     let outcome = load_skills_from_roots([SkillRoot {
         path: plugin_root.join("skills").abs(),
         scope: SkillScope::User,
-    }]);
+        file_system: Arc::clone(&LOCAL_FS),
+    }])
+    .await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1207,7 +1536,7 @@ async fn loads_short_description_from_metadata() {
     fs::write(&skill_path, contents).unwrap();
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1240,7 +1569,7 @@ async fn enforces_short_description_length_limits() {
     fs::write(skill_dir.join(SKILLS_FILENAME), contents).unwrap();
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert_eq!(outcome.skills.len(), 0);
     assert_eq!(outcome.errors.len(), 1);
     assert!(
@@ -1269,7 +1598,7 @@ async fn skips_hidden_and_invalid() {
     fs::write(invalid_dir.join(SKILLS_FILENAME), "---\nname: bad").unwrap();
 
     let cfg = make_config(&codex_home).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert_eq!(outcome.skills.len(), 0);
     assert_eq!(outcome.errors.len(), 1);
     assert!(
@@ -1287,7 +1616,7 @@ async fn enforces_length_limits() {
     write_skill(&codex_home, "max-len", "max-len", &max_desc);
     let cfg = make_config(&codex_home).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1297,7 +1626,7 @@ async fn enforces_length_limits() {
 
     let too_long_desc = "\u{1F4A1}".repeat(MAX_DESCRIPTION_LEN + 1);
     write_skill(&codex_home, "too-long", "too-long", &too_long_desc);
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert_eq!(outcome.skills.len(), 1);
     assert_eq!(outcome.errors.len(), 1);
     assert!(
@@ -1319,7 +1648,7 @@ async fn loads_skills_from_repo_root() {
     let skill_path = write_skill_at(&skills_root, "repo", "repo-skill", "from repo");
     let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1354,7 +1683,7 @@ async fn loads_skills_from_agents_dir_without_codex_dir() {
     );
     let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1406,7 +1735,7 @@ async fn loads_skills_from_all_codex_dirs_under_project_root() {
 
     let cfg = make_config_for_cwd(&codex_home, nested_dir).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1456,7 +1785,7 @@ async fn loads_skills_from_codex_dir_when_not_git_repo() {
 
     let cfg = make_config_for_cwd(&codex_home, work_dir.path().to_path_buf()).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1487,12 +1816,15 @@ async fn deduplicates_by_path_preferring_first_root() {
         SkillRoot {
             path: root.path().abs(),
             scope: SkillScope::Repo,
+            file_system: Arc::clone(&LOCAL_FS),
         },
         SkillRoot {
             path: root.path().abs(),
             scope: SkillScope::User,
+            file_system: Arc::clone(&LOCAL_FS),
         },
-    ]);
+    ])
+    .await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1533,7 +1865,7 @@ async fn keeps_duplicate_names_from_repo_and_user() {
 
     let cfg = make_config_for_cwd(&codex_home, repo_dir.path().to_path_buf()).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1596,7 +1928,7 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
     );
 
     let cfg = make_config_for_cwd(&codex_home, nested_dir).await;
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
 
     assert!(
         outcome.errors.is_empty(),
@@ -1658,7 +1990,7 @@ async fn repo_skills_search_does_not_escape_repo_root() {
 
     let cfg = make_config_for_cwd(&codex_home, repo_dir).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1687,7 +2019,7 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
 
     let cfg = make_config_for_cwd(&codex_home, file_path).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1727,7 +2059,7 @@ async fn non_git_repo_skills_search_does_not_walk_parents() {
 
     let cfg = make_config_for_cwd(&codex_home, nested_dir).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1745,7 +2077,7 @@ async fn loads_skills_from_system_cache_when_present() {
 
     let cfg = make_config_for_cwd(&codex_home, work_dir.path().to_path_buf()).await;
 
-    let outcome = load_skills_for_test(&cfg);
+    let outcome = load_skills_for_test(&cfg).await;
     assert!(
         outcome.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -1771,10 +2103,16 @@ async fn skill_roots_include_admin_with_lowest_priority() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cfg = make_config(&codex_home).await;
 
-    let scopes: Vec<SkillScope> = super::skill_roots(&cfg.config_layer_stack, &cfg.cwd, Vec::new())
-        .into_iter()
-        .map(|root| root.scope)
-        .collect();
+    let scopes: Vec<SkillScope> = super::skill_roots(
+        Some(Arc::clone(&LOCAL_FS)),
+        &cfg.config_layer_stack,
+        &cfg.cwd,
+        Vec::new(),
+    )
+    .await
+    .into_iter()
+    .map(|root| root.scope)
+    .collect();
     let mut expected = vec![SkillScope::User, SkillScope::System];
     if home_dir().is_some() {
         expected.insert(1, SkillScope::User);

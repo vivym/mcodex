@@ -192,7 +192,12 @@ async fn run_remote_compact_task_inner_impl(
                     {
                         let mut account_pool_manager = account_pool_manager.lock().await;
                         if let Err(report_err) =
-                            account_pool_manager.report_usage_limit_reached().await
+                            account_pool_manager
+                                .report_usage_limit_reached(
+                                    e.rate_limits.as_deref(),
+                                    e.resets_at,
+                                )
+                                .await
                         {
                             warn!(
                                 "failed to record account-pool usage-limit event: {report_err:#}"
