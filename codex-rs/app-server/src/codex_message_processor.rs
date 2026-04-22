@@ -18,6 +18,9 @@ use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::pooled_runtime_scope::PooledRuntimeReservation;
+use crate::pooled_runtime_scope::PooledRuntimeScope;
+use crate::pooled_runtime_scope::unsupported_transport_error;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
 use crate::transport::AppServerTransport;
@@ -438,6 +441,25 @@ enum ThreadShutdownResult {
     TimedOut,
 }
 
+enum PooledRuntimeAdmission {
+    NotPooled,
+    Reserved(PooledRuntimeReservation),
+}
+
+impl PooledRuntimeAdmission {
+    async fn promote(self, thread_id: ThreadId) {
+        if let Self::Reserved(reservation) = self {
+            reservation.promote(thread_id).await;
+        }
+    }
+
+    async fn rollback(self) {
+        if let Self::Reserved(reservation) = self {
+            reservation.rollback().await;
+        }
+    }
+}
+
 impl Drop for ActiveLogin {
     fn drop(&mut self) {
         self.cancel();
@@ -457,6 +479,7 @@ pub(crate) struct CodexMessageProcessor {
     cloud_requirements: Arc<RwLock<CloudRequirementsLoader>>,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pooled_runtime_scope: Arc<PooledRuntimeScope>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     command_exec_manager: CommandExecManager,
@@ -481,11 +504,22 @@ struct ListenerTaskContext {
     thread_state_manager: ThreadStateManager,
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pooled_runtime_scope: Arc<PooledRuntimeScope>,
     analytics_events_client: AnalyticsEventsClient,
     general_analytics_enabled: bool,
     thread_watch_manager: ThreadWatchManager,
     fallback_model_provider: String,
     codex_home: PathBuf,
+}
+
+#[derive(Clone)]
+struct ThreadUnloadContext {
+    thread_manager: Arc<ThreadManager>,
+    outgoing: Arc<OutgoingMessageSender>,
+    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    thread_state_manager: ThreadStateManager,
+    thread_watch_manager: ThreadWatchManager,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -725,6 +759,7 @@ impl CodexMessageProcessor {
             cloud_requirements,
             active_login: Arc::new(Mutex::new(None)),
             pending_thread_unloads: Arc::new(Mutex::new(HashSet::new())),
+            pooled_runtime_scope: Arc::new(PooledRuntimeScope::default()),
             thread_state_manager: ThreadStateManager::new(),
             thread_watch_manager: ThreadWatchManager::new_with_outgoing(outgoing),
             command_exec_manager: CommandExecManager::default(),
@@ -868,6 +903,7 @@ impl CodexMessageProcessor {
         request: ClientRequest,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        transport: AppServerTransport,
         request_context: RequestContext,
     ) {
         let to_connection_request_id = |request_id| ConnectionRequestId {
@@ -886,6 +922,7 @@ impl CodexMessageProcessor {
                     params,
                     app_server_client_name.clone(),
                     app_server_client_version.clone(),
+                    transport,
                     request_context,
                 )
                 .await;
@@ -895,11 +932,11 @@ impl CodexMessageProcessor {
                     .await;
             }
             ClientRequest::ThreadResume { request_id, params } => {
-                self.thread_resume(to_connection_request_id(request_id), params)
+                self.thread_resume(to_connection_request_id(request_id), params, transport)
                     .await;
             }
             ClientRequest::ThreadFork { request_id, params } => {
-                self.thread_fork(to_connection_request_id(request_id), params)
+                self.thread_fork(to_connection_request_id(request_id), params, transport)
                     .await;
             }
             ClientRequest::ThreadArchive { request_id, params } => {
@@ -1107,21 +1144,15 @@ impl CodexMessageProcessor {
                 request_id,
                 params: _,
             } => {
-                self.account_lease_read(
-                    to_connection_request_id(request_id),
-                    AppServerTransport::Off,
-                )
-                .await;
+                self.account_lease_read(to_connection_request_id(request_id), transport)
+                    .await;
             }
             ClientRequest::AccountLeaseResume {
                 request_id,
                 params: _,
             } => {
-                self.account_lease_resume(
-                    to_connection_request_id(request_id),
-                    AppServerTransport::Off,
-                )
-                .await;
+                self.account_lease_resume(to_connection_request_id(request_id), transport)
+                    .await;
             }
             ClientRequest::AccountPoolRead { request_id, params } => {
                 self.account_pool_read(to_connection_request_id(request_id), params)
@@ -1744,31 +1775,63 @@ impl CodexMessageProcessor {
         }
 
         if matches!(transport, AppServerTransport::WebSocket { .. }) {
-            return Err(JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: "pooled lease mode is only supported for stdio".to_string(),
-                data: None,
-            });
-        }
-
-        if self.thread_manager.list_thread_ids().await.len() > 1 {
-            return Err(JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: "pooled mode requires one loaded thread".to_string(),
-                data: None,
-            });
+            return Err(unsupported_transport_error());
         }
 
         Ok(())
     }
 
-    async fn single_loaded_thread(&self) -> Option<Arc<CodexThread>> {
-        let thread_ids = self.thread_manager.list_thread_ids().await;
-        let [thread_id] = thread_ids.as_slice() else {
-            return None;
-        };
+    async fn pooled_runtime_enabled_for_transport(
+        &self,
+        transport: AppServerTransport,
+    ) -> std::result::Result<bool, JSONRPCErrorError> {
+        if !account_lease_api::pooled_mode_is_enabled(self.config.as_ref()).await? {
+            return Ok(false);
+        }
 
-        self.thread_manager.get_thread(*thread_id).await.ok()
+        if matches!(transport, AppServerTransport::WebSocket { .. }) {
+            return Err(unsupported_transport_error());
+        }
+
+        Ok(true)
+    }
+
+    async fn reserve_top_level_pooled_runtime(
+        &self,
+        pooled_runtime_enabled: bool,
+    ) -> std::result::Result<PooledRuntimeAdmission, JSONRPCErrorError> {
+        Self::reserve_top_level_pooled_runtime_for_task(
+            &self.thread_manager,
+            &self.pooled_runtime_scope,
+            pooled_runtime_enabled,
+        )
+        .await
+    }
+
+    async fn reserve_top_level_pooled_runtime_for_task(
+        thread_manager: &Arc<ThreadManager>,
+        pooled_runtime_scope: &Arc<PooledRuntimeScope>,
+        pooled_runtime_enabled: bool,
+    ) -> std::result::Result<PooledRuntimeAdmission, JSONRPCErrorError> {
+        if !pooled_runtime_enabled {
+            return Ok(PooledRuntimeAdmission::NotPooled);
+        }
+
+        if let Some(thread_id) = pooled_runtime_scope.loaded_thread_id().await
+            && thread_manager.get_thread(thread_id).await.is_err()
+        {
+            pooled_runtime_scope.mark_thread_unloaded(thread_id).await;
+        }
+
+        pooled_runtime_scope
+            .reserve()
+            .await
+            .map(PooledRuntimeAdmission::Reserved)
+    }
+
+    async fn single_loaded_thread(&self) -> Option<Arc<CodexThread>> {
+        let thread_id = self.pooled_runtime_scope.loaded_thread_id().await?;
+        self.thread_manager.get_thread(thread_id).await.ok()
     }
 
     async fn single_loaded_thread_account_lease_snapshot(
@@ -2457,6 +2520,7 @@ impl CodexMessageProcessor {
         params: ThreadStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        transport: AppServerTransport,
         request_context: RequestContext,
     ) {
         let ThreadStartParams {
@@ -2492,6 +2556,14 @@ impl CodexMessageProcessor {
             personality,
         );
         typesafe_overrides.ephemeral = ephemeral;
+        let pooled_runtime_enabled =
+            match self.pooled_runtime_enabled_for_transport(transport).await {
+                Ok(enabled) => enabled,
+                Err(error) => {
+                    self.outgoing.send_error(request_id, error).await;
+                    return;
+                }
+            };
         let cloud_requirements = self.current_cloud_requirements();
         let cli_overrides = self.current_cli_overrides();
         let listener_task_context = ListenerTaskContext {
@@ -2499,6 +2571,7 @@ impl CodexMessageProcessor {
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
             analytics_events_client: self.analytics_events_client.clone(),
             general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
             thread_watch_manager: self.thread_watch_manager.clone(),
@@ -2521,6 +2594,7 @@ impl CodexMessageProcessor {
                 dynamic_tools,
                 session_start_source,
                 persist_extended_history,
+                pooled_runtime_enabled,
                 service_name,
                 experimental_raw_events,
                 request_trace,
@@ -2597,6 +2671,7 @@ impl CodexMessageProcessor {
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         persist_extended_history: bool,
+        pooled_runtime_enabled: bool,
         service_name: Option<String>,
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
@@ -2732,6 +2807,22 @@ impl CodexMessageProcessor {
                 .collect()
         };
         let core_dynamic_tool_count = core_dynamic_tools.len();
+        let pooled_runtime_admission = match Self::reserve_top_level_pooled_runtime_for_task(
+            &listener_task_context.thread_manager,
+            &listener_task_context.pooled_runtime_scope,
+            pooled_runtime_enabled,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                listener_task_context
+                    .outgoing
+                    .send_error(request_id, error)
+                    .await;
+                return;
+            }
+        };
 
         match listener_task_context
             .thread_manager
@@ -2763,6 +2854,7 @@ impl CodexMessageProcessor {
                     session_configured,
                     ..
                 } = new_conv;
+                pooled_runtime_admission.promote(thread_id).await;
                 if let Err(error) = Self::set_app_server_client_info(
                     thread.as_ref(),
                     app_server_client_name,
@@ -2874,6 +2966,7 @@ impl CodexMessageProcessor {
                     .await;
             }
             Err(err) => {
+                pooled_runtime_admission.rollback().await;
                 let error = JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("error creating thread: {err}"),
@@ -4281,7 +4374,12 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn thread_resume(&self, request_id: ConnectionRequestId, params: ThreadResumeParams) {
+    async fn thread_resume(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadResumeParams,
+        transport: AppServerTransport,
+    ) {
         if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
             && self
                 .pending_thread_unloads
@@ -4389,6 +4487,24 @@ impl CodexMessageProcessor {
         let fallback_model_provider = config.model_provider_id.clone();
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
         let response_history = thread_history.clone();
+        let pooled_runtime_admission = match self
+            .reserve_top_level_pooled_runtime(
+                match self.pooled_runtime_enabled_for_transport(transport).await {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                        return;
+                    }
+                },
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
 
         match self
             .thread_manager
@@ -4406,6 +4522,7 @@ impl CodexMessageProcessor {
                 thread,
                 session_configured,
             }) => {
+                pooled_runtime_admission.promote(thread_id).await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
                     self.send_internal_error(
@@ -4487,6 +4604,7 @@ impl CodexMessageProcessor {
                 self.outgoing.send_response(request_id, response).await;
             }
             Err(err) => {
+                pooled_runtime_admission.rollback().await;
                 let error = JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("error resuming thread: {err}"),
@@ -4828,7 +4946,12 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn thread_fork(&self, request_id: ConnectionRequestId, params: ThreadForkParams) {
+    async fn thread_fork(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadForkParams,
+        transport: AppServerTransport,
+    ) {
         let ThreadForkParams {
             thread_id,
             path,
@@ -4952,6 +5075,24 @@ impl CodexMessageProcessor {
 
         let fallback_model_provider = config.model_provider_id.clone();
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
+        let pooled_runtime_admission = match self
+            .reserve_top_level_pooled_runtime(
+                match self.pooled_runtime_enabled_for_transport(transport).await {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        self.outgoing.send_error(request_id, error).await;
+                        return;
+                    }
+                },
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
 
         let NewThread {
             thread_id,
@@ -4971,6 +5112,7 @@ impl CodexMessageProcessor {
         {
             Ok(thread) => thread,
             Err(err) => {
+                pooled_runtime_admission.rollback().await;
                 match err {
                     CodexErr::Io(_) | CodexErr::Json(_) => {
                         self.send_invalid_request_error(
@@ -4993,6 +5135,7 @@ impl CodexMessageProcessor {
                 return;
             }
         };
+        pooled_runtime_admission.promote(thread_id).await;
 
         // Auto-attach a conversation listener when forking a thread.
         Self::log_listener_attach_result(
@@ -6003,6 +6146,9 @@ impl CodexMessageProcessor {
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
         self.pending_thread_unloads.lock().await.remove(&thread_id);
+        self.pooled_runtime_scope
+            .mark_thread_unloaded(thread_id)
+            .await;
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
@@ -6015,14 +6161,18 @@ impl CodexMessageProcessor {
     }
 
     async fn unload_thread_without_subscribers(
-        thread_manager: Arc<ThreadManager>,
-        outgoing: Arc<OutgoingMessageSender>,
-        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
-        thread_state_manager: ThreadStateManager,
-        thread_watch_manager: ThreadWatchManager,
+        context: ThreadUnloadContext,
         thread_id: ThreadId,
         thread: Arc<CodexThread>,
     ) {
+        let ThreadUnloadContext {
+            thread_manager,
+            outgoing,
+            pending_thread_unloads,
+            pooled_runtime_scope,
+            thread_state_manager,
+            thread_watch_manager,
+        } = context;
         info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
         // Any pending app-server -> client requests for this thread can no longer be
@@ -6037,12 +6187,14 @@ impl CodexMessageProcessor {
                 ThreadShutdownResult::Complete => {
                     if thread_manager.remove_thread(&thread_id).await.is_none() {
                         info!("thread {thread_id} was already removed before teardown finalized");
+                        pooled_runtime_scope.mark_thread_unloaded(thread_id).await;
                         thread_watch_manager
                             .remove_thread(&thread_id.to_string())
                             .await;
                         pending_thread_unloads.lock().await.remove(&thread_id);
                         return;
                     }
+                    pooled_runtime_scope.mark_thread_unloaded(thread_id).await;
                     thread_watch_manager
                         .remove_thread(&thread_id.to_string())
                         .await;
@@ -7974,6 +8126,7 @@ impl CodexMessageProcessor {
                 thread_state_manager: self.thread_state_manager.clone(),
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+                pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
                 thread_watch_manager: self.thread_watch_manager.clone(),
@@ -8088,6 +8241,7 @@ impl CodexMessageProcessor {
                 thread_state_manager: self.thread_state_manager.clone(),
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+                pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
                 thread_watch_manager: self.thread_watch_manager.clone(),
@@ -8137,6 +8291,7 @@ impl CodexMessageProcessor {
             thread_manager,
             thread_state_manager,
             pending_thread_unloads,
+            pooled_runtime_scope,
             analytics_events_client: _,
             general_analytics_enabled: _,
             thread_watch_manager,
@@ -8256,11 +8411,14 @@ impl CodexMessageProcessor {
                             pending_thread_unloads.insert(conversation_id);
                         }
                         Self::unload_thread_without_subscribers(
-                            thread_manager.clone(),
-                            outgoing_for_task.clone(),
-                            pending_thread_unloads.clone(),
-                            thread_state_manager.clone(),
-                            thread_watch_manager.clone(),
+                            ThreadUnloadContext {
+                                thread_manager: thread_manager.clone(),
+                                outgoing: outgoing_for_task.clone(),
+                                pending_thread_unloads: pending_thread_unloads.clone(),
+                                pooled_runtime_scope: pooled_runtime_scope.clone(),
+                                thread_state_manager: thread_state_manager.clone(),
+                                thread_watch_manager: thread_watch_manager.clone(),
+                            },
                             conversation_id,
                             conversation.clone(),
                         )

@@ -567,7 +567,7 @@ async fn account_lease_read_reports_remote_reset_and_retry_suppressed_reason() -
 }
 
 #[tokio::test]
-async fn pooled_mode_rejects_multi_thread_stdio_runtime() -> Result<()> {
+async fn pooled_mode_rejects_second_top_level_stdio_runtime_creation() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_pooled_config_toml(codex_home.path(), &server.uri())?;
@@ -590,25 +590,25 @@ async fn pooled_mode_rejects_multi_thread_stdio_runtime() -> Result<()> {
     let second_id = mcp
         .send_thread_start_request(ThreadStartParams::default())
         .await?;
-    let _: ThreadStartResponse = to_response(
-        timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(second_id)),
-        )
-        .await??,
-    )?;
-
-    let request_id = mcp.send_account_lease_read_request().await?;
     let error: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(second_id)),
     )
     .await??;
 
     assert!(
-        error.error.message.contains("one loaded thread"),
+        error
+            .error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("errorCode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("pooledRuntimeAlreadyLoaded"),
         "unexpected error: {error:?}"
     );
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.suppressed, false);
 
     Ok(())
 }

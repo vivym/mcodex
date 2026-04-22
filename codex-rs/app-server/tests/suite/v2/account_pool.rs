@@ -1,7 +1,14 @@
 use super::connection_handling_websocket::DEFAULT_READ_TIMEOUT;
+use super::connection_handling_websocket::connect_websocket;
+use super::connection_handling_websocket::read_jsonrpc_message;
+use super::connection_handling_websocket::read_response_for_id;
+use super::connection_handling_websocket::send_initialize_request;
+use super::connection_handling_websocket::send_request;
+use super::connection_handling_websocket::spawn_websocket_server;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
@@ -20,10 +27,18 @@ use codex_app_server_protocol::AccountPoolEventsListResponse;
 use codex_app_server_protocol::AccountPoolReadParams;
 use codex_app_server_protocol::AccountPoolReadResponse;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadArchiveResponse;
+use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_state::AccountPoolEventRecord;
 use codex_state::LegacyAccountImport;
@@ -163,32 +178,13 @@ async fn account_pool_read_rejects_unconfigured_pool_even_with_state() -> Result
 }
 
 #[tokio::test]
-async fn account_pool_read_succeeds_with_multiple_loaded_threads() -> Result<()> {
+async fn account_pool_read_succeeds_with_one_loaded_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
     seed_two_accounts(codex_home.path()).await?;
     let mut mcp = initialized_mcp(codex_home.path()).await?;
 
-    let first_id = mcp
-        .send_thread_start_request(ThreadStartParams::default())
-        .await?;
-    let _: ThreadStartResponse = to_response(
-        timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(first_id)),
-        )
-        .await??,
-    )?;
-
-    let second_id = mcp
-        .send_thread_start_request(ThreadStartParams::default())
-        .await?;
-    let _: ThreadStartResponse = to_response(
-        timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(second_id)),
-        )
-        .await??,
-    )?;
+    let thread = start_thread(&mut mcp).await?;
+    assert!(!thread.id.is_empty());
 
     let response: AccountPoolReadResponse = send_account_pool_request(
         &mut mcp,
@@ -202,6 +198,133 @@ async fn account_pool_read_succeeds_with_multiple_loaded_threads() -> Result<()>
     assert_eq!(response.pool_id, LEGACY_DEFAULT_POOL_ID);
     assert_eq!(response.summary.total_accounts, 2);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_pooled_mode_rejects_second_loaded_top_level_thread() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    seed_two_accounts(codex_home.path()).await?;
+    let mut mcp = initialized_mcp(codex_home.path()).await?;
+
+    let first = start_thread(&mut mcp).await?;
+    let error = start_thread_error(&mut mcp).await?;
+
+    assert_eq!(
+        pooled_runtime_error_code(&error),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+    assert!(!first.id.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_pooled_mode_releases_host_when_loaded_thread_archives() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    seed_two_accounts(codex_home.path()).await?;
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let mut mcp = initialized_mcp_with_responses(codex_home.path(), responses).await?;
+
+    let first = start_thread(&mut mcp).await?;
+    start_turn_and_wait_completed(&mut mcp, first.id.as_str()).await?;
+    archive_thread(&mut mcp, first.id.as_str()).await?;
+
+    let second = start_thread(&mut mcp).await?;
+
+    assert_ne!(first.id, second.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_pooled_mode_blocks_resume_and_fork_that_would_create_second_top_level_context()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    seed_two_accounts(codex_home.path()).await?;
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let mut mcp = initialized_mcp_with_responses(codex_home.path(), responses).await?;
+
+    let loaded = start_thread(&mut mcp).await?;
+    start_turn_and_wait_completed(&mut mcp, loaded.id.as_str()).await?;
+    let rollout_path = loaded
+        .path
+        .expect("started thread should report a rollout path");
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            history: None,
+            path: Some(rollout_path),
+            model: None,
+            model_provider: None,
+            service_tier: None,
+            cwd: None,
+            approval_policy: None,
+            approvals_reviewer: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        })
+        .await?;
+    let resume_error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    assert_eq!(
+        pooled_runtime_error_code(&resume_error),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: loaded.id,
+            ..Default::default()
+        })
+        .await?;
+    let fork_error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    assert_eq!(
+        pooled_runtime_error_code(&fork_error),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_app_server_rejects_pooled_runtime_host_creation() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_default_pool_state(codex_home.path()).await?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut ws = connect_websocket(bind_addr).await?;
+    send_initialize_request(&mut ws, /*id*/ 1, "ws_account_pool_client").await?;
+    let init = read_response_for_id(&mut ws, /*id*/ 1).await?;
+    assert_eq!(init.id, RequestId::Integer(1));
+
+    send_request(
+        &mut ws,
+        "thread/start",
+        /*id*/ 2,
+        Some(serde_json::to_value(ThreadStartParams::default())?),
+    )
+    .await?;
+    let error = read_websocket_error_for_id(&mut ws, /*id*/ 2).await?;
+
+    assert_eq!(
+        pooled_runtime_error_code(&error),
+        Some("pooledRuntimeUnsupportedTransport")
+    );
+
+    process.kill().await?;
     Ok(())
 }
 
@@ -344,11 +467,109 @@ where
 
 async fn initialized_mcp(codex_home: &std::path::Path) -> Result<McpProcess> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    create_pooled_config_toml(codex_home, &server.uri())?;
+    initialized_mcp_with_server(codex_home, &server.uri()).await
+}
+
+async fn initialized_mcp_with_responses(
+    codex_home: &std::path::Path,
+    responses: Vec<String>,
+) -> Result<McpProcess> {
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    initialized_mcp_with_server(codex_home, &server.uri()).await
+}
+
+async fn initialized_mcp_with_server(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+) -> Result<McpProcess> {
+    create_pooled_config_toml(codex_home, server_uri)?;
 
     let mut mcp = McpProcess::new_with_env(codex_home, &[("OPENAI_API_KEY", None)]).await?;
     mcp.initialize().await?;
     Ok(mcp)
+}
+
+async fn start_thread(mcp: &mut McpProcess) -> Result<codex_app_server_protocol::Thread> {
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(response)?;
+    Ok(thread)
+}
+
+async fn start_thread_error(mcp: &mut McpProcess) -> Result<JSONRPCError> {
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await?
+}
+
+async fn start_turn_and_wait_completed(mcp: &mut McpProcess, thread_id: &str) -> Result<()> {
+    let request_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![UserInput::Text {
+                text: "materialize rollout".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: TurnStartResponse = to_response(response)?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    Ok(())
+}
+
+async fn archive_thread(mcp: &mut McpProcess, thread_id: &str) -> Result<()> {
+    let request_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: thread_id.to_string(),
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let _: ThreadArchiveResponse = to_response(response)?;
+    Ok(())
+}
+
+fn pooled_runtime_error_code(error: &JSONRPCError) -> Option<&str> {
+    error.error.data.as_ref()?.get("errorCode")?.as_str()
+}
+
+async fn read_websocket_error_for_id(
+    stream: &mut super::connection_handling_websocket::WsClient,
+    id: i64,
+) -> Result<JSONRPCError> {
+    let target_id = RequestId::Integer(id);
+    loop {
+        let message = read_jsonrpc_message(stream).await?;
+        if let JSONRPCMessage::Error(error) = message
+            && error.id == target_id
+        {
+            return Ok(error);
+        }
+    }
 }
 
 async fn seed_default_pool_state(codex_home: &std::path::Path) -> Result<Arc<StateRuntime>> {

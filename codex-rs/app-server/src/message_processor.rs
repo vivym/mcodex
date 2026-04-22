@@ -924,6 +924,7 @@ impl MessageProcessor {
                         other,
                         session.app_server_client_name.clone(),
                         session.client_version.clone(),
+                        transport,
                         request_context,
                     )
                     .boxed()

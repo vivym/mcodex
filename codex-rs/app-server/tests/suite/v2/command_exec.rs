@@ -129,8 +129,8 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
 }
 
 #[tokio::test]
-async fn command_exec_env_overrides_merge_with_server_environment_and_support_unset() -> Result<()>
-{
+async fn command_exec_env_overrides_merge_with_server_environment_and_support_unset_without_legacy_home_leak()
+-> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
@@ -146,7 +146,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
             command: vec![
                 "/bin/sh".to_string(),
                 "-lc".to_string(),
-                "printf '%s|%s|%s|%s' \"$COMMAND_EXEC_BASELINE\" \"$COMMAND_EXEC_EXTRA\" \"${RUST_LOG-unset}\" \"$CODEX_HOME\"".to_string(),
+                "printf '%s|%s|%s|%s|%s' \"$COMMAND_EXEC_BASELINE\" \"$COMMAND_EXEC_EXTRA\" \"${RUST_LOG-unset}\" \"$MCODEX_HOME\" \"${CODEX_HOME-unset}\"".to_string(),
             ],
             process_id: None,
             tty: false,
@@ -178,7 +178,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         response,
         CommandExecResponse {
             exit_code: 0,
-            stdout: format!("request|added|unset|{}", codex_home.path().display()),
+            stdout: format!("request|added|unset|{}|unset", codex_home.path().display()),
             stderr: String::new(),
         }
     );
