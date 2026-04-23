@@ -642,6 +642,13 @@ Synchronous path must stay bounded:
 - budget pressure may delay close completion or move the mutator onto a slower
   exact capture path, but it must not be the reason that `path_replay_status`
   becomes `partial` or `unavailable`
+- truth-first slow path is an accepted v1 operational cost for opaque or
+  non-write-through mutators; implementations must surface close-path telemetry
+  that distinguishes bounded close from slow exact capture, and operators must
+  be able to configure alerting/SLA thresholds for slow-path frequency and age
+- structured first-party mutators should converge toward zero steady-state
+  slow-path usage; recurring slow-path fallback on those paths is an ingress
+  coverage gap, not a reason to weaken exactness guarantees
 - descriptor-only evidence is valid only when the exact immutable replay input
   for the affected content is genuinely unavailable, unreadable, redacted, or
   otherwise not capturable; it must not be used merely because exact capture was
@@ -903,6 +910,10 @@ Rules:
   externally visible. A replayable batch may therefore stall a stream only at
   the head, not leave a permanently tentative hole in the middle of visible
   history
+- head-of-line blocking at the stream head is an accepted consequence of
+  checkpointable committed export in v1; implementations must surface the age of
+  the oldest head-blocking replayable batch and enforce operator-configurable
+  finalize/repair SLA thresholds rather than weakening export correctness
 - outcome marker events are not counted in `append_batch_size`; they carry the
   `append_batch_id` in payload and may omit participant index fields
 - batch outcome payloads carry `append_batch_id`, participating streams, ordered
@@ -1466,6 +1477,9 @@ Rules:
   window or another stronger retention root still depends on their artifacts
 - retention roots determine artifact lifetime; `retention_class` communicates
   why an artifact is pinned, while the store remains globally deduplicated
+- the local retention window and archive migration policy must be explicit
+  operator-visible configuration; implementations must not silently treat local
+  exact retention as either unbounded forever or zero-length best effort
 - implementations must support tiered retention:
   - local hot / local durable retention for ordinary recent states and file
     versions
@@ -1473,6 +1487,12 @@ Rules:
     replay material
   - cold or archive migration for artifacts that must remain logically
     replayable after leaving the local hot window
+- if exact replay is still promised after an artifact leaves local hot/durable
+  storage, the implementation must retain that artifact inside
+  `ExactArtifactStore` with `storage_class = coldArchived`; archive migration
+  may move bytes to colder backing storage, but it must not introduce a second
+  untyped locator model or silently break the replay contract when the local
+  retention window expires
 - hot indexes, tree-entry caches, and other derived acceleration structures are
   not retention roots and may be evicted without weakening exact replay
 - supervised exact-ingress paths should publish replay artifacts into
@@ -4144,14 +4164,19 @@ Rules:
 - budget-driven large rewrites still close with an exact immutable truth source,
   using delta externalization, manifest checkpoints, or
   `filesystemDeltaSnapshotState` rather than deferred truth recovery
+- truth-first slow-path close records telemetry/metrics distinct from bounded
+  close and can be alerted on without weakening exactness semantics
 - `ExactArtifactStore` deduplicates Git promotion, filesystem snapshots, path
   deltas, and working-tree evidence under one retention model
 - `checkpointCompaction` promotes already-captured exact truth into faster query
   structures without changing recorder truth or becoming a second truth source
 - exact Git-backed states require durable `git_tree_oid` inputs, not `hashOnly`
   references
-- promoted Git objects are deduplicated, retained only while exact states or
-  exports reference them, and can be reclaimed after that retention window
+- promoted Git objects are deduplicated, retained while any surviving retention
+  root still depends on them, including local-window exact states/file
+  versions, projector inputs, persisted exports, active blob-read sessions, and
+  explicit archival retention, and can be reclaimed only after those roots are
+  gone or migrated to replay-preserving cold archive storage
 - multi-parent logical states require `path_replay_parent_workspace_state_id` or
   checkpoint promotion before path replay is valid
 - file/entity-scoped projection DAG dependency blocking and pending/partial
@@ -4231,6 +4256,8 @@ Rules:
 - finished blob-audit sessions may compact intermediate checkpoints only after
   policy-defined durability conditions while retaining session authorization and
   final retained delivery proof
+- committed export blocks only at the stream head, and metrics expose the age of
+  any head-blocking replayable batch until finalize/repair completes
 - raw-content access-audit payloads record byte range and delivered content
   digest when disclosure succeeds
 - deterministic server-selected audit-stream resolution
@@ -4334,6 +4361,9 @@ Do not promise hunk or range queries before this phase is complete.
 - define `ExactGitState(git_tree_oid)` as an authoritative exact manifest source
 - implement `ExactArtifactStore` retention, dedupe, and GC before exact
   Git-backed or filesystem-backed states depend on unreachable/local artifacts
+- make local retention window, archive migration, and replay-preserving
+  cold-tier policy explicit before exact artifact growth is relied on in
+  production
 - add bootstrap prehistory
 - add file version and file entity edge model
 - add directed file entity edge records
