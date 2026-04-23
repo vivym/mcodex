@@ -323,7 +323,7 @@ fact:
 WorkspaceTransition
 - transition_id: String
 - primary_cause: CauseRef
-- supporting_observation_event_refs: Vec<EventRef>
+- supporting_evidence_event_refs: Vec<EventRef>
 - workspace_stream_id: String
 - workspace_instance_id: String
 - pre_workspace_state_id: String
@@ -347,7 +347,7 @@ Rules:
   new `post_workspace_state_id` and advance the workspace head through a
   `WorkspaceTransition`; recording only a drift event without a new recorded
   state is invalid
-- `primary_cause = observationSet` and `supporting_observation_event_refs` must
+- `primary_cause = observationSet` and `supporting_evidence_event_refs` must
   be de-duplicated and ordered by the
   canonical `(ledger_scope, stream_id, stream_epoch, sequence)` of the
   referenced events
@@ -363,12 +363,21 @@ Rules:
 - when a transition closes a Codex-attributable write window,
   `primary_cause` must be `mutationInterval`; any reconcile, drift,
   unsupervised, or external observations from the same close path must be
-  recorded in `supporting_observation_event_refs`
+  recorded in `supporting_evidence_event_refs`
 - when a transition is an authoritative reconcile with no owning mutation
   interval, `primary_cause` must be `observationSet`; implementations must not
   invent a synthetic Codex write interval for that transition
-- `supporting_observation_event_refs` is explanatory evidence only; it must not
+- `supporting_evidence_event_refs` is explanatory evidence only; it must not
   override the single authoritative `primary_cause`
+- `primary_cause.observationSet.observation_event_refs` and
+  `supporting_evidence_event_refs` must be disjoint
+- when `primary_cause = observationSet`, every observation that participates in
+  the authoritative reconcile must appear in
+  `primary_cause.observationSet.observation_event_refs`; implementations must
+  not split one authoritative reconcile set across both fields
+- when `primary_cause = mutationInterval`, reconcile/drift observations from the
+  same close path belong in `supporting_evidence_event_refs`, not in an
+  additional `observationSet`
 - the `code.workspace_state_captured` event that establishes a transition must
   carry a `causality_refs.caused_by` that is byte-for-byte equivalent to
   `WorkspaceTransition.primary_cause`; implementations must not serialize a
@@ -673,9 +682,9 @@ FileChangeEvidence
 - post_file_version_ref: Option<String>
 - pre_git_blob_oid: Option<String>
 - post_git_blob_oid: Option<String>
-- pre_blob_ref: Option<String>
-- post_blob_ref: Option<String>
-- tombstone_ref: Option<String>
+- pre_blob_ref: Option<ExactArtifactRef>
+- post_blob_ref: Option<ExactArtifactRef>
+- tombstone_ref: Option<ExactArtifactRef>
 - diff_basis
   - GitTree
   - GitWorkingTree
@@ -820,9 +829,9 @@ AppendBatch
   - one or more `TraceKernelEvent` appends across one or more ledger scopes
 - referenced_event_refs
 - outcome
-  - Committed
-  - Aborted
-  - Repaired
+  - committed
+  - aborted
+  - repaired
 ```
 
 `AppendBatch` is not only an internal transaction helper. It is a replayable
@@ -1387,6 +1396,32 @@ Rules:
 All immutable non-event content required for exact replay belongs to one
 content-addressed `ExactArtifactStore`.
 
+```text
+ExactArtifactRef
+- artifact_id: String
+- artifact_kind
+  - promotedGitObject
+  - stateManifest
+  - pathDelta
+  - filesystemDeltaSnapshot
+  - filesystemSnapshot
+  - workingTreeBlob
+  - tombstoneBlob
+  - other
+- content_digest: String
+- storage_class
+  - localHot
+  - localDurable
+  - exportedBundle
+  - coldArchived
+- retention_class
+  - ephemeral
+  - sessionBound
+  - stateBound
+  - exportBound
+  - archival
+```
+
 It covers:
 
 - promoted unreachable Git trees and blobs
@@ -1401,9 +1436,14 @@ Rules:
 
 - exact artifact refs are immutable and globally deduplicated by content or
   object identity as appropriate
+- `ExactArtifactRef` is the canonical typed handle for exact replay artifacts;
+  workspace states, file versions, blob locators, and file-change evidence must
+  use it instead of untyped string locators
 - retained exact workspace states, file versions, projector inputs, persisted
   exports, active blob-read sessions, and explicit archival policies are the
   retention roots for exact artifacts
+- retention roots determine artifact lifetime; `retention_class` communicates
+  why an artifact is pinned, while the store remains globally deduplicated
 - hot indexes, tree-entry caches, and other derived acceleration structures are
   not retention roots and may be evicted without weakening exact replay
 - supervised exact-ingress paths should publish replay artifacts into
@@ -1512,10 +1552,10 @@ WorkspaceStateRecord
   - exact
   - partial
   - unavailable
-- state_manifest_ref: Option<String>
-- filesystem_delta_snapshot_ref: Option<String>
-- filesystem_snapshot_ref: Option<String>
-- path_delta_ref: Option<String>
+- state_manifest_ref: Option<ExactArtifactRef>
+- filesystem_delta_snapshot_ref: Option<ExactArtifactRef>
+- filesystem_snapshot_ref: Option<ExactArtifactRef>
+- path_delta_ref: Option<ExactArtifactRef>
 - changed_path_entries: Vec<WorkspacePathEntry>
 - checkpoint_kind
   - none
@@ -1597,7 +1637,7 @@ FileVersionRecord
   - storedUnreachable
   - hashOnly
   - notGitBacked
-- blob_ref: Option<String>
+- blob_ref: Option<ExactArtifactRef>
 - byte_size: Option<u64>
 - line_count: Option<u32>
 - line_index_digest: Option<String>
@@ -2259,8 +2299,10 @@ metadata, but they must not replace `event_type` inside the ledger event.
 `ledger_context.category` uses the lower-camel wire strings above, and those
 exact values are part of the canonical hash input.
 
-When events are exported through `provenanceEvent/export`, the mapped name is
-surfaced as `ExportedTraceEvent.external_event_name` under the selected
+When events are exported through `provenanceEvent/exportRawReplay` or
+`provenanceEvent/exportCommitted`, the mapped name is surfaced as
+`RawReplayExportedTraceEvent.external_event_name` or
+`CommittedExportedTraceEvent.external_event_name` under the selected
 `export_contract_version`.
 
 Events created outside a session or thread, such as bootstrap, blob custody,
@@ -2333,7 +2375,12 @@ Required typed payloads:
     - `allowed`
     - `denied`
     - `unavailable`
-  - `requested_byte_range: Option<ByteRange>`
+  - `opening_requested_byte_range: Option<ByteRange>`
+  - `authorized_session_scope`
+    - `wholeBlob`
+    - `contiguousForwardRead`
+      - `start_offset: u64`
+      - `max_offset_exclusive: Option<u64>`
 - `access.blob_read_delivered`
   - `authorization_event_ref: EventRef`
   - `blob_read_session_id: String`
@@ -2395,7 +2442,7 @@ Required typed payloads:
 - `system.append_batch_aborted`
   - `append_batch_id`
   - `participating_stream_refs: Vec<LedgerStreamRef>`
-  - `materialized_event_refs: Vec<EventRef>`
+  - `materialized_event_refs_ordered: Vec<EventRef>`
   - `reserved_append_refs: Vec<AppendReservationRef>`
   - `stream_local_outcomes: Vec<StreamLocalBatchOutcome>`
   - `abort_reason`
@@ -2681,10 +2728,10 @@ Do not make the canonical blob shape depend on a local file path.
 
 `LocalBlobLocator`
 
-- `blob_ref_id`
+- `blob_ref_id: String`
 - `descriptor_event_ref: EventRef`
 - `availability: BlobAvailability`
-- `local_storage_ref`
+- `local_storage_ref: ExactArtifactRef`
 
 Canonical export should depend on `BlobDescriptor`. The local locator is an
 implementation detail for the local collector, but it must still bind to one
@@ -2705,8 +2752,8 @@ available. Serialized wire values are camelCase:
 - `auditFailure`
   - audit-stream or audit-append failure; no content and no access event refs
 - `selectorFailure`
-  - unresolved selector status and reason codes; no content and no audit event,
-    because no exact custody fact was selected
+  - selector resolution failed; authoritative status lives in the top-level
+    `ReadBlobResponse.query_status`, and no exact custody fact was selected
 - `invalidRequest`
   - resolved selector but invalid offset/continuation/session parameters; no
     content and no newly disclosed bytes
@@ -2743,6 +2790,10 @@ entitlements.
 `access.blob_read_authorized` is emitted once per logical blob-read session.
 `opening_request_id` identifies the RPC that opened that session; later resumed
 RPCs are linked by `blob_read_session_id`, not by reusing `opening_request_id`.
+`opening_requested_byte_range` captures only the opening RPC's requested range.
+The session's total disclosure budget is instead defined by
+`authorized_session_scope`; resumed reads that would exceed that scope must open
+a new blob-read session rather than silently extend the original one.
 
 `access.blob_read_delivered` is cumulative at the checkpoint level:
 
@@ -2774,7 +2825,8 @@ Provenance must have its own v2 surface.
 - `provenanceMutationInterval/read`
 - `provenanceWorkspaceTransition/read`
 - `provenanceMutationObservation/read`
-- `provenanceEvent/export`
+- `provenanceEvent/exportRawReplay`
+- `provenanceEvent/exportCommitted`
 - `provenanceBlobManifest/read`
 - `provenanceBlob/read`
 
@@ -2824,7 +2876,10 @@ Canonical list/export ordering:
   stream_epoch ASC`
 - `provenanceRevisionAlias/list`: `workspace_instance_id ASC, git_commit_oid ASC,
   git_tree_oid ASC, alias_id ASC`
-- `provenanceEvent/export`: `sequence ASC` within the selected stream epoch
+- `provenanceEvent/exportRawReplay`: `sequence ASC` within the selected stream
+  epoch
+- `provenanceEvent/exportCommitted`: `sequence ASC` within the selected stream
+  epoch
 - `provenanceBlobManifest/read`: `blob_ref_id ASC`
 - candidate lineage pagination: `depth ASC, child_hunk_id ASC,
   parent_hunk_id ASC, edge_id ASC`
@@ -2910,6 +2965,10 @@ zero-width side. Range queries must not use `PatchLineSpan`.
 - `blobRef`
   - `selector: WorkspaceCustodySelector`
   - `blob_ref_id: String`
+- `blobReadAttempt`
+  - `selector: WorkspaceCustodySelector`
+  - `blob_ref_id: String`
+  - `continuation_token_fingerprint: Option<String>`
 - `blobReadSession`
   - `selector: WorkspaceCustodySelector`
   - `blob_ref_id: String`
@@ -3064,7 +3123,7 @@ Rules:
 - `workspace_stream_id: String`
 - `workspace_instance_id: String`
 - `primary_cause: CauseRef`
-- `supporting_observation_event_refs: Vec<EventRef>`
+- `supporting_evidence_event_refs: Vec<EventRef>`
 - `pre_workspace_state_id: String`
 - `post_workspace_state_id: String`
 - `establishing_event_ref: EventRef`
@@ -3437,21 +3496,15 @@ The direct-id read rule applies to `provenanceHunk/read`,
 `provenanceWorkspaceTransition/read`, and
 `provenanceMutationObservation/read` as well as `provenanceTurn/read`.
 
-`provenanceEvent/export`
+`ExportContinuityStatus`
 
-- `ExportEventsParams`
-  - `ledger_scope: LedgerScope`
-  - `stream_id: String`
-  - `stream_epoch: u64`
-  - `export_contract_version: Option<String>`
-  - `cursor: Option<String>`
-  - `limit: Option<u32>`
-  - `after_sequence: Option<u64>`
-  - `after_event_hash: Option<String>`
-  - `snapshot_head_sequence: Option<u64>`
-  - `snapshot_head_event_hash: Option<String>`
+- `expected_next_sequence: u64`
+- `last_exported_sequence: Option<u64>`
+- `last_exported_event_hash: Option<String>`
+- `gap_detected: bool`
+- `repair_required: bool`
 
-Resume rules:
+Shared resume rules for both export surfaces:
 
 - `cursor` is mutually exclusive with `after_sequence` and `after_event_hash`
 - `after_sequence` and `after_event_hash` must either both be provided or both
@@ -3471,16 +3524,83 @@ Resume rules:
   requested epoch
 - the first page establishes a snapshot head; subsequent pages returned via
   `cursor` must paginate against that fixed snapshot, not a moving live head
+- `snapshot_head_sequence` and `snapshot_head_event_hash` are populated only
+  when `query_status.selector_status = Matched`. Selector mismatch or
+  unavailable responses serialize both fields as `null` and return `data = []`
+- `stream_epoch_descriptor` and `continuity_status` are populated only when the
+  requested stream epoch resolved exactly
+- when `query_status.selector_status = Matched`, `schema_bundle_ref` is
+  mandatory and must identify the exact schema bundle needed to validate every
+  row in `data`. It may be `null` only for selector mismatch or unavailable
+  responses
 
-`ExportContinuityStatus`
+`provenanceEvent/exportRawReplay`
 
-- `expected_next_sequence: u64`
-- `last_exported_sequence: Option<u64>`
-- `last_exported_event_hash: Option<String>`
-- `gap_detected: bool`
-- `repair_required: bool`
+- `ExportRawReplayEventsParams`
+  - `ledger_scope: LedgerScope`
+  - `stream_id: String`
+  - `stream_epoch: u64`
+  - `export_contract_version: String`
+  - `cursor: Option<String>`
+  - `limit: Option<u32>`
+  - `after_sequence: Option<u64>`
+  - `after_event_hash: Option<String>`
+  - `snapshot_head_sequence: Option<u64>`
+  - `snapshot_head_event_hash: Option<String>`
 
-`ExportedTraceEvent`
+`RawReplayExportedTraceEvent`
+
+- `kernel_event: TraceKernelEvent`
+- `external_event_name: String`
+
+`ExportRawReplayEventsResponse`
+
+- `requested_stream_ref: LedgerStreamRef`
+- `stream_epoch_descriptor: Option<StreamEpochDescriptor>`
+- `query_status: QueryResolutionStatus`
+- `export_contract_version: String`
+- `required_schema_versions: Vec<String>`
+- `schema_bundle_ref: Option<SchemaBundleRef>`
+- `data: Vec<RawReplayExportedTraceEvent>`
+- `next_cursor: Option<String>`
+- `snapshot_head_sequence: Option<u64>`
+- `snapshot_head_event_hash: Option<String>`
+- `continuity_status: Option<ExportContinuityStatus>`
+- `missing_blob_refs: Vec<String>`
+
+`provenanceEvent/exportRawReplay` is the lossless append-only export surface.
+It must return every durable event in the selected stream epoch that is visible
+at or before the chosen raw replay snapshot head, including standalone events,
+replayable batch participants, outcome markers, aborts, repairs, and
+handoff/seal events. `export_contract_version` is mandatory on the request;
+servers must reject omitted or unknown raw replay contract versions rather than
+silently defaulting to the local newest mapping.
+
+`ExportRawReplayEventsResponse` is the canonical lossless export artifact. Any
+persisted raw export bundle must retain `requested_stream_ref`,
+`export_contract_version`, and the paired `TraceSchemaBundle` or a durable
+reference to it. `required_schema_versions` lists every
+`kernel_event.schema_version` present in `data`; the paired bundle must cover
+all of them. `schema_bundle_ref` may identify a separately fetched bundle, but
+it must include the exact `schema_bundle_digest` that validators need to bind
+exported events to schema content. Storing only the bare `data` vector is not a
+valid lossless export format.
+
+`provenanceEvent/exportCommitted`
+
+- `ExportCommittedEventsParams`
+  - `ledger_scope: LedgerScope`
+  - `stream_id: String`
+  - `stream_epoch: u64`
+  - `export_contract_version: Option<String>`
+  - `cursor: Option<String>`
+  - `limit: Option<u32>`
+  - `after_sequence: Option<u64>`
+  - `after_event_hash: Option<String>`
+  - `snapshot_head_sequence: Option<u64>`
+  - `snapshot_head_event_hash: Option<String>`
+
+`CommittedExportedTraceEvent`
 
 - `kernel_event: TraceKernelEvent`
 - `external_event_name: String`
@@ -3489,7 +3609,7 @@ Resume rules:
   - `committed`
 - `batch_outcome_terminus_event_ref: Option<EventRef>`
 
-`ExportEventsResponse`
+`ExportCommittedEventsResponse`
 
 - `requested_stream_ref: LedgerStreamRef`
 - `stream_epoch_descriptor: Option<StreamEpochDescriptor>`
@@ -3497,55 +3617,40 @@ Resume rules:
 - `export_contract_version: String`
 - `required_schema_versions: Vec<String>`
 - `schema_bundle_ref: Option<SchemaBundleRef>`
-- `data: Vec<ExportedTraceEvent>`
+- `data: Vec<CommittedExportedTraceEvent>`
 - `next_cursor: Option<String>`
 - `snapshot_head_sequence: Option<u64>`
 - `snapshot_head_event_hash: Option<String>`
 - `continuity_status: Option<ExportContinuityStatus>`
 - `missing_blob_refs: Vec<String>`
 
-`snapshot_head_sequence` and `snapshot_head_event_hash` are populated only when
-`query_status.selector_status = Matched`. Selector mismatch or unavailable
-responses serialize both fields as `null` and return `data = []`.
+`provenanceEvent/exportCommitted` is the checkpointable committed projection.
+It may default `export_contract_version` to the local latest supported mapping,
+but it is not the lossless replay artifact. It exposes only finalized committed
+recorder truth.
 
-`stream_epoch_descriptor` and `continuity_status` are populated only when the
-requested stream epoch resolved exactly. `export_contract_version` must echo the
-effective contract version used to compute `external_event_name`, even when the
-caller omitted it and the server selected a default.
-
-When `query_status.selector_status = Matched`, `schema_bundle_ref` is mandatory
-and must identify the exact schema bundle needed to validate every row in
-`data`. It may be `null` only for selector mismatch or unavailable responses.
-
-`ExportEventsResponse` is the canonical export artifact. Any persisted export
-bundle must retain `requested_stream_ref`, `export_contract_version`, and the
-paired `TraceSchemaBundle` or a durable reference to it. `required_schema_versions`
-lists every `kernel_event.schema_version` present in `data`; the paired bundle
-must cover all of them. `schema_bundle_ref` may identify a separately fetched
-bundle, but it must include the exact `schema_bundle_digest` that validators
-need to bind exported events to schema content. Storing only the bare `data`
-vector is not a valid lossless export format.
-
-`snapshot_head_sequence` and `snapshot_head_event_hash` are resume assertions for
-continuing a previously established export snapshot. They must be omitted on an
-initial page request and may be supplied only together when resuming from a
-prior page's fixed snapshot head.
-
-Replayable batch participants are exportable only after their stream-local
-outcome terminus is durable and visible to the exporter. Default checkpointable
+Replayable batch participants are committed-exportable only after their
+stream-local outcome terminus is durable and visible to the exporter. Committed
 export includes only participants from batches whose finalized outcome kind is
 `committed`; aborted and repaired participants remain raw/forensic history and
-must not be exposed as committed recorder truth. The exporter computes the first
-page's snapshot head as the latest checkpointable event at or before the live
-head, where no earlier replayable batch participant lacks a visible stream-local
-outcome terminus. The exporter must not advance `next_cursor`,
-`snapshot_head_sequence`, or `snapshot_head_event_hash` past that
-checkpointable frontier. Exported participant rows include `batch_export_state`
-and `batch_outcome_terminus_event_ref` so collectors can verify that they
-checkpoint only finalized committed facts. In a writable handoff batch, the old
-stream's terminus ref may therefore point to `system.stream_sealed`. Compliant
-writers must keep any such stall at the stream head by withholding later
-same-epoch visibility until the local outcome terminus is durable.
+must not be exposed as committed recorder truth. The committed exporter
+computes the first page's snapshot head as the latest checkpointable event at
+or before the live head, where no earlier replayable batch participant lacks a
+visible stream-local outcome terminus. The committed exporter must not advance
+`next_cursor`, `snapshot_head_sequence`, or `snapshot_head_event_hash` past
+that checkpointable frontier. Exported participant rows include
+`batch_export_state` and `batch_outcome_terminus_event_ref` so collectors can
+verify that they checkpoint only finalized committed facts. In a writable
+handoff batch, the old stream's terminus ref may therefore point to
+`system.stream_sealed`. Compliant writers must keep any such stall at the
+stream head by withholding later same-epoch visibility until the local outcome
+terminus is durable.
+
+For both export surfaces, `snapshot_head_sequence` and
+`snapshot_head_event_hash` are resume assertions for continuing a previously
+established export snapshot. They must be omitted on an initial page request
+and may be supplied only together when resuming from a prior page's fixed
+snapshot head.
 
 `provenanceBlobManifest/read`
 
@@ -3625,6 +3730,8 @@ Rules:
 - when `continuation_token` is supplied, the server must resume that exact
   descriptor-pinned session; request fields that disagree with the token are
   request validation errors
+- malformed or undecodable continuation tokens are request validation errors and
+  must anchor `query_status.status_anchor = blobReadAttempt`
 - before issuing a continuation token, the server must either encode the
   resumable digest state into that token or persist a digest checkpoint that
   the token can deterministically recover; resumed reads must not require
@@ -3682,6 +3789,8 @@ Rules:
   conflicts return `BlobRequestInvalidResult`
 - initial-resolution descriptor mismatches anchor
   `query_status.status_anchor = blobRef`
+- request-validation failures before the server can recover one exact
+  descriptor-pinned session anchor `query_status.status_anchor = blobReadAttempt`
 - descriptor-pinned blob-read session failures must anchor
   `query_status.status_anchor = blobReadSession`
 
@@ -3723,7 +3832,6 @@ Rules:
 
 - `type = auditFailure`
 - `audit_status: QueryResolutionStatus`
-- `reason_codes: Vec<String>`
 
 `BlobSelectorFailureResult`
 
@@ -3747,7 +3855,9 @@ Rules:
 
 `ReadBlobResponse.query_status` is the single authoritative selector-resolution
 status for blob reads. `BlobSelectorFailureResult` must not carry a second
-`QueryResolutionStatus`.
+`QueryResolutionStatus`. `BlobAuditFailureResult` must not duplicate
+`reason_codes`; callers read audit failure reasons from
+`audit_status.reason_codes`.
 
 If `query_status.selector_status != Matched`, `result` must be
 `BlobSelectorFailureResult`. Resolved-target variants are valid only when the
@@ -3963,7 +4073,8 @@ Rules:
   `rangeOutOfBounds` returning `selector_status = Matched` and `candidates = []`
 - candidate-scoped lineage pagination without a shared top-level cursor
 - lineage cursors reject rebind to a different candidate/state/revision
-- `provenanceEvent/export` resume hash mismatches returning
+- `provenanceEvent/exportRawReplay` and `provenanceEvent/exportCommitted`
+  resume hash mismatches returning
   `query_status.selector_status = ConstraintMismatch`
 - chunked blob `inlineChunk`, `unavailable`, and `accessDenied` responses
 - blob `auditFailure` responses for audit-stream resolution or append failures
@@ -4084,8 +4195,6 @@ fixtures, including TypeScript bindings, and run the protocol crate tests.
   `provenanceMutationInterval/read` for captured execution and interval facts
 - implement `provenanceWorkspaceTransition/read` and
   `provenanceMutationObservation/read`
-- unify `WorkspaceTransition.primary_cause` and `CauseRef` into one canonical
-  cause model before exposing authoritative transition reads
 
 Do not promise hunk or range queries before this phase is complete.
 
@@ -4127,8 +4236,8 @@ Do not promise hunk or range queries before this phase is complete.
 
 ### Phase 5: Export and Repair
 
-- add `provenanceSchema/read`, `provenanceEvent/export`, blob manifest, and
-  chunked blob reads
+- add `provenanceSchema/read`, `provenanceEvent/exportRawReplay`,
+  `provenanceEvent/exportCommitted`, blob manifest, and chunked blob reads
 - add exact access-audit authorization refs and blob selector-failure responses
 - add snapshot-bound blob manifest pagination
 - add initial-resolution versus resumed-session blob protocol with token-owned
