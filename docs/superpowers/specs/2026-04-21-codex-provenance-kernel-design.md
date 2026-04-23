@@ -326,9 +326,8 @@ WorkspaceTransition
 - supporting_evidence_event_refs: Vec<EventRef>
 - workspace_stream_id: String
 - workspace_instance_id: String
-- pre_workspace_state_id: String
+- pre_workspace_state_id: Option<String>
 - post_workspace_state_id: String
-- establishing_event_ref: EventRef
 - recorder_status: RecorderStatus
 ```
 
@@ -355,9 +354,10 @@ Rules:
   facts such as `code.unsupervised_workspace_mutation_observed` or
   `code.external_workspace_mutation_observed`; they are not required to be
   `MutationObservation`s
-- `WorkspaceTransition.establishing_event_ref` must point to the exact
-  `code.workspace_state_captured` event that carries the authoritative custody
-  transition payload for `post_workspace_state_id`
+- the authoritative establishing event for a transition is the enclosing
+  `code.workspace_state_captured` event that carries this
+  `WorkspaceTransition`; canonical transition payloads must not embed an
+  `EventRef` back to that same event
 - `primary_cause = mutationInterval` is valid only for Codex-attributable
   writes that closed an `execution.mutation_interval_closed` event
 - when a transition closes a Codex-attributable write window,
@@ -383,6 +383,10 @@ Rules:
   `WorkspaceTransition.primary_cause`; implementations must not serialize a
   separate semantically-equivalent cause shape for the same authoritative
   transition
+- `pre_workspace_state_id = None` is valid only for the first authoritative
+  recorded state in a workspace stream and only when `primary_cause` is
+  `genesisBootstrap` or `baselineCapture`
+- every non-initial transition must set `pre_workspace_state_id = Some(...)`
 
 `MutationInterval` owns timing and evidence boundaries. `WorkspaceTransition`
 owns the authoritative `pre_workspace_state_id -> post_workspace_state_id`
@@ -496,6 +500,12 @@ about a mutation or projection transition must use
 `state_ref = transition(pre_workspace_state_id, post_workspace_state_id)`. The
 kernel must not collapse a two-state transition into one opaque
 `workspace_state_id`.
+
+For the first authoritative recorded state in a workspace stream, a
+`code.workspace_state_captured` event may therefore pair
+`pre_workspace_state_id = None` with a point-in-time cause such as
+`genesisBootstrap` or `baselineCapture`. Implementations must not invent a fake
+predecessor state solely to satisfy transition encoding.
 
 Append validation must enforce an explicit event-family x cause-variant
 compatibility matrix. At minimum:
@@ -622,14 +632,20 @@ Synchronous path must stay bounded:
 - capture pre/post workspace state anchors
 - capture execution context
 - capture file-change summary
-- record immutable file-change evidence within configured limits
+- record immutable file-change evidence within configured limits when the active
+  mutator already published exact artifacts through supervised write-through
+  capture
 - record the interval and its status
-- if content exceeds capture limits, record descriptor-only evidence and mark
-  the missing immutable inputs as `coverage = Partial` or `coverage = Unavailable`
-- if path replay data exceeds capture limits and cannot be externalized as
-  immutable chunks inside the close-path budget, record
-  `path_replay_status = partial` or `unavailable`; do not block the interactive
-  path to build an O(repo size) manifest
+- if supervised exact-ingress coverage is absent, the close path must switch to
+  a truth-first slow path that still captures an exact immutable source before
+  minting the new authoritative workspace state
+- budget pressure may delay close completion or move the mutator onto a slower
+  exact capture path, but it must not be the reason that `path_replay_status`
+  becomes `partial` or `unavailable`
+- descriptor-only evidence is valid only when the exact immutable replay input
+  for the affected content is genuinely unavailable, unreadable, redacted, or
+  otherwise not capturable; it must not be used merely because exact capture was
+  expensive
 - use `indexing_status = Pending` only for deferred compute over immutable
   inputs that were already captured at interval close
 
@@ -909,6 +925,8 @@ Rules:
 - `system.append_batch_repaired` payloads must describe the raw repaired batch's
   own materialized participant set. They must not be overloaded to describe the
   later authoritative replacement facts emitted by projector or system repair.
+  If the repaired batch also had reserved-but-unmaterialized append slots, the
+  payload must include those `AppendReservationRef`s explicitly.
 - every `WorkspaceTransition` close path is a required `ReplayableAppendBatch`
   boundary whenever it emits both execution-side interval facts and
   workspace-custody facts
@@ -940,6 +958,8 @@ AppendReservationRef
 
 Abort payloads must use `AppendReservationRef` for unmaterialized reservations.
 They must not use `EventRef` unless the event row and event hash actually exist.
+Repaired payloads follow the same rule for any reserved-but-unmaterialized
+members that survived into the repaired-batch record.
 
 `LedgerStreamRef` is the scope-local stream coordinate used in batch and export
 payloads:
@@ -1351,8 +1371,8 @@ Optional supplemental diagnostic system event families:
 
 Rules:
 
-- every `BlobDescriptor.status` transition must correspond to a blob or system
-  event in the journal
+- every blob availability transition must correspond to a replayable blob or
+  system event in the journal
 - redaction, checksum mismatch, expiry, and missing-content detection must not
   be represented only as mutable row updates
 - export consumers must be able to replay blob custody from `TraceKernelEvent`
@@ -1439,11 +1459,20 @@ Rules:
 - `ExactArtifactRef` is the canonical typed handle for exact replay artifacts;
   workspace states, file versions, blob locators, and file-change evidence must
   use it instead of untyped string locators
-- retained exact workspace states, file versions, projector inputs, persisted
-  exports, active blob-read sessions, and explicit archival policies are the
-  retention roots for exact artifacts
+- retained projector inputs, persisted exports, active blob-read sessions, and
+  explicit archival policies are retention roots for exact artifacts
+- ordinary exact workspace states and file versions are retention roots only
+  while they remain inside the implementation's configured local retention
+  window or another stronger retention root still depends on their artifacts
 - retention roots determine artifact lifetime; `retention_class` communicates
   why an artifact is pinned, while the store remains globally deduplicated
+- implementations must support tiered retention:
+  - local hot / local durable retention for ordinary recent states and file
+    versions
+  - export-bound or archival retention for long-lived externally persisted
+    replay material
+  - cold or archive migration for artifacts that must remain logically
+    replayable after leaving the local hot window
 - hot indexes, tree-entry caches, and other derived acceleration structures are
   not retention roots and may be evicted without weakening exact replay
 - supervised exact-ingress paths should publish replay artifacts into
@@ -1719,9 +1748,13 @@ Rules:
 - `storedUnreachable` Git trees/blobs live in `ExactArtifactStore`, which must
   be content-addressed and deduplicated by object identity and bytes; promotion
   must not create one retained copy per workspace state or per file version
-- exact workspace states, file versions, projector inputs, persisted export
-  bundles, and any active blob-read session that still depends on promoted
-  content hold the retention references for those exact artifacts
+- projector inputs, persisted export bundles, active blob-read sessions, and
+  any exact workspace state or file version that still lies inside the
+  configured local retention window hold the retention references for promoted
+  content
+- once an ordinary state/file-version root ages out of the local retention
+  window, implementations may release its local exact artifacts only if another
+  surviving retention root or cold/archive tier still preserves exact replay
 - an exact artifact may be garbage-collected only after no retention root still
   references it and any configured grace period has elapsed
 - local hot caches may evict derived tree-entry indexes without affecting
@@ -2354,7 +2387,7 @@ Required typed payloads:
 
 - `blob.descriptor_recorded`
   - `blob_descriptor: BlobDescriptor`
-  - `recorded_by: EventRef`
+  - `initial_availability: BlobAvailability`
 - `blob.availability_changed`
   - `blob_ref_id: String`
   - `descriptor_event_ref: EventRef`
@@ -2369,6 +2402,8 @@ Required typed payloads:
   - `target_blob_ref_id: String`
   - `authorizing_custody_event_ref: EventRef`
   - `target_descriptor_event_ref: EventRef`
+  - `target_availability: BlobAvailability`
+  - `target_availability_event_ref: EventRef`
   - `target_workspace_event_ref: Option<EventRef>`
   - `access_purpose: String`
   - `result`
@@ -2450,6 +2485,7 @@ Required typed payloads:
   - `append_batch_id`
   - `participating_stream_refs: Vec<LedgerStreamRef>`
   - `materialized_event_refs_ordered: Vec<EventRef>`
+  - `reserved_append_refs: Vec<AppendReservationRef>`
   - `stream_local_outcomes: Vec<StreamLocalBatchOutcome>`
   - `repair_reason`
 - `system.stream_sealed`
@@ -2716,26 +2752,53 @@ Do not make the canonical blob shape depend on a local file path.
 - `ref_kind: String`
 - `scope: String`
 - `sensitivity: String`
-- `status: BlobAvailability`
 - `retention_hint: Option<String>`
 - `legal_hold_hint: Option<String>`
 - `required_for_reconstruction: bool`
+
+`BlobDescriptor` is immutable content identity. Current availability is not part
+of the descriptor. Availability changes are represented by replayable
+availability facts and resolved separately at query time.
+
+`blob_ref_id` is the immutable blob-identity key in v1. A given
+`(workspace_stream_id, stream_epoch, blob_ref_id)` must resolve to exactly one
+visible `blob.descriptor_recorded` event. v1 does not define blob-descriptor
+supersession. If content identity changes, the recorder must mint a new
+`blob_ref_id` rather than append a second competing descriptor for the same id.
+Append validation must reject a second visible descriptor event for the same
+epoch-local `blob_ref_id`.
 
 `BlobManifestEntry`
 
 - `blob_descriptor: BlobDescriptor`
 - `descriptor_event_ref: EventRef`
+- `availability: BlobAvailability`
+- `availability_event_ref: EventRef`
 
 `LocalBlobLocator`
 
 - `blob_ref_id: String`
 - `descriptor_event_ref: EventRef`
 - `availability: BlobAvailability`
+- `availability_event_ref: EventRef`
 - `local_storage_ref: ExactArtifactRef`
 
 Canonical export should depend on `BlobDescriptor`. The local locator is an
 implementation detail for the local collector, but it must still bind to one
 exact descriptor event rather than only a mutable `blob_ref_id`.
+
+Descriptor selection and availability resolution are separate steps:
+
+- `blob.descriptor_recorded` selects immutable blob identity
+- the effective current availability for that descriptor is resolved from the
+  latest visible availability fact in the same snapshot
+- if no later `blob.availability_changed` exists, the descriptor event itself is
+  the authoritative `availability_event_ref` and its
+  `initial_availability` remains the current availability
+- the authoritative descriptor event for a blob identity is the enclosing
+  `blob.descriptor_recorded` event that carries this `BlobDescriptor`; the
+  canonical payload must not embed a self-referential `EventRef` back to that
+  same event
 
 Blob reads return a tagged result instead of assuming content is always
 available. Serialized wire values are camelCase:
@@ -2949,12 +3012,23 @@ zero-width side. Range queries must not use `PatchLineSpan`.
 - `reason_codes`
 - `status_anchor: StatusAnchor`
 
+`AuditFailureStatus`
+
+- `audit_result`
+  - `streamUnavailable`
+  - `appendFailed`
+  - `writeRejected`
+- `reason_codes`
+- `status_anchor: StatusAnchor`
+
 `StatusAnchor`
 
 - `workspaceState`
   - `workspace_state_id: String`
 - `workspaceStream`
   - `workspace_stream_id: String`
+- `liveWorkspaceSelector`
+  - `selector: LiveWorkspaceSelector`
 - `ledgerStream`
   - `ledger_scope: LedgerScope`
   - `stream_id: String`
@@ -2968,11 +3042,13 @@ zero-width side. Range queries must not use `PatchLineSpan`.
 - `blobReadAttempt`
   - `selector: WorkspaceCustodySelector`
   - `blob_ref_id: String`
+  - `expected_descriptor_event_ref: Option<EventRef>`
   - `continuation_token_fingerprint: Option<String>`
 - `blobReadSession`
   - `selector: WorkspaceCustodySelector`
   - `blob_ref_id: String`
   - `descriptor_event_ref: EventRef`
+  - `availability_event_ref: EventRef`
   - `blob_read_session_id: String`
 - `turn`
   - `session_id: String`
@@ -2994,6 +3070,11 @@ zero-width side. Range queries must not use `PatchLineSpan`.
   - `event_ref: Option<EventRef>`
 - `codeRevision`
   - `selector: CodeRangeSelector`
+- `codeRangeRequest`
+  - `selector: CodeRangeSelector`
+  - `path: String`
+  - `range: QueryLineRange`
+  - `expected_range_fingerprint: Option<String>`
 - `schemaBundle`
   - `schema_bundle_id: Option<String>`
   - `schema_bundle_digest: Option<String>`
@@ -3124,7 +3205,7 @@ Rules:
 - `workspace_instance_id: String`
 - `primary_cause: CauseRef`
 - `supporting_evidence_event_refs: Vec<EventRef>`
-- `pre_workspace_state_id: String`
+- `pre_workspace_state_id: Option<String>`
 - `post_workspace_state_id: String`
 - `establishing_event_ref: EventRef`
 - `recorder_status: RecorderStatus`
@@ -3159,7 +3240,12 @@ Rules:
 - `event_type: String`
 - `workspace_state_id: String`
 - `cause_ref: CauseRef`
-- `blob_refs: Vec<BlobDescriptor>`
+- `blob_refs: Vec<BlobDescriptorRef>`
+
+`BlobDescriptorRef`
+
+- `blob_descriptor: BlobDescriptor`
+- `descriptor_event_ref: EventRef`
 
 `ProvenanceQueryEnvelope`
 
@@ -3167,9 +3253,14 @@ Rules:
 - `activity_refs: Vec<ActivityRef>`
 - `mutation_interval_refs: Vec<MutationIntervalRef>`
 - `code_refs: Vec<CodeFactRef>`
-- `blob_refs: Vec<BlobDescriptor>`
+- `blob_refs: Vec<BlobDescriptorRef>`
 - `status: ProvenanceStatus`
 - `sanitized_summary: Option<String>`
+
+`BlobDescriptorRef` is the exact immutable descriptor pin that query clients may
+feed back into `provenanceBlob/read.expected_descriptor_event_ref` without
+requiring a fresh descriptor re-resolution step. Current availability remains a
+separate query-time concern handled by blob manifest/read surfaces.
 
 `RangeResolutionCandidate`
 
@@ -3190,9 +3281,15 @@ status for the whole range query. A candidate envelope must describe the
 resolved candidate only; its `status.query_status.selector_status` must
 therefore be `Matched`.
 
+`LineagePageEntry`
+
+- `depth: u32`
+- `child_hunk_id: String`
+- `edge: HunkParentEdge`
+
 `LineagePage`
 
-- `edges: Vec<HunkParentEdge>`
+- `entries: Vec<LineagePageEntry>`
 - `next_cursor: Option<String>`
 
 `LineagePage` is present only when `ReadRangeParams.include_lineage = true`.
@@ -3271,6 +3368,8 @@ Rules:
   each matched workspace stream candidate
 - callers that need the fact which established the current workspace state must
   use `workspace_state_event_ref`, not `head_event_ref`
+- ambiguous or unavailable selector resolution for this RPC must anchor
+  `query_status.status_anchor = liveWorkspaceSelector`
 
 `StreamHeadCandidate`
 
@@ -3379,12 +3478,15 @@ Rules:
   selector resolved exactly, but no matching path/range exists in the resolved
   state; servers must use a specific reason code such as `pathNotFound` or
   `rangeOutOfBounds`
+- range-query failures and constraint mismatches must anchor to
+  `StatusAnchor.codeRangeRequest`, not only to the bare selector
 - `cursor` paginates lineage edges for the candidate identified by
   `lineage_candidate_id`; it does not change selector resolution
 - `lineage_candidate_id` is required whenever `cursor` is provided
 - lineage pagination cursors must bind to the first-page candidate resolution:
   at minimum `candidate_id`, `resolved_workspace_state_id`, `requested_path`,
-  `requested_range`, and the selected authoritative `lineage_revision_id`
+  `requested_range`, the selected authoritative `lineage_revision_id`,
+  `max_depth`, and `segment_limit`
 - if a cursor is replayed against a different candidate binding, the server must
   reject it with `query_status.selector_status = ConstraintMismatch` instead of
   silently re-resolving a fresh candidate
@@ -3524,6 +3626,9 @@ Shared resume rules for both export surfaces:
   requested epoch
 - the first page establishes a snapshot head; subsequent pages returned via
   `cursor` must paginate against that fixed snapshot, not a moving live head
+- every export cursor must bind the effective `export_contract_version` chosen
+  on the first page; replaying a cursor under a different effective export
+  mapping is a request validation error
 - `snapshot_head_sequence` and `snapshot_head_event_hash` are populated only
   when `query_status.selector_status = Matched`. Selector mismatch or
   unavailable responses serialize both fields as `null` and return `data = []`
@@ -3629,6 +3734,14 @@ It may default `export_contract_version` to the local latest supported mapping,
 but it is not the lossless replay artifact. It exposes only finalized committed
 recorder truth.
 
+If the first committed-export page omitted `export_contract_version`, the
+response's echoed effective version becomes part of the fixed snapshot context.
+Cursor-based resume must reuse that bound version implicitly through the cursor.
+Stateless fixed-snapshot resume (`after_sequence` / `after_event_hash` plus
+`snapshot_head_*`) must supply that same effective `export_contract_version`
+explicitly; otherwise the server must reject the resume rather than silently
+remapping rows.
+
 Replayable batch participants are committed-exportable only after their
 stream-local outcome terminus is durable and visible to the exporter. Committed
 export includes only participants from batches whose finalized outcome kind is
@@ -3667,15 +3780,18 @@ Rules:
 - page 1 of a cursor-based manifest read must bind a stable snapshot of the
   requested epoch's visible descriptor set; later pages must read against that
   same snapshot rather than the live newest-visible set
-- each returned `BlobManifestEntry` represents the newest non-superseded
-  `blob.descriptor_recorded` fact visible in the requested workspace custody
-  epoch for that `blob_ref_id`, together with its exact descriptor `EventRef`
+- each returned `BlobManifestEntry` represents the unique visible
+  `blob.descriptor_recorded` fact for that `blob_ref_id` in the requested
+  workspace custody epoch, together with its exact descriptor `EventRef`
 - `blob_ref_ids` mode is for fetching explicit descriptors by id
 - `cursor` / `limit` mode is for paginating the stream-scoped manifest
 - `blob_ref_ids` is mutually exclusive with `cursor` and `limit`
 - every opaque `next_cursor` must bind the original selector, filters, sort
   order, and manifest snapshot watermark; reusing a cursor with changed request
   inputs is a request validation error
+- each returned `BlobManifestEntry` must carry both the immutable
+  `descriptor_event_ref` and the resolved `availability_event_ref` that made the
+  entry's current availability authoritative in that snapshot
 
 `ReadBlobManifestResponse`
 
@@ -3720,13 +3836,17 @@ Rules:
   `blob.descriptor_recorded` event for `(workspace_stream_id, stream_epoch,
   blob_ref_id)`; implementations must not choose between descriptor,
   availability, or workspace-state facts ad hoc
+- the authorization event must also pin the resolved effective availability via
+  `target_availability` and `target_availability_event_ref`; later
+  availability changes must not retroactively change what availability fact
+  justified the original authorization decision
 - the first request in a logical blob-read session may omit
   `continuation_token`; if more bytes remain, the response must return a new
   opaque continuation token that binds selector, `blob_ref_id`,
-  `descriptor_event_ref`, the audit session identity, next offset, access
-  purpose, a visibility watermark for the resolved descriptor, and resumable
-  digest-checkpoint state sufficient to continue cumulative delivery hashing
-  without re-reading previously disclosed bytes
+  `descriptor_event_ref`, `availability_event_ref`, the audit session identity,
+  next offset, access purpose, a visibility watermark for the resolved
+  descriptor, and resumable digest-checkpoint state sufficient to continue
+  cumulative delivery hashing without re-reading previously disclosed bytes
 - when `continuation_token` is supplied, the server must resume that exact
   descriptor-pinned session; request fields that disagree with the token are
   request validation errors
@@ -3743,9 +3863,12 @@ Rules:
   next offset
 - `expected_descriptor_event_ref` is valid only for an initial resolution
   request and must be absent when `continuation_token` is supplied
-- in v1, the first request with no continuation token selects the newest
-  non-superseded `blob.descriptor_recorded` event for that `blob_ref_id`
-  visible in the requested workspace custody epoch
+- in v1, the first request with no continuation token selects the unique visible
+  `blob.descriptor_recorded` event for that `blob_ref_id` in the requested
+  workspace custody epoch
+- after selecting that immutable descriptor, the server must resolve the
+  effective current availability from the same snapshot and bind it with an
+  exact `availability_event_ref`
 - on an initial resolution request, if `expected_descriptor_event_ref` is
   provided, it must resolve to that exact selected descriptor event or the
   server returns `query_status.selector_status = ConstraintMismatch` with no
@@ -3788,7 +3911,9 @@ Rules:
 - invalid offsets, cursor/token mismatches, or other blob-read parameter
   conflicts return `BlobRequestInvalidResult`
 - initial-resolution descriptor mismatches anchor
-  `query_status.status_anchor = blobRef`
+  `query_status.status_anchor = blobReadAttempt` with
+  `expected_descriptor_event_ref` populated and
+  `continuation_token_fingerprint = None`
 - request-validation failures before the server can recover one exact
   descriptor-pinned session anchor `query_status.status_anchor = blobReadAttempt`
 - descriptor-pinned blob-read session failures must anchor
@@ -3800,6 +3925,7 @@ Rules:
 - `blob_descriptor: BlobDescriptor`
 - `descriptor_event_ref: EventRef`
 - `availability: BlobAvailability`
+- `availability_event_ref: EventRef`
 - `offset: u64`
 - `byte_count: u32`
 - `base64_content: String`
@@ -3816,6 +3942,7 @@ Rules:
 - `blob_descriptor: BlobDescriptor`
 - `descriptor_event_ref: EventRef`
 - `availability: BlobAvailability`
+- `availability_event_ref: EventRef`
 - `reason_code: String`
 - `authorization_event_ref: EventRef`
 - `delivery_event_ref: Option<EventRef>`
@@ -3825,13 +3952,15 @@ Rules:
 - `type = accessDenied`
 - `blob_descriptor: BlobDescriptor`
 - `descriptor_event_ref: EventRef`
+- `availability: BlobAvailability`
+- `availability_event_ref: EventRef`
 - `policy_reason_code: String`
 - `authorization_event_ref: EventRef`
 
 `BlobAuditFailureResult`
 
 - `type = auditFailure`
-- `audit_status: QueryResolutionStatus`
+- `audit_status: AuditFailureStatus`
 
 `BlobSelectorFailureResult`
 
