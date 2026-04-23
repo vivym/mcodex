@@ -1489,10 +1489,11 @@ Rules:
     replayable after leaving the local hot window
 - if exact replay is still promised after an artifact leaves local hot/durable
   storage, the implementation must retain that artifact inside
-  `ExactArtifactStore` with `storage_class = coldArchived`; archive migration
-  may move bytes to colder backing storage, but it must not introduce a second
-  untyped locator model or silently break the replay contract when the local
-  retention window expires
+  `ExactArtifactStore` under a replay-preserving non-local `storage_class`
+  (`exportedBundle` or `coldArchived`). Archive migration may move bytes to
+  colder backing storage or retained export media, but it must not introduce a
+  second untyped locator model or silently break the replay contract when the
+  local retention window expires
 - hot indexes, tree-entry caches, and other derived acceleration structures are
   not retention roots and may be evicted without weakening exact replay
 - supervised exact-ingress paths should publish replay artifacts into
@@ -1774,7 +1775,8 @@ Rules:
   content
 - once an ordinary state/file-version root ages out of the local retention
   window, implementations may release its local exact artifacts only if another
-  surviving retention root or cold/archive tier still preserves exact replay
+  surviving retention root or replay-preserving non-local `ExactArtifactStore`
+  tier still preserves exact replay
 - an exact artifact may be garbage-collected only after no retention root still
   references it and any configured grace period has elapsed
 - local hot caches may evict derived tree-entry indexes without affecting
@@ -4166,6 +4168,9 @@ Rules:
   `filesystemDeltaSnapshotState` rather than deferred truth recovery
 - truth-first slow-path close records telemetry/metrics distinct from bounded
   close and can be alerted on without weakening exactness semantics
+- slow-path telemetry includes operator-configurable threshold surfaces for
+  frequency/age alerting, and recurring fallback on structured first-party
+  mutators is detectable as an ingress-coverage gap
 - `ExactArtifactStore` deduplicates Git promotion, filesystem snapshots, path
   deltas, and working-tree evidence under one retention model
 - `checkpointCompaction` promotes already-captured exact truth into faster query
@@ -4176,7 +4181,8 @@ Rules:
   root still depends on them, including local-window exact states/file
   versions, projector inputs, persisted exports, active blob-read sessions, and
   explicit archival retention, and can be reclaimed only after those roots are
-  gone or migrated to replay-preserving cold archive storage
+  gone or migrated to replay-preserving non-local `ExactArtifactStore` storage
+  classes such as `exportedBundle` or `coldArchived`
 - multi-parent logical states require `path_replay_parent_workspace_state_id` or
   checkpoint promotion before path replay is valid
 - file/entity-scoped projection DAG dependency blocking and pending/partial
@@ -4258,6 +4264,8 @@ Rules:
   final retained delivery proof
 - committed export blocks only at the stream head, and metrics expose the age of
   any head-blocking replayable batch until finalize/repair completes
+- committed export blocking also exposes operator-configurable finalize/repair
+  SLA threshold surfaces, not only raw blocking-age telemetry
 - raw-content access-audit payloads record byte range and delivered content
   digest when disclosure succeeds
 - deterministic server-selected audit-stream resolution
@@ -4346,6 +4354,9 @@ fixtures, including TypeScript bindings, and run the protocol crate tests.
 - record immutable file-change evidence
 - implement write-through exact artifact capture for supervised exact-ingress
   mutators
+- expose slow-path telemetry plus operator-configurable frequency/age threshold
+  surfaces, and mark recurring fallback on structured first-party mutators as
+  an ingress-coverage gap
 - persist execution and coarse code facts synchronously
 - implement `provenanceTurn/read`, `provenanceActivity/read`, and
   `provenanceMutationInterval/read` for captured execution and interval facts
@@ -4362,8 +4373,8 @@ Do not promise hunk or range queries before this phase is complete.
 - implement `ExactArtifactStore` retention, dedupe, and GC before exact
   Git-backed or filesystem-backed states depend on unreachable/local artifacts
 - make local retention window, archive migration, and replay-preserving
-  cold-tier policy explicit before exact artifact growth is relied on in
-  production
+  non-local `ExactArtifactStore` policy explicit before exact artifact growth is
+  relied on in production
 - add bootstrap prehistory
 - add file version and file entity edge model
 - add directed file entity edge records
@@ -4402,6 +4413,8 @@ Do not promise hunk or range queries before this phase is complete.
 - add initial-resolution versus resumed-session blob protocol with token-owned
   descriptor/session pinning across chunked reads
 - add session-scoped blob audit checkpoints
+- expose committed-export head-blocking age plus operator-configurable
+  finalize/repair SLA threshold surfaces
 - make blob delivery checkpoints cumulative and descriptor-session anchored
 - add export rows with explicit external event names and effective contract
   version
