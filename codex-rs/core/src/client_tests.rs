@@ -1160,8 +1160,7 @@ async fn responses_http_streaming_stops_when_sibling_member_reports_terminal_una
 }
 
 #[tokio::test]
-async fn responses_http_streaming_stops_for_same_member_sibling_without_canceling_long_lived_member()
- {
+async fn responses_http_streaming_stops_for_same_member_sibling_and_cancels_long_lived_member() {
     core_test_support::skip_if_no_network!();
 
     let (tx_complete, rx_complete) = tokio::sync::oneshot::channel();
@@ -1243,10 +1242,7 @@ async fn responses_http_streaming_stops_for_same_member_sibling_without_cancelin
         terminal.is_none() || matches!(terminal, Some(Err(_))),
         "unexpected stream event after same-member sibling 401: {terminal:?}"
     );
-    assert!(
-        !member_cancel.is_cancelled(),
-        "long-lived member binding should survive reporting-member exemption"
-    );
+    assert!(member_cancel.is_cancelled());
     wait_for_admitted_count(&authority, 0).await;
 
     let _ = tx_complete.send(());

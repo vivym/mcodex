@@ -405,8 +405,8 @@ async fn terminal_401_cancels_same_member_sibling_requests_for_live_admission() 
 }
 
 #[tokio::test]
-async fn terminal_401_preserves_long_lived_turn_member_for_reporting_member() -> anyhow::Result<()>
-{
+async fn terminal_401_cancels_long_lived_turn_member_but_not_reporting_request()
+-> anyhow::Result<()> {
     let runtime_lease_host =
         RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-a".to_string()));
     runtime_lease_host
@@ -450,7 +450,7 @@ async fn terminal_401_preserves_long_lived_turn_member_for_reporting_member() ->
         .report_terminal_unauthorized(&reporter_admission.snapshot)
         .await?;
 
-    assert!(!turn_cancel.is_cancelled());
+    assert!(turn_cancel.is_cancelled());
     assert!(!reporter_cancel.is_cancelled());
     assert!(sibling_cancel.is_cancelled());
 
@@ -512,7 +512,7 @@ fn guardian_reusable_session_rebinds_membership_per_invocation() {
 }
 
 #[test]
-fn collaboration_tree_cancel_can_exempt_reporting_member() {
+fn collaboration_tree_terminal_401_exempts_only_reporting_request_registration() {
     let registry = Arc::new(CollaborationTreeRegistry::default());
     let tree_id = CollaborationTreeId::for_test("turn:reporting-member");
     let reporter_turn_cancel = CancellationToken::new();
@@ -540,13 +540,9 @@ fn collaboration_tree_cancel_can_exempt_reporting_member() {
         sibling_other_member_cancel.clone(),
     );
 
-    registry.cancel_tree_for_terminal_unauthorized(
-        &tree_id,
-        Some(reporter.member_id()),
-        Some(reporter.registration_id()),
-    );
+    registry.cancel_tree_for_terminal_unauthorized(&tree_id, Some(reporter.registration_id()));
 
-    assert!(!reporter_turn_cancel.is_cancelled());
+    assert!(reporter_turn_cancel.is_cancelled());
     assert!(!reporter_cancel.is_cancelled());
     assert!(sibling_same_member_cancel.is_cancelled());
     assert!(sibling_other_member_cancel.is_cancelled());

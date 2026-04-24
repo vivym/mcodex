@@ -3235,6 +3235,57 @@ async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_close_agent_rejects_root_uuid_when_spawned_metadata_shares_thread_id() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    turn.config = Arc::new(config);
+    session
+        .services
+        .agent_control
+        .register_session_root(session.conversation_id, &turn.session_source);
+    session
+        .services
+        .agent_control
+        .register_spawned_agent_for_test(
+            root.thread_id,
+            AgentPath::try_from("/root/duplicate").expect("agent path"),
+            Some("Duplicate".to_string()),
+            Some("worker".to_string()),
+            Some("duplicate task".to_string()),
+        );
+
+    let err = CloseAgentHandlerV2
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": root.thread_id.to_string()})),
+        ))
+        .await
+        .expect_err("close_agent should still reject the root thread id");
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
+    );
+    assert_ne!(
+        manager.agent_control().get_status(root.thread_id).await,
+        AgentStatus::NotFound
+    );
+}
+
+#[tokio::test]
 async fn close_agent_submits_shutdown_and_returns_previous_status() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();

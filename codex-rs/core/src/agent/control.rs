@@ -787,6 +787,40 @@ impl AgentControl {
         self.state.agent_metadata_for_thread(agent_id)
     }
 
+    pub(crate) fn get_agent_metadata_for_explicit_thread_target(
+        &self,
+        agent_id: ThreadId,
+    ) -> Option<AgentMetadata> {
+        self.state
+            .root_agent_metadata_for_thread(agent_id)
+            .or_else(|| self.state.agent_metadata_for_thread(agent_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_spawned_agent_for_test(
+        &self,
+        thread_id: ThreadId,
+        agent_path: AgentPath,
+        agent_nickname: Option<String>,
+        agent_role: Option<String>,
+        last_task_message: Option<String>,
+    ) {
+        let mut reservation = self
+            .state
+            .reserve_spawn_slot(/*max_threads*/ None)
+            .expect("test spawn slot should reserve");
+        reservation
+            .reserve_agent_path(&agent_path)
+            .expect("test agent path should reserve");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(agent_path),
+            agent_nickname,
+            agent_role,
+            last_task_message,
+        });
+    }
+
     pub(crate) async fn list_live_agent_subtree_thread_ids(
         &self,
         agent_id: ThreadId,

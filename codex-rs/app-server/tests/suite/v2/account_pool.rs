@@ -58,6 +58,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const LEGACY_DEFAULT_POOL_ID: &str = "legacy-default";
 const MISSING_POOL_ID: &str = "missing-pool";
@@ -390,34 +394,36 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
         ]),
     )
     .await;
-    let _child_a_turn = responses::mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(|req: &wiremock::Request| {
             body_contains(req, CHILD_A_PROMPT)
                 && !body_contains(req, SPAWN_A_CALL_ID)
                 && !body_contains(req, SPAWN_B_CALL_ID)
-        },
-        responses::sse(vec![
+        })
+        .respond_with(delayed_sse_response(responses::sse(vec![
             responses::ev_response_created("resp-child-a"),
             responses::ev_assistant_message("msg-child-a", "child A done"),
             responses::ev_completed("resp-child-a"),
-        ]),
-    )
-    .await;
-    let _child_b_turn = responses::mount_sse_once_match(
-        &server,
-        |req: &wiremock::Request| {
+        ])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(|req: &wiremock::Request| {
             body_contains(req, CHILD_B_PROMPT)
                 && !body_contains(req, SPAWN_A_CALL_ID)
                 && !body_contains(req, SPAWN_B_CALL_ID)
-        },
-        responses::sse(vec![
+        })
+        .respond_with(delayed_sse_response(responses::sse(vec![
             responses::ev_response_created("resp-child-b"),
             responses::ev_assistant_message("msg-child-b", "child B done"),
             responses::ev_completed("resp-child-b"),
-        ]),
-    )
-    .await;
+        ])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
     let parent_follow_up = responses::mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
@@ -460,7 +466,7 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     mcp.initialize().await?;
 
     let parent = start_thread(&mut mcp).await?;
-    let child_thread_ids = spawn_two_children_and_wait_completed(
+    let child_thread_ids = spawn_two_children_and_wait_parent_completed(
         &mut mcp,
         parent.id.as_str(),
         PARENT_PROMPT,
@@ -480,6 +486,12 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     assert_eq!(reported_child_thread_ids, child_thread_ids);
 
     archive_thread(&mut mcp, parent.id.as_str()).await?;
+    let blocked_by_live_children = start_thread_error(&mut mcp).await?;
+    assert_eq!(
+        pooled_runtime_error_code(&blocked_by_live_children),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+    wait_for_child_turns_completed(&mut mcp, &child_thread_ids).await?;
     archive_thread(&mut mcp, first_owner.as_str()).await?;
     let still_blocked = start_thread_error(&mut mcp).await?;
     assert_eq!(
@@ -499,6 +511,10 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
         "parent should not receive a follow-up after only spawn B returns"
     );
     Ok(())
+}
+
+fn delayed_sse_response(body: String) -> ResponseTemplate {
+    responses::sse_response(body).set_delay(std::time::Duration::from_secs(2))
 }
 
 #[tokio::test]
@@ -905,7 +921,7 @@ async fn start_turn_and_wait_completed(mcp: &mut McpProcess, thread_id: &str) ->
     Ok(())
 }
 
-async fn spawn_two_children_and_wait_completed(
+async fn spawn_two_children_and_wait_parent_completed(
     mcp: &mut McpProcess,
     thread_id: &str,
     prompt: &str,
@@ -951,7 +967,6 @@ async fn spawn_two_children_and_wait_completed(
         }
     }
 
-    let mut completed_child_thread_ids = std::collections::HashSet::new();
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let notification = mcp
@@ -967,7 +982,6 @@ async fn spawn_two_children_and_wait_completed(
                     "child turn should complete without error: {:?}",
                     completed.turn.error
                 );
-                completed_child_thread_ids.insert(completed.thread_id.clone());
             }
             if completed.thread_id == thread_id && completed.turn.id == turn.turn.id {
                 anyhow::ensure!(
@@ -981,6 +995,14 @@ async fn spawn_two_children_and_wait_completed(
     })
     .await??;
 
+    Ok(child_thread_ids)
+}
+
+async fn wait_for_child_turns_completed(
+    mcp: &mut McpProcess,
+    child_thread_ids: &[String],
+) -> Result<()> {
+    let mut completed_child_thread_ids = std::collections::HashSet::new();
     timeout(DEFAULT_READ_TIMEOUT, async {
         while completed_child_thread_ids.len() < child_thread_ids.len() {
             let notification = mcp
@@ -1002,8 +1024,7 @@ async fn spawn_two_children_and_wait_completed(
         Ok::<(), anyhow::Error>(())
     })
     .await??;
-
-    Ok(child_thread_ids)
+    Ok(())
 }
 
 async fn archive_thread(mcp: &mut McpProcess, thread_id: &str) -> Result<()> {

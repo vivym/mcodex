@@ -17,7 +17,7 @@ pub(crate) async fn resolve_agent_target_with_metadata(
         let metadata = session
             .services
             .agent_control
-            .get_agent_metadata(thread_id)
+            .get_agent_metadata_for_explicit_thread_target(thread_id)
             .unwrap_or(AgentMetadata {
                 agent_id: Some(thread_id),
                 ..Default::default()

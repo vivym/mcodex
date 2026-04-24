@@ -334,7 +334,6 @@ impl RuntimeLeaseAuthority {
             self.collaboration_registry()
                 .cancel_tree_for_terminal_unauthorized(
                     &snapshot.collaboration_tree_id,
-                    snapshot.collaboration_member_id.as_deref(),
                     snapshot.collaboration_registration_id,
                 );
         }

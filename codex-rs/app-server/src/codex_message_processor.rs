@@ -527,6 +527,7 @@ struct ListenerTaskContext {
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    config: Arc<Config>,
     analytics_events_client: AnalyticsEventsClient,
     general_analytics_enabled: bool,
     thread_watch_manager: ThreadWatchManager,
@@ -540,6 +541,7 @@ struct ThreadUnloadContext {
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
 }
@@ -1856,16 +1858,27 @@ impl CodexMessageProcessor {
             .map(PooledRuntimeAdmission::Reserved)
     }
 
-    async fn single_loaded_thread(&self) -> Option<Arc<CodexThread>> {
-        let thread_id = self.pooled_runtime_scope.loaded_thread_id().await?;
-        self.thread_manager.get_thread(thread_id).await.ok()
-    }
-
     async fn loaded_or_process_account_lease_config(
         &self,
     ) -> (Arc<Config>, Option<codex_core::AccountLeaseRuntimeSnapshot>) {
-        let Some(thread) = self.single_loaded_thread().await else {
-            return (Arc::clone(&self.config), None);
+        Self::loaded_or_process_account_lease_config_for_context(
+            &self.thread_manager,
+            &self.pooled_runtime_scope,
+            &self.config,
+        )
+        .await
+    }
+
+    async fn loaded_or_process_account_lease_config_for_context(
+        thread_manager: &Arc<ThreadManager>,
+        pooled_runtime_scope: &Arc<PooledRuntimeScope>,
+        process_config: &Arc<Config>,
+    ) -> (Arc<Config>, Option<codex_core::AccountLeaseRuntimeSnapshot>) {
+        let Some(thread_id) = pooled_runtime_scope.loaded_thread_id().await else {
+            return (Arc::clone(process_config), None);
+        };
+        let Ok(thread) = thread_manager.get_thread(thread_id).await else {
+            return (Arc::clone(process_config), None);
         };
         let config = thread.effective_config().await;
         let live_snapshot = thread.account_lease_snapshot().await;
@@ -2604,6 +2617,7 @@ impl CodexMessageProcessor {
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+            config: Arc::clone(&self.config),
             analytics_events_client: self.analytics_events_client.clone(),
             general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
             thread_watch_manager: self.thread_watch_manager.clone(),
@@ -2915,6 +2929,7 @@ impl CodexMessageProcessor {
                             pooled_runtime_scope: listener_task_context
                                 .pooled_runtime_scope
                                 .clone(),
+                            config: listener_task_context.config.clone(),
                             thread_state_manager: listener_task_context
                                 .thread_state_manager
                                 .clone(),
@@ -6395,6 +6410,7 @@ impl CodexMessageProcessor {
             outgoing: self.outgoing.clone(),
             pending_thread_unloads: self.pending_thread_unloads.clone(),
             pooled_runtime_scope: self.pooled_runtime_scope.clone(),
+            config: self.config.clone(),
             thread_state_manager: self.thread_state_manager.clone(),
             thread_watch_manager: self.thread_watch_manager.clone(),
         }
@@ -6748,37 +6764,80 @@ impl CodexMessageProcessor {
         thread_id: ThreadId,
         watch_notification: ThreadWatchRemovalNotification,
     ) {
-        let ThreadUnloadContext {
-            thread_manager,
-            outgoing,
-            pending_thread_unloads,
-            pooled_runtime_scope,
-            thread_state_manager,
-            thread_watch_manager,
-        } = context;
-        pending_thread_unloads.lock().await.remove(&thread_id);
+        context
+            .pending_thread_unloads
+            .lock()
+            .await
+            .remove(&thread_id);
         Self::mark_pooled_runtime_thread_unloaded(
-            &thread_manager,
-            &pooled_runtime_scope,
+            &context.thread_manager,
+            &context.pooled_runtime_scope,
             thread_id,
         )
         .await;
-        outgoing
+        let account_lease_notification =
+            Self::changed_account_lease_notification_after_teardown(&context, thread_id).await;
+        context
+            .outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
-        thread_state_manager.remove_thread_state(thread_id).await;
+        context
+            .thread_state_manager
+            .remove_thread_state(thread_id)
+            .await;
         match watch_notification {
             ThreadWatchRemovalNotification::Publish => {
-                thread_watch_manager
+                context
+                    .thread_watch_manager
                     .remove_thread(&thread_id.to_string())
                     .await;
             }
             ThreadWatchRemovalNotification::Suppress => {
-                thread_watch_manager
+                context
+                    .thread_watch_manager
                     .remove_thread_silently(&thread_id.to_string())
                     .await;
             }
         }
+        if let Some(notification) = account_lease_notification {
+            context
+                .outgoing
+                .send_server_notification(ServerNotification::AccountLeaseUpdated(notification))
+                .await;
+        }
+    }
+
+    async fn changed_account_lease_notification_after_teardown(
+        context: &ThreadUnloadContext,
+        thread_id: ThreadId,
+    ) -> Option<codex_app_server_protocol::AccountLeaseUpdatedNotification> {
+        let thread_state = context
+            .thread_state_manager
+            .thread_state_if_exists(thread_id)
+            .await?;
+        let (config, live_snapshot) = Self::loaded_or_process_account_lease_config_for_context(
+            &context.thread_manager,
+            &context.pooled_runtime_scope,
+            &context.config,
+        )
+        .await;
+        let notification = match account_lease_api::read_account_lease(
+            config.as_ref(),
+            live_snapshot,
+        )
+        .await
+        {
+            Ok(response) => response.into(),
+            Err(err) => {
+                warn!(
+                    "failed to build account lease updated notification after thread teardown: {}",
+                    err.message
+                );
+                return None;
+            }
+        };
+        let mut thread_state = thread_state.lock().await;
+        thread_state.take_changed_account_lease_notification(notification)
     }
 
     async fn mark_pooled_runtime_thread_unloaded(
@@ -6894,57 +6953,60 @@ impl CodexMessageProcessor {
         thread_id: ThreadId,
         thread: Arc<CodexThread>,
     ) {
-        let ThreadUnloadContext {
-            thread_manager,
-            outgoing,
-            pending_thread_unloads,
-            pooled_runtime_scope,
-            thread_state_manager,
-            thread_watch_manager,
-        } = context;
         info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
         // Any pending app-server -> client requests for this thread can no longer be
         // answered; cancel their callbacks before shutdown/unload.
-        outgoing
+        context
+            .outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
-        thread_state_manager.remove_thread_state(thread_id).await;
+        context
+            .thread_state_manager
+            .clear_thread_listener(thread_id)
+            .await;
 
         tokio::spawn(async move {
             match Self::wait_for_thread_shutdown(&thread).await {
                 ThreadShutdownResult::Complete => {
                     Self::mark_pooled_runtime_thread_unloaded(
-                        &thread_manager,
-                        &pooled_runtime_scope,
+                        &context.thread_manager,
+                        &context.pooled_runtime_scope,
                         thread_id,
                     )
                     .await;
-                    if thread_manager.remove_thread(&thread_id).await.is_none() {
+                    let removed_thread = context
+                        .thread_manager
+                        .remove_thread(&thread_id)
+                        .await
+                        .is_some();
+                    let outgoing = context.outgoing.clone();
+                    Self::finalize_thread_teardown_for_context(context, thread_id).await;
+                    if !removed_thread {
                         info!("thread {thread_id} was already removed before teardown finalized");
-                        thread_watch_manager
-                            .remove_thread(&thread_id.to_string())
-                            .await;
-                        pending_thread_unloads.lock().await.remove(&thread_id);
                         return;
                     }
-                    thread_watch_manager
-                        .remove_thread(&thread_id.to_string())
-                        .await;
                     let notification = ThreadClosedNotification {
                         thread_id: thread_id.to_string(),
                     };
                     outgoing
                         .send_server_notification(ServerNotification::ThreadClosed(notification))
                         .await;
-                    pending_thread_unloads.lock().await.remove(&thread_id);
                 }
                 ThreadShutdownResult::SubmitFailed => {
-                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    context
+                        .pending_thread_unloads
+                        .lock()
+                        .await
+                        .remove(&thread_id);
                     warn!("failed to submit Shutdown to thread {thread_id}");
                 }
                 ThreadShutdownResult::TimedOut => {
-                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    context
+                        .pending_thread_unloads
+                        .lock()
+                        .await
+                        .remove(&thread_id);
                     warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
                 }
             }
@@ -7074,30 +7136,22 @@ impl CodexMessageProcessor {
                 state_db_ctx = Some(ctx);
             }
             info!("thread {thread_id} was active; shutting down");
-            match Self::wait_for_thread_shutdown(&conversation).await {
-                ThreadShutdownResult::Complete => {}
-                ThreadShutdownResult::SubmitFailed => {
-                    error!(
-                        "failed to submit Shutdown to thread {thread_id}; proceeding with archive"
-                    );
-                }
-                ThreadShutdownResult::TimedOut => {
-                    warn!("thread {thread_id} shutdown timed out; proceeding with archive");
-                }
-            }
-        }
-        self.pooled_runtime_scope
-            .mark_thread_unloaded_or_transfer(thread_id, pooled_runtime_replacement_thread_id)
+            let shutdown_result = Self::wait_for_thread_shutdown(&conversation).await;
+            Self::finalize_active_thread_archive_after_shutdown(
+                self.thread_unload_context(),
+                thread_id,
+                pooled_runtime_replacement_thread_id,
+                shutdown_result,
+            )
+            .await?;
+        } else {
+            Self::finalize_thread_archive_teardown(
+                self.thread_unload_context(),
+                thread_id,
+                pooled_runtime_replacement_thread_id,
+            )
             .await;
-        if self
-            .thread_manager
-            .remove_thread(&thread_id)
-            .await
-            .is_none()
-        {
-            info!("thread {thread_id} was already removed before archive finalized");
         }
-        self.finalize_thread_teardown(thread_id).await;
 
         if state_db_ctx.is_none() {
             state_db_ctx = get_state_db(&self.config).await;
@@ -7126,6 +7180,63 @@ impl CodexMessageProcessor {
             message: format!("failed to archive thread: {err}"),
             data: None,
         })
+    }
+
+    async fn finalize_active_thread_archive_after_shutdown(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        replacement_thread_id: Option<ThreadId>,
+        shutdown_result: ThreadShutdownResult,
+    ) -> Result<(), JSONRPCErrorError> {
+        match shutdown_result {
+            ThreadShutdownResult::Complete => {
+                Self::finalize_thread_archive_teardown(context, thread_id, replacement_thread_id)
+                    .await;
+                Ok(())
+            }
+            ThreadShutdownResult::SubmitFailed => {
+                error!(
+                    "failed to submit Shutdown to thread {thread_id}; leaving active thread loaded"
+                );
+                Err(JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!(
+                        "failed to archive thread {thread_id}: unable to submit shutdown to active thread; leaving thread loaded"
+                    ),
+                    data: None,
+                })
+            }
+            ThreadShutdownResult::TimedOut => {
+                warn!("thread {thread_id} shutdown timed out; leaving active thread loaded");
+                Err(JSONRPCErrorError {
+                    code: INTERNAL_ERROR_CODE,
+                    message: format!(
+                        "failed to archive thread {thread_id}: active thread did not shut down before timeout; leaving thread loaded"
+                    ),
+                    data: None,
+                })
+            }
+        }
+    }
+
+    async fn finalize_thread_archive_teardown(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        replacement_thread_id: Option<ThreadId>,
+    ) {
+        context
+            .pooled_runtime_scope
+            .mark_thread_unloaded_or_transfer(thread_id, replacement_thread_id)
+            .await;
+        if context
+            .thread_manager
+            .remove_thread(&thread_id)
+            .await
+            .is_none()
+        {
+            info!("thread {thread_id} was already removed before archive finalized");
+        }
+        Self::finalize_thread_teardown_for_context(context, thread_id).await;
     }
 
     async fn apps_list(&self, request_id: ConnectionRequestId, params: AppsListParams) {
@@ -9020,6 +9131,7 @@ impl CodexMessageProcessor {
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
                 pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+                config: Arc::clone(&self.config),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
                 thread_watch_manager: self.thread_watch_manager.clone(),
@@ -9135,6 +9247,7 @@ impl CodexMessageProcessor {
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
                 pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+                config: Arc::clone(&self.config),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
                 thread_watch_manager: self.thread_watch_manager.clone(),
@@ -9185,6 +9298,7 @@ impl CodexMessageProcessor {
             thread_state_manager,
             pending_thread_unloads,
             pooled_runtime_scope,
+            config,
             analytics_events_client: _,
             general_analytics_enabled: _,
             thread_watch_manager,
@@ -9309,6 +9423,7 @@ impl CodexMessageProcessor {
                                 outgoing: outgoing_for_task.clone(),
                                 pending_thread_unloads: pending_thread_unloads.clone(),
                                 pooled_runtime_scope: pooled_runtime_scope.clone(),
+                                config: config.clone(),
                                 thread_state_manager: thread_state_manager.clone(),
                                 thread_watch_manager: thread_watch_manager.clone(),
                             },
@@ -12273,6 +12388,31 @@ mod tests {
         }
     }
 
+    async fn read_account_lease_updated_notification(
+        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
+    ) -> codex_app_server_protocol::AccountLeaseUpdatedNotification {
+        loop {
+            let envelope =
+                tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+                    .await
+                    .expect("timed out waiting for accountLease/updated notification")
+                    .expect("outgoing channel closed");
+            let message = match envelope {
+                OutgoingEnvelope::ToConnection { message, .. }
+                | OutgoingEnvelope::Broadcast { message } => message,
+            };
+            let OutgoingMessage::AppServerNotification(notification) = message else {
+                continue;
+            };
+            let codex_app_server_protocol::ServerNotification::AccountLeaseUpdated(notification) =
+                notification
+            else {
+                continue;
+            };
+            return notification;
+        }
+    }
+
     fn assert_no_outgoing_message(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
         assert!(matches!(
             outgoing_rx.try_recv(),
@@ -12524,6 +12664,200 @@ mod tests {
                 .loaded_root_thread_id()
                 .await,
             None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_thread_archive_incomplete_shutdown_keeps_thread_loaded_and_pooled_runtime()
+    -> Result<()> {
+        for shutdown_result in [
+            ThreadShutdownResult::SubmitFailed,
+            ThreadShutdownResult::TimedOut,
+        ] {
+            let harness = TestCodexMessageProcessorHarness::new().await?;
+            let started = harness
+                .thread_manager
+                .start_thread(harness.config.as_ref().clone())
+                .await?;
+            let thread_id = started.thread_id;
+            harness
+                .processor
+                .pooled_runtime_scope
+                .reserve()
+                .await
+                .expect("reserve pooled runtime")
+                .promote(thread_id)
+                .await;
+
+            let result = CodexMessageProcessor::finalize_active_thread_archive_after_shutdown(
+                harness.processor.thread_unload_context(),
+                thread_id,
+                /*replacement_thread_id*/ None,
+                shutdown_result,
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "incomplete shutdown must fail archive finalization"
+            );
+            assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
+            assert_eq!(
+                harness
+                    .processor
+                    .pooled_runtime_scope
+                    .loaded_thread_id()
+                    .await,
+                Some(thread_id)
+            );
+            started.thread.shutdown_and_wait().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_thread_teardown_emits_account_lease_update_when_live_state_clears()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+        let previous_live_notification =
+            codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("pool-main".to_string()),
+                suppressed: false,
+                lease_acquired_at: Some(1),
+                min_switch_interval_secs: Some(30),
+                proactive_switch_pending: Some(false),
+                proactive_switch_suppressed: Some(false),
+                proactive_switch_allowed_at: None,
+            };
+        let thread_state = harness
+            .processor
+            .thread_state_manager
+            .thread_state(thread_id)
+            .await;
+        {
+            let mut thread_state = thread_state.lock().await;
+            assert_eq!(
+                thread_state.take_changed_account_lease_notification(previous_live_notification),
+                Some(codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                    account_id: Some("acct-1".to_string()),
+                    pool_id: Some("pool-main".to_string()),
+                    suppressed: false,
+                    lease_acquired_at: Some(1),
+                    min_switch_interval_secs: Some(30),
+                    proactive_switch_pending: Some(false),
+                    proactive_switch_suppressed: Some(false),
+                    proactive_switch_allowed_at: None,
+                })
+            );
+        }
+
+        CodexMessageProcessor::finalize_thread_teardown_for_context(
+            harness.processor.thread_unload_context(),
+            thread_id,
+        )
+        .await;
+
+        assert_eq!(
+            read_account_lease_updated_notification(&mut harness.outgoing_rx).await,
+            codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                account_id: None,
+                pool_id: None,
+                suppressed: false,
+                lease_acquired_at: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+            }
+        );
+        started.thread.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unload_thread_without_subscribers_emits_account_lease_update_when_live_state_clears()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+        let previous_live_notification =
+            codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("pool-main".to_string()),
+                suppressed: false,
+                lease_acquired_at: Some(1),
+                min_switch_interval_secs: Some(30),
+                proactive_switch_pending: Some(false),
+                proactive_switch_suppressed: Some(false),
+                proactive_switch_allowed_at: None,
+            };
+        let thread_state = harness
+            .processor
+            .thread_state_manager
+            .thread_state(thread_id)
+            .await;
+        {
+            let mut thread_state = thread_state.lock().await;
+            assert_eq!(
+                thread_state.take_changed_account_lease_notification(previous_live_notification),
+                Some(codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                    account_id: Some("acct-1".to_string()),
+                    pool_id: Some("pool-main".to_string()),
+                    suppressed: false,
+                    lease_acquired_at: Some(1),
+                    min_switch_interval_secs: Some(30),
+                    proactive_switch_pending: Some(false),
+                    proactive_switch_suppressed: Some(false),
+                    proactive_switch_allowed_at: None,
+                })
+            );
+        }
+
+        CodexMessageProcessor::unload_thread_without_subscribers(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            read_account_lease_updated_notification(&mut harness.outgoing_rx).await,
+            codex_app_server_protocol::AccountLeaseUpdatedNotification {
+                account_id: None,
+                pool_id: None,
+                suppressed: false,
+                lease_acquired_at: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+            }
         );
         Ok(())
     }

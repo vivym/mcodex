@@ -2377,11 +2377,26 @@ Run:
 ```bash
 cd codex-rs
 cargo test -p codex-app-server account_pool -- --nocapture
+cargo test -p codex-app-server account_lease -- --nocapture
+cargo test -p codex-app-server thread_archive -- --nocapture
 ```
 
 Expected: PASS.
 
-- [ ] **Step 3: Run formatting**
+- [ ] **Step 3: Run CLI focused suite**
+
+Run:
+
+```bash
+cd codex-rs
+cargo test -p codex-cli mcodex -- --nocapture
+cargo test -p codex-cli --test accounts -- --nocapture
+cargo test -p codex-cli --test accounts_observability -- --nocapture
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Run formatting**
 
 Run:
 
@@ -2392,7 +2407,7 @@ just fmt
 
 Expected: no remaining rustfmt changes, or only expected formatting changes from this plan.
 
-- [ ] **Step 4: Run scoped lints**
+- [ ] **Step 5: Run scoped lints**
 
 Run:
 
@@ -2401,11 +2416,12 @@ cd codex-rs
 just fix -p codex-core
 just fix -p codex-app-server
 just fix -p codex-account-pool
+just fix -p codex-cli
 ```
 
 Expected: no unresolved clippy diagnostics.
 
-- [ ] **Step 5: Ask before full workspace tests**
+- [ ] **Step 6: Ask before full workspace tests**
 
 Because this plan changes `codex-core`, ask the user before running the complete suite:
 
@@ -2416,7 +2432,7 @@ cargo test
 
 Expected if approved: PASS.
 
-- [ ] **Step 6: Commit verification fixes**
+- [ ] **Step 7: Commit verification fixes**
 
 If `just fix` or docs updates changed files:
 

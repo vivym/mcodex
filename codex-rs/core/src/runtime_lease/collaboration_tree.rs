@@ -237,16 +237,10 @@ struct RegistryState {
     members: HashMap<CollaborationTreeId, HashMap<Uuid, RegisteredMember>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CollaborationRegistrationKind {
-    LongLived,
-    RequestLease,
-}
-
 struct RegisteredMember {
+    #[cfg(test)]
     member_id: String,
     cancellation_token: CancellationToken,
-    kind: CollaborationRegistrationKind,
 }
 
 impl CollaborationTreeRegistry {
@@ -255,7 +249,6 @@ impl CollaborationTreeRegistry {
         tree_id: CollaborationTreeId,
         member_id: String,
         cancellation_token: CancellationToken,
-        kind: CollaborationRegistrationKind,
     ) -> CollaborationTreeMembership {
         let registration_id = Uuid::now_v7();
         self.inner
@@ -267,9 +260,9 @@ impl CollaborationTreeRegistry {
             .insert(
                 registration_id,
                 RegisteredMember {
+                    #[cfg(test)]
                     member_id: member_id.clone(),
                     cancellation_token,
-                    kind,
                 },
             );
         CollaborationTreeMembership {
@@ -286,12 +279,7 @@ impl CollaborationTreeRegistry {
         member_id: String,
         cancellation_token: CancellationToken,
     ) -> CollaborationTreeMembership {
-        self.register_member(
-            tree_id,
-            member_id,
-            cancellation_token,
-            CollaborationRegistrationKind::LongLived,
-        )
+        self.register_member(tree_id, member_id, cancellation_token)
     }
 
     pub(crate) fn register_request_member(
@@ -300,12 +288,7 @@ impl CollaborationTreeRegistry {
         member_id: String,
         cancellation_token: CancellationToken,
     ) -> CollaborationTreeMembership {
-        self.register_member(
-            tree_id,
-            member_id,
-            cancellation_token,
-            CollaborationRegistrationKind::RequestLease,
-        )
+        self.register_member(tree_id, member_id, cancellation_token)
     }
 
     #[cfg(test)]
@@ -331,7 +314,6 @@ impl CollaborationTreeRegistry {
     pub(crate) fn cancel_tree_for_terminal_unauthorized(
         &self,
         tree_id: &CollaborationTreeId,
-        exempt_member_id: Option<&str>,
         exempt_request_registration_id: Option<Uuid>,
     ) {
         let tokens = self
@@ -343,12 +325,8 @@ impl CollaborationTreeRegistry {
             .map(|members| {
                 members
                     .iter()
-                    .filter(|(registration_id, member)| {
-                        if Some(**registration_id) == exempt_request_registration_id {
-                            return false;
-                        }
-                        !(member.kind == CollaborationRegistrationKind::LongLived
-                            && Some(member.member_id.as_str()) == exempt_member_id)
+                    .filter(|(registration_id, _)| {
+                        Some(**registration_id) != exempt_request_registration_id
                     })
                     .map(|(_, member)| member.cancellation_token.clone())
                     .collect::<Vec<_>>()

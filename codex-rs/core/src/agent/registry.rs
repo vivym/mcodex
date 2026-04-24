@@ -169,6 +169,18 @@ impl AgentRegistry {
             .cloned()
     }
 
+    pub(crate) fn root_agent_metadata_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<AgentMetadata> {
+        let active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metadata = active_agents.agent_tree.get(AgentPath::ROOT)?;
+        (metadata.agent_id == Some(thread_id)).then(|| metadata.clone())
+    }
+
     pub(crate) fn agent_metadata_for_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata> {
         let active_agents = self
             .active_agents
