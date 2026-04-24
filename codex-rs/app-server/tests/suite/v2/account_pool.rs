@@ -418,10 +418,11 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
         ]),
     )
     .await;
-    let _parent_follow_up = responses::mount_sse_once_match(
+    let parent_follow_up = responses::mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, SPAWN_A_CALL_ID) && body_contains(req, SPAWN_B_CALL_ID)
+            request_function_call_output_agent_id(req, SPAWN_A_CALL_ID).is_some()
+                && request_function_call_output_agent_id(req, SPAWN_B_CALL_ID).is_some()
         },
         responses::sse(vec![
             responses::ev_response_created("resp-parent-2"),
@@ -430,15 +431,27 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
         ]),
     )
     .await;
-    let _parent_follow_up_after_children = responses::mount_sse_once_match(
+    let parent_follow_up_after_spawn_a_only = responses::mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, "child A done") && body_contains(req, "child B done")
+            request_function_call_output_agent_id(req, SPAWN_A_CALL_ID).is_some()
+                && request_function_call_output_agent_id(req, SPAWN_B_CALL_ID).is_none()
         },
         responses::sse(vec![
-            responses::ev_response_created("resp-parent-3"),
-            responses::ev_assistant_message("msg-parent-3", "parent done after children"),
-            responses::ev_completed("resp-parent-3"),
+            responses::ev_response_created("resp-parent-3a"),
+            responses::ev_completed("resp-parent-3a"),
+        ]),
+    )
+    .await;
+    let parent_follow_up_after_spawn_b_only = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            request_function_call_output_agent_id(req, SPAWN_B_CALL_ID).is_some()
+                && request_function_call_output_agent_id(req, SPAWN_A_CALL_ID).is_none()
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-parent-3b"),
+            responses::ev_completed("resp-parent-3b"),
         ]),
     )
     .await;
@@ -458,6 +471,13 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     child_thread_ids.sort();
     let first_owner = child_thread_ids[0].clone();
     let sibling = child_thread_ids[1].clone();
+    let parent_follow_up_request = parent_follow_up.single_request();
+    let mut reported_child_thread_ids = vec![
+        response_function_call_output_agent_id(&parent_follow_up_request, SPAWN_A_CALL_ID)?,
+        response_function_call_output_agent_id(&parent_follow_up_request, SPAWN_B_CALL_ID)?,
+    ];
+    reported_child_thread_ids.sort();
+    assert_eq!(reported_child_thread_ids, child_thread_ids);
 
     archive_thread(&mut mcp, parent.id.as_str()).await?;
     archive_thread(&mut mcp, first_owner.as_str()).await?;
@@ -470,6 +490,14 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     archive_thread(&mut mcp, sibling.as_str()).await?;
     let next_top_level = start_thread(&mut mcp).await?;
     assert!(!next_top_level.id.is_empty());
+    assert!(
+        parent_follow_up_after_spawn_a_only.requests().is_empty(),
+        "parent should not receive a follow-up after only spawn A returns"
+    );
+    assert!(
+        parent_follow_up_after_spawn_b_only.requests().is_empty(),
+        "parent should not receive a follow-up after only spawn B returns"
+    );
     Ok(())
 }
 
@@ -923,6 +951,7 @@ async fn spawn_two_children_and_wait_completed(
         }
     }
 
+    let mut completed_child_thread_ids = std::collections::HashSet::new();
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let notification = mcp
@@ -932,6 +961,14 @@ async fn spawn_two_children_and_wait_completed(
                 serde_json::from_value(notification.params.ok_or_else(|| {
                     anyhow::anyhow!("turn/completed notification missing params")
                 })?)?;
+            if child_thread_ids.contains(&completed.thread_id) {
+                anyhow::ensure!(
+                    completed.turn.error.is_none(),
+                    "child turn should complete without error: {:?}",
+                    completed.turn.error
+                );
+                completed_child_thread_ids.insert(completed.thread_id.clone());
+            }
             if completed.thread_id == thread_id && completed.turn.id == turn.turn.id {
                 anyhow::ensure!(
                     completed.turn.error.is_none(),
@@ -941,6 +978,28 @@ async fn spawn_two_children_and_wait_completed(
                 return Ok::<(), anyhow::Error>(());
             }
         }
+    })
+    .await??;
+
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        while completed_child_thread_ids.len() < child_thread_ids.len() {
+            let notification = mcp
+                .read_stream_until_notification_message("turn/completed")
+                .await?;
+            let completed: TurnCompletedNotification =
+                serde_json::from_value(notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("turn/completed notification missing params")
+                })?)?;
+            if child_thread_ids.contains(&completed.thread_id) {
+                anyhow::ensure!(
+                    completed.turn.error.is_none(),
+                    "child turn should complete without error: {:?}",
+                    completed.turn.error
+                );
+                completed_child_thread_ids.insert(completed.thread_id);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
     })
     .await??;
 
@@ -966,6 +1025,44 @@ fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     String::from_utf8(req.body.clone())
         .ok()
         .is_some_and(|body| body.contains(text))
+}
+
+fn request_function_call_output_agent_id(req: &wiremock::Request, call_id: &str) -> Option<String> {
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(req.body.as_slice()) else {
+        return None;
+    };
+    body.get("input")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|input| {
+            input.iter().find_map(|item| {
+                let is_matching = item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("function_call_output")
+                    && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id);
+                is_matching
+                    .then(|| item.get("output").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .and_then(spawn_output_agent_id)
+            })
+        })
+}
+
+fn response_function_call_output_agent_id(
+    req: &responses::ResponsesRequest,
+    call_id: &str,
+) -> Result<String> {
+    let output_text = req
+        .function_call_output_text(call_id)
+        .ok_or_else(|| anyhow::anyhow!("missing function_call_output for {call_id}"))?;
+    spawn_output_agent_id(output_text.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing agent_id in function_call_output for {call_id}"))
+}
+
+fn spawn_output_agent_id(output_text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(output_text)
+        .ok()?
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn pooled_runtime_error_code(error: &JSONRPCError) -> Option<&str> {
