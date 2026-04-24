@@ -979,25 +979,35 @@ impl ThreadManagerState {
         };
         let (runtime_lease_host, initial_collaboration_tree_id) = match parent_runtime_thread_id {
             RuntimeLeaseInheritanceSource::None => (None, None),
-            RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => self
-                .threads
-                .read()
-                .await
-                .get(&parent_thread_id)
-                .map(|thread| {
-                    (
-                        thread.codex.session.services.runtime_lease_host.clone(),
-                        Some(
-                            thread
-                                .codex
-                                .session
-                                .services
-                                .model_client
-                                .current_collaboration_tree_id(),
-                        ),
-                    )
-                })
-                .unwrap_or((None, None)),
+            RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => {
+                let parent_thread = self
+                    .threads
+                    .read()
+                    .await
+                    .get(&parent_thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodexErr::Fatal(format!(
+                            "runtime lease parent thread {parent_thread_id} is not loaded; cannot inherit runtime lease authority"
+                        ))
+                    })?;
+                (
+                    parent_thread
+                        .codex
+                        .session
+                        .services
+                        .runtime_lease_host
+                        .clone(),
+                    Some(
+                        parent_thread
+                            .codex
+                            .session
+                            .services
+                            .model_client
+                            .current_collaboration_tree_id(),
+                    ),
+                )
+            }
             RuntimeLeaseInheritanceSource::Explicit(inheritance) => {
                 (inheritance.host, Some(inheritance.collaboration_tree_id))
             }

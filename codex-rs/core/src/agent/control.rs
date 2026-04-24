@@ -70,6 +70,12 @@ pub(crate) struct ListedAgent {
     pub(crate) last_task_message: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAgentReference {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) metadata: AgentMetadata,
+}
+
 fn default_agent_nickname_list() -> Vec<&'static str> {
     AGENT_NAMES
         .lines()
@@ -803,20 +809,46 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    #[cfg(test)]
     pub(crate) async fn resolve_agent_reference(
+        &self,
+        current_thread_id: ThreadId,
+        current_session_source: &SessionSource,
+        agent_reference: &str,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .resolve_agent_reference_with_metadata(
+                current_thread_id,
+                current_session_source,
+                agent_reference,
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn resolve_agent_reference_with_metadata(
         &self,
         _current_thread_id: ThreadId,
         current_session_source: &SessionSource,
         agent_reference: &str,
-    ) -> CodexResult<ThreadId> {
+    ) -> CodexResult<ResolvedAgentReference> {
         let current_agent_path = current_session_source
             .get_agent_path()
             .unwrap_or_else(AgentPath::root);
         let agent_path = current_agent_path
             .resolve(agent_reference)
             .map_err(CodexErr::UnsupportedOperation)?;
-        if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
-            return Ok(thread_id);
+        if let Some(metadata) = self.state.agent_metadata_for_path(&agent_path) {
+            let Some(thread_id) = metadata.agent_id else {
+                return Err(CodexErr::UnsupportedOperation(format!(
+                    "live agent path `{}` is not bound to a thread",
+                    agent_path.as_str()
+                )));
+            };
+            return Ok(ResolvedAgentReference {
+                thread_id,
+                metadata,
+            });
         }
         Err(CodexErr::UnsupportedOperation(format!(
             "live agent path `{}` not found",

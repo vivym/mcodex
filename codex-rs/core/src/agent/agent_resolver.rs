@@ -1,24 +1,41 @@
+use crate::agent::control::ResolvedAgentReference;
+use crate::agent::registry::AgentMetadata;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use codex_protocol::ThreadId;
 use std::sync::Arc;
 
-/// Resolves a single tool-facing agent target to a thread id.
-pub(crate) async fn resolve_agent_target(
+/// Resolves a single tool-facing agent target with metadata from the same namespace lookup.
+pub(crate) async fn resolve_agent_target_with_metadata(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
     target: &str,
-) -> Result<ThreadId, FunctionCallError> {
+) -> Result<ResolvedAgentReference, FunctionCallError> {
     register_session_root(session, turn);
     if let Ok(thread_id) = ThreadId::from_string(target) {
-        return Ok(thread_id);
+        let metadata = session
+            .services
+            .agent_control
+            .get_agent_metadata(thread_id)
+            .unwrap_or(AgentMetadata {
+                agent_id: Some(thread_id),
+                ..Default::default()
+            });
+        return Ok(ResolvedAgentReference {
+            thread_id,
+            metadata,
+        });
     }
 
     session
         .services
         .agent_control
-        .resolve_agent_reference(session.conversation_id, &turn.session_source, target)
+        .resolve_agent_reference_with_metadata(
+            session.conversation_id,
+            &turn.session_source,
+            target,
+        )
         .await
         .map_err(|err| match err {
             codex_protocol::error::CodexErr::UnsupportedOperation(message) => {
