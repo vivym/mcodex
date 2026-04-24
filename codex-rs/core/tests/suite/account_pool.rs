@@ -14,7 +14,6 @@ use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
-use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -922,7 +921,7 @@ async fn hard_failover_uses_active_limit_family_through_runtime_authority() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Result<()> {
+async fn repeated_unauthorized_recovery_preserves_account_for_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -936,6 +935,7 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
                 .insert_header("content-type", "application/json")
                 .set_body_string("unauthorized"),
             sse_with_primary_usage_percent("resp-2", 11.0),
+            sse_with_primary_usage_percent("resp-3", 12.0),
         ],
     )
     .await;
@@ -944,26 +944,42 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
 
-    let first_turn_error = submit_turn_and_wait(&test, "unauthorized turn").await?;
-    assert_eq!(
-        first_turn_error
-            .as_ref()
-            .and_then(|err| err.codex_error_info.clone()),
-        Some(CodexErrorInfo::Unauthorized)
-    );
+    let first_turn_error = submit_turn_and_wait(&test, "recover repeated unauthorized").await?;
+    assert!(first_turn_error.is_none());
 
-    let second_turn_error = submit_turn_and_wait(&test, "after unauthorized").await?;
+    let second_turn_error = submit_turn_and_wait(&test, "after recovered unauthorized").await?;
     assert!(second_turn_error.is_none());
 
     let requests = response_mock.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected one in-turn unauthorized retry before next-turn rotation"
+        4,
+        "expected repeated in-turn unauthorized recovery without next-turn rotation"
     );
     assert_account_ids_in_order(
         &requests,
-        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+        &[
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+        ],
+    );
+    let lease_acquired_event_type = event_type_name(AccountPoolEventType::LeaseAcquired);
+    let non_replayable_turn = reason_code_name(AccountPoolReasonCode::NonReplayableTurn);
+    let events = list_account_pool_events(&test).await?;
+    let hard_failover_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == lease_acquired_event_type
+                && event.reason_code.as_deref() == Some(non_replayable_turn.as_str())
+                && event_detail_str(event, "source") == Some("rotation")
+                && event_detail_str(event, "intent") == Some("hardFailover")
+        })
+        .count();
+    assert_eq!(
+        hard_failover_count, 0,
+        "recoverable unauthorized should not mark the lease unavailable for next-turn rotation: {events:#?}"
     );
 
     Ok(())
@@ -1476,21 +1492,125 @@ async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<()> {
+async fn pre_turn_remote_compact_repeated_unauthorized_recovers_without_rotation() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_pre_turn_remote_compact_failure_rotates_next_turn(
+    struct CompactSeqResponder {
+        next_call: std::sync::atomic::AtomicUsize,
+        responses: Vec<ResponseTemplate>,
+    }
+
+    impl Respond for CompactSeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .next_call
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.responses
+                .get(call_index)
+                .unwrap_or_else(|| panic!("missing compact response for call {call_index}"))
+                .clone()
+        }
+    }
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
         vec![
-            ResponseTemplate::new(401)
-                .insert_header("content-type", "application/json")
-                .set_body_string("unauthorized"),
-            ResponseTemplate::new(401)
-                .insert_header("content-type", "application/json")
-                .set_body_string("unauthorized"),
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("m1", "before compact"),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 500),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("m2", "after compact recovery"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("m3", "after recovered compact"),
+                ev_completed("resp-3"),
+            ]),
         ],
-        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
     )
-    .await
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(CompactSeqResponder {
+            next_call: std::sync::atomic::AtomicUsize::new(0),
+            responses: vec![
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("unauthorized"),
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("unauthorized"),
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({
+                        "output": [{
+                            "type": "compaction",
+                            "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                        }]
+                    })),
+            ],
+        })
+        .up_to_n_times(3)
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config.model_auto_compact_token_limit = Some(120);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "seed usage for compact").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "turn with recovered compact").await?;
+    assert!(second_turn_error.is_none());
+
+    let third_turn_error = submit_turn_and_wait(&test, "turn after recovered compact").await?;
+    assert!(third_turn_error.is_none());
+
+    let response_requests = response_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        3,
+        "recovered pre-turn compact should not duplicate the current turn or force next-turn rotation"
+    );
+    assert_account_ids_in_order(
+        &response_requests,
+        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID],
+    );
+
+    let all_requests = server.received_requests().await.unwrap_or_default();
+    let compact_request_account_ids = all_requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses/compact")
+        })
+        .map(|request| {
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_request_account_ids,
+        vec![
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+        ]
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -56,15 +56,39 @@ use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+const GUARDIAN_SNAPSHOT_TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
 fn fixed_guardian_parent_session_id() -> ThreadId {
     ThreadId::from_string("11111111-1111-4111-8111-111111111111")
         .expect("fixed parent session id should be a valid UUID")
+}
+
+fn run_guardian_snapshot_test_with_large_stack<F, Fut>(name: &str, test: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(GUARDIAN_SNAPSHOT_TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(test())
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
+    }
 }
 
 async fn guardian_test_session_and_turn(
@@ -894,8 +918,15 @@ fn parse_guardian_assessment_extracts_embedded_json() {
     assert_eq!(parsed.outcome, GuardianAssessmentOutcome::Allow);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
+#[test]
+fn guardian_review_request_layout_matches_model_visible_request_snapshot() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_review_request_layout_matches_model_visible_request_snapshot",
+        guardian_review_request_layout_matches_model_visible_request_snapshot_impl,
+    )
+}
+
+async fn guardian_review_request_layout_matches_model_visible_request_snapshot_impl()
 -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1020,8 +1051,15 @@ async fn build_guardian_prompt_items_includes_parent_session_id() -> anyhow::Res
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow::Result<()> {
+#[test]
+fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_reuses_prompt_cache_key_and_appends_prior_reviews",
+        guardian_reuses_prompt_cache_key_and_appends_prior_reviews_impl,
+    )
+}
+
+async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews_impl() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1266,9 +1304,16 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reusable_session_rebinds_collaboration_tree_per_invocation() -> anyhow::Result<()>
-{
+#[test]
+fn guardian_reusable_session_rebinds_collaboration_tree_per_invocation() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_reusable_session_rebinds_collaboration_tree_per_invocation",
+        guardian_reusable_session_rebinds_collaboration_tree_per_invocation_impl,
+    )
+}
+
+async fn guardian_reusable_session_rebinds_collaboration_tree_per_invocation_impl()
+-> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let first_assessment = serde_json::json!({
@@ -1455,8 +1500,15 @@ async fn guardian_reusable_session_rebinds_collaboration_tree_per_invocation() -
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_reusable_session_survives_tree_scoped_cancellation() -> anyhow::Result<()> {
+#[test]
+fn guardian_reusable_session_survives_tree_scoped_cancellation() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_reusable_session_survives_tree_scoped_cancellation",
+        guardian_reusable_session_survives_tree_scoped_cancellation_impl,
+    )
+}
+
+async fn guardian_reusable_session_survives_tree_scoped_cancellation_impl() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let first_assessment = serde_json::json!({
@@ -1663,8 +1715,15 @@ async fn guardian_reusable_session_survives_tree_scoped_cancellation() -> anyhow
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_review_session_inherits_parent_lease_auth() -> anyhow::Result<()> {
+#[test]
+fn guardian_review_session_inherits_parent_lease_auth() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_review_session_inherits_parent_lease_auth",
+        guardian_review_session_inherits_parent_lease_auth_impl,
+    )
+}
+
+async fn guardian_review_session_inherits_parent_lease_auth_impl() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     struct TestLeaseScopedAuthSession {
@@ -1799,8 +1858,16 @@ async fn guardian_review_session_inherits_parent_lease_auth() -> anyhow::Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> anyhow::Result<()> {
+#[test]
+fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_review_surfaces_responses_api_errors_in_rejection_reason",
+        guardian_review_surfaces_responses_api_errors_in_rejection_reason_impl,
+    )
+}
+
+async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason_impl()
+-> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1906,8 +1973,16 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn guardian_parallel_reviews_fork_from_last_committed_trunk_history() -> anyhow::Result<()> {
+#[test]
+fn guardian_parallel_reviews_fork_from_last_committed_trunk_history() -> anyhow::Result<()> {
+    run_guardian_snapshot_test_with_large_stack(
+        "guardian_parallel_reviews_fork_from_last_committed_trunk_history",
+        guardian_parallel_reviews_fork_from_last_committed_trunk_history_impl,
+    )
+}
+
+async fn guardian_parallel_reviews_fork_from_last_committed_trunk_history_impl()
+-> anyhow::Result<()> {
     let first_assessment = serde_json::json!({
         "risk_level": "low",
         "user_authorization": "high",
