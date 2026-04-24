@@ -118,7 +118,7 @@ async fn wait_for_responses_request_count(
 }
 
 #[tokio::test]
-async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
+async fn thread_resume_accepts_materialized_zero_turn_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -140,26 +140,23 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
 
-    // Resume should fail before the first user message materializes rollout storage.
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread.id.clone(),
             ..Default::default()
         })
         .await?;
-    let resume_err: JSONRPCError = timeout(
+    let resume_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
     )
     .await??;
-    assert!(
-        resume_err
-            .error
-            .message
-            .contains("no rollout found for thread id"),
-        "unexpected resume error: {}",
-        resume_err.error.message
-    );
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(resumed.id, thread.id);
+    assert_eq!(resumed.path, thread.path);
+    assert_eq!(resumed.status, ThreadStatus::Idle);
 
     Ok(())
 }
@@ -1804,6 +1801,163 @@ async fn thread_resume_by_path_preserves_source_config_baseline_after_config_cha
 }
 
 #[tokio::test]
+async fn thread_resume_by_thread_id_preserves_zero_turn_start_config_baseline_after_config_changes()
+-> Result<()> {
+    assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
+        ResumeSource::ThreadId,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn thread_resume_by_path_preserves_zero_turn_start_config_baseline_after_config_changes()
+-> Result<()> {
+    assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
+        ResumeSource::Path,
+    )
+    .await
+}
+
+enum ResumeSource {
+    ThreadId,
+    Path,
+}
+
+async fn assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
+    source: ResumeSource,
+) -> Result<()> {
+    let source_server = responses::start_mock_server().await;
+    let current_server = responses::start_mock_server().await;
+    let source_mock = responses::mount_sse_once(
+        &source_server,
+        source_config_sse("source-resume-resp", "source-resume-msg"),
+    )
+    .await;
+    mount_current_provider_responder(&current_server).await;
+    let codex_home = TempDir::new()?;
+    write_dual_provider_config_toml(
+        codex_home.path(),
+        DualProviderConfig {
+            default_provider: "source_provider",
+            model: "gpt-5.2-codex",
+            model_reasoning_effort: "high",
+            service_tier: "flex",
+            approval_policy: "on-request",
+            sandbox_mode: "danger-full-access",
+            instructions: "source base instructions",
+            developer_instructions: "source developer instructions",
+            source_server_uri: &source_server.uri(),
+            current_server_uri: &current_server.uri(),
+        },
+    )?;
+
+    let mut primary = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+    let start_id = primary
+        .send_thread_start_request(ThreadStartParams {
+            base_instructions: Some("zero-turn baseline base instructions".to_string()),
+            developer_instructions: Some("zero-turn baseline developer instructions".to_string()),
+            personality: Some(Personality::Friendly),
+            persist_extended_history: false,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let Some(thread_path) = thread.path.clone() else {
+        anyhow::bail!("source thread path missing");
+    };
+    drop(primary);
+
+    write_dual_provider_config_toml(
+        codex_home.path(),
+        DualProviderConfig {
+            default_provider: "current_provider",
+            model: "gpt-5.1-codex-max",
+            model_reasoning_effort: "low",
+            service_tier: "fast",
+            approval_policy: "never",
+            sandbox_mode: "read-only",
+            instructions: "current base instructions",
+            developer_instructions: "current developer instructions",
+            source_server_uri: &source_server.uri(),
+            current_server_uri: &current_server.uri(),
+        },
+    )?;
+
+    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
+    let resume_params = match source {
+        ResumeSource::ThreadId => ThreadResumeParams {
+            thread_id: thread.id,
+            ..Default::default()
+        },
+        ResumeSource::Path => ThreadResumeParams {
+            thread_id: "ignored-when-path-is-present".to_string(),
+            path: Some(thread_path),
+            ..Default::default()
+        },
+    };
+    let resume_id = secondary.send_thread_resume_request(resume_params).await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse {
+        thread: resumed,
+        model,
+        model_provider,
+        service_tier,
+        approval_policy,
+        sandbox,
+        reasoning_effort,
+        ..
+    } = to_response::<ThreadResumeResponse>(resume_resp)?;
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(model_provider, "source_provider");
+    assert_eq!(service_tier, Some(ServiceTier::Flex));
+    assert_eq!(approval_policy, AskForApproval::OnRequest);
+    assert_eq!(sandbox, SandboxPolicy::DangerFullAccess);
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+
+    let turn_id = secondary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: resumed.id,
+            input: vec![UserInput::Text {
+                text: "continue zero-turn source config".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let source_requests = source_mock.requests();
+    assert_eq!(source_requests.len(), 1);
+    wait_for_responses_request_count(&current_server, /*expected_count*/ 0).await?;
+    let [source_request] = source_requests.as_slice() else {
+        anyhow::bail!("expected one resumed turn request");
+    };
+    assert_zero_turn_start_override_request(source_request);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_by_path_ignores_mismatched_source_first_session_meta() -> Result<()> {
     let source_server = responses::start_mock_server().await;
     let current_server = responses::start_mock_server().await;
@@ -3228,6 +3382,53 @@ fn assert_source_config_request(request: &responses::ResponsesRequest) {
             .iter()
             .all(|text| !text.contains("current developer instructions")),
         "resumed turn should not use current developer instructions: {developer_texts:?}"
+    );
+}
+
+fn assert_zero_turn_start_override_request(request: &responses::ResponsesRequest) {
+    let body = request.body_json();
+    assert_eq!(body["model"], json!("gpt-5.2-codex"));
+    assert_eq!(body["service_tier"], json!("flex"));
+    assert_eq!(body["reasoning"]["effort"], json!("high"));
+
+    let instructions_text = request.instructions_text();
+    assert!(
+        instructions_text.contains("zero-turn baseline base instructions"),
+        "expected zero-turn baseline base instructions, got {instructions_text:?}"
+    );
+    assert!(
+        !instructions_text.contains("source base instructions"),
+        "resumed turn should not fall back to stale config-file base instructions: {instructions_text:?}"
+    );
+    assert!(
+        !instructions_text.contains("current base instructions"),
+        "resumed turn should not use current base instructions: {instructions_text:?}"
+    );
+
+    let developer_texts = request.message_input_texts("developer");
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("zero-turn baseline developer instructions")),
+        "expected zero-turn baseline developer instructions, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains("source developer instructions")),
+        "resumed turn should not fall back to stale config-file developer instructions: {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains("current developer instructions")),
+        "resumed turn should not use current developer instructions: {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("<personality_spec>")),
+        "expected start-only personality in developer input, got {developer_texts:?}"
     );
 }
 

@@ -2955,6 +2955,24 @@ impl CodexMessageProcessor {
                         otel.name = "app_server.thread_start.config_snapshot",
                     ))
                     .await;
+                thread.ensure_rollout_materialized().await;
+                let effective_config = thread.effective_config().await;
+                let start_config_baseline = thread_config_baseline_snapshot(
+                    thread_id,
+                    &session_configured,
+                    &PersistedThreadConfigBaselineFields {
+                        personality: effective_config.personality,
+                        personality_overrides_rollout: false,
+                        base_instructions: effective_config.base_instructions.clone(),
+                        developer_instructions: effective_config.developer_instructions.clone(),
+                        developer_instructions_overrides_rollout: false,
+                    },
+                );
+                Self::persist_thread_config_baseline_snapshot_for_config(
+                    listener_task_context.config.as_ref(),
+                    &start_config_baseline,
+                )
+                .await;
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     &config_snapshot,
@@ -4812,7 +4830,14 @@ impl CodexMessageProcessor {
         &self,
         snapshot: &ThreadConfigBaselineSnapshot,
     ) {
-        let Some(state_db_ctx) = get_state_db(&self.config).await else {
+        Self::persist_thread_config_baseline_snapshot_for_config(&self.config, snapshot).await;
+    }
+
+    async fn persist_thread_config_baseline_snapshot_for_config(
+        config: &Config,
+        snapshot: &ThreadConfigBaselineSnapshot,
+    ) {
+        let Some(state_db_ctx) = get_state_db(config).await else {
             return;
         };
         if let Err(err) = state_db_ctx.upsert_thread_config_baseline(snapshot).await {

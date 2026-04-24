@@ -30,6 +30,7 @@ use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -243,6 +244,270 @@ async fn thread_fork_by_path_preserves_source_config_baseline_after_config_chang
 }
 
 #[tokio::test]
+async fn thread_fork_by_thread_id_preserves_loaded_zero_turn_start_config_baseline_after_start_override()
+-> Result<()> {
+    let source_server = responses::start_mock_server().await;
+    let source_mock = responses::mount_sse_once(
+        &source_server,
+        source_config_sse("source-fork-resp", "source-fork-msg"),
+    )
+    .await;
+    let current_server = responses::start_mock_server().await;
+    mount_current_provider_responder(&current_server).await;
+    let codex_home = TempDir::new()?;
+    write_dual_provider_config_toml(
+        codex_home.path(),
+        DualProviderConfig {
+            default_provider: "source_provider",
+            model: "gpt-5.2-codex",
+            model_reasoning_effort: "high",
+            service_tier: "flex",
+            approval_policy: "on-request",
+            sandbox_mode: "danger-full-access",
+            instructions: "source base instructions",
+            developer_instructions: "source developer instructions",
+            source_server_uri: &source_server.uri(),
+            current_server_uri: &current_server.uri(),
+        },
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            base_instructions: Some("zero-turn baseline base instructions".to_string()),
+            developer_instructions: Some("zero-turn baseline developer instructions".to_string()),
+            personality: Some(Personality::Friendly),
+            persist_extended_history: false,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: forked,
+        model,
+        model_provider,
+        service_tier,
+        approval_policy,
+        sandbox,
+        reasoning_effort,
+        ..
+    } = to_response::<ThreadForkResponse>(fork_resp)?;
+    assert_eq!(forked.forked_from_id, Some(thread.id));
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(model_provider, "source_provider");
+    assert_eq!(service_tier, Some(ServiceTier::Flex));
+    assert_eq!(
+        approval_policy,
+        codex_app_server_protocol::AskForApproval::OnRequest
+    );
+    assert_eq!(sandbox, SandboxPolicy::DangerFullAccess);
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+
+    let turn_id = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: forked.id,
+            input: vec![UserInput::Text {
+                text: "continue zero-turn fork with start override".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let source_requests = source_mock.requests();
+    assert_eq!(source_requests.len(), 1);
+    assert_no_responses_requests(&current_server).await?;
+    assert_zero_turn_start_override_request(source_requests.last().expect("forked turn request"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_fork_by_thread_id_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes()
+-> Result<()> {
+    assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
+        ForkSource::ThreadId,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn thread_fork_by_path_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes()
+-> Result<()> {
+    assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
+        ForkSource::Path,
+    )
+    .await
+}
+
+async fn assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
+    source: ForkSource,
+) -> Result<()> {
+    let source_server = responses::start_mock_server().await;
+    let source_mock = responses::mount_sse_once(
+        &source_server,
+        source_config_sse("source-fork-resp", "source-fork-msg"),
+    )
+    .await;
+    let current_server = responses::start_mock_server().await;
+    mount_current_provider_responder(&current_server).await;
+    let codex_home = TempDir::new()?;
+    write_dual_provider_config_toml(
+        codex_home.path(),
+        DualProviderConfig {
+            default_provider: "source_provider",
+            model: "gpt-5.2-codex",
+            model_reasoning_effort: "high",
+            service_tier: "flex",
+            approval_policy: "on-request",
+            sandbox_mode: "danger-full-access",
+            instructions: "source base instructions",
+            developer_instructions: "source developer instructions",
+            source_server_uri: &source_server.uri(),
+            current_server_uri: &current_server.uri(),
+        },
+    )?;
+
+    let mut primary = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
+    let start_id = primary
+        .send_thread_start_request(ThreadStartParams {
+            base_instructions: Some("zero-turn baseline base instructions".to_string()),
+            developer_instructions: Some("zero-turn baseline developer instructions".to_string()),
+            personality: Some(Personality::Friendly),
+            persist_extended_history: false,
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        primary.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let source_thread_id = thread.id;
+    let Some(source_thread_path) = thread.path else {
+        anyhow::bail!("source thread path missing");
+    };
+    drop(primary);
+
+    write_dual_provider_config_toml(
+        codex_home.path(),
+        DualProviderConfig {
+            default_provider: "current_provider",
+            model: "gpt-5.1-codex-max",
+            model_reasoning_effort: "low",
+            service_tier: "fast",
+            approval_policy: "never",
+            sandbox_mode: "read-only",
+            instructions: "current base instructions",
+            developer_instructions: "current developer instructions",
+            source_server_uri: &source_server.uri(),
+            current_server_uri: &current_server.uri(),
+        },
+    )?;
+
+    let mut secondary = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, secondary.initialize()).await??;
+    let fork_params = match source {
+        ForkSource::ThreadId => ThreadForkParams {
+            thread_id: source_thread_id.clone(),
+            ..Default::default()
+        },
+        ForkSource::Path => ThreadForkParams {
+            thread_id: "ignored-when-path-is-present".to_string(),
+            path: Some(source_thread_path),
+            ..Default::default()
+        },
+    };
+    let fork_id = secondary.send_thread_fork_request(fork_params).await?;
+    let fork_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_response_message(RequestId::Integer(fork_id)),
+    )
+    .await??;
+    let ThreadForkResponse {
+        thread: forked,
+        model,
+        model_provider,
+        service_tier,
+        approval_policy,
+        sandbox,
+        reasoning_effort,
+        ..
+    } = to_response::<ThreadForkResponse>(fork_resp)?;
+    assert_eq!(forked.forked_from_id, Some(source_thread_id));
+    assert_eq!(model, "gpt-5.2-codex");
+    assert_eq!(model_provider, "source_provider");
+    assert_eq!(service_tier, Some(ServiceTier::Flex));
+    assert_eq!(
+        approval_policy,
+        codex_app_server_protocol::AskForApproval::OnRequest
+    );
+    assert_eq!(sandbox, SandboxPolicy::DangerFullAccess);
+    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+
+    let turn_id = secondary
+        .send_turn_start_request(TurnStartParams {
+            thread_id: forked.id,
+            input: vec![UserInput::Text {
+                text: "continue zero-turn fork with start override".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_response_message(RequestId::Integer(turn_id)),
+    )
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        secondary.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let source_requests = source_mock.requests();
+    assert_eq!(source_requests.len(), 1);
+    assert_no_responses_requests(&current_server).await?;
+    let [source_request] = source_requests.as_slice() else {
+        anyhow::bail!("expected one forked turn request");
+    };
+    assert_zero_turn_start_override_request(source_request);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_fork_by_path_ignores_mismatched_source_first_session_meta() -> Result<()> {
     let source_server = responses::start_mock_server().await;
     let current_server = responses::start_mock_server().await;
@@ -445,7 +710,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
 }
 
 #[tokio::test]
-async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
+async fn thread_fork_accepts_materialized_zero_turn_thread() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
@@ -465,26 +730,22 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
     )
     .await??;
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let source_thread_id = thread.id;
 
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
-            thread_id: thread.id,
+            thread_id: source_thread_id.clone(),
             ..Default::default()
         })
         .await?;
-    let fork_err: JSONRPCError = timeout(
+    let fork_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(fork_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
     )
     .await??;
-    assert!(
-        fork_err
-            .error
-            .message
-            .contains("no rollout found for thread id"),
-        "unexpected fork error: {}",
-        fork_err.error.message
-    );
+    let ThreadForkResponse { thread: forked, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
+    assert_eq!(forked.forked_from_id, Some(source_thread_id));
+    assert_eq!(forked.status, ThreadStatus::Idle);
 
     Ok(())
 }
@@ -1773,6 +2034,9 @@ developer_instructions = "{developer_instructions}"
 
 model_provider = "{default_provider}"
 
+[features]
+personality = true
+
 [model_providers.source_provider]
 name = "Source provider for fork baseline test"
 base_url = "{source_server_uri}/v1"
@@ -1829,6 +2093,53 @@ fn assert_source_config_request(request: &responses::ResponsesRequest) {
             .iter()
             .all(|text| !text.contains("current developer instructions")),
         "forked turn should not use current developer instructions: {developer_texts:?}"
+    );
+}
+
+fn assert_zero_turn_start_override_request(request: &responses::ResponsesRequest) {
+    let body = request.body_json();
+    assert_eq!(body["model"], json!("gpt-5.2-codex"));
+    assert_eq!(body["service_tier"], json!("flex"));
+    assert_eq!(body["reasoning"]["effort"], json!("high"));
+
+    let instructions_text = request.instructions_text();
+    assert!(
+        instructions_text.contains("zero-turn baseline base instructions"),
+        "expected zero-turn baseline base instructions, got {instructions_text:?}"
+    );
+    assert!(
+        !instructions_text.contains("source base instructions"),
+        "forked turn should not fall back to stale config-file base instructions: {instructions_text:?}"
+    );
+    assert!(
+        !instructions_text.contains("current base instructions"),
+        "forked turn should not use current base instructions: {instructions_text:?}"
+    );
+
+    let developer_texts = request.message_input_texts("developer");
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("zero-turn baseline developer instructions")),
+        "expected zero-turn baseline developer instructions, got {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains("source developer instructions")),
+        "forked turn should not fall back to stale config-file developer instructions: {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains("current developer instructions")),
+        "forked turn should not use current developer instructions: {developer_texts:?}"
+    );
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("<personality_spec>")),
+        "expected start-only personality in developer input, got {developer_texts:?}"
     );
 }
 

@@ -97,8 +97,19 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
     assert!(
-        !thread_path.exists(),
-        "fresh thread rollout should not be materialized until first user message"
+        thread_path.exists(),
+        "fresh thread rollout should be materialized so zero-turn resume/fork can resolve it"
+    );
+    let rollout_contents = std::fs::read_to_string(&thread_path)?;
+    assert!(
+        rollout_contents.contains("\"type\":\"session_meta\"")
+            || rollout_contents.contains("\"type\": \"session_meta\""),
+        "materialized rollout should contain session metadata: {rollout_contents}"
+    );
+    assert!(
+        rollout_contents.contains(thread.id.as_str()),
+        "materialized rollout should contain thread id {}: {rollout_contents}",
+        thread.id
     );
 
     // Wire contract: thread title field is `name`, serialized as null when unset.
