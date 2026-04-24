@@ -445,6 +445,24 @@ enum ThreadShutdownResult {
     TimedOut,
 }
 
+#[derive(Clone, Copy)]
+enum ThreadWatchRemovalNotification {
+    Publish,
+    Suppress,
+}
+
+#[derive(Clone, Copy)]
+enum FailedSetupReaperVisibility {
+    Hidden,
+    VisibleStarted,
+}
+
+#[derive(Clone, Copy)]
+enum FailedSetupArtifactCleanup {
+    Preserve,
+    DeleteCreatedRollout,
+}
+
 enum PooledRuntimeAdmission {
     NotPooled,
     Reserved(PooledRuntimeReservation),
@@ -2887,6 +2905,28 @@ impl CodexMessageProcessor {
                 )
                 .await
                 {
+                    Self::cleanup_failed_top_level_thread_setup_for_context(
+                        ThreadUnloadContext {
+                            thread_manager: listener_task_context.thread_manager.clone(),
+                            outgoing: listener_task_context.outgoing.clone(),
+                            pending_thread_unloads: listener_task_context
+                                .pending_thread_unloads
+                                .clone(),
+                            pooled_runtime_scope: listener_task_context
+                                .pooled_runtime_scope
+                                .clone(),
+                            thread_state_manager: listener_task_context
+                                .thread_state_manager
+                                .clone(),
+                            thread_watch_manager: listener_task_context
+                                .thread_watch_manager
+                                .clone(),
+                        },
+                        thread_id,
+                        thread.clone(),
+                        FailedSetupArtifactCleanup::DeleteCreatedRollout,
+                    )
+                    .await;
                     listener_task_context
                         .outgoing
                         .send_error(request_id, error)
@@ -4547,6 +4587,12 @@ impl CodexMessageProcessor {
         let fallback_model_provider = config.model_provider_id.clone();
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
         let response_history = thread_history.clone();
+        let failed_setup_artifact_cleanup = match &response_history {
+            InitialHistory::Resumed(_) => FailedSetupArtifactCleanup::Preserve,
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                FailedSetupArtifactCleanup::DeleteCreatedRollout
+            }
+        };
         let pooled_runtime_scope_required =
             match Self::pooled_runtime_scope_required_for_config(&config, transport).await {
                 Ok(required) => required,
@@ -4588,10 +4634,14 @@ impl CodexMessageProcessor {
                     &session_configured,
                     &persisted_resume_config_baseline_fields,
                 );
-                self.persist_thread_config_baseline_snapshot(&persisted_resume_config_baseline)
-                    .await;
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
+                    self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
+                        thread_id,
+                        &thread,
+                        failed_setup_artifact_cleanup,
+                    )
+                    .await;
                     self.send_internal_error(
                         request_id,
                         format!("rollout path missing for thread {thread_id}"),
@@ -4599,20 +4649,6 @@ impl CodexMessageProcessor {
                     .await;
                     return;
                 };
-                // Auto-attach a thread listener when resuming a thread.
-                Self::log_listener_attach_result(
-                    self.ensure_conversation_listener(
-                        thread_id,
-                        request_id.connection_id,
-                        /*raw_events_enabled*/ false,
-                        ApiVersion::V2,
-                    )
-                    .await,
-                    thread_id,
-                    request_id.connection_id,
-                    "thread",
-                );
-
                 let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
                         thread_id,
@@ -4626,10 +4662,33 @@ impl CodexMessageProcessor {
                 {
                     Ok(thread) => thread,
                     Err(message) => {
+                        self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
+                            thread_id,
+                            &thread,
+                            failed_setup_artifact_cleanup,
+                        )
+                        .await;
                         self.send_internal_error(request_id, message).await;
                         return;
                     }
                 };
+
+                self.persist_thread_config_baseline_snapshot(&persisted_resume_config_baseline)
+                    .await;
+
+                // Auto-attach a thread listener when resuming a thread.
+                Self::log_listener_attach_result(
+                    self.ensure_conversation_listener(
+                        thread_id,
+                        request_id.connection_id,
+                        /*raw_events_enabled*/ false,
+                        ApiVersion::V2,
+                    )
+                    .await,
+                    thread_id,
+                    request_id.connection_id,
+                    "thread",
+                );
 
                 self.thread_watch_manager
                     .upsert_thread(thread.clone())
@@ -5318,29 +5377,13 @@ impl CodexMessageProcessor {
             }
         };
         pooled_runtime_admission.promote(thread_id).await;
-        if session_configured.rollout_path.is_some() {
-            let persisted_fork_config_baseline = thread_config_baseline_snapshot(
+        let persisted_fork_config_baseline = session_configured.rollout_path.as_ref().map(|_| {
+            thread_config_baseline_snapshot(
                 thread_id,
                 &session_configured,
                 &persisted_fork_config_baseline_fields,
-            );
-            self.persist_thread_config_baseline_snapshot(&persisted_fork_config_baseline)
-                .await;
-        }
-
-        // Auto-attach a conversation listener when forking a thread.
-        Self::log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-                ApiVersion::V2,
             )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
+        });
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so they rebuild their visible history from the copied source rollout instead.
@@ -5358,6 +5401,8 @@ impl CodexMessageProcessor {
                     thread
                 }
                 Err(err) => {
+                    self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
+                        .await;
                     self.send_internal_error(
                         request_id,
                         format!(
@@ -5391,6 +5436,8 @@ impl CodexMessageProcessor {
             )
             .await
             {
+                self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
+                    .await;
                 self.send_internal_error(request_id, message).await;
                 return;
             }
@@ -5405,9 +5452,30 @@ impl CodexMessageProcessor {
             )
             .await
         {
+            self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
+                .await;
             self.send_internal_error(request_id, message).await;
             return;
         }
+
+        if let Some(persisted_fork_config_baseline) = persisted_fork_config_baseline.as_ref() {
+            self.persist_thread_config_baseline_snapshot(persisted_fork_config_baseline)
+                .await;
+        }
+
+        // Auto-attach a conversation listener when forking a thread.
+        Self::log_listener_attach_result(
+            self.ensure_conversation_listener(
+                thread_id,
+                request_id.connection_id,
+                /*raw_events_enabled*/ false,
+                ApiVersion::V2,
+            )
+            .await,
+            thread_id,
+            request_id.connection_id,
+            "thread",
+        );
 
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())
@@ -6321,23 +6389,396 @@ impl CodexMessageProcessor {
         }
     }
 
+    fn thread_unload_context(&self) -> ThreadUnloadContext {
+        ThreadUnloadContext {
+            thread_manager: self.thread_manager.clone(),
+            outgoing: self.outgoing.clone(),
+            pending_thread_unloads: self.pending_thread_unloads.clone(),
+            pooled_runtime_scope: self.pooled_runtime_scope.clone(),
+            thread_state_manager: self.thread_state_manager.clone(),
+            thread_watch_manager: self.thread_watch_manager.clone(),
+        }
+    }
+
+    async fn cleanup_failed_top_level_thread_setup(
+        &self,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) {
+        self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
+            thread_id,
+            thread,
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+        )
+        .await;
+    }
+
+    async fn cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
+        &self,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        Self::cleanup_failed_top_level_thread_setup_for_context(
+            self.thread_unload_context(),
+            thread_id,
+            thread.clone(),
+            artifact_cleanup,
+        )
+        .await;
+    }
+
+    async fn cleanup_failed_top_level_thread_setup_for_context(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        let shutdown_result = Self::wait_for_thread_shutdown(&thread).await;
+        Self::finalize_failed_top_level_thread_setup(
+            context,
+            thread_id,
+            thread,
+            artifact_cleanup,
+            shutdown_result,
+        )
+        .await;
+    }
+
+    async fn finalize_failed_top_level_thread_setup(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+        shutdown_result: ThreadShutdownResult,
+    ) {
+        match shutdown_result {
+            ThreadShutdownResult::Complete => {
+                Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
+                let _ = context.thread_manager.remove_thread(&thread_id).await;
+                Self::finalize_thread_teardown_for_context_with_watch_notification(
+                    context,
+                    thread_id,
+                    ThreadWatchRemovalNotification::Suppress,
+                )
+                .await;
+            }
+            ThreadShutdownResult::SubmitFailed => {
+                warn!(
+                    "failed to submit Shutdown to top-level thread {thread_id} after setup failure; keeping pooled runtime loaded"
+                );
+                Self::spawn_failed_thread_setup_reaper(
+                    context,
+                    thread_id,
+                    thread,
+                    FailedSetupReaperVisibility::Hidden,
+                    artifact_cleanup,
+                );
+            }
+            ThreadShutdownResult::TimedOut => {
+                warn!(
+                    "top-level thread {thread_id} shutdown timed out after setup failure; keeping pooled runtime loaded"
+                );
+                Self::spawn_failed_thread_setup_reaper(
+                    context,
+                    thread_id,
+                    thread,
+                    FailedSetupReaperVisibility::Hidden,
+                    artifact_cleanup,
+                );
+            }
+        }
+    }
+
+    async fn cleanup_failed_setup_artifacts(
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        let FailedSetupArtifactCleanup::DeleteCreatedRollout = artifact_cleanup else {
+            return;
+        };
+
+        if let Some(rollout_path) = thread.rollout_path() {
+            match tokio::fs::remove_file(&rollout_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        "failed to delete rollout `{}` after failed setup for thread {thread_id}: {err}",
+                        rollout_path.display()
+                    );
+                }
+            }
+        }
+
+        if let Some(state_db) = thread.state_db()
+            && let Err(err) = state_db.delete_thread(thread_id).await
+        {
+            warn!("failed to delete state db row after failed setup for thread {thread_id}: {err}");
+        }
+    }
+
+    async fn track_loaded_thread_from_runtime(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) -> Thread {
+        let config_snapshot = thread.config_snapshot().await;
+        let mut api_thread =
+            build_thread_from_snapshot(thread_id, &config_snapshot, thread.rollout_path());
+        context
+            .thread_watch_manager
+            .upsert_thread_silently(api_thread.clone())
+            .await;
+        api_thread.status = resolve_thread_status(
+            context
+                .thread_watch_manager
+                .loaded_status_for_thread(&api_thread.id)
+                .await,
+            /*has_in_progress_turn*/ false,
+        );
+        api_thread
+    }
+
+    async fn emit_thread_started_from_runtime(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+    ) {
+        let api_thread =
+            Self::track_loaded_thread_from_runtime(context.clone(), thread_id, thread).await;
+        context
+            .outgoing
+            .send_server_notification(ServerNotification::ThreadStarted(
+                ThreadStartedNotification { thread: api_thread },
+            ))
+            .await;
+    }
+
+    fn spawn_failed_thread_setup_reaper(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        visibility: FailedSetupReaperVisibility,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        tokio::spawn(async move {
+            Self::reap_failed_thread_setup(
+                context,
+                thread_id,
+                thread,
+                visibility,
+                artifact_cleanup,
+            )
+            .await;
+        });
+    }
+
+    async fn reap_failed_thread_setup(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        visibility: FailedSetupReaperVisibility,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        let shutdown_result = Self::wait_for_thread_shutdown(&thread).await;
+        Self::finalize_failed_thread_setup_reap(
+            context,
+            thread_id,
+            thread,
+            visibility,
+            artifact_cleanup,
+            shutdown_result,
+        )
+        .await;
+    }
+
+    async fn finalize_failed_thread_setup_reap(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        visibility: FailedSetupReaperVisibility,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+        shutdown_result: ThreadShutdownResult,
+    ) {
+        match shutdown_result {
+            ThreadShutdownResult::Complete => {
+                Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
+                let removed_thread = context
+                    .thread_manager
+                    .remove_thread(&thread_id)
+                    .await
+                    .is_some();
+                let outgoing = context.outgoing.clone();
+                let watch_notification = match visibility {
+                    FailedSetupReaperVisibility::Hidden => ThreadWatchRemovalNotification::Suppress,
+                    FailedSetupReaperVisibility::VisibleStarted => {
+                        ThreadWatchRemovalNotification::Publish
+                    }
+                };
+                Self::finalize_thread_teardown_for_context_with_watch_notification(
+                    context,
+                    thread_id,
+                    watch_notification,
+                )
+                .await;
+                if removed_thread
+                    && matches!(visibility, FailedSetupReaperVisibility::VisibleStarted)
+                {
+                    outgoing
+                        .send_server_notification(ServerNotification::ThreadClosed(
+                            ThreadClosedNotification {
+                                thread_id: thread_id.to_string(),
+                            },
+                        ))
+                        .await;
+                }
+            }
+            ThreadShutdownResult::SubmitFailed => {
+                warn!(
+                    "failed to submit Shutdown while reaping thread {thread_id} after setup failure; keeping pooled runtime loaded"
+                );
+                Self::handle_failed_setup_reap_incomplete(
+                    context,
+                    thread_id,
+                    thread,
+                    visibility,
+                    artifact_cleanup,
+                )
+                .await;
+            }
+            ThreadShutdownResult::TimedOut => {
+                warn!(
+                    "thread {thread_id} shutdown timed out while reaping after setup failure; keeping pooled runtime loaded"
+                );
+                Self::handle_failed_setup_reap_incomplete(
+                    context,
+                    thread_id,
+                    thread,
+                    visibility,
+                    artifact_cleanup,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn handle_failed_setup_reap_incomplete(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        visibility: FailedSetupReaperVisibility,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        match visibility {
+            FailedSetupReaperVisibility::Hidden => {
+                Self::emit_thread_started_from_runtime(context.clone(), thread_id, &thread).await;
+                Self::spawn_visible_failed_setup_completion_reaper(
+                    context,
+                    thread_id,
+                    thread,
+                    artifact_cleanup,
+                );
+            }
+            FailedSetupReaperVisibility::VisibleStarted => {
+                Self::track_loaded_thread_from_runtime(context.clone(), thread_id, &thread).await;
+                Self::spawn_visible_failed_setup_completion_reaper(
+                    context,
+                    thread_id,
+                    thread,
+                    artifact_cleanup,
+                );
+            }
+        }
+    }
+
+    fn spawn_visible_failed_setup_completion_reaper(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        thread: Arc<CodexThread>,
+        artifact_cleanup: FailedSetupArtifactCleanup,
+    ) {
+        tokio::spawn(async move {
+            if let Err(err) = thread.shutdown_and_wait().await {
+                warn!(
+                    "failed to complete visible failed-setup thread {thread_id} shutdown; keeping pooled runtime loaded: {err}"
+                );
+                return;
+            }
+
+            Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
+            let removed_thread = context
+                .thread_manager
+                .remove_thread(&thread_id)
+                .await
+                .is_some();
+            let outgoing = context.outgoing.clone();
+            Self::finalize_thread_teardown_for_context(context, thread_id).await;
+            if removed_thread {
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadClosed(
+                        ThreadClosedNotification {
+                            thread_id: thread_id.to_string(),
+                        },
+                    ))
+                    .await;
+            }
+        });
+    }
+
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
-        self.pending_thread_unloads.lock().await.remove(&thread_id);
+        Self::finalize_thread_teardown_for_context(self.thread_unload_context(), thread_id).await;
+    }
+
+    async fn finalize_thread_teardown_for_context(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+    ) {
+        Self::finalize_thread_teardown_for_context_with_watch_notification(
+            context,
+            thread_id,
+            ThreadWatchRemovalNotification::Publish,
+        )
+        .await;
+    }
+
+    async fn finalize_thread_teardown_for_context_with_watch_notification(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        watch_notification: ThreadWatchRemovalNotification,
+    ) {
+        let ThreadUnloadContext {
+            thread_manager,
+            outgoing,
+            pending_thread_unloads,
+            pooled_runtime_scope,
+            thread_state_manager,
+            thread_watch_manager,
+        } = context;
+        pending_thread_unloads.lock().await.remove(&thread_id);
         Self::mark_pooled_runtime_thread_unloaded(
-            &self.thread_manager,
-            &self.pooled_runtime_scope,
+            &thread_manager,
+            &pooled_runtime_scope,
             thread_id,
         )
         .await;
-        self.outgoing
+        outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
-        self.thread_state_manager
-            .remove_thread_state(thread_id)
-            .await;
-        self.thread_watch_manager
-            .remove_thread(&thread_id.to_string())
-            .await;
+        thread_state_manager.remove_thread_state(thread_id).await;
+        match watch_notification {
+            ThreadWatchRemovalNotification::Publish => {
+                thread_watch_manager
+                    .remove_thread(&thread_id.to_string())
+                    .await;
+            }
+            ThreadWatchRemovalNotification::Suppress => {
+                thread_watch_manager
+                    .remove_thread_silently(&thread_id.to_string())
+                    .await;
+            }
+        }
     }
 
     async fn mark_pooled_runtime_thread_unloaded(
@@ -8321,6 +8762,12 @@ impl CodexMessageProcessor {
                         session_configured.session_id,
                         err
                     );
+                    Self::emit_thread_started_from_runtime(
+                        self.thread_unload_context(),
+                        thread_id,
+                        &review_thread,
+                    )
+                    .await;
                 }
             }
         } else {
@@ -8328,6 +8775,12 @@ impl CodexMessageProcessor {
                 "review thread {} has no rollout path",
                 session_configured.session_id
             );
+            Self::emit_thread_started_from_runtime(
+                self.thread_unload_context(),
+                thread_id,
+                &review_thread,
+            )
+            .await;
         }
 
         let turn_id = match self
@@ -8340,8 +8793,12 @@ impl CodexMessageProcessor {
         {
             Ok(turn_id) => turn_id,
             Err(err) => {
-                self.cleanup_failed_detached_review_thread_start(thread_id, &review_thread)
-                    .await;
+                self.cleanup_failed_detached_review_thread_start(
+                    thread_id,
+                    &review_thread,
+                    /*thread_started_emitted*/ true,
+                )
+                .await;
                 return Err(JSONRPCErrorError {
                     code: INTERNAL_ERROR_CODE,
                     message: format!("failed to start detached review turn: {err}"),
@@ -8362,29 +8819,98 @@ impl CodexMessageProcessor {
         &self,
         thread_id: ThreadId,
         review_thread: &Arc<CodexThread>,
+        thread_started_emitted: bool,
     ) {
-        match Self::wait_for_thread_shutdown(review_thread).await {
+        let shutdown_result = Self::wait_for_thread_shutdown(review_thread).await;
+        Self::finalize_failed_detached_review_thread_start(
+            self.thread_unload_context(),
+            thread_id,
+            review_thread.clone(),
+            shutdown_result,
+            thread_started_emitted,
+        )
+        .await;
+    }
+
+    async fn finalize_failed_detached_review_thread_start(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        review_thread: Arc<CodexThread>,
+        shutdown_result: ThreadShutdownResult,
+        thread_started_emitted: bool,
+    ) {
+        match shutdown_result {
             ThreadShutdownResult::Complete => {
-                let _ = self.thread_manager.remove_thread(&thread_id).await;
-                self.finalize_thread_teardown(thread_id).await;
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(
-                        ThreadClosedNotification {
-                            thread_id: thread_id.to_string(),
-                        },
-                    ))
-                    .await;
+                Self::cleanup_failed_setup_artifacts(
+                    thread_id,
+                    &review_thread,
+                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
+                )
+                .await;
+                let _ = context.thread_manager.remove_thread(&thread_id).await;
+                let outgoing = context.outgoing.clone();
+                Self::finalize_thread_teardown_for_context(context, thread_id).await;
+                if thread_started_emitted {
+                    outgoing
+                        .send_server_notification(ServerNotification::ThreadClosed(
+                            ThreadClosedNotification {
+                                thread_id: thread_id.to_string(),
+                            },
+                        ))
+                        .await;
+                }
             }
             ThreadShutdownResult::SubmitFailed => {
                 warn!(
-                    "failed to shut down detached review thread {thread_id} after submit failure; leaving thread loaded"
+                    "failed to shut down detached review thread {thread_id} after submit failure; keeping pooled runtime loaded"
+                );
+                Self::ensure_detached_review_thread_started(
+                    context.clone(),
+                    thread_id,
+                    &review_thread,
+                    thread_started_emitted,
+                )
+                .await;
+                Self::spawn_failed_thread_setup_reaper(
+                    context,
+                    thread_id,
+                    review_thread,
+                    FailedSetupReaperVisibility::VisibleStarted,
+                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
                 );
             }
             ThreadShutdownResult::TimedOut => {
                 warn!(
-                    "detached review thread {thread_id} shutdown timed out after submit failure; leaving thread loaded"
+                    "detached review thread {thread_id} shutdown timed out after submit failure; keeping pooled runtime loaded"
+                );
+                Self::ensure_detached_review_thread_started(
+                    context.clone(),
+                    thread_id,
+                    &review_thread,
+                    thread_started_emitted,
+                )
+                .await;
+                Self::spawn_failed_thread_setup_reaper(
+                    context,
+                    thread_id,
+                    review_thread,
+                    FailedSetupReaperVisibility::VisibleStarted,
+                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
                 );
             }
+        }
+    }
+
+    async fn ensure_detached_review_thread_started(
+        context: ThreadUnloadContext,
+        thread_id: ThreadId,
+        review_thread: &Arc<CodexThread>,
+        thread_started_emitted: bool,
+    ) {
+        if thread_started_emitted {
+            Self::track_loaded_thread_from_runtime(context, thread_id, review_thread).await;
+        } else {
+            Self::emit_thread_started_from_runtime(context, thread_id, review_thread).await;
         }
     }
 
@@ -9295,8 +9821,23 @@ async fn maybe_emit_account_lease_updated_notification(
     let Some(live_snapshot) = conversation.account_lease_snapshot().await else {
         return;
     };
+    let config = conversation.effective_config().await;
     let notification =
-        account_lease_api::account_lease_updated_notification_from_runtime_snapshot(&live_snapshot);
+        match account_lease_api::account_lease_updated_notification_from_runtime_snapshot(
+            config.as_ref(),
+            &live_snapshot,
+        )
+        .await
+        {
+            Ok(notification) => notification,
+            Err(err) => {
+                warn!(
+                    "failed to build account lease updated notification from runtime snapshot: {}",
+                    err.message
+                );
+                return;
+            }
+        };
     let notification = {
         let mut thread_state = thread_state.lock().await;
         thread_state.take_changed_account_lease_notification(notification)
@@ -11707,6 +12248,55 @@ mod tests {
         }
     }
 
+    async fn read_thread_started_notification(
+        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
+    ) -> codex_app_server_protocol::ThreadStartedNotification {
+        loop {
+            let envelope =
+                tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+                    .await
+                    .expect("timed out waiting for thread/started notification")
+                    .expect("outgoing channel closed");
+            let message = match envelope {
+                OutgoingEnvelope::ToConnection { message, .. }
+                | OutgoingEnvelope::Broadcast { message } => message,
+            };
+            let OutgoingMessage::AppServerNotification(notification) = message else {
+                continue;
+            };
+            let codex_app_server_protocol::ServerNotification::ThreadStarted(notification) =
+                notification
+            else {
+                continue;
+            };
+            return notification;
+        }
+    }
+
+    fn assert_no_outgoing_message(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
+        assert!(matches!(
+            outgoing_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn drain_outgoing_messages(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
+        while outgoing_rx.try_recv().is_ok() {}
+    }
+
+    async fn wait_until_thread_removed(thread_manager: &Arc<ThreadManager>, thread_id: ThreadId) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if thread_manager.get_thread(thread_id).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for failed setup reaper to remove thread");
+    }
+
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
         use codex_protocol::protocol::RolloutItem;
@@ -11854,7 +12444,11 @@ mod tests {
         started.thread.shutdown_and_wait().await?;
         harness
             .processor
-            .cleanup_failed_detached_review_thread_start(thread_id, &started.thread)
+            .cleanup_failed_detached_review_thread_start(
+                thread_id,
+                &started.thread,
+                /*thread_started_emitted*/ true,
+            )
             .await;
 
         assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
@@ -11888,6 +12482,525 @@ mod tests {
                 .thread_id,
             thread_id.to_string()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_failed_top_level_thread_setup_removes_thread_and_clears_pooled_runtime()
+    -> Result<()> {
+        let harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        harness
+            .processor
+            .cleanup_failed_top_level_thread_setup(thread_id, &started.thread)
+            .await;
+
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            None
+        );
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_root_thread_id()
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_failed_top_level_thread_setup_deletes_created_rollout_and_state() -> Result<()>
+    {
+        let harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        started.thread.ensure_rollout_materialized().await;
+        let rollout_path = started
+            .thread
+            .rollout_path()
+            .expect("persistent test thread should have a rollout path");
+        let state_db = started
+            .thread
+            .state_db()
+            .expect("persistent test thread should have state db");
+        assert!(
+            tokio::fs::try_exists(&rollout_path).await?,
+            "rollout should exist before failed setup cleanup"
+        );
+        assert!(
+            state_db.get_thread(thread_id).await?.is_some(),
+            "state row should exist before failed setup cleanup"
+        );
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        harness
+            .processor
+            .cleanup_failed_top_level_thread_setup(thread_id, &started.thread)
+            .await;
+
+        assert!(
+            !tokio::fs::try_exists(&rollout_path).await?,
+            "created rollout should be deleted after failed setup cleanup"
+        );
+        assert_eq!(state_db.get_thread(thread_id).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_failed_top_level_thread_setup_preserves_existing_rollout_and_state_when_requested()
+    -> Result<()> {
+        let harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        started.thread.ensure_rollout_materialized().await;
+        let rollout_path = started
+            .thread
+            .rollout_path()
+            .expect("persistent test thread should have a rollout path");
+        let state_db = started
+            .thread
+            .state_db()
+            .expect("persistent test thread should have state db");
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        harness
+            .processor
+            .cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
+                thread_id,
+                &started.thread,
+                FailedSetupArtifactCleanup::Preserve,
+            )
+            .await;
+
+        assert!(
+            tokio::fs::try_exists(&rollout_path).await?,
+            "existing rollout should be preserved after failed setup cleanup"
+        );
+        assert!(
+            state_db.get_thread(thread_id).await?.is_some(),
+            "existing state row should be preserved after failed setup cleanup"
+        );
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_top_level_thread_setup_reaps_hidden_thread_silently_after_shutdown_timeout()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        CodexMessageProcessor::finalize_failed_top_level_thread_setup(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+            ThreadShutdownResult::TimedOut,
+        )
+        .await;
+
+        assert_no_outgoing_message(&mut harness.outgoing_rx);
+        wait_until_thread_removed(&harness.thread_manager, thread_id).await;
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            None
+        );
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_root_thread_id()
+                .await,
+            None
+        );
+        assert_no_outgoing_message(&mut harness.outgoing_rx);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_failed_setup_reaper_reveals_thread_when_shutdown_still_times_out() -> Result<()>
+    {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        CodexMessageProcessor::finalize_failed_thread_setup_reap(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            FailedSetupReaperVisibility::Hidden,
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+            ThreadShutdownResult::TimedOut,
+        )
+        .await;
+
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            Some(thread_id)
+        );
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+        started.thread.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_failed_setup_reaper_closes_revealed_thread_after_late_shutdown() -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        CodexMessageProcessor::finalize_failed_thread_setup_reap(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            FailedSetupReaperVisibility::Hidden,
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+            ThreadShutdownResult::TimedOut,
+        )
+        .await;
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+
+        started.thread.shutdown_and_wait().await?;
+
+        assert_eq!(
+            read_thread_closed_notification(&mut harness.outgoing_rx)
+                .await
+                .thread_id,
+            thread_id.to_string()
+        );
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_detached_review_thread_start_reveals_thread_after_shutdown_timeout()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+
+        CodexMessageProcessor::finalize_failed_detached_review_thread_start(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            ThreadShutdownResult::TimedOut,
+            /*thread_started_emitted*/ false,
+        )
+        .await;
+
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            Some(thread_id)
+        );
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+        started.thread.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_detached_review_thread_start_does_not_emit_duplicate_started_after_shutdown_timeout()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+        CodexMessageProcessor::emit_thread_started_from_runtime(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            &started.thread,
+        )
+        .await;
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+
+        CodexMessageProcessor::finalize_failed_detached_review_thread_start(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            ThreadShutdownResult::TimedOut,
+            /*thread_started_emitted*/ true,
+        )
+        .await;
+
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            Some(thread_id)
+        );
+        assert_no_outgoing_message(&mut harness.outgoing_rx);
+        started.thread.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_detached_review_visible_reaper_closes_thread_after_late_shutdown() -> Result<()>
+    {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+        CodexMessageProcessor::emit_thread_started_from_runtime(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            &started.thread,
+        )
+        .await;
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+
+        CodexMessageProcessor::finalize_failed_thread_setup_reap(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            FailedSetupReaperVisibility::VisibleStarted,
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+            ThreadShutdownResult::TimedOut,
+        )
+        .await;
+        assert_no_outgoing_message(&mut harness.outgoing_rx);
+
+        started.thread.shutdown_and_wait().await?;
+
+        assert_eq!(
+            read_thread_closed_notification(&mut harness.outgoing_rx)
+                .await
+                .thread_id,
+            thread_id.to_string()
+        );
+        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
+        assert_eq!(
+            harness
+                .processor
+                .pooled_runtime_scope
+                .loaded_thread_id()
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_detached_review_reaper_does_not_emit_closed_when_thread_already_unloaded()
+    -> Result<()> {
+        let mut harness = TestCodexMessageProcessorHarness::new().await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let thread_id = started.thread_id;
+        harness
+            .processor
+            .pooled_runtime_scope
+            .reserve()
+            .await
+            .expect("reserve pooled runtime")
+            .promote(thread_id)
+            .await;
+        CodexMessageProcessor::emit_thread_started_from_runtime(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            &started.thread,
+        )
+        .await;
+        assert_eq!(
+            read_thread_started_notification(&mut harness.outgoing_rx)
+                .await
+                .thread
+                .id,
+            thread_id.to_string()
+        );
+
+        assert!(
+            harness
+                .thread_manager
+                .remove_thread(&thread_id)
+                .await
+                .is_some()
+        );
+        CodexMessageProcessor::finalize_thread_teardown_for_context(
+            harness.processor.thread_unload_context(),
+            thread_id,
+        )
+        .await;
+        drain_outgoing_messages(&mut harness.outgoing_rx);
+
+        CodexMessageProcessor::reap_failed_thread_setup(
+            harness.processor.thread_unload_context(),
+            thread_id,
+            started.thread.clone(),
+            FailedSetupReaperVisibility::VisibleStarted,
+            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+        )
+        .await;
+
+        assert_no_outgoing_message(&mut harness.outgoing_rx);
         Ok(())
     }
 

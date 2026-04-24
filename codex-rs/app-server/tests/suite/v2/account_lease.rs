@@ -9,6 +9,7 @@ use super::connection_handling_websocket::spawn_websocket_server;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::McpProcess;
@@ -19,14 +20,18 @@ use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AccountLeaseUpdatedNotification;
+use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
+use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
@@ -169,20 +174,22 @@ async fn account_lease_read_and_resume_use_loaded_thread_request_config() -> Res
         Some("legacy-default")
     );
 
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "initial accountLease/updated before resume",
+            is_primary_account_lease_update,
+        ),
+    )
+    .await??;
+    mcp.clear_message_buffer();
+
     let _: JSONRPCResponse = mcp.account_lease_resume().await?;
     let notification = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_matching_notification(
             "accountLease/updated after resume",
-            |notification| {
-                notification.method == "accountLease/updated"
-                    && notification
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("accountId"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(PRIMARY_ACCOUNT_ID)
-            },
+            is_primary_account_lease_update,
         ),
     )
     .await??;
@@ -304,10 +311,16 @@ async fn account_lease_updated_emits_on_resume() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let _: JSONRPCResponse = mcp.account_lease_resume().await?;
-    assert_eq!(
-        mcp.next_notification_method().await?,
-        "accountLease/updated"
-    );
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("accountLease/updated"),
+    )
+    .await??;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(updated.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(updated.suppressed, false);
 
     Ok(())
 }
@@ -339,6 +352,33 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
     )
     .await
     .context("timed out waiting for first turn rate-limit error")??;
+    let failed_turn_completed = timeout(
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed for first failed turn",
+            |notification| {
+                notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(_first_turn.id.as_str())
+            },
+        ),
+    )
+    .await
+    .context("timed out waiting for first failed turn/completed notification")??;
+    let failed_turn_completed: TurnCompletedNotification = serde_json::from_value(
+        failed_turn_completed
+            .params
+            .context("first failed turn/completed notification missing params")?,
+    )?;
+    ensure!(
+        failed_turn_completed.turn.error.is_some(),
+        "first turn should complete with rate-limit error"
+    );
     wait_for_terminal_thread_status_after_failed_turn(
         &mut mcp,
         &thread.id,
@@ -355,19 +395,14 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
         ACCOUNT_LEASE_ROTATION_TIMEOUT,
     )
     .await?;
+    let mut rotated_turn_completed = false;
     let notification = match timeout(
         ACCOUNT_LEASE_ROTATION_TIMEOUT,
-        mcp.read_stream_until_matching_notification(
-            "accountLease/updated for rotated account",
-            |notification| {
-                notification.method == "accountLease/updated"
-                    && notification
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("accountId"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(SECONDARY_ACCOUNT_ID)
-            },
+        wait_for_secondary_account_lease_update(
+            &mut mcp,
+            &thread.id,
+            second_turn.id.as_str(),
+            &mut rotated_turn_completed,
         ),
     )
     .await
@@ -391,26 +426,165 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
     assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
     assert_eq!(updated.suppressed, false);
 
-    timeout(
-        ACCOUNT_LEASE_ROTATION_TIMEOUT,
-        mcp.read_stream_until_matching_notification(
-            "turn/completed for rotated account turn",
-            |notification| {
-                notification.method == "turn/completed"
-                    && notification
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("turn"))
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(second_turn.id.as_str())
-            },
-        ),
-    )
-    .await
-    .context("timed out waiting for rotated turn/completed notification")??;
+    if !rotated_turn_completed {
+        timeout(
+            ACCOUNT_LEASE_ROTATION_TIMEOUT,
+            wait_for_rotated_turn_completed(&mut mcp, &thread.id, second_turn.id.as_str()),
+        )
+        .await
+        .context("timed out waiting for rotated turn/completed notification")??;
+    }
 
     Ok(())
+}
+
+async fn wait_for_secondary_account_lease_update(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    turn_id: &str,
+    rotated_turn_completed: &mut bool,
+) -> Result<JSONRPCNotification> {
+    loop {
+        let message = mcp.read_next_message().await?;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        ensure_no_turn_error_notification(&notification, thread_id, turn_id)?;
+        if is_secondary_account_lease_update(&notification) {
+            return Ok(notification);
+        }
+        if is_completed_turn_notification(&notification, thread_id, turn_id)? {
+            *rotated_turn_completed = true;
+        }
+    }
+}
+
+async fn wait_for_rotated_turn_completed(
+    mcp: &mut McpProcess,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    loop {
+        let message = mcp.read_next_message().await?;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        ensure_no_turn_error_notification(&notification, thread_id, turn_id)?;
+        if is_completed_turn_notification(&notification, thread_id, turn_id)? {
+            return Ok(());
+        }
+    }
+}
+
+fn is_completed_turn_notification(
+    notification: &JSONRPCNotification,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<bool> {
+    if notification.method != "turn/completed" {
+        return Ok(false);
+    }
+    let params = notification
+        .params
+        .clone()
+        .context("turn/completed notification missing params")?;
+    let completed: TurnCompletedNotification = serde_json::from_value(params)?;
+    if completed.thread_id != thread_id || completed.turn.id != turn_id {
+        return Ok(false);
+    }
+    ensure!(
+        completed.turn.error.is_none(),
+        "rotated account turn should complete without error: {:?}",
+        completed.turn.error
+    );
+    Ok(true)
+}
+
+fn ensure_no_turn_error_notification(
+    notification: &JSONRPCNotification,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()> {
+    if notification.method != "error" {
+        return Ok(());
+    }
+    let params = notification
+        .params
+        .clone()
+        .context("error notification missing params")?;
+    let error: ErrorNotification = serde_json::from_value(params)?;
+    if error.thread_id == thread_id && error.turn_id == turn_id && !error.will_retry {
+        bail!(
+            "rotated account turn emitted error notification: {:?}",
+            error.error
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rotated_turn_error_guard_allows_retryable_same_turn_errors() {
+    let notification = JSONRPCNotification {
+        method: "error".to_string(),
+        params: Some(json!(ErrorNotification {
+            error: TurnError {
+                message: "retrying drained account".to_string(),
+                codex_error_info: None,
+                additional_details: None,
+            },
+            will_retry: true,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        })),
+    };
+
+    ensure_no_turn_error_notification(&notification, "thread-1", "turn-1")
+        .expect("retryable same-turn errors should not interrupt the rotated turn");
+}
+
+#[test]
+fn rotated_turn_error_guard_rejects_terminal_same_turn_errors() {
+    let notification = JSONRPCNotification {
+        method: "error".to_string(),
+        params: Some(json!(ErrorNotification {
+            error: TurnError {
+                message: "drained account".to_string(),
+                codex_error_info: None,
+                additional_details: None,
+            },
+            will_retry: false,
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        })),
+    };
+
+    let error = ensure_no_turn_error_notification(&notification, "thread-1", "turn-1")
+        .expect_err("rotated turn should reject terminal same-turn errors");
+    assert!(
+        error
+            .to_string()
+            .contains("rotated account turn emitted error notification")
+    );
+}
+
+fn is_primary_account_lease_update(notification: &JSONRPCNotification) -> bool {
+    notification.method == "accountLease/updated"
+        && notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("accountId"))
+            .and_then(serde_json::Value::as_str)
+            == Some(PRIMARY_ACCOUNT_ID)
+}
+
+fn is_secondary_account_lease_update(notification: &JSONRPCNotification) -> bool {
+    notification.method == "accountLease/updated"
+        && notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("accountId"))
+            .and_then(serde_json::Value::as_str)
+            == Some(SECONDARY_ACCOUNT_ID)
 }
 
 #[tokio::test]

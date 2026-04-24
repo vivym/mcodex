@@ -729,6 +729,206 @@ async fn owned_authority_rotations_produce_new_generation_and_gate_replacement_a
     Ok(())
 }
 
+async fn single_account_owned_authority_for_test(
+    holder_id: &str,
+    account_id: &str,
+) -> anyhow::Result<(tempfile::TempDir, RuntimeLeaseAuthority)> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    state_db
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: "pool-main".to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: Some("workspace-main".to_string()),
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    save_auth(
+        &pooled_auth_home(codex_home.path(), account_id),
+        &auth_dot_json_for_account(account_id),
+        AuthCredentialsStoreMode::File,
+    )?;
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some(account_id.to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        holder_id.to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+
+    Ok((codex_home, RuntimeLeaseAuthority::owned_manager(manager)))
+}
+
+#[tokio::test]
+async fn owned_authority_hard_failure_without_alternate_waits_for_generation_drain()
+-> anyhow::Result<()> {
+    let (_codex_home, authority) = single_account_owned_authority_for_test(
+        "holder-single-hard-failure",
+        "acct-single-hard-failure",
+    )
+    .await?;
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-single-hard-failure",
+        CollaborationTreeId::for_test("tree-single-hard-failure"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    authority
+        .report_usage_limit_reached(&first.snapshot)
+        .await?;
+
+    let no_candidate_wait = authority.wait_for_no_candidate_drain_wait_for_test();
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), no_candidate_wait)
+        .await
+        .expect("timed out waiting for replacement admission to enter no-candidate drain wait");
+    assert!(
+        !waiter.is_finished(),
+        "replacement admission should wait until the failed generation drains"
+    );
+
+    drop(first.guard);
+    let err = waiter
+        .await
+        .expect("replacement waiter should not panic")
+        .expect_err("single-account hard failure should have no replacement account");
+    assert_eq!(err, LeaseAdmissionError::NoEligibleAccount);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_authority_terminal_unauthorized_without_alternate_waits_for_generation_drain()
+-> anyhow::Result<()> {
+    let (_codex_home, authority) = single_account_owned_authority_for_test(
+        "holder-single-terminal-401",
+        "acct-single-terminal-401",
+    )
+    .await?;
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-single-terminal-401",
+        CollaborationTreeId::for_test("tree-single-terminal-401"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    authority
+        .report_terminal_unauthorized(&first.snapshot)
+        .await?;
+
+    let no_candidate_wait = authority.wait_for_no_candidate_drain_wait_for_test();
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(request_context)
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), no_candidate_wait)
+        .await
+        .expect("timed out waiting for terminal-401 admission to enter no-candidate drain wait");
+    assert!(
+        !waiter.is_finished(),
+        "terminal-401 replacement admission should wait until the failed generation drains"
+    );
+
+    drop(first.guard);
+    let err = waiter
+        .await
+        .expect("replacement waiter should not panic")
+        .expect_err("single-account terminal 401 should have no replacement account");
+    assert_eq!(err, LeaseAdmissionError::NoEligibleAccount);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn owned_authority_hard_failure_waiting_without_alternate_can_be_cancelled()
+-> anyhow::Result<()> {
+    let (_codex_home, authority) = single_account_owned_authority_for_test(
+        "holder-single-hard-failure-cancel",
+        "acct-single-hard-failure-cancel",
+    )
+    .await?;
+    let first_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-single-hard-failure-cancel",
+        CollaborationTreeId::for_test("tree-single-hard-failure-cancel"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(first_context)
+        .await?;
+    authority
+        .report_usage_limit_reached(&first.snapshot)
+        .await?;
+
+    let cancel = CancellationToken::new();
+    let waiting_context = LeaseRequestContext::for_test_with_cancel(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-single-hard-failure-cancel-waiter",
+        CollaborationTreeId::for_test("tree-single-hard-failure-cancel-waiter"),
+        cancel.clone(),
+    );
+    let no_candidate_wait = authority.wait_for_no_candidate_drain_wait_for_test();
+    let waiter = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            authority
+                .acquire_request_lease_for_test(waiting_context)
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), no_candidate_wait)
+        .await
+        .expect("timed out waiting for cancellable admission to enter no-candidate drain wait");
+    assert!(
+        !waiter.is_finished(),
+        "replacement admission should wait before cancellation"
+    );
+
+    cancel.cancel();
+    let err = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("timed out waiting for cancelled admission")
+        .expect("replacement waiter should not panic")
+        .expect_err("cancelled replacement waiter should fail");
+    assert_eq!(err, LeaseAdmissionError::Cancelled);
+
+    drop(first.guard);
+    Ok(())
+}
+
 #[tokio::test]
 async fn owned_authority_admission_heartbeat_renews_active_lease_until_guard_drop()
 -> anyhow::Result<()> {

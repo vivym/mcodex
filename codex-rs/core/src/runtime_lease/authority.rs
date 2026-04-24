@@ -36,6 +36,8 @@ struct AuthorityInner {
     admissions: StdMutex<AdmissionTrackerState>,
     recorded_boundaries: StdMutex<Vec<RequestBoundaryKind>>,
     changed: Notify,
+    #[cfg(test)]
+    no_candidate_drain_waiting: Notify,
 }
 
 struct AuthorityState {
@@ -138,6 +140,8 @@ impl RuntimeLeaseAuthority {
                 }),
                 recorded_boundaries: StdMutex::new(Vec::new()),
                 changed: Notify::new(),
+                #[cfg(test)]
+                no_candidate_drain_waiting: Notify::new(),
             }),
         }
     }
@@ -392,11 +396,23 @@ impl RuntimeLeaseAuthority {
                 return Err(LeaseAdmissionError::Cancelled);
             }
             let heartbeat_interval = manager_guard.heartbeat_interval();
-            let preview = manager_guard
+            let preview = match manager_guard
                 .preview_next_bridged_turn()
                 .await
                 .map_err(|_| LeaseAdmissionError::RuntimeShutdown)?
-                .ok_or(LeaseAdmissionError::NoEligibleAccount)?;
+            {
+                Some(preview) => preview,
+                None if self.inner.has_active_admissions() => {
+                    #[cfg(test)]
+                    self.inner.no_candidate_drain_waiting.notify_one();
+                    drop(manager_guard);
+                    tokio::select! {
+                        () = context.cancel.cancelled() => return Err(LeaseAdmissionError::Cancelled),
+                        () = changed => continue,
+                    }
+                }
+                None => return Err(LeaseAdmissionError::NoEligibleAccount),
+            };
             if context.cancel.is_cancelled() {
                 return Err(LeaseAdmissionError::Cancelled);
             }
@@ -534,9 +550,23 @@ impl RuntimeLeaseAuthority {
     pub(crate) fn ptr_eq_for_test(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_no_candidate_drain_wait_for_test(&self) {
+        self.inner.no_candidate_drain_waiting.notified().await;
+    }
 }
 
 impl AuthorityInner {
+    fn has_active_admissions(&self) -> bool {
+        !self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admissions
+            .is_empty()
+    }
+
     fn preview_admission(&self, generation: u64) -> AdmissionPreview {
         let admissions = self
             .admissions
