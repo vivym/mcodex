@@ -241,9 +241,11 @@ impl RuntimeLeaseHost {
         member_id: String,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> CollaborationTreeMembership {
-        self.0
-            .collaboration_registry
-            .register_member(tree_id, member_id, cancellation_token)
+        self.0.collaboration_registry.register_long_lived_member(
+            tree_id,
+            member_id,
+            cancellation_token,
+        )
     }
 
     pub(crate) fn pooled_authority(&self) -> Option<RuntimeLeaseAuthority> {

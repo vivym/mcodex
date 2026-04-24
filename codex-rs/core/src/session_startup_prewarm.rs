@@ -225,6 +225,7 @@ async fn schedule_startup_prewarm_inner(
         .turn_metadata_state
         .current_header_value();
     let mut client_session = session.services.model_client.new_session();
+    client_session.set_request_cancellation_token(startup_cancellation_token.child_token());
     client_session
         .prewarm_websocket(
             &startup_prompt,

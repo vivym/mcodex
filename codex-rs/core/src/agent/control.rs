@@ -12,6 +12,8 @@ use crate::rollout::RolloutRecorder;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::thread_manager::RuntimeLeaseInheritance;
+use crate::thread_manager::RuntimeLeaseInheritanceSource;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_features::Feature;
@@ -161,7 +163,7 @@ impl AgentControl {
                 initial_operation,
                 session_source,
                 SpawnAgentOptions::default(),
-                /*runtime_parent_thread_id*/ None,
+                RuntimeLeaseInheritanceSource::None,
             )
             .await?
             .thread_id)
@@ -180,7 +182,26 @@ impl AgentControl {
                 initial_operation,
                 session_source,
                 SpawnAgentOptions::default(),
-                Some(parent_thread_id),
+                RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id),
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn spawn_agent_with_runtime_lease_inheritance(
+        &self,
+        inheritance: RuntimeLeaseInheritance,
+        config: crate::config::Config,
+        initial_operation: Op,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .spawn_agent_internal(
+                config,
+                initial_operation,
+                session_source,
+                SpawnAgentOptions::default(),
+                RuntimeLeaseInheritanceSource::Explicit(inheritance),
             )
             .await?
             .thread_id)
@@ -199,7 +220,7 @@ impl AgentControl {
             initial_operation,
             session_source,
             options,
-            /*runtime_parent_thread_id*/ None,
+            RuntimeLeaseInheritanceSource::None,
         )
         .await
     }
@@ -210,7 +231,7 @@ impl AgentControl {
         initial_operation: Op,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
-        runtime_parent_thread_id: Option<ThreadId>,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
         let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
@@ -262,7 +283,7 @@ impl AgentControl {
                         config,
                         self.clone(),
                         session_source,
-                        runtime_parent_thread_id,
+                        runtime_lease_inheritance,
                         /*persist_extended_history*/ false,
                         /*metrics_service_name*/ None,
                         inherited_shell_snapshot,

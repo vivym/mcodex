@@ -11,6 +11,8 @@ use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
+use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::RuntimeLeaseHost;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills_watcher::SkillsWatcher;
 use crate::skills_watcher::SkillsWatcherEvent;
@@ -40,6 +42,8 @@ use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
@@ -72,6 +76,19 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
+
+#[derive(Clone)]
+pub(crate) struct RuntimeLeaseInheritance {
+    pub(crate) host: Option<RuntimeLeaseHost>,
+    pub(crate) collaboration_tree_id: CollaborationTreeId,
+}
+
+#[derive(Clone)]
+pub(crate) enum RuntimeLeaseInheritanceSource {
+    None,
+    LookupThread(ThreadId),
+    Explicit(RuntimeLeaseInheritance),
+}
 
 pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
     FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
@@ -668,6 +685,11 @@ impl ThreadManager {
     {
         let snapshot = snapshot.into();
         let history = RolloutRecorder::get_rollout_history(&path).await?;
+        let source_thread_id = match &history {
+            InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+            InitialHistory::Forked(_) => history.forked_from_id(),
+            InitialHistory::New | InitialHistory::Cleared => None,
+        };
         let snapshot_state = snapshot_turn_state(&history);
         let history = match snapshot {
             ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
@@ -687,6 +709,7 @@ impl ThreadManager {
                 }
             }
         };
+        let history = ensure_fork_history_preserves_source_thread_id(history, source_thread_id);
         Box::pin(self.state.spawn_thread(
             config,
             history,
@@ -789,7 +812,7 @@ impl ThreadManagerState {
             config,
             agent_control,
             session_source,
-            /*runtime_parent_thread_id*/ None,
+            RuntimeLeaseInheritanceSource::None,
             persist_extended_history,
             metrics_service_name,
             inherited_shell_snapshot,
@@ -804,7 +827,7 @@ impl ThreadManagerState {
         config: Config,
         agent_control: AgentControl,
         session_source: SessionSource,
-        runtime_parent_thread_id: Option<ThreadId>,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
@@ -816,7 +839,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
-            runtime_parent_thread_id,
+            runtime_lease_inheritance,
             Vec::new(),
             persist_extended_history,
             metrics_service_name,
@@ -844,7 +867,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
-            /*runtime_parent_thread_id*/ None,
+            RuntimeLeaseInheritanceSource::None,
             Vec::new(),
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
@@ -873,7 +896,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
-            /*runtime_parent_thread_id*/ None,
+            RuntimeLeaseInheritanceSource::None,
             Vec::new(),
             persist_extended_history,
             /*metrics_service_name*/ None,
@@ -905,7 +928,7 @@ impl ThreadManagerState {
             auth_manager,
             agent_control,
             self.session_source.clone(),
-            /*runtime_parent_thread_id*/ None,
+            RuntimeLeaseInheritanceSource::None,
             dynamic_tools,
             persist_extended_history,
             metrics_service_name,
@@ -925,7 +948,7 @@ impl ThreadManagerState {
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
-        runtime_parent_thread_id: Option<ThreadId>,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
@@ -945,38 +968,40 @@ impl ThreadManagerState {
         let parent_runtime_thread_id = match &session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id, ..
-            }) => Some(*parent_thread_id),
-            SessionSource::SubAgent(_) => runtime_parent_thread_id,
+            }) => RuntimeLeaseInheritanceSource::LookupThread(*parent_thread_id),
+            SessionSource::SubAgent(_) => runtime_lease_inheritance,
             SessionSource::Cli
             | SessionSource::VSCode
             | SessionSource::Exec
             | SessionSource::Mcp
             | SessionSource::Custom(_)
-            | SessionSource::Unknown => None,
+            | SessionSource::Unknown => RuntimeLeaseInheritanceSource::None,
         };
-        let (runtime_lease_host, initial_collaboration_tree_id) =
-            if let Some(parent_thread_id) = parent_runtime_thread_id {
-                self.threads
-                    .read()
-                    .await
-                    .get(&parent_thread_id)
-                    .map(|thread| {
-                        (
-                            thread.codex.session.services.runtime_lease_host.clone(),
-                            Some(
-                                thread
-                                    .codex
-                                    .session
-                                    .services
-                                    .model_client
-                                    .current_collaboration_tree_id(),
-                            ),
-                        )
-                    })
-                    .unwrap_or((None, None))
-            } else {
-                (None, None)
-            };
+        let (runtime_lease_host, initial_collaboration_tree_id) = match parent_runtime_thread_id {
+            RuntimeLeaseInheritanceSource::None => (None, None),
+            RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => self
+                .threads
+                .read()
+                .await
+                .get(&parent_thread_id)
+                .map(|thread| {
+                    (
+                        thread.codex.session.services.runtime_lease_host.clone(),
+                        Some(
+                            thread
+                                .codex
+                                .session
+                                .services
+                                .model_client
+                                .current_collaboration_tree_id(),
+                        ),
+                    )
+                })
+                .unwrap_or((None, None)),
+            RuntimeLeaseInheritanceSource::Explicit(inheritance) => {
+                (inheritance.host, Some(inheritance.collaboration_tree_id))
+            }
+        };
         let mut runtime_lease_startup_reservation =
             if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
                 Some(
@@ -1011,7 +1036,7 @@ impl ThreadManagerState {
             metrics_service_name,
             inherited_shell_snapshot,
             inherited_exec_policy,
-            inherited_lease_auth_session: None,
+            compat_inherited_lease_auth_session: None,
             runtime_lease_host,
             user_shell_override,
             parent_trace,
@@ -1121,6 +1146,46 @@ fn truncate_before_nth_user_message(
         InitialHistory::New
     } else {
         InitialHistory::Forked(rolled)
+    }
+}
+
+fn ensure_fork_history_preserves_source_thread_id(
+    history: InitialHistory,
+    source_thread_id: Option<ThreadId>,
+) -> InitialHistory {
+    let Some(source_thread_id) = source_thread_id else {
+        return history;
+    };
+    match history {
+        InitialHistory::Forked(mut items) => {
+            if let Some(session_meta_index) = items.iter().position(|item| {
+                matches!(
+                    item,
+                    RolloutItem::SessionMeta(SessionMetaLine {
+                        meta: SessionMeta { id, .. },
+                        ..
+                    }) if *id == source_thread_id
+                )
+            }) {
+                if session_meta_index != 0 {
+                    let session_meta = items.remove(session_meta_index);
+                    items.insert(0, session_meta);
+                }
+            } else {
+                items.insert(
+                    0,
+                    RolloutItem::SessionMeta(SessionMetaLine {
+                        meta: SessionMeta {
+                            id: source_thread_id,
+                            ..Default::default()
+                        },
+                        git: None,
+                    }),
+                );
+            }
+            InitialHistory::Forked(items)
+        }
+        InitialHistory::New | InitialHistory::Cleared | InitialHistory::Resumed(_) => history,
     }
 }
 

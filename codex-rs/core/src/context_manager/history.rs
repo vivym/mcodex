@@ -262,6 +262,57 @@ impl ContextManager {
         self.replace(snapshot[..cut_idx].to_vec());
     }
 
+    pub(crate) fn strip_pre_turn_context_updates(&mut self) -> bool {
+        let snapshot = self.items.clone();
+        let user_positions = user_message_positions(&snapshot);
+        if user_positions.is_empty() {
+            return false;
+        }
+
+        let mut remove = vec![false; snapshot.len()];
+        let mut removed_any = false;
+        for (turn_idx, &user_pos) in user_positions.iter().enumerate() {
+            let lower_bound = turn_idx
+                .checked_sub(1)
+                .and_then(|prev_idx| user_positions.get(prev_idx).copied())
+                .map(|prev_user_pos| prev_user_pos.saturating_add(1))
+                .unwrap_or(0);
+            let mut scan = user_pos;
+            while scan > lower_bound {
+                match &snapshot[scan - 1] {
+                    ResponseItem::Message { role, content, .. }
+                        if role == "developer" && is_contextual_dev_message_content(content) =>
+                    {
+                        remove[scan - 1] = true;
+                        removed_any = true;
+                        scan -= 1;
+                    }
+                    ResponseItem::Message { role, content, .. }
+                        if role == "user" && is_contextual_user_message_content(content) =>
+                    {
+                        remove[scan - 1] = true;
+                        removed_any = true;
+                        scan -= 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        if !removed_any {
+            return false;
+        }
+
+        self.replace(
+            snapshot
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, item)| (!remove[idx]).then_some(item))
+                .collect(),
+        );
+        true
+    }
+
     pub(crate) fn update_token_info(
         &mut self,
         usage: &TokenUsage,

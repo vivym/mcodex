@@ -441,7 +441,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
-    pub(crate) inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
@@ -497,7 +497,7 @@ impl Codex {
             inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
             runtime_lease_host,
             parent_trace: _,
             analytics_events_client,
@@ -690,7 +690,7 @@ impl Codex {
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
             runtime_lease_host,
             environment,
             analytics_events_client,
@@ -1117,9 +1117,11 @@ impl TurnContext {
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
+            approvals_reviewer: Some(self.config.approvals_reviewer),
             sandbox_policy: self.sandbox_policy.get().clone(),
             network: self.turn_context_network_item(),
             model: self.model_info.slug.clone(),
+            service_tier: self.config.service_tier,
             personality: self.personality,
             collaboration_mode: Some(self.collaboration_mode.clone()),
             realtime_active: Some(self.realtime_active),
@@ -1682,7 +1684,7 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
-        inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
         runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
         environment: Option<Arc<Environment>>,
         analytics_events_client: Option<AnalyticsEventsClient>,
@@ -2098,7 +2100,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|host| host.pooled_authority().is_none());
         debug_assert!(
-            !(inherited_pooled_runtime_host && inherited_lease_auth_session.is_some()),
+            !(inherited_pooled_runtime_host && compat_inherited_lease_auth_session.is_some()),
             "inherited pooled runtime host must not be combined with static inherited lease auth"
         );
         if inherited_pooled_runtime_host && let Some(host) = runtime_lease_host.as_ref() {
@@ -2111,7 +2113,7 @@ impl Session {
         // Static lease inheritance remains as compatibility for children that do
         // not receive a pooled runtime host.
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
-        lease_auth.replace_current(inherited_lease_auth_session.clone());
+        lease_auth.replace_current(compat_inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
         let authority_owned_runtime_lease = if pooled_root_needs_authority {
             SessionServices::build_root_runtime_lease_authority(
@@ -2274,7 +2276,6 @@ impl Session {
         for event in events {
             sess.send_event_raw(event).await;
         }
-
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
         sess.start_skills_watcher_listener();
         // Construct sandbox_state before MCP startup so it can be sent to each
@@ -2537,6 +2538,11 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                self
+                    .clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+                        turn_context.as_ref(),
+                    )
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -2573,6 +2579,11 @@ impl Session {
             }
             InitialHistory::Forked(rollout_items) => {
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                    .await;
+                self
+                    .clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+                        turn_context.as_ref(),
+                    )
                     .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -2615,6 +2626,53 @@ impl Session {
         self.set_previous_turn_settings(previous_turn_settings.clone())
             .await;
         previous_turn_settings
+    }
+
+    async fn clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+        &self,
+        turn_context: &TurnContext,
+    ) {
+        let Some(expected_developer_instructions) = turn_context
+            .developer_instructions
+            .as_deref()
+            .filter(|instructions| !instructions.is_empty())
+        else {
+            return;
+        };
+
+        let mut state = self.state.lock().await;
+        let history_contains_expected_developer_instructions =
+            state.history.raw_items().iter().any(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "developer" => {
+                    content.iter().any(|content_item| {
+                        matches!(
+                            content_item,
+                            ContentItem::InputText { text }
+                                if text.contains(expected_developer_instructions)
+                        )
+                    })
+                }
+                ResponseItem::Message { .. }
+                | ResponseItem::Reasoning { .. }
+                | ResponseItem::FunctionCall { .. }
+                | ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::ToolSearchOutput { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::CustomToolCallOutput { .. }
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::GhostSnapshot { .. }
+                | ResponseItem::Other => false,
+            });
+        if history_contains_expected_developer_instructions {
+            return;
+        }
+
+        state.history.strip_pre_turn_context_updates();
+        state.set_reference_context_item(None);
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -4140,6 +4198,7 @@ impl Session {
         // context items. This keeps later runtime diffing aligned with the current turn state.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
+        drop(state);
     }
 
     pub(crate) async fn update_token_usage_info(
@@ -6308,7 +6367,14 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    let pre_sampling_compacted = match run_pre_sampling_compact(&sess, &turn_context, None).await {
+    let pre_sampling_compacted = match run_pre_sampling_compact(
+        &sess,
+        &turn_context,
+        None,
+        cancellation_token.child_token(),
+    )
+    .await
+    {
         Ok(pre_sampling_compacted) => pre_sampling_compacted,
         Err(_) => {
             error!("Failed to run pre-sampling compact");
@@ -6516,8 +6582,16 @@ pub(crate) async fn run_turn(
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut client_session = match prewarmed_client_session {
+        Some(mut client_session) => {
+            // Startup prewarm can create the session before the first real turn binds its
+            // collaboration tree. Refresh the admission context without discarding the
+            // prewarmed transport session.
+            client_session.rebind_collaboration_context_from_client();
+            client_session
+        }
+        None => sess.services.model_client.new_session(),
+    };
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
@@ -6643,6 +6717,7 @@ pub(crate) async fn run_turn(
                         None,
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        cancellation_token.child_token(),
                     )
                     .await
                     .is_err()
@@ -6858,6 +6933,7 @@ async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
@@ -6865,6 +6941,7 @@ async fn run_pre_sampling_compact(
         turn_context,
         total_usage_tokens_before_compaction,
         account_id_override.clone(),
+        cancellation_token.child_token(),
     )
     .await?;
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -6881,6 +6958,7 @@ async fn run_pre_sampling_compact(
             account_id_override,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            cancellation_token.child_token(),
         )
         .await?;
         pre_sampling_compacted = true;
@@ -6899,6 +6977,7 @@ async fn maybe_run_previous_model_inline_compact(
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -6930,6 +7009,7 @@ async fn maybe_run_previous_model_inline_compact(
             account_id_override,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
@@ -6944,6 +7024,7 @@ async fn run_auto_compact(
     account_id_override: Option<String>,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
         run_inline_remote_auto_compact_task(
@@ -6953,6 +7034,7 @@ async fn run_auto_compact(
             account_id_override,
             reason,
             phase,
+            cancellation_token.child_token(),
         )
         .await?;
     } else {
@@ -6962,6 +7044,7 @@ async fn run_auto_compact(
             initial_context_injection,
             reason,
             phase,
+            cancellation_token.child_token(),
         )
         .await?;
     }
@@ -7976,6 +8059,7 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
+    client_session.set_request_cancellation_token(cancellation_token.child_token());
     let mut stream = client_session
         .stream(
             prompt,

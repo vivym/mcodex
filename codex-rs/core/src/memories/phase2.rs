@@ -145,11 +145,18 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
             ),
             tokio_util::sync::CancellationToken::new(),
         );
+    let runtime_lease_inheritance = crate::thread_manager::RuntimeLeaseInheritance {
+        host: session.services.runtime_lease_host.clone(),
+        collaboration_tree_id: session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+    };
     let thread_id = match session
         .services
         .agent_control
-        .spawn_agent_from_parent_thread(
-            session.conversation_id,
+        .spawn_agent_with_runtime_lease_inheritance(
+            runtime_lease_inheritance,
             agent_config,
             prompt.into(),
             Some(source),

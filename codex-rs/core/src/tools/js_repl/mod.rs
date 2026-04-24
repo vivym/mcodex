@@ -130,6 +130,7 @@ struct ExecContext {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     tracker: SharedTurnDiffTracker,
+    cancellation_token: CancellationToken,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -833,12 +834,25 @@ impl JsReplManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn execute(
         &self,
         session: Arc<Session>,
         turn: Arc<TurnContext>,
         tracker: SharedTurnDiffTracker,
         args: JsReplArgs,
+    ) -> Result<JsExecResult, FunctionCallError> {
+        self.execute_with_cancellation(session, turn, tracker, args, CancellationToken::new())
+            .await
+    }
+
+    pub async fn execute_with_cancellation(
+        &self,
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        tracker: SharedTurnDiffTracker,
+        args: JsReplArgs,
+        cancellation_token: CancellationToken,
     ) -> Result<JsExecResult, FunctionCallError> {
         let _permit = self.exec_lock.clone().acquire_owned().await.map_err(|_| {
             FunctionCallError::RespondToModel("js_repl execution unavailable".to_string())
@@ -891,6 +905,7 @@ impl JsReplManager {
                     session: Arc::clone(&session),
                     turn: Arc::clone(&turn),
                     tracker,
+                    cancellation_token: cancellation_token.child_token(),
                 },
             );
             (req_id, rx)
@@ -1612,6 +1627,7 @@ impl JsReplManager {
                 tracker,
                 call,
                 crate::tools::router::ToolCallSource::JsRepl,
+                exec.cancellation_token.child_token(),
             )
             .await
         {

@@ -604,22 +604,19 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
 
     skip_if_no_network!(Ok(()));
 
-    let server = start_websocket_server(vec![
-        vec![],
-        vec![vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_env", "instructions": "backend prompt" }
-        })]],
-    ])
-    .await;
+    let session_updated = vec![json!({
+        "type": "session.updated",
+        "session": { "id": "sess_env", "instructions": "backend prompt" }
+    })];
+    // Startup prewarm is optional when runtime lease plumbing is present. Make
+    // either the optional prewarm or the realtime start connection usable; the
+    // assertion below still targets the realtime handshake that carries the env
+    // API key.
+    let server =
+        start_websocket_server(vec![vec![session_updated.clone()], vec![session_updated]]).await;
 
     let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build_with_websocket_server(&server).await?;
-    assert!(
-        server
-            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
-            .await
-    );
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {

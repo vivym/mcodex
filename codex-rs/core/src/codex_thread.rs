@@ -244,6 +244,11 @@ impl CodexThread {
         self.codex.thread_config_snapshot().await
     }
 
+    #[doc(hidden)]
+    pub async fn effective_config(&self) -> std::sync::Arc<crate::config::Config> {
+        self.codex.session.get_config().await
+    }
+
     pub async fn read_mcp_resource(
         &self,
         server: &str,

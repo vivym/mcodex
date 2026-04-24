@@ -60,6 +60,26 @@ enum WsCommand {
     },
 }
 
+type WebsocketRequestStartup = Result<(), ApiError>;
+
+fn startup_failure(
+    startup_tx: &mut Option<oneshot::Sender<WebsocketRequestStartup>>,
+    err: ApiError,
+) -> ApiError {
+    if let Some(startup_tx) = startup_tx.take() {
+        let _ = startup_tx.send(Err(err));
+        ApiError::Stream("websocket request failed during startup".to_string())
+    } else {
+        err
+    }
+}
+
+fn mark_startup_succeeded(startup_tx: &mut Option<oneshot::Sender<WebsocketRequestStartup>>) {
+    if let Some(startup_tx) = startup_tx.take() {
+        let _ = startup_tx.send(Ok(()));
+    }
+}
+
 impl WsStream {
     fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
@@ -219,6 +239,7 @@ impl ResponsesWebsocketConnection {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = oneshot::channel::<WebsocketRequestStartup>();
         let stream = Arc::clone(&self.stream);
         let idle_timeout = self.idle_timeout;
         let server_reasoning_included = self.server_reasoning_included;
@@ -271,6 +292,7 @@ impl ResponsesWebsocketConnection {
                         result = run_websocket_response_stream(
                             ws_stream,
                             tx_event.clone(),
+                            Some(startup_tx),
                             request_body,
                             idle_timeout,
                             telemetry,
@@ -294,7 +316,13 @@ impl ResponsesWebsocketConnection {
             .instrument(current_span),
         );
 
-        Ok(ResponseStream::with_cancel(rx_event, cancel_tx))
+        match startup_rx.await {
+            Ok(Ok(())) => Ok(ResponseStream::with_cancel(rx_event, cancel_tx)),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(ApiError::Stream(
+                "websocket startup task ended before request started".to_string(),
+            )),
+        }
     }
 }
 
@@ -551,6 +579,7 @@ fn json_header_value(value: Value) -> Option<HeaderValue> {
 async fn run_websocket_response_stream(
     ws_stream: &mut WsStream,
     tx_event: mpsc::Sender<std::result::Result<ResponseEvent, ApiError>>,
+    mut startup_tx: Option<oneshot::Sender<WebsocketRequestStartup>>,
     request_body: Value,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
@@ -581,7 +610,9 @@ async fn run_websocket_response_stream(
         );
     }
 
-    result?;
+    if let Err(err) = result {
+        return Err(startup_failure(&mut startup_tx, err));
+    }
 
     loop {
         let poll_start = Instant::now();
@@ -594,15 +625,19 @@ async fn run_websocket_response_stream(
         let message = match response {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
-                return Err(ApiError::Stream(err.to_string()));
+                return Err(startup_failure(
+                    &mut startup_tx,
+                    ApiError::Stream(err.to_string()),
+                ));
             }
             Ok(None) => {
-                return Err(ApiError::Stream(
-                    "stream closed before response.completed".into(),
+                return Err(startup_failure(
+                    &mut startup_tx,
+                    ApiError::Stream("stream closed before response.completed".into()),
                 ));
             }
             Err(err) => {
-                return Err(err);
+                return Err(startup_failure(&mut startup_tx, err));
             }
         };
 
@@ -613,7 +648,7 @@ async fn run_websocket_response_stream(
                     && let Some(error) =
                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
                 {
-                    return Err(error);
+                    return Err(startup_failure(&mut startup_tx, error));
                 }
 
                 let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
@@ -623,6 +658,7 @@ async fn run_websocket_response_stream(
                         continue;
                     }
                 };
+                mark_startup_succeeded(&mut startup_tx);
                 if event.kind() == "codex.rate_limits" {
                     if let Some(snapshot) = parse_rate_limit_event(&text)
                         && tx_event
@@ -664,16 +700,20 @@ async fn run_websocket_response_stream(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        return Err(error.into_api_error());
+                        return Err(startup_failure(&mut startup_tx, error.into_api_error()));
                     }
                 }
             }
             Message::Binary(_) => {
-                return Err(ApiError::Stream("unexpected binary websocket event".into()));
+                return Err(startup_failure(
+                    &mut startup_tx,
+                    ApiError::Stream("unexpected binary websocket event".into()),
+                ));
             }
             Message::Close(_) => {
-                return Err(ApiError::Stream(
-                    "websocket closed by server before response.completed".into(),
+                return Err(startup_failure(
+                    &mut startup_tx,
+                    ApiError::Stream("websocket closed by server before response.completed".into()),
                 ));
             }
             Message::Frame(_) => {}

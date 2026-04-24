@@ -1,7 +1,7 @@
 use super::*;
 use crate::CodexThread;
 use crate::ThreadManager;
-use crate::codex::make_session_and_context;
+use crate::codex::make_session_and_context as make_base_session_and_context;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
@@ -70,6 +70,7 @@ fn invocation(
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
         tool_name: codex_tools::ToolName::plain(tool_name),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         payload,
     }
 }
@@ -85,10 +86,19 @@ fn parse_agent_id(id: &str) -> ThreadId {
 }
 
 fn thread_manager() -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
-    )
+    let mut provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
+    provider.supports_websockets = false;
+    ThreadManager::with_models_provider_for_tests(CodexAuth::from_api_key("dummy"), provider)
+}
+
+async fn make_session_and_context() -> (crate::codex::Session, TurnContext) {
+    let (session, mut turn) = make_base_session_and_context().await;
+    Arc::make_mut(&mut turn.config)
+        .model_provider
+        .supports_websockets = false;
+    turn.provider.supports_websockets = false;
+    (session, turn)
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {

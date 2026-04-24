@@ -20,8 +20,13 @@ struct PooledRuntimeScopeState {
 }
 
 enum PooledRuntimeContext {
-    Starting { reservation_id: u64 },
-    Loaded { thread_id: ThreadId },
+    Starting {
+        reservation_id: u64,
+    },
+    Loaded {
+        owner_thread_id: ThreadId,
+        root_thread_id: ThreadId,
+    },
 }
 
 impl PooledRuntimeScope {
@@ -46,18 +51,46 @@ impl PooledRuntimeScope {
     pub(crate) async fn loaded_thread_id(&self) -> Option<ThreadId> {
         let state = self.state.lock().await;
         match state.current {
-            Some(PooledRuntimeContext::Loaded { thread_id }) => Some(thread_id),
+            Some(PooledRuntimeContext::Loaded {
+                owner_thread_id, ..
+            }) => Some(owner_thread_id),
             Some(PooledRuntimeContext::Starting { .. }) | None => None,
         }
     }
 
-    pub(crate) async fn mark_thread_unloaded(&self, unloaded_thread_id: ThreadId) {
+    pub(crate) async fn loaded_root_thread_id(&self) -> Option<ThreadId> {
+        let state = self.state.lock().await;
+        match state.current {
+            Some(PooledRuntimeContext::Loaded { root_thread_id, .. }) => Some(root_thread_id),
+            Some(PooledRuntimeContext::Starting { .. }) | None => None,
+        }
+    }
+
+    pub(crate) async fn reject_if_occupied(&self) -> Result<(), JSONRPCErrorError> {
+        let state = self.state.lock().await;
+        if let Some(current) = &state.current {
+            return Err(already_loaded_error(current));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn mark_thread_unloaded_or_transfer(
+        &self,
+        unloaded_thread_id: ThreadId,
+        replacement_thread_id: Option<ThreadId>,
+    ) {
         let mut state = self.state.lock().await;
-        if matches!(
-            state.current,
-            Some(PooledRuntimeContext::Loaded { thread_id }) if thread_id == unloaded_thread_id
-        ) {
-            state.current = None;
+        if let Some(PooledRuntimeContext::Loaded {
+            owner_thread_id,
+            root_thread_id,
+        }) = state.current
+            && owner_thread_id == unloaded_thread_id
+        {
+            state.current =
+                replacement_thread_id.map(|owner_thread_id| PooledRuntimeContext::Loaded {
+                    owner_thread_id,
+                    root_thread_id,
+                });
         }
     }
 
@@ -69,7 +102,10 @@ impl PooledRuntimeScope {
                 reservation_id: current_reservation_id
             }) if current_reservation_id == reservation_id
         ) {
-            state.current = Some(PooledRuntimeContext::Loaded { thread_id });
+            state.current = Some(PooledRuntimeContext::Loaded {
+                owner_thread_id: thread_id,
+                root_thread_id: thread_id,
+            });
         }
     }
 
@@ -116,8 +152,10 @@ fn already_loaded_error(current: &PooledRuntimeContext) -> JSONRPCErrorError {
         PooledRuntimeContext::Starting { .. } => {
             "pooled runtime already has a top-level context starting".to_string()
         }
-        PooledRuntimeContext::Loaded { thread_id } => {
-            format!("pooled runtime already has loaded top-level thread {thread_id}")
+        PooledRuntimeContext::Loaded {
+            owner_thread_id, ..
+        } => {
+            format!("pooled runtime already has loaded top-level thread {owner_thread_id}")
         }
     };
     pooled_runtime_error(POOLED_RUNTIME_ALREADY_LOADED, message)
@@ -128,5 +166,59 @@ fn pooled_runtime_error(error_code: &str, message: impl Into<String>) -> JSONRPC
         code: INVALID_REQUEST_ERROR_CODE,
         message: message.into(),
         data: Some(json!({ "errorCode": error_code })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unload_can_transfer_loaded_pooled_owner_to_live_descendant() {
+        let scope = Arc::new(PooledRuntimeScope::default());
+        let parent_thread_id = ThreadId::new();
+        let child_thread_id = ThreadId::new();
+
+        scope
+            .reserve()
+            .await
+            .expect("reserve")
+            .promote(parent_thread_id)
+            .await;
+        scope
+            .mark_thread_unloaded_or_transfer(parent_thread_id, Some(child_thread_id))
+            .await;
+
+        pretty_assertions::assert_eq!(scope.loaded_thread_id().await, Some(child_thread_id));
+        pretty_assertions::assert_eq!(scope.loaded_root_thread_id().await, Some(parent_thread_id));
+
+        scope
+            .mark_thread_unloaded_or_transfer(child_thread_id, None)
+            .await;
+        pretty_assertions::assert_eq!(scope.loaded_thread_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn unload_transfer_preserves_original_root_across_multiple_handoffs() {
+        let scope = Arc::new(PooledRuntimeScope::default());
+        let parent_thread_id = ThreadId::new();
+        let first_child_thread_id = ThreadId::new();
+        let second_child_thread_id = ThreadId::new();
+
+        scope
+            .reserve()
+            .await
+            .expect("reserve")
+            .promote(parent_thread_id)
+            .await;
+        scope
+            .mark_thread_unloaded_or_transfer(parent_thread_id, Some(first_child_thread_id))
+            .await;
+        scope
+            .mark_thread_unloaded_or_transfer(first_child_thread_id, Some(second_child_thread_id))
+            .await;
+
+        pretty_assertions::assert_eq!(scope.loaded_thread_id().await, Some(second_child_thread_id));
+        pretty_assertions::assert_eq!(scope.loaded_root_thread_id().await, Some(parent_thread_id));
     }
 }

@@ -23,6 +23,7 @@ impl ToolHandler for McpHandler {
             turn,
             call_id,
             payload,
+            cancellation_token,
             ..
         } = invocation;
 
@@ -50,6 +51,7 @@ impl ToolHandler for McpHandler {
             server,
             tool,
             arguments_str,
+            cancellation_token,
         )
         .await;
 

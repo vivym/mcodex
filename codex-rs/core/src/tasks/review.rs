@@ -120,14 +120,15 @@ async fn start_review_conversation(
         .clone()
         .unwrap_or_else(|| ctx.model_info.slug.clone());
     sub_agent_config.model = Some(model);
+    let compat_inherited_lease_auth_session = session
+        .clone_session()
+        .services
+        .lease_auth
+        .current_session();
     (run_codex_thread_one_shot(
         sub_agent_config,
         session.auth_manager(),
-        session
-            .clone_session()
-            .services
-            .lease_auth
-            .current_session(),
+        compat_inherited_lease_auth_session,
         session.models_manager(),
         input,
         session.clone_session(),

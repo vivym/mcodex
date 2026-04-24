@@ -36,6 +36,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt.md");
@@ -61,12 +62,22 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.is_openai()
 }
 
+struct CompactTaskRequest {
+    input: Vec<UserInput>,
+    initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+    cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let prompt = turn_context.compact_prompt().to_string();
     let input = vec![UserInput::Text {
@@ -78,11 +89,14 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         turn_context,
-        input,
-        initial_context_injection,
-        CompactionTrigger::Auto,
-        reason,
-        phase,
+        CompactTaskRequest {
+            input,
+            initial_context_injection,
+            trigger: CompactionTrigger::Auto,
+            reason,
+            phase,
+            cancellation_token,
+        },
     )
     .await?;
     Ok(())
@@ -92,6 +106,7 @@ pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -103,11 +118,14 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(
         sess.clone(),
         turn_context,
-        input,
-        InitialContextInjection::DoNotInject,
-        CompactionTrigger::Manual,
-        CompactionReason::UserRequested,
-        CompactionPhase::StandaloneTurn,
+        CompactTaskRequest {
+            input,
+            initial_context_injection: InitialContextInjection::DoNotInject,
+            trigger: CompactionTrigger::Manual,
+            reason: CompactionReason::UserRequested,
+            phase: CompactionPhase::StandaloneTurn,
+            cancellation_token,
+        },
     )
     .await
 }
@@ -115,12 +133,16 @@ pub(crate) async fn run_compact_task(
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    input: Vec<UserInput>,
-    initial_context_injection: InitialContextInjection,
-    trigger: CompactionTrigger,
-    reason: CompactionReason,
-    phase: CompactionPhase,
+    request: CompactTaskRequest,
 ) -> CodexResult<()> {
+    let CompactTaskRequest {
+        input,
+        initial_context_injection,
+        trigger,
+        reason,
+        phase,
+        cancellation_token,
+    } = request;
     let attempt = CompactionAnalyticsAttempt::begin(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -135,6 +157,7 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         input,
         initial_context_injection,
+        cancellation_token,
     )
     .await;
     attempt
@@ -152,6 +175,7 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -192,6 +216,7 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             turn_metadata_header.as_deref(),
             &prompt,
+            cancellation_token.child_token(),
         )
         .await;
 
@@ -535,7 +560,9 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
     prompt: &Prompt,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
+    client_session.set_request_cancellation_token(cancellation_token);
     let mut stream = client_session
         .stream_inline_compaction(
             prompt,

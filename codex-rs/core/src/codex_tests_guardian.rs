@@ -145,6 +145,7 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "test-call".to_string(),
             tool_name: codex_tools::ToolName::plain("shell"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": params.command.clone(),
@@ -211,6 +212,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
             tracker: Arc::clone(&tracker),
             call_id: "exec-call".to_string(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "cmd": "echo hi",
@@ -324,6 +326,7 @@ async fn shell_handler_allows_sticky_turn_permissions_without_inline_request_per
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "sticky-turn-grant".to_string(),
             tool_name: codex_tools::ToolName::plain("shell"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": [
@@ -449,7 +452,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(parent_exec_policy)),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: None,
         user_shell_override: None,
         parent_trace: None,

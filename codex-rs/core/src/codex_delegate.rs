@@ -63,11 +63,15 @@ use crate::codex::completed_session_loop_termination;
 /// The returned `events_rx` yields non-approval events emitted by the sub-agent.
 /// Approval requests are handled via `parent_session` and are not surfaced.
 /// The returned `ops_tx` allows the caller to submit additional `Op`s to the sub-agent.
+///
+/// `compat_inherited_lease_auth_session` exists only for non-pooled
+/// compatibility paths. Pooled children must rely on the inherited runtime
+/// lease host instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
@@ -95,13 +99,13 @@ pub(crate) async fn run_codex_thread_interactive(
         } else {
             None
         };
-    let inherited_lease_auth_session = if runtime_lease_host
+    let compat_inherited_lease_auth_session = if runtime_lease_host
         .as_ref()
         .is_some_and(|host| host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled)
     {
         None
     } else {
-        inherited_lease_auth_session
+        compat_inherited_lease_auth_session
     };
 
     let spawn_result = Codex::spawn(CodexSpawnArgs {
@@ -122,7 +126,7 @@ pub(crate) async fn run_codex_thread_interactive(
         persist_extended_history: false,
         metrics_service_name: None,
         inherited_shell_snapshot: None,
-        inherited_lease_auth_session,
+        compat_inherited_lease_auth_session,
         runtime_lease_host,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
@@ -143,16 +147,22 @@ pub(crate) async fn run_codex_thread_interactive(
             return Err(err);
         }
     };
+    let initial_collaboration_tree_id = match &subagent_source {
+        SubAgentSource::Other(source) if source == crate::guardian::GUARDIAN_REVIEWER_NAME => {
+            crate::runtime_lease::CollaborationTreeId::root_for_session(
+                &codex.session.conversation_id.to_string(),
+            )
+        }
+        _ => parent_session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+    };
     codex
         .session
         .services
         .model_client
-        .set_collaboration_tree_id(
-            parent_session
-                .services
-                .model_client
-                .current_collaboration_tree_id(),
-        );
+        .set_collaboration_tree_id(initial_collaboration_tree_id);
     if let Some(reservation) = runtime_lease_startup_reservation.take()
         && let Err(err) = reservation
             .promote_to_session(&codex.session.conversation_id.to_string())
@@ -224,7 +234,7 @@ pub(crate) async fn run_codex_thread_interactive(
 pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
@@ -244,7 +254,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let io = run_codex_thread_interactive(
         config,
         auth_manager,
-        inherited_lease_auth_session,
+        compat_inherited_lease_auth_session,
         models_manager,
         parent_session,
         parent_ctx,

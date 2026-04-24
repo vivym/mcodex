@@ -283,7 +283,8 @@ async fn admission_guard_releases_exactly_once() {
 }
 
 #[tokio::test]
-async fn terminal_401_cancels_reporting_tree_but_not_unrelated_tree() -> anyhow::Result<()> {
+async fn terminal_401_cancels_reporting_tree_siblings_but_not_unrelated_tree() -> anyhow::Result<()>
+{
     let runtime_lease_host =
         RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-a".to_string()));
     runtime_lease_host
@@ -293,12 +294,20 @@ async fn terminal_401_cancels_reporting_tree_but_not_unrelated_tree() -> anyhow:
         .expect("test host should publish authority");
 
     let tree_a_cancel = CancellationToken::new();
+    let tree_a_sibling_cancel = CancellationToken::new();
     let tree_b_cancel = CancellationToken::new();
     let tree_a_request = LeaseRequestContext::for_test_with_cancel(
         RequestBoundaryKind::ResponsesHttp,
         "session-a",
         CollaborationTreeId::for_test("tree-a"),
         tree_a_cancel.clone(),
+    );
+    let tree_a_sibling_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a-sibling".to_string(),
+        CollaborationTreeId::for_test("tree-a"),
+        Some("sibling".to_string()),
+        tree_a_sibling_cancel.clone(),
     );
     let tree_b_request = LeaseRequestContext::for_test_with_cancel(
         RequestBoundaryKind::ResponsesHttp,
@@ -310,6 +319,9 @@ async fn terminal_401_cancels_reporting_tree_but_not_unrelated_tree() -> anyhow:
     let tree_a_admission = authority
         .acquire_request_lease_for_test(tree_a_request)
         .await?;
+    let tree_a_sibling_admission = authority
+        .acquire_request_lease_for_test(tree_a_sibling_request)
+        .await?;
     let tree_b_admission = authority
         .acquire_request_lease_for_test(tree_b_request)
         .await?;
@@ -318,12 +330,132 @@ async fn terminal_401_cancels_reporting_tree_but_not_unrelated_tree() -> anyhow:
         .report_terminal_unauthorized(&tree_a_admission.snapshot)
         .await?;
 
-    assert!(tree_a_cancel.is_cancelled());
+    assert!(!tree_a_cancel.is_cancelled());
+    assert!(tree_a_sibling_cancel.is_cancelled());
     assert!(!tree_b_cancel.is_cancelled());
     assert!(!authority.runtime_snapshot().await.active);
 
     drop(tree_a_admission.guard);
+    drop(tree_a_sibling_admission.guard);
     drop(tree_b_admission.guard);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_401_cancels_same_member_sibling_requests_for_live_admission() -> anyhow::Result<()>
+{
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-a".to_string()));
+    runtime_lease_host
+        .install_authority(RuntimeLeaseAuthority::for_test_accepting("acct-a", 11))?;
+    let authority = runtime_lease_host
+        .pooled_authority()
+        .expect("test host should publish authority");
+
+    let tree_id = CollaborationTreeId::for_test("tree-a");
+    let reporter_cancel = CancellationToken::new();
+    let sibling_same_member_cancel = CancellationToken::new();
+    let sibling_other_member_cancel = CancellationToken::new();
+    let reporter_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a".to_string(),
+        tree_id.clone(),
+        Some("reporter".to_string()),
+        reporter_cancel.clone(),
+    );
+    let sibling_same_member_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-b".to_string(),
+        tree_id.clone(),
+        Some("reporter".to_string()),
+        sibling_same_member_cancel.clone(),
+    );
+    let sibling_other_member_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-c".to_string(),
+        tree_id,
+        Some("sibling".to_string()),
+        sibling_other_member_cancel.clone(),
+    );
+
+    let reporter_admission = authority
+        .acquire_request_lease_for_test(reporter_request)
+        .await?;
+    let sibling_same_member_admission = authority
+        .acquire_request_lease_for_test(sibling_same_member_request)
+        .await?;
+    let sibling_other_member_admission = authority
+        .acquire_request_lease_for_test(sibling_other_member_request)
+        .await?;
+
+    authority
+        .report_terminal_unauthorized(&reporter_admission.snapshot)
+        .await?;
+
+    assert!(!reporter_cancel.is_cancelled());
+    assert!(sibling_same_member_cancel.is_cancelled());
+    assert!(sibling_other_member_cancel.is_cancelled());
+
+    drop(reporter_admission.guard);
+    drop(sibling_same_member_admission.guard);
+    drop(sibling_other_member_admission.guard);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_401_preserves_long_lived_turn_member_for_reporting_member() -> anyhow::Result<()>
+{
+    let runtime_lease_host =
+        RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-a".to_string()));
+    runtime_lease_host
+        .install_authority(RuntimeLeaseAuthority::for_test_accepting("acct-a", 11))?;
+    let authority = runtime_lease_host
+        .pooled_authority()
+        .expect("test host should publish authority");
+
+    let tree_id = CollaborationTreeId::for_test("tree-a");
+    let turn_cancel = CancellationToken::new();
+    let _turn_membership = runtime_lease_host.register_collaboration_member(
+        tree_id.clone(),
+        "reporter".to_string(),
+        turn_cancel.clone(),
+    );
+    let reporter_cancel = CancellationToken::new();
+    let sibling_cancel = CancellationToken::new();
+    let reporter_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-a".to_string(),
+        tree_id.clone(),
+        Some("reporter".to_string()),
+        reporter_cancel.clone(),
+    );
+    let sibling_request = LeaseRequestContext::new(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-b".to_string(),
+        tree_id,
+        Some("sibling".to_string()),
+        sibling_cancel.clone(),
+    );
+
+    let reporter_admission = authority
+        .acquire_request_lease_for_test(reporter_request)
+        .await?;
+    let sibling_admission = authority
+        .acquire_request_lease_for_test(sibling_request)
+        .await?;
+
+    authority
+        .report_terminal_unauthorized(&reporter_admission.snapshot)
+        .await?;
+
+    assert!(!turn_cancel.is_cancelled());
+    assert!(!reporter_cancel.is_cancelled());
+    assert!(sibling_cancel.is_cancelled());
+
+    drop(reporter_admission.guard);
+    drop(sibling_admission.guard);
 
     Ok(())
 }
@@ -337,7 +469,7 @@ fn guardian_reusable_session_rebinds_membership_per_invocation() {
     let first_tree_id = CollaborationTreeId::for_test("guardian:turn-1");
     let first_cancel = CancellationToken::new();
     {
-        let first_membership = registry.register_member(
+        let first_membership = registry.register_long_lived_member(
             first_tree_id.clone(),
             "guardian:member-1".to_string(),
             first_cancel.clone(),
@@ -358,7 +490,7 @@ fn guardian_reusable_session_rebinds_membership_per_invocation() {
     let second_tree_id = CollaborationTreeId::for_test("guardian:turn-2");
     let second_cancel = CancellationToken::new();
     {
-        let second_membership = registry.register_member(
+        let second_membership = registry.register_long_lived_member(
             second_tree_id.clone(),
             "guardian:member-2".to_string(),
             second_cancel.clone(),
@@ -377,6 +509,47 @@ fn guardian_reusable_session_rebinds_membership_per_invocation() {
 
     registry.cancel_tree(&second_tree_id);
     assert!(!second_cancel.is_cancelled());
+}
+
+#[test]
+fn collaboration_tree_cancel_can_exempt_reporting_member() {
+    let registry = Arc::new(CollaborationTreeRegistry::default());
+    let tree_id = CollaborationTreeId::for_test("turn:reporting-member");
+    let reporter_turn_cancel = CancellationToken::new();
+    let reporter_cancel = CancellationToken::new();
+    let sibling_same_member_cancel = CancellationToken::new();
+    let sibling_other_member_cancel = CancellationToken::new();
+    let reporter = registry.register_request_member(
+        tree_id.clone(),
+        "reporter".to_string(),
+        reporter_cancel.clone(),
+    );
+    let _reporter_turn = registry.register_long_lived_member(
+        tree_id.clone(),
+        "reporter".to_string(),
+        reporter_turn_cancel.clone(),
+    );
+    let _sibling_same_member = registry.register_request_member(
+        tree_id.clone(),
+        "reporter".to_string(),
+        sibling_same_member_cancel.clone(),
+    );
+    let _sibling_other_member = registry.register_request_member(
+        tree_id.clone(),
+        "sibling".to_string(),
+        sibling_other_member_cancel.clone(),
+    );
+
+    registry.cancel_tree_for_terminal_unauthorized(
+        &tree_id,
+        Some(reporter.member_id()),
+        Some(reporter.registration_id()),
+    );
+
+    assert!(!reporter_turn_cancel.is_cancelled());
+    assert!(!reporter_cancel.is_cancelled());
+    assert!(sibling_same_member_cancel.is_cancelled());
+    assert!(sibling_other_member_cancel.is_cancelled());
 }
 
 #[test]
@@ -1814,7 +1987,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -1845,7 +2018,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
         user_shell_override: None,
         parent_trace: None,
@@ -1919,9 +2092,21 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
             crate::client::LeaseRequestPurpose::Standard,
-            None,
-            "runtime-lease-parent-request",
-            CancellationToken::new(),
+            crate::client::AdmittedClientSetupRequest {
+                collaboration_tree_id: &root
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_tree_id(),
+                collaboration_member_id: root
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_member_id(),
+                turn_id: None,
+                request_id: "runtime-lease-parent-request",
+                cancellation_token: CancellationToken::new(),
+            },
         )
         .await?;
     let child_admitted = child
@@ -1931,9 +2116,21 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
             crate::client::LeaseRequestPurpose::Standard,
-            None,
-            "runtime-lease-child-request",
-            CancellationToken::new(),
+            crate::client::AdmittedClientSetupRequest {
+                collaboration_tree_id: &child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_tree_id(),
+                collaboration_member_id: child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_member_id(),
+                turn_id: None,
+                request_id: "runtime-lease-child-request",
+                cancellation_token: CancellationToken::new(),
+            },
         )
         .await?;
     assert_eq!(
@@ -2025,7 +2222,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2095,7 +2292,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2126,7 +2323,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
         user_shell_override: None,
         parent_trace: None,
@@ -2174,9 +2371,21 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
             crate::client::LeaseRequestPurpose::Standard,
-            None,
-            "runtime-lease-child-lifecycle-request",
-            CancellationToken::new(),
+            crate::client::AdmittedClientSetupRequest {
+                collaboration_tree_id: &child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_tree_id(),
+                collaboration_member_id: child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_member_id(),
+                turn_id: None,
+                request_id: "runtime-lease-child-lifecycle-request",
+                cancellation_token: CancellationToken::new(),
+            },
         )
         .await?;
     assert_eq!(
@@ -2228,7 +2437,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
             "runtime-c".to_string(),
         ))),
@@ -2245,9 +2454,21 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
             crate::client::LeaseRequestPurpose::Standard,
-            None,
-            "runtime-lease-contender-request",
-            CancellationToken::new(),
+            crate::client::AdmittedClientSetupRequest {
+                collaboration_tree_id: &contender
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_tree_id(),
+                collaboration_member_id: contender
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_member_id(),
+                turn_id: None,
+                request_id: "runtime-lease-contender-request",
+                cancellation_token: CancellationToken::new(),
+            },
         )
         .await?;
     assert_eq!(
@@ -2326,7 +2547,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2373,7 +2594,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2435,7 +2656,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2467,7 +2688,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2538,7 +2759,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: None,
         user_shell_override: None,
         parent_trace: None,
@@ -2611,7 +2832,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(root_runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -2630,9 +2851,21 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         .admitted_client_setup(
             RequestBoundaryKind::ResponsesHttp,
             crate::client::LeaseRequestPurpose::Standard,
-            None,
-            "runtime-lease-config-only-child-request",
-            CancellationToken::new(),
+            crate::client::AdmittedClientSetupRequest {
+                collaboration_tree_id: &child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_tree_id(),
+                collaboration_member_id: child
+                    .session
+                    .services
+                    .model_client
+                    .current_collaboration_member_id(),
+                turn_id: None,
+                request_id: "runtime-lease-config-only-child-request",
+                cancellation_token: CancellationToken::new(),
+            },
         )
         .await?;
     assert_eq!(

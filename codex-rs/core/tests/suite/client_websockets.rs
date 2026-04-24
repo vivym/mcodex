@@ -2244,6 +2244,42 @@ async fn remote_session_reset_changes_session_id_without_changing_thread_id() {
     server.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_session_reset_clears_turn_state_before_reconnect() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server_with_headers(vec![
+        WebSocketConnectionConfig {
+            requests: vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+            response_headers: vec![("x-codex-turn-state".to_string(), "turn-state-1".to_string())],
+            accept_delay: None,
+            close_after_requests: true,
+        },
+        WebSocketConnectionConfig {
+            requests: vec![vec![ev_response_created("resp-2"), ev_completed("resp-2")]],
+            response_headers: vec![("x-codex-turn-state".to_string(), "turn-state-2".to_string())],
+            accept_delay: None,
+            close_after_requests: true,
+        },
+    ])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let mut session = harness.client.new_session();
+
+    stream_until_complete(&mut session, &harness, &prompt).await;
+    session.reset_remote_session_identity();
+    stream_until_complete(&mut session, &harness, &prompt).await;
+
+    let handshakes = server.handshakes();
+    assert_eq!(handshakes.len(), 2);
+    assert_eq!(handshakes[0].header("x-codex-turn-state").as_deref(), None);
+    assert_eq!(handshakes[1].header("x-codex-turn-state").as_deref(), None);
+
+    server.shutdown().await;
+}
+
 fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {
     websocket_provider_with_connect_timeout(server, /*websocket_connect_timeout_ms*/ None)
 }

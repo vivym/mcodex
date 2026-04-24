@@ -36,6 +36,7 @@ use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -125,6 +126,79 @@ async fn account_lease_read_reports_live_active_lease_fields_after_turn_start() 
     assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
     assert!(response.lease_id.is_some());
     assert_eq!(response.lease_epoch, Some(1));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_and_resume_use_loaded_thread_request_config() -> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_accounts(codex_home.path(), &server.uri())?;
+    let runtime = seed_default_pool_state(codex_home.path()).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread_with_config(&mut mcp, pooled_accounts_request_config()).await?;
+    let _turn = start_turn(&mut mcp, &thread.id, "request scoped lease").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.active, true);
+    assert_eq!(response.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(
+        response.effective_pool_resolution_source.as_deref(),
+        Some("configDefault")
+    );
+    assert_eq!(
+        response.configured_default_pool_id.as_deref(),
+        Some("legacy-default")
+    );
+
+    let _: JSONRPCResponse = mcp.account_lease_resume().await?;
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "accountLease/updated after resume",
+            |notification| {
+                notification.method == "accountLease/updated"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("accountId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(PRIMARY_ACCOUNT_ID)
+            },
+        ),
+    )
+    .await??;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(updated.account_id.as_deref(), Some(PRIMARY_ACCOUNT_ID));
+    assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(updated.suppressed, false);
+    assert!(updated.lease_acquired_at.is_some());
+
+    let after_resume: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(after_resume.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(
+        after_resume.effective_pool_resolution_source.as_deref(),
+        Some("configDefault")
+    );
 
     Ok(())
 }
@@ -400,7 +474,7 @@ async fn account_lease_read_reports_shared_startup_selection_without_accounts_co
 }
 
 #[tokio::test]
-async fn policy_only_config_does_not_enable_websocket_account_lease_runtime() -> Result<()> {
+async fn policy_only_config_rejects_websocket_account_lease_runtime() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_policy_only_pooled_config_toml(codex_home.path(), &server.uri())?;
@@ -423,13 +497,14 @@ async fn policy_only_config_does_not_enable_websocket_account_lease_runtime() ->
         /*params*/ None,
     )
     .await?;
-    let response: AccountLeaseReadResponse =
-        to_response(read_response_for_id(&mut ws, /*id*/ 2).await?)?;
-    assert_eq!(response.active, false);
-    assert_eq!(response.suppressed, false);
-    assert_eq!(response.account_id, None);
-    assert_eq!(response.pool_id, None);
-    assert_eq!(response.switch_reason, None);
+    let error = read_error_for_id(&mut ws, /*id*/ 2).await?;
+    assert!(
+        error
+            .error
+            .message
+            .contains("pooled lease mode is only supported for stdio"),
+        "unexpected websocket error: {error:?}"
+    );
 
     process
         .kill()
@@ -735,6 +810,26 @@ async fn start_thread(mcp: &mut McpProcess) -> Result<codex_app_server_protocol:
     start_thread_with_timeout(mcp, DEFAULT_READ_TIMEOUT).await
 }
 
+async fn start_thread_with_config(
+    mcp: &mut McpProcess,
+    config: HashMap<String, serde_json::Value>,
+) -> Result<codex_app_server_protocol::Thread> {
+    let thread_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            config: Some(config),
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_id)),
+    )
+    .await
+    .context("timed out waiting for request-config thread/start response")??;
+    let ThreadStartResponse { thread, .. } = to_response(response)?;
+    Ok(thread)
+}
+
 async fn start_thread_with_timeout(
     mcp: &mut McpProcess,
     read_timeout: Duration,
@@ -908,6 +1003,22 @@ supports_websockets = false
 "#
         ),
     )
+}
+
+fn pooled_accounts_request_config() -> HashMap<String, serde_json::Value> {
+    HashMap::from([
+        ("accounts.backend".to_string(), json!("local")),
+        ("accounts.default_pool".to_string(), json!("legacy-default")),
+        ("accounts.allocation_mode".to_string(), json!("exclusive")),
+        (
+            "accounts.pools.legacy-default.allow_context_reuse".to_string(),
+            json!(false),
+        ),
+        (
+            "accounts.pools.legacy-default.account_kinds".to_string(),
+            json!(["chatgpt"]),
+        ),
+    ])
 }
 
 fn create_policy_only_pooled_config_toml(

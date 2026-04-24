@@ -814,6 +814,8 @@ ON CONFLICT(thread_id, position) DO NOTHING
             self.upsert_thread(&metadata).await
         };
         upsert_result?;
+        self.upsert_thread_config_baseline_from_rollout_items(builder, items)
+            .await?;
         if let Some(memory_mode) = extract_memory_mode(items)
             && let Err(err) = self
                 .set_thread_memory_mode(builder.id, memory_mode.as_str())
@@ -929,7 +931,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
     })
 }
 
-fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
+pub(super) fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
     let parsed_source = serde_json::from_str(source)
         .or_else(|_| serde_json::from_value::<SessionSource>(Value::String(source.to_string())));
     match parsed_source.ok() {

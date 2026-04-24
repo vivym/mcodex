@@ -2471,12 +2471,8 @@ impl InitialHistory {
     pub fn forked_from_id(&self) -> Option<ThreadId> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.forked_from_id,
-                    _ => None,
-                })
-            }
+            InitialHistory::Resumed(resumed) => canonical_resumed_session_meta(resumed)
+                .and_then(|meta_line| meta_line.meta.forked_from_id),
             InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
                 _ => None,
@@ -2487,7 +2483,9 @@ impl InitialHistory {
     pub fn session_cwd(&self) -> Option<PathBuf> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => session_cwd_from_items(&resumed.history),
+            InitialHistory::Resumed(resumed) => {
+                canonical_resumed_session_meta(resumed).map(|meta_line| meta_line.meta.cwd.clone())
+            }
             InitialHistory::Forked(items) => session_cwd_from_items(items),
         }
     }
@@ -2529,12 +2527,8 @@ impl InitialHistory {
         // TODO: SessionMeta should (in theory) always be first in the history, so we can probably only check the first item?
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
-                    _ => None,
-                })
-            }
+            InitialHistory::Resumed(resumed) => canonical_resumed_session_meta(resumed)
+                .and_then(|meta_line| meta_line.meta.base_instructions.clone()),
             InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
                 _ => None,
@@ -2545,18 +2539,27 @@ impl InitialHistory {
     pub fn get_dynamic_tools(&self) -> Option<Vec<DynamicToolSpec>> {
         match self {
             InitialHistory::New | InitialHistory::Cleared => None,
-            InitialHistory::Resumed(resumed) => {
-                resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                    _ => None,
-                })
-            }
+            InitialHistory::Resumed(resumed) => canonical_resumed_session_meta(resumed)
+                .and_then(|meta_line| meta_line.meta.dynamic_tools.clone()),
             InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
                 RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
                 _ => None,
             }),
         }
     }
+}
+
+fn canonical_resumed_session_meta(resumed: &ResumedHistory) -> Option<&SessionMetaLine> {
+    resumed.history.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == resumed.conversation_id => {
+            Some(meta_line)
+        }
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::EventMsg(_) => None,
+    })
 }
 
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
@@ -2822,10 +2825,14 @@ pub struct TurnContextItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     pub approval_policy: AskForApproval,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub sandbox_policy: SandboxPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<TurnContextNetworkItem>,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3798,6 +3805,7 @@ pub struct CollabResumeEndEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dynamic_tools::DynamicToolSpec;
     use crate::items::ImageGenerationItem;
     use crate::items::UserMessageItem;
     use crate::items::WebSearchItem;
@@ -3856,6 +3864,89 @@ mod tests {
             .get_writable_roots_with_cwd(cwd)
             .iter()
             .any(|root| root.is_path_writable(path))
+    }
+
+    fn test_dynamic_tool(name: &str) -> DynamicToolSpec {
+        DynamicToolSpec {
+            name: name.to_string(),
+            description: format!("dynamic tool {name}"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+            }),
+            defer_loading: false,
+        }
+    }
+
+    #[test]
+    fn resumed_history_prefers_matching_session_meta_for_thread_start_metadata() {
+        let source_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let child_base_instructions = BaseInstructions {
+            text: "child base instructions".to_string(),
+        };
+        let child_dynamic_tools = vec![test_dynamic_tool("child-tool")];
+        let history = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: child_id,
+            history: vec![
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        id: source_id,
+                        base_instructions: Some(BaseInstructions {
+                            text: "source base instructions".to_string(),
+                        }),
+                        dynamic_tools: Some(vec![test_dynamic_tool("source-tool")]),
+                        cwd: PathBuf::from("/tmp/source-cwd"),
+                        ..Default::default()
+                    },
+                    git: None,
+                }),
+                RolloutItem::SessionMeta(SessionMetaLine {
+                    meta: SessionMeta {
+                        id: child_id,
+                        base_instructions: Some(child_base_instructions.clone()),
+                        dynamic_tools: Some(child_dynamic_tools.clone()),
+                        cwd: PathBuf::from("/tmp/child-cwd"),
+                        ..Default::default()
+                    },
+                    git: None,
+                }),
+            ],
+            rollout_path: PathBuf::from("/tmp/resumed-rollout.jsonl"),
+        });
+
+        assert_eq!(history.session_cwd(), Some(PathBuf::from("/tmp/child-cwd")));
+        assert_eq!(
+            history.get_base_instructions(),
+            Some(child_base_instructions)
+        );
+        assert_eq!(history.get_dynamic_tools(), Some(child_dynamic_tools));
+    }
+
+    #[test]
+    fn resumed_history_ignores_mismatched_session_meta_when_no_canonical_match_exists() {
+        let source_id = ThreadId::new();
+        let child_id = ThreadId::new();
+        let history = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: child_id,
+            history: vec![RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    id: source_id,
+                    base_instructions: Some(BaseInstructions {
+                        text: "source base instructions".to_string(),
+                    }),
+                    dynamic_tools: Some(vec![test_dynamic_tool("source-tool")]),
+                    cwd: PathBuf::from("/tmp/source-cwd"),
+                    ..Default::default()
+                },
+                git: None,
+            })],
+            rollout_path: PathBuf::from("/tmp/resumed-rollout.jsonl"),
+        });
+
+        assert_eq!(history.session_cwd(), None);
+        assert_eq!(history.get_base_instructions(), None);
+        assert_eq!(history.get_dynamic_tools(), None);
     }
 
     #[test]
@@ -4944,12 +5035,14 @@ mod tests {
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             network: Some(TurnContextNetworkItem {
                 allowed_domains: vec!["api.example.com".to_string()],
                 denied_domains: vec!["blocked.example.com".to_string()],
             }),
             model: "gpt-5".to_string(),
+            service_tier: None,
             personality: None,
             collaboration_mode: None,
             realtime_active: None,

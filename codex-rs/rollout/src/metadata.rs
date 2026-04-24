@@ -1,7 +1,6 @@
 use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::SESSIONS_SUBDIR;
 use crate::config::RolloutConfigView;
-use crate::list;
 use crate::list::parse_timestamp_uuid_from_filename;
 use crate::recorder::RolloutRecorder;
 use crate::state_db::normalize_cwd_for_state_db;
@@ -54,6 +53,11 @@ pub(crate) fn builder_from_session_meta(
     builder.agent_path = session_meta.meta.agent_path.clone();
     builder.cwd = session_meta.meta.cwd.clone();
     builder.cli_version = Some(session_meta.meta.cli_version.clone());
+    builder.base_instructions = session_meta
+        .meta
+        .base_instructions
+        .as_ref()
+        .map(|instructions| instructions.text.clone());
     builder.sandbox_policy = SandboxPolicy::new_read_only_policy();
     builder.approval_mode = AskForApproval::OnRequest;
     if let Some(git) = session_meta.git.as_ref() {
@@ -64,10 +68,38 @@ pub(crate) fn builder_from_session_meta(
     Some(builder)
 }
 
+fn rollout_identity_from_filename(rollout_path: &Path) -> Option<(DateTime<Utc>, ThreadId)> {
+    let file_name = rollout_path.file_name()?.to_str()?;
+    if !file_name.starts_with(ROLLOUT_PREFIX) || !file_name.ends_with(ROLLOUT_SUFFIX) {
+        return None;
+    }
+    let (created_ts, uuid) = parse_timestamp_uuid_from_filename(file_name)?;
+    let created_at =
+        DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)?.with_nanosecond(0)?;
+    let thread_id = ThreadId::from_string(&uuid.to_string()).ok()?;
+    Some((created_at, thread_id))
+}
+
 pub fn builder_from_items(
     items: &[RolloutItem],
     rollout_path: &Path,
 ) -> Option<ThreadMetadataBuilder> {
+    let filename_identity = rollout_identity_from_filename(rollout_path);
+    if let Some((_, filename_thread_id)) = filename_identity.as_ref()
+        && let Some(session_meta) = canonical_session_meta(items, *filename_thread_id)
+    {
+        return builder_from_session_meta(session_meta, rollout_path);
+    }
+
+    if let Some((created_at, thread_id)) = filename_identity {
+        return Some(ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.to_path_buf(),
+            created_at,
+            SessionSource::default(),
+        ));
+    }
+
     if let Some(session_meta) = items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
         RolloutItem::ResponseItem(_)
@@ -79,33 +111,61 @@ pub fn builder_from_items(
         return Some(builder);
     }
 
-    let file_name = rollout_path.file_name()?.to_str()?;
-    if !file_name.starts_with(ROLLOUT_PREFIX) || !file_name.ends_with(ROLLOUT_SUFFIX) {
-        return None;
-    }
-    let (created_ts, uuid) = parse_timestamp_uuid_from_filename(file_name)?;
-    let created_at =
-        DateTime::<Utc>::from_timestamp(created_ts.unix_timestamp(), 0)?.with_nanosecond(0)?;
-    let id = ThreadId::from_string(&uuid.to_string()).ok()?;
-    Some(ThreadMetadataBuilder::new(
-        id,
-        rollout_path.to_path_buf(),
-        created_at,
-        SessionSource::default(),
-    ))
+    None
 }
 
-pub async fn extract_metadata_from_rollout(
+fn canonical_session_meta(items: &[RolloutItem], thread_id: ThreadId) -> Option<&SessionMetaLine> {
+    items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => Some(meta_line),
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::EventMsg(_) => None,
+    })
+}
+
+struct RolloutExtractionData {
+    builder: ThreadMetadataBuilder,
+    items: Vec<RolloutItem>,
+    outcome: ExtractionOutcome,
+}
+
+fn normalize_rollout_items_for_state_db(items: &mut [RolloutItem]) {
+    for item in items {
+        match item {
+            RolloutItem::SessionMeta(meta_line) => {
+                meta_line.meta.cwd = normalize_cwd_for_state_db(&meta_line.meta.cwd);
+            }
+            RolloutItem::TurnContext(turn_context) => {
+                turn_context.cwd = normalize_cwd_for_state_db(&turn_context.cwd);
+            }
+            RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::SessionConfigured(
+                session_configured,
+            )) => {
+                session_configured.cwd = normalize_cwd_for_state_db(&session_configured.cwd);
+            }
+            RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+            }
+        }
+    }
+}
+
+async fn load_rollout_extraction_data(
     rollout_path: &Path,
     default_provider: &str,
-) -> anyhow::Result<ExtractionOutcome> {
-    let (items, _thread_id, parse_errors) =
+    normalize_for_state_db: bool,
+) -> anyhow::Result<RolloutExtractionData> {
+    let (mut items, _thread_id, parse_errors) =
         RolloutRecorder::load_rollout_items(rollout_path).await?;
     if items.is_empty() {
         return Err(anyhow::anyhow!(
             "empty session file: {}",
             rollout_path.display()
         ));
+    }
+    if normalize_for_state_db {
+        normalize_rollout_items_for_state_db(items.as_mut_slice());
     }
     let builder = builder_from_items(items.as_slice(), rollout_path).ok_or_else(|| {
         anyhow::anyhow!(
@@ -120,17 +180,35 @@ pub async fn extract_metadata_from_rollout(
     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
         metadata.updated_at = updated_at;
     }
-    Ok(ExtractionOutcome {
-        metadata,
-        memory_mode: items.iter().rev().find_map(|item| match item {
-            RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-            RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TurnContext(_)
-            | RolloutItem::EventMsg(_) => None,
-        }),
-        parse_errors,
+    let memory_mode = items.iter().rev().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
+        RolloutItem::ResponseItem(_)
+        | RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::EventMsg(_) => None,
+    });
+    Ok(RolloutExtractionData {
+        builder,
+        items,
+        outcome: ExtractionOutcome {
+            metadata,
+            memory_mode,
+            parse_errors,
+        },
     })
+}
+
+pub async fn extract_metadata_from_rollout(
+    rollout_path: &Path,
+    default_provider: &str,
+) -> anyhow::Result<ExtractionOutcome> {
+    Ok(load_rollout_extraction_data(
+        rollout_path,
+        default_provider,
+        /*normalize_for_state_db*/ false,
+    )
+    .await?
+    .outcome)
 }
 
 pub(crate) async fn backfill_sessions(
@@ -232,22 +310,37 @@ pub(crate) async fn backfill_sessions(
     for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            match extract_metadata_from_rollout(&rollout.path, config.model_provider_id()).await {
-                Ok(outcome) => {
-                    if outcome.parse_errors > 0
+            match load_rollout_extraction_data(
+                &rollout.path,
+                config.model_provider_id(),
+                /*normalize_for_state_db*/ true,
+            )
+            .await
+            {
+                Ok(extraction) => {
+                    if extraction.outcome.parse_errors > 0
                         && let Some(ref metric_client) = metric_client
                     {
                         let _ = metric_client.counter(
                             DB_ERROR_METRIC,
-                            outcome.parse_errors as i64,
+                            extraction.outcome.parse_errors as i64,
                             &[("stage", "backfill_sessions")],
                         );
                     }
-                    let mut metadata = outcome.metadata;
-                    metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-                    let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
-                    if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
-                        metadata.prefer_existing_git_info(&existing_metadata);
+                    let RolloutExtractionData {
+                        mut builder,
+                        items,
+                        outcome:
+                            ExtractionOutcome {
+                                mut metadata,
+                                memory_mode,
+                                parse_errors: _,
+                            },
+                    } = extraction;
+                    let memory_mode = memory_mode.unwrap_or_else(|| "enabled".to_string());
+                    let existing_metadata = runtime.get_thread(metadata.id).await.ok().flatten();
+                    if let Some(existing_metadata) = existing_metadata.as_ref() {
+                        metadata.prefer_existing_git_info(existing_metadata);
                     }
                     if rollout.archived && metadata.archived_at.is_none() {
                         let fallback_archived_at = metadata.updated_at;
@@ -255,6 +348,7 @@ pub(crate) async fn backfill_sessions(
                             .await
                             .or(Some(fallback_archived_at));
                     }
+                    builder.cwd = metadata.cwd.clone();
                     if let Err(err) = runtime.upsert_thread(&metadata).await {
                         stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
@@ -270,11 +364,27 @@ pub(crate) async fn backfill_sessions(
                             );
                             continue;
                         }
+                        if let Err(err) = runtime
+                            .backfill_thread_config_baseline_from_rollout_items(
+                                &builder,
+                                items.as_slice(),
+                            )
+                            .await
+                        {
+                            stats.failed = stats.failed.saturating_add(1);
+                            warn!(
+                                "failed to backfill config baseline {}: {err}",
+                                rollout.path.display()
+                            );
+                            continue;
+                        }
                         stats.upserted = stats.upserted.saturating_add(1);
-                        if let Ok(meta_line) = list::read_session_meta_line(&rollout.path).await {
+                        if let Some(meta_line) =
+                            canonical_session_meta(items.as_slice(), metadata.id)
+                        {
                             if let Err(err) = runtime
                                 .persist_dynamic_tools(
-                                    meta_line.meta.id,
+                                    metadata.id,
                                     meta_line.meta.dynamic_tools.as_deref(),
                                 )
                                 .await
@@ -286,7 +396,7 @@ pub(crate) async fn backfill_sessions(
                             }
                         } else {
                             warn!(
-                                "failed to read session meta for dynamic tools {}",
+                                "failed to resolve session meta for dynamic tools {}",
                                 rollout.path.display()
                             );
                         }

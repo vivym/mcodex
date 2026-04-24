@@ -273,6 +273,7 @@ impl GuardianReviewSessionManager {
         let trunk_candidate = match run_before_review_deadline(
             deadline,
             params.external_cancel.as_ref(),
+            /*internal_cancel*/ None,
             self.state.lock(),
         )
         .await
@@ -290,6 +291,7 @@ impl GuardianReviewSessionManager {
                     let review_session = match run_before_review_deadline_with_cancel(
                         deadline,
                         params.external_cancel.as_ref(),
+                        /*internal_cancel*/ None,
                         &spawn_cancel_token,
                         Box::pin(spawn_guardian_review_session(
                             &params,
@@ -418,6 +420,26 @@ impl GuardianReviewSessionManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn trunk_session_id_for_test(&self) -> Option<String> {
+        let trunk = self.state.lock().await.trunk.clone()?;
+        Some(trunk.codex.session.conversation_id.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn trunk_collaboration_tree_id_for_test(&self) -> Option<String> {
+        let trunk = self.state.lock().await.trunk.clone()?;
+        Some(
+            trunk
+                .codex
+                .session
+                .services
+                .model_client
+                .current_collaboration_tree_id()
+                .to_string(),
+        )
+    }
+
     async fn remove_trunk_if_current(
         &self,
         trunk: &Arc<GuardianReviewSession>,
@@ -467,6 +489,7 @@ impl GuardianReviewSessionManager {
         let review_session = match run_before_review_deadline_with_cancel(
             deadline,
             params.external_cancel.as_ref(),
+            /*internal_cancel*/ None,
             &spawn_cancel_token,
             Box::pin(spawn_guardian_review_session(
                 &params,
@@ -511,10 +534,12 @@ async fn spawn_guardian_review_session(
         ),
         None => (None, 0, None),
     };
+    let compat_inherited_lease_auth_session =
+        params.parent_session.services.lease_auth.current_session();
     let codex = run_codex_thread_interactive(
         spawn_config,
         params.parent_session.services.auth_manager.clone(),
-        params.parent_session.services.lease_auth.current_session(),
+        compat_inherited_lease_auth_session,
         params.parent_session.services.models_manager.clone(),
         Arc::clone(&params.parent_session),
         Arc::clone(&params.parent_turn),
@@ -542,6 +567,7 @@ async fn run_review_on_session(
     params: &GuardianReviewSessionParams,
     deadline: tokio::time::Instant,
 ) -> (GuardianReviewSessionOutcome, bool) {
+    let invocation_cancel_token = review_session.cancel_token.child_token();
     let _collaboration_binding = review_session
         .codex
         .session
@@ -558,7 +584,7 @@ async fn run_review_on_session(
                 params.parent_turn.sub_id,
                 uuid::Uuid::now_v7()
             ),
-            review_session.cancel_token.clone(),
+            invocation_cancel_token.clone(),
         );
     let (send_followup_reminder, prompt_mode) = {
         let state = review_session.state.lock().await;
@@ -581,6 +607,7 @@ async fn run_review_on_session(
     let submit_result = run_before_review_deadline(
         deadline,
         params.external_cancel.as_ref(),
+        Some(&invocation_cancel_token),
         Box::pin(async {
             params
                 .parent_session
@@ -632,8 +659,13 @@ async fn run_review_on_session(
         }
     };
 
-    let outcome =
-        wait_for_guardian_review(review_session, deadline, params.external_cancel.as_ref()).await;
+    let outcome = wait_for_guardian_review(
+        review_session,
+        deadline,
+        params.external_cancel.as_ref(),
+        Some(&invocation_cancel_token),
+    )
+    .await;
     if matches!(outcome.0, GuardianReviewSessionOutcome::Completed(_)) {
         let mut state = review_session.state.lock().await;
         state.prior_review_count = state.prior_review_count.saturating_add(1);
@@ -668,6 +700,7 @@ async fn wait_for_guardian_review(
     review_session: &GuardianReviewSession,
     deadline: tokio::time::Instant,
     external_cancel: Option<&CancellationToken>,
+    internal_cancel: Option<&CancellationToken>,
 ) -> (GuardianReviewSessionOutcome, bool) {
     let timeout = tokio::time::sleep_until(deadline);
     tokio::pin!(timeout);
@@ -676,23 +709,26 @@ async fn wait_for_guardian_review(
     loop {
         tokio::select! {
             _ = &mut timeout => {
-                let keep_review_session = interrupt_and_drain_turn(&review_session.codex).await.is_ok();
-                return (GuardianReviewSessionOutcome::TimedOut, keep_review_session);
+                let _ = interrupt_and_drain_turn(&review_session.codex).await;
+                return (GuardianReviewSessionOutcome::TimedOut, false);
             }
             _ = async {
-                if let Some(cancel_token) = external_cancel {
-                    cancel_token.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
+                wait_for_any_cancel(external_cancel, internal_cancel).await;
             } => {
-                let keep_review_session = interrupt_and_drain_turn(&review_session.codex).await.is_ok();
-                return (GuardianReviewSessionOutcome::Aborted, keep_review_session);
+                let _ = interrupt_and_drain_turn(&review_session.codex).await;
+                return (GuardianReviewSessionOutcome::Aborted, false);
             }
             event = review_session.codex.next_event() => {
                 match event {
                     Ok(event) => match event.msg {
                         EventMsg::TurnComplete(turn_complete) => {
+                            if turn_complete.last_agent_message.is_none()
+                                && (external_cancel.is_some_and(CancellationToken::is_cancelled)
+                                    || internal_cancel
+                                        .is_some_and(CancellationToken::is_cancelled))
+                            {
+                                return (GuardianReviewSessionOutcome::Aborted, false);
+                            }
                             if turn_complete.last_agent_message.is_none()
                                 && let Some(error_message) = last_error_message
                             {
@@ -710,7 +746,7 @@ async fn wait_for_guardian_review(
                             last_error_message = Some(error.message);
                         }
                         EventMsg::TurnAborted(_) => {
-                            return (GuardianReviewSessionOutcome::Aborted, true);
+                            return (GuardianReviewSessionOutcome::Aborted, false);
                         }
                         _ => {}
                     },
@@ -785,17 +821,14 @@ pub(crate) fn build_guardian_review_session_config(
 async fn run_before_review_deadline<T>(
     deadline: tokio::time::Instant,
     external_cancel: Option<&CancellationToken>,
+    internal_cancel: Option<&CancellationToken>,
     future: impl Future<Output = T>,
 ) -> Result<T, GuardianReviewSessionOutcome> {
     tokio::select! {
         _ = tokio::time::sleep_until(deadline) => Err(GuardianReviewSessionOutcome::TimedOut),
         result = future => Ok(result),
         _ = async {
-            if let Some(cancel_token) = external_cancel {
-                cancel_token.cancelled().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
+            wait_for_any_cancel(external_cancel, internal_cancel).await;
         } => Err(GuardianReviewSessionOutcome::Aborted),
     }
 }
@@ -803,14 +836,38 @@ async fn run_before_review_deadline<T>(
 async fn run_before_review_deadline_with_cancel<T>(
     deadline: tokio::time::Instant,
     external_cancel: Option<&CancellationToken>,
+    internal_cancel: Option<&CancellationToken>,
     cancel_token: &CancellationToken,
     future: impl Future<Output = T>,
 ) -> Result<T, GuardianReviewSessionOutcome> {
-    let result = run_before_review_deadline(deadline, external_cancel, future).await;
+    let result =
+        run_before_review_deadline(deadline, external_cancel, internal_cancel, future).await;
     if result.is_err() {
         cancel_token.cancel();
     }
     result
+}
+
+async fn wait_for_any_cancel(
+    external_cancel: Option<&CancellationToken>,
+    internal_cancel: Option<&CancellationToken>,
+) {
+    tokio::select! {
+        _ = async {
+            if let Some(cancel_token) = external_cancel {
+                cancel_token.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            if let Some(cancel_token) = internal_cancel {
+                cancel_token.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+    }
 }
 
 async fn interrupt_and_drain_turn(codex: &Codex) -> anyhow::Result<()> {
@@ -874,6 +931,7 @@ mod tests {
         let outcome = run_before_review_deadline(
             tokio::time::Instant::now() + Duration::from_millis(10),
             /*external_cancel*/ None,
+            /*internal_cancel*/ None,
             async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             },
@@ -898,6 +956,7 @@ mod tests {
         let outcome = run_before_review_deadline(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Some(&cancel_token),
+            /*internal_cancel*/ None,
             std::future::pending::<()>(),
         )
         .await;
@@ -915,6 +974,7 @@ mod tests {
         let outcome = run_before_review_deadline_with_cancel(
             tokio::time::Instant::now() + Duration::from_millis(10),
             /*external_cancel*/ None,
+            /*internal_cancel*/ None,
             &cancel_token,
             async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -942,6 +1002,7 @@ mod tests {
         let outcome = run_before_review_deadline_with_cancel(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Some(&external_cancel),
+            /*internal_cancel*/ None,
             &cancel_token,
             std::future::pending::<()>(),
         )
@@ -961,6 +1022,7 @@ mod tests {
         let outcome = run_before_review_deadline_with_cancel(
             tokio::time::Instant::now() + Duration::from_secs(1),
             /*external_cancel*/ None,
+            /*internal_cancel*/ None,
             &cancel_token,
             async { 42usize },
         )

@@ -1407,9 +1407,11 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
+        approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy.get().clone(),
         network: None,
         model: previous_model.to_string(),
+        service_tier: None,
         personality: turn_context.personality,
         collaboration_mode: Some(turn_context.collaboration_mode.clone()),
         realtime_active: Some(turn_context.realtime_active),
@@ -2798,7 +2800,7 @@ async fn codex_spawn_preserves_runtime_lease_host_handle() {
         metrics_service_name: None,
         inherited_shell_snapshot: None,
         inherited_exec_policy: Some(Arc::new(ExecPolicyManager::default())),
-        inherited_lease_auth_session: None,
+        compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
         user_shell_override: None,
         parent_trace: None,
@@ -5452,6 +5454,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             tracker,
             call,
             ToolCallSource::Direct,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .err()
@@ -5694,6 +5697,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             tracker: Arc::clone(&turn_diff_tracker),
             call_id,
             tool_name: codex_tools::ToolName::plain(tool_name),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": params.command.clone(),
@@ -5772,6 +5776,7 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
             tracker: Arc::clone(&tracker),
             call_id: "exec-call".to_string(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "cmd": "echo hi",

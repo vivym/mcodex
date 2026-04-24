@@ -12,6 +12,8 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use core_test_support::PathBufExt;
@@ -114,6 +116,43 @@ fn truncates_before_requested_user_message() {
         serde_json::to_value(truncated2.get_rollout_items()).unwrap(),
         serde_json::to_value(initial2).unwrap()
     );
+}
+
+#[test]
+fn ensure_fork_history_reorders_canonical_session_meta_to_front() {
+    let canonical_thread_id = ThreadId::new();
+    let mismatched_thread_id = ThreadId::new();
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: mismatched_thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: canonical_thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::ResponseItem(user_msg("hello")),
+    ]);
+
+    let normalized =
+        ensure_fork_history_preserves_source_thread_id(history, Some(canonical_thread_id));
+
+    let InitialHistory::Forked(items) = normalized else {
+        panic!("expected forked history");
+    };
+    assert!(matches!(
+        items.first(),
+        Some(RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta { id, .. },
+            ..
+        })) if *id == canonical_thread_id
+    ));
 }
 
 #[test]
@@ -447,7 +486,7 @@ async fn non_threadspawn_child_with_explicit_runtime_parent_inherits_runtime_lea
             config,
             root.thread.codex.session.services.agent_control.clone(),
             SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
-            Some(root.thread_id),
+            RuntimeLeaseInheritanceSource::LookupThread(root.thread_id),
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
             /*inherited_shell_snapshot*/ None,

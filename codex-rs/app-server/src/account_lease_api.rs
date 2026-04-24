@@ -54,6 +54,7 @@ pub(crate) async fn read_account_lease(
 
 pub(crate) async fn resume_account_lease(
     config: &Config,
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
 ) -> Result<AccountLeaseUpdatedNotification, JSONRPCErrorError> {
     let state_db = init_state_db(config).await?;
 
@@ -78,6 +79,14 @@ pub(crate) async fn resume_account_lease(
     else {
         return Ok(empty_account_lease_response().into());
     };
+
+    if let Some(live_snapshot) = live_snapshot {
+        return Ok(account_lease_response_from_runtime_snapshot(
+            &live_snapshot,
+            Some(&startup_context.startup),
+        )
+        .into());
+    }
 
     Ok(account_lease_response_from_startup_status(startup_context.startup).into())
 }

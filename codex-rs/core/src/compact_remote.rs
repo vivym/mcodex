@@ -33,6 +33,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 
+struct RemoteCompactTaskRequest {
+    initial_context_injection: InitialContextInjection,
+    account_id_override: Option<String>,
+    trigger: CompactionTrigger,
+    reason: CompactionReason,
+    phase: CompactionPhase,
+    cancellation_token: CancellationToken,
+}
+
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -40,15 +49,19 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     account_id_override: Option<String>,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
-        initial_context_injection,
-        account_id_override,
-        CompactionTrigger::Auto,
-        reason,
-        phase,
+        RemoteCompactTaskRequest {
+            initial_context_injection,
+            account_id_override,
+            trigger: CompactionTrigger::Auto,
+            reason,
+            phase,
+            cancellation_token,
+        },
     )
     .await?;
     Ok(())
@@ -58,6 +71,7 @@ pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -70,11 +84,14 @@ pub(crate) async fn run_remote_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
-        InitialContextInjection::DoNotInject,
-        account_id_override,
-        CompactionTrigger::Manual,
-        CompactionReason::UserRequested,
-        CompactionPhase::StandaloneTurn,
+        RemoteCompactTaskRequest {
+            initial_context_injection: InitialContextInjection::DoNotInject,
+            account_id_override,
+            trigger: CompactionTrigger::Manual,
+            reason: CompactionReason::UserRequested,
+            phase: CompactionPhase::StandaloneTurn,
+            cancellation_token,
+        },
     )
     .await
 }
@@ -82,12 +99,16 @@ pub(crate) async fn run_remote_compact_task(
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    initial_context_injection: InitialContextInjection,
-    account_id_override: Option<String>,
-    trigger: CompactionTrigger,
-    reason: CompactionReason,
-    phase: CompactionPhase,
+    request: RemoteCompactTaskRequest,
 ) -> CodexResult<()> {
+    let RemoteCompactTaskRequest {
+        initial_context_injection,
+        account_id_override,
+        trigger,
+        reason,
+        phase,
+        cancellation_token,
+    } = request;
     let attempt = CompactionAnalyticsAttempt::begin(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -102,6 +123,7 @@ async fn run_remote_compact_task_inner(
         turn_context,
         initial_context_injection,
         account_id_override,
+        cancellation_token,
     )
     .await;
     attempt
@@ -126,6 +148,7 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
@@ -181,6 +204,8 @@ async fn run_remote_compact_task_inner_impl(
             summary: turn_context.reasoning_summary,
             session_telemetry: &turn_context.session_telemetry,
             turn_id: Some(&turn_context.sub_id),
+            collaboration_tree_id: sess.services.model_client.current_collaboration_tree_id(),
+            cancellation_token: cancellation_token.child_token(),
             account_id_override,
         })
         .or_else(|err| async {

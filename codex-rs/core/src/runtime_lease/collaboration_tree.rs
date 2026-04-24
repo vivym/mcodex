@@ -64,6 +64,7 @@ struct BindingState {
 struct BindingEntry {
     id: Uuid,
     tree_id: CollaborationTreeId,
+    member_id: Option<String>,
 }
 
 impl BindingState {
@@ -72,6 +73,12 @@ impl BindingState {
             .last()
             .map(|binding| &binding.tree_id)
             .unwrap_or(&self.base_tree_id)
+    }
+
+    fn current_member_id(&self) -> Option<&str> {
+        self.bindings
+            .last()
+            .and_then(|binding| binding.member_id.as_deref())
     }
 }
 
@@ -105,6 +112,14 @@ impl CollaborationTreeBindingHandle {
             .clone()
     }
 
+    pub(crate) fn current_member_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_member_id()
+            .map(ToString::to_string)
+    }
+
     pub(crate) fn set_current(&self, tree_id: CollaborationTreeId) -> CollaborationTreeId {
         let (previous_tree_id, current_tree_id) = {
             let mut state = self
@@ -120,7 +135,7 @@ impl CollaborationTreeBindingHandle {
         previous_tree_id
     }
 
-    fn push_binding(&self, tree_id: CollaborationTreeId) -> Uuid {
+    fn push_binding(&self, tree_id: CollaborationTreeId, member_id: Option<String>) -> Uuid {
         let binding_id = Uuid::now_v7();
         {
             let mut state = self
@@ -130,6 +145,7 @@ impl CollaborationTreeBindingHandle {
             state.bindings.push(BindingEntry {
                 id: binding_id,
                 tree_id: tree_id.clone(),
+                member_id,
             });
         }
         self.tx.send_replace(tree_id);
@@ -165,7 +181,10 @@ impl CollaborationTreeBinding {
         tree_id: CollaborationTreeId,
         membership: Option<CollaborationTreeMembership>,
     ) -> Self {
-        let binding_id = handle.push_binding(tree_id);
+        let member_id = membership
+            .as_ref()
+            .map(|membership| membership.member_id().to_string());
+        let binding_id = handle.push_binding(tree_id, member_id);
         Self {
             _membership: membership,
             binding_id,
@@ -183,6 +202,7 @@ impl Drop for CollaborationTreeBinding {
 pub(crate) struct CollaborationTreeMembership {
     registry: Arc<CollaborationTreeRegistry>,
     tree_id: CollaborationTreeId,
+    registration_id: Uuid,
     member_id: String,
 }
 
@@ -190,12 +210,20 @@ impl CollaborationTreeMembership {
     pub(crate) fn tree_id(&self) -> &CollaborationTreeId {
         &self.tree_id
     }
+
+    pub(crate) fn registration_id(&self) -> Uuid {
+        self.registration_id
+    }
+
+    pub(crate) fn member_id(&self) -> &str {
+        &self.member_id
+    }
 }
 
 impl Drop for CollaborationTreeMembership {
     fn drop(&mut self) {
         self.registry
-            .unregister_member(&self.tree_id, self.member_id.as_str());
+            .unregister_member(&self.tree_id, self.registration_id);
     }
 }
 
@@ -206,30 +234,81 @@ pub(crate) struct CollaborationTreeRegistry {
 
 #[derive(Default)]
 struct RegistryState {
-    members: HashMap<CollaborationTreeId, HashMap<String, CancellationToken>>,
+    members: HashMap<CollaborationTreeId, HashMap<Uuid, RegisteredMember>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollaborationRegistrationKind {
+    LongLived,
+    RequestLease,
+}
+
+struct RegisteredMember {
+    member_id: String,
+    cancellation_token: CancellationToken,
+    kind: CollaborationRegistrationKind,
 }
 
 impl CollaborationTreeRegistry {
-    pub(crate) fn register_member(
+    fn register_member(
         self: &Arc<Self>,
         tree_id: CollaborationTreeId,
         member_id: String,
         cancellation_token: CancellationToken,
+        kind: CollaborationRegistrationKind,
     ) -> CollaborationTreeMembership {
+        let registration_id = Uuid::now_v7();
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .members
             .entry(tree_id.clone())
             .or_default()
-            .insert(member_id.clone(), cancellation_token);
+            .insert(
+                registration_id,
+                RegisteredMember {
+                    member_id: member_id.clone(),
+                    cancellation_token,
+                    kind,
+                },
+            );
         CollaborationTreeMembership {
             registry: Arc::clone(self),
             tree_id,
+            registration_id,
             member_id,
         }
     }
 
+    pub(crate) fn register_long_lived_member(
+        self: &Arc<Self>,
+        tree_id: CollaborationTreeId,
+        member_id: String,
+        cancellation_token: CancellationToken,
+    ) -> CollaborationTreeMembership {
+        self.register_member(
+            tree_id,
+            member_id,
+            cancellation_token,
+            CollaborationRegistrationKind::LongLived,
+        )
+    }
+
+    pub(crate) fn register_request_member(
+        self: &Arc<Self>,
+        tree_id: CollaborationTreeId,
+        member_id: String,
+        cancellation_token: CancellationToken,
+    ) -> CollaborationTreeMembership {
+        self.register_member(
+            tree_id,
+            member_id,
+            cancellation_token,
+            CollaborationRegistrationKind::RequestLease,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn cancel_tree(&self, tree_id: &CollaborationTreeId) {
         let tokens = self
             .inner
@@ -237,14 +316,50 @@ impl CollaborationTreeRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .members
             .get(tree_id)
-            .map(|members| members.values().cloned().collect::<Vec<_>>())
+            .map(|members| {
+                members
+                    .values()
+                    .map(|member| member.cancellation_token.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         for token in tokens {
             token.cancel();
         }
     }
 
-    fn unregister_member(&self, tree_id: &CollaborationTreeId, member_id: &str) {
+    pub(crate) fn cancel_tree_for_terminal_unauthorized(
+        &self,
+        tree_id: &CollaborationTreeId,
+        exempt_member_id: Option<&str>,
+        exempt_request_registration_id: Option<Uuid>,
+    ) {
+        let tokens = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .members
+            .get(tree_id)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|(registration_id, member)| {
+                        if Some(**registration_id) == exempt_request_registration_id {
+                            return false;
+                        }
+                        !(member.kind == CollaborationRegistrationKind::LongLived
+                            && Some(member.member_id.as_str()) == exempt_member_id)
+                    })
+                    .map(|(_, member)| member.cancellation_token.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for token in tokens {
+            token.cancel();
+        }
+    }
+
+    fn unregister_member(&self, tree_id: &CollaborationTreeId, registration_id: Uuid) {
         let mut state = self
             .inner
             .lock()
@@ -252,7 +367,7 @@ impl CollaborationTreeRegistry {
         let Some(members) = state.members.get_mut(tree_id) else {
             return;
         };
-        members.remove(member_id);
+        members.remove(&registration_id);
         if members.is_empty() {
             state.members.remove(tree_id);
         }
@@ -276,7 +391,12 @@ impl CollaborationTreeRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .members
             .get(tree_id)
-            .map(|members| members.keys().cloned().collect())
+            .map(|members| {
+                members
+                    .values()
+                    .map(|member| member.member_id.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }

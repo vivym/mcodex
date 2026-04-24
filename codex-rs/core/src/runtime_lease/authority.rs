@@ -179,9 +179,11 @@ impl RuntimeLeaseAuthority {
                             && generation.accepting
                         {
                             let membership = self.register_collaboration_membership(&context);
+                            let registration_id = membership.registration_id();
                             match self.inner.try_admit(
                                 &context,
                                 generation,
+                                Some(registration_id),
                                 vec![Box::new(membership)],
                             ) {
                                 AdmissionAttempt::Admitted(admission) => {
@@ -326,7 +328,11 @@ impl RuntimeLeaseAuthority {
         };
         if report_result.as_ref().copied().unwrap_or(true) {
             self.collaboration_registry()
-                .cancel_tree(&snapshot.collaboration_tree_id);
+                .cancel_tree_for_terminal_unauthorized(
+                    &snapshot.collaboration_tree_id,
+                    snapshot.collaboration_member_id.as_deref(),
+                    snapshot.collaboration_registration_id,
+                );
         }
         report_result.map(|_| ())
     }
@@ -433,9 +439,11 @@ impl RuntimeLeaseAuthority {
             let heartbeat_guard =
                 start_manager_heartbeat(Arc::clone(&manager), heartbeat_interval, &context.cancel);
             let membership = self.register_collaboration_membership(&context);
+            let registration_id = membership.registration_id();
             match self.inner.try_admit(
                 &context,
                 &generation,
+                Some(registration_id),
                 vec![Box::new(heartbeat_guard), Box::new(membership)],
             ) {
                 AdmissionAttempt::Admitted(admission) => return Ok(*admission),
@@ -453,9 +461,13 @@ impl RuntimeLeaseAuthority {
         &self,
         context: &LeaseRequestContext,
     ) -> CollaborationTreeMembership {
-        self.collaboration_registry().register_member(
+        let member_id = context
+            .collaboration_member_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", context.session_id, Uuid::now_v7()));
+        self.collaboration_registry().register_request_member(
             context.collaboration_tree_id.clone(),
-            format!("{}:{}", context.session_id, Uuid::now_v7()),
+            member_id,
             context.cancel.clone(),
         )
     }
@@ -542,6 +554,7 @@ impl AuthorityInner {
         self: &Arc<Self>,
         context: &LeaseRequestContext,
         generation: &GenerationState,
+        collaboration_registration_id: Option<Uuid>,
         drop_guards: Vec<Box<dyn Send + Sync>>,
     ) -> AdmissionAttempt {
         if matches!(
@@ -570,6 +583,7 @@ impl AuthorityInner {
         let inner = Arc::clone(self);
         let snapshot = LeaseSnapshot {
             admission_id,
+            collaboration_registration_id,
             pool_id: generation.pool_id.clone(),
             account_id: generation.account_id.clone(),
             selection_family: generation.selection_family.clone(),
@@ -577,6 +591,7 @@ impl AuthorityInner {
             boundary: context.boundary,
             session_id: context.session_id.clone(),
             collaboration_tree_id: context.collaboration_tree_id.clone(),
+            collaboration_member_id: context.collaboration_member_id.clone(),
             allow_context_reuse: generation.allow_context_reuse,
             auth_handle: LeaseAuthHandle::new(Arc::clone(&generation.auth_session)),
         };

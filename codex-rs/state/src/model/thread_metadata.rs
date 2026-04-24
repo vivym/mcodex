@@ -126,6 +126,8 @@ pub struct ThreadMetadataBuilder {
     pub cwd: PathBuf,
     /// Version of the CLI that created the thread.
     pub cli_version: Option<String>,
+    /// Base instructions captured from session metadata, if present.
+    pub base_instructions: Option<String>,
     /// The sandbox policy.
     pub sandbox_policy: SandboxPolicy,
     /// The approval mode.
@@ -160,6 +162,7 @@ impl ThreadMetadataBuilder {
             model_provider: None,
             cwd: PathBuf::new(),
             cli_version: None,
+            base_instructions: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             approval_mode: AskForApproval::OnRequest,
             archived_at: None,

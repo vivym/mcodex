@@ -57,6 +57,7 @@ pub(crate) struct LeaseRequestContext {
     pub(crate) boundary: RequestBoundaryKind,
     pub(crate) session_id: String,
     pub(crate) collaboration_tree_id: CollaborationTreeId,
+    pub(crate) collaboration_member_id: Option<String>,
     pub(crate) cancel: CancellationToken,
 }
 
@@ -66,12 +67,14 @@ impl LeaseRequestContext {
         boundary: RequestBoundaryKind,
         session_id: String,
         collaboration_tree_id: CollaborationTreeId,
+        collaboration_member_id: Option<String>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             boundary,
             session_id,
             collaboration_tree_id,
+            collaboration_member_id,
             cancel,
         }
     }
@@ -86,6 +89,7 @@ impl LeaseRequestContext {
             boundary,
             session_id.to_string(),
             collaboration_tree_id,
+            /*collaboration_member_id*/ None,
             CancellationToken::new(),
         )
     }
@@ -101,6 +105,7 @@ impl LeaseRequestContext {
             boundary,
             session_id.to_string(),
             collaboration_tree_id,
+            /*collaboration_member_id*/ None,
             cancel,
         )
     }
@@ -137,6 +142,7 @@ impl LeaseAuthHandle {
 #[derive(Clone, Debug)]
 pub(crate) struct LeaseSnapshot {
     pub(crate) admission_id: Uuid,
+    pub(crate) collaboration_registration_id: Option<Uuid>,
     pub(crate) pool_id: String,
     pub(crate) account_id: String,
     pub(crate) selection_family: String,
@@ -144,6 +150,7 @@ pub(crate) struct LeaseSnapshot {
     pub(crate) boundary: RequestBoundaryKind,
     pub(crate) session_id: String,
     pub(crate) collaboration_tree_id: CollaborationTreeId,
+    pub(crate) collaboration_member_id: Option<String>,
     pub(crate) allow_context_reuse: bool,
     pub(crate) auth_handle: LeaseAuthHandle,
 }
@@ -196,6 +203,7 @@ impl LeaseSnapshot {
 
         Self {
             admission_id: Uuid::now_v7(),
+            collaboration_registration_id: None,
             pool_id: pool_id.to_string(),
             account_id: account_id.to_string(),
             selection_family: selection_family.to_string(),
@@ -203,6 +211,7 @@ impl LeaseSnapshot {
             boundary: RequestBoundaryKind::ResponsesHttp,
             session_id: "session-for-test".to_string(),
             collaboration_tree_id: CollaborationTreeId::for_test("tree-for-test"),
+            collaboration_member_id: None,
             allow_context_reuse,
             auth_handle: LeaseAuthHandle::new(Arc::new(TestLeaseScopedAuthSession {
                 binding: LeaseAuthBinding {

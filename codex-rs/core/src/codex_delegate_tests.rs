@@ -224,7 +224,7 @@ async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> an
     let child = run_codex_thread_interactive(
         pooled_config.as_ref().clone(),
         Arc::clone(&parent_session.services.auth_manager),
-        /*inherited_lease_auth_session*/ None,
+        /*compat_inherited_lease_auth_session*/ None,
         Arc::clone(&parent_session.services.models_manager),
         Arc::clone(&parent_session),
         parent_ctx,
@@ -333,7 +333,7 @@ async fn run_codex_thread_one_shot_registers_invocation_collaboration_membership
     let child = run_codex_thread_one_shot(
         pooled_config.as_ref().clone(),
         Arc::clone(&parent_session.services.auth_manager),
-        /*inherited_lease_auth_session*/ None,
+        /*compat_inherited_lease_auth_session*/ None,
         Arc::clone(&parent_session.services.models_manager),
         vec![UserInput::Text {
             text: "keep the review idle".into(),
