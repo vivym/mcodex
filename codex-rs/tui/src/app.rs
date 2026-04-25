@@ -3921,13 +3921,18 @@ impl App {
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
 
         #[cfg(not(debug_assertions))]
-        let pre_loop_exit_reason = if let Some(latest_version) = upgrade_version {
+        let pre_loop_exit_reason = if let Some(crate::updates::CachedUpdateInfo {
+            latest_version,
+            latest_notes_url,
+        }) = upgrade_version
+        {
             let control = app
                 .handle_event(
                     tui,
                     &mut app_server,
                     AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
                         latest_version,
+                        latest_notes_url,
                         crate::update_action::get_update_action(),
                     ))),
                 )
@@ -8854,9 +8859,11 @@ guardian_approval = true
             current_date: None,
             timezone: None,
             approval_policy: primary_session.approval_policy,
+            approvals_reviewer: Some(primary_session.approvals_reviewer),
             sandbox_policy: primary_session.sandbox_policy.clone(),
             network: None,
             model: "gpt-agent".to_string(),
+            service_tier: primary_session.service_tier,
             personality: None,
             collaboration_mode: None,
             realtime_active: Some(false),

@@ -300,6 +300,122 @@ fn register_root_thread_indexes_root_path() {
         registry.agent_id_for_path(&AgentPath::root()),
         Some(root_thread_id)
     );
+    assert_eq!(
+        registry.agent_metadata_for_thread(root_thread_id),
+        Some(AgentMetadata {
+            agent_id: Some(root_thread_id),
+            agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(root_thread_id),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn release_spawned_thread_keeps_root_placeholder_for_same_thread_id() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+
+    registry.register_root_thread(thread_id);
+    let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
+    reservation.commit(agent_metadata(thread_id));
+
+    registry.release_spawned_thread(thread_id);
+    let active_agents = registry
+        .active_agents
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        active_agents.agent_tree.get(AgentPath::ROOT),
+        Some(&AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(thread_id),
+            ..Default::default()
+        })
+    );
+    assert_eq!(active_agents.agent_tree.len(), 1);
+    drop(active_agents);
+
+    let reservation = registry
+        .reserve_spawn_slot(Some(1))
+        .expect("slot released after removing spawned entry");
+    drop(reservation);
+}
+
+#[test]
+fn thread_metadata_prefers_spawned_agent_over_root_placeholder_for_same_thread_id() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+    let mut reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
+    let spawned_metadata = AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_path: Some(agent_path("/root/researcher")),
+        root_thread_id: Some(thread_id),
+        agent_nickname: Some("Researcher".to_string()),
+        agent_role: Some("worker".to_string()),
+        last_task_message: Some("initial task".to_string()),
+    };
+
+    registry.register_root_thread(thread_id);
+    reservation
+        .reserve_agent_path(&agent_path("/root/researcher"))
+        .expect("reserve spawned path");
+    reservation.commit(spawned_metadata.clone());
+
+    assert_eq!(
+        registry.agent_metadata_for_thread(thread_id),
+        Some(spawned_metadata.clone())
+    );
+
+    registry.update_last_task_message(thread_id, "updated task".to_string());
+    let expected_metadata = AgentMetadata {
+        last_task_message: Some("updated task".to_string()),
+        ..spawned_metadata
+    };
+    assert_eq!(
+        registry.agent_metadata_for_thread(thread_id),
+        Some(expected_metadata)
+    );
+}
+
+#[test]
+fn path_metadata_keeps_root_distinct_from_spawned_duplicate_thread_id() {
+    let registry = Arc::new(AgentRegistry::default());
+    let thread_id = ThreadId::new();
+    let mut reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
+    let spawned_metadata = AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_path: Some(agent_path("/root/researcher")),
+        root_thread_id: Some(thread_id),
+        agent_nickname: Some("Researcher".to_string()),
+        agent_role: Some("worker".to_string()),
+        last_task_message: Some("initial task".to_string()),
+    };
+
+    registry.register_root_thread(thread_id);
+    reservation
+        .reserve_agent_path(&agent_path("/root/researcher"))
+        .expect("reserve spawned path");
+    reservation.commit(spawned_metadata.clone());
+
+    assert_eq!(
+        registry.agent_metadata_for_path(&AgentPath::root()),
+        Some(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(thread_id),
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        registry.agent_metadata_for_path(&agent_path("/root/researcher")),
+        Some(spawned_metadata)
+    );
+    assert!(
+        registry.live_agents().is_empty(),
+        "duplicate root thread id should not be listed as a separate live agent"
+    );
 }
 
 #[test]

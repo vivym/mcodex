@@ -3,66 +3,82 @@ use codex_product_identity::MCODEX;
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// Update via npm.
-    NpmGlobalLatest,
-    /// Update via bun.
-    BunGlobalLatest,
-    /// Update via Homebrew.
-    BrewUpgrade,
+    /// Update via the script-managed installer.
+    ScriptManagedLatest,
+}
+
+#[cfg_attr(test, derive(Debug, Clone, Copy, PartialEq, Eq))]
+pub(crate) enum UpdatePlatform {
+    Unix,
+    Windows,
+}
+
+impl UpdatePlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            UpdatePlatform::Windows
+        } else {
+            UpdatePlatform::Unix
+        }
+    }
 }
 
 impl UpdateAction {
-    /// Returns the list of command-line arguments for invoking the update.
-    pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", MCODEX.npm_package_name]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", MCODEX.npm_package_name]),
-            UpdateAction::BrewUpgrade => {
-                ("brew", &["upgrade", "--cask", MCODEX.homebrew_cask_token])
+    /// Returns the user-facing update command for display.
+    pub fn command_str(self) -> String {
+        self.display_command_for_platform(UpdatePlatform::current())
+            .to_string()
+    }
+
+    /// Returns the shell command and arguments for invoking the update.
+    pub fn shell_invocation(self) -> (&'static str, &'static [&'static str]) {
+        self.shell_invocation_for_platform(UpdatePlatform::current())
+    }
+
+    pub(crate) fn display_command_for_platform(self, platform: UpdatePlatform) -> &'static str {
+        match (self, platform) {
+            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Unix) => {
+                MCODEX.unix_install_command
+            }
+            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Windows) => {
+                MCODEX.windows_install_command
             }
         }
     }
 
-    /// Returns string representation of the command-line arguments for invoking the update.
-    pub fn command_str(self) -> String {
-        let (command, args) = self.command_args();
-        shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
-            .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
+    pub(crate) fn shell_invocation_for_platform(
+        self,
+        platform: UpdatePlatform,
+    ) -> (&'static str, &'static [&'static str]) {
+        match (self, platform) {
+            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Unix) => {
+                ("sh", &["-c", MCODEX.unix_install_command])
+            }
+            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Windows) => (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    MCODEX.windows_install_runner_command,
+                ],
+            ),
+        }
     }
 }
 
 #[cfg(not(debug_assertions))]
 pub(crate) fn get_update_action() -> Option<UpdateAction> {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let managed_by_npm = std::env::var_os("CODEX_MANAGED_BY_NPM").is_some();
-    let managed_by_bun = std::env::var_os("CODEX_MANAGED_BY_BUN").is_some();
+    let managed = std::env::var("MCODEX_INSTALL_MANAGED").as_deref() == Ok("1");
+    let method = std::env::var("MCODEX_INSTALL_METHOD").ok();
 
-    detect_update_action(
-        cfg!(target_os = "macos"),
-        &exe,
-        managed_by_npm,
-        managed_by_bun,
-    )
+    detect_update_action(managed, method.as_deref())
 }
 
 #[cfg(any(not(debug_assertions), test))]
-fn detect_update_action(
-    is_macos: bool,
-    current_exe: &std::path::Path,
-    managed_by_npm: bool,
-    managed_by_bun: bool,
-) -> Option<UpdateAction> {
-    if managed_by_npm {
-        Some(UpdateAction::NpmGlobalLatest)
-    } else if managed_by_bun {
-        Some(UpdateAction::BunGlobalLatest)
-    } else if is_macos
-        && (current_exe.starts_with("/opt/homebrew") || current_exe.starts_with("/usr/local"))
-    {
-        Some(UpdateAction::BrewUpgrade)
-    } else {
-        None
-    }
+fn detect_update_action(managed: bool, method: Option<&str>) -> Option<UpdateAction> {
+    (managed && method == Some("script")).then_some(UpdateAction::ScriptManagedLatest)
 }
 
 #[cfg(test)]
@@ -70,67 +86,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_update_action_without_env_mutation() {
+    fn detects_script_managed_update_action_only() {
         assert_eq!(
-            detect_update_action(
-                /*is_macos*/ false,
-                std::path::Path::new("/any/path"),
-                /*managed_by_npm*/ false,
-                /*managed_by_bun*/ false
-            ),
+            detect_update_action(/*managed*/ false, /*method*/ None),
             None
         );
         assert_eq!(
-            detect_update_action(
-                /*is_macos*/ false,
-                std::path::Path::new("/any/path"),
-                /*managed_by_npm*/ true,
-                /*managed_by_bun*/ false
-            ),
-            Some(UpdateAction::NpmGlobalLatest)
+            detect_update_action(/*managed*/ false, /*method*/ Some("script")),
+            None
         );
         assert_eq!(
-            detect_update_action(
-                /*is_macos*/ false,
-                std::path::Path::new("/any/path"),
-                /*managed_by_npm*/ false,
-                /*managed_by_bun*/ true
-            ),
-            Some(UpdateAction::BunGlobalLatest)
+            detect_update_action(/*managed*/ true, /*method*/ None),
+            None
         );
         assert_eq!(
-            detect_update_action(
-                /*is_macos*/ true,
-                std::path::Path::new("/opt/homebrew/bin/codex"),
-                /*managed_by_npm*/ false,
-                /*managed_by_bun*/ false
-            ),
-            Some(UpdateAction::BrewUpgrade)
+            detect_update_action(/*managed*/ true, /*method*/ Some("npm")),
+            None
         );
         assert_eq!(
-            detect_update_action(
-                /*is_macos*/ true,
-                std::path::Path::new("/usr/local/bin/codex"),
-                /*managed_by_npm*/ false,
-                /*managed_by_bun*/ false
-            ),
-            Some(UpdateAction::BrewUpgrade)
+            detect_update_action(/*managed*/ true, /*method*/ Some("script")),
+            Some(UpdateAction::ScriptManagedLatest)
         );
     }
 
     #[test]
-    fn update_commands_use_mcodex_identity() {
+    fn script_update_commands_use_oss_installers() {
         assert_eq!(
-            UpdateAction::NpmGlobalLatest.command_str(),
-            "npm install -g @vivym/mcodex"
+            UpdateAction::ScriptManagedLatest.display_command_for_platform(UpdatePlatform::Unix),
+            MCODEX.unix_install_command
         );
         assert_eq!(
-            UpdateAction::BunGlobalLatest.command_str(),
-            "bun install -g @vivym/mcodex"
+            UpdateAction::ScriptManagedLatest.display_command_for_platform(UpdatePlatform::Windows),
+            MCODEX.windows_install_command
         );
+    }
+
+    #[test]
+    fn script_update_runner_uses_unix_shell() {
         assert_eq!(
-            UpdateAction::BrewUpgrade.command_str(),
-            "brew upgrade --cask mcodex"
+            UpdateAction::ScriptManagedLatest.shell_invocation_for_platform(UpdatePlatform::Unix),
+            ("sh", &["-c", MCODEX.unix_install_command] as &[&str])
+        );
+    }
+
+    #[test]
+    fn script_update_runner_uses_single_powershell_invocation() {
+        let args: &[&str] = &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            MCODEX.windows_install_runner_command,
+        ];
+
+        assert_eq!(
+            UpdateAction::ScriptManagedLatest
+                .shell_invocation_for_platform(UpdatePlatform::Windows),
+            ("powershell", args)
         );
     }
 }

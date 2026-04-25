@@ -85,6 +85,14 @@ mod tests {
 
     #[async_trait]
     impl AccountPoolExecutionBackend for FakeStartupBackend {
+        async fn plan_runtime_selection(
+            &self,
+            _request: &crate::types::SelectionRequest,
+            _holder_instance_id: &str,
+        ) -> anyhow::Result<(String, crate::SelectionPlan)> {
+            unimplemented!("not used in tests")
+        }
+
         async fn acquire_lease(
             &self,
             _pool_id: &str,

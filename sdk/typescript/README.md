@@ -2,7 +2,11 @@
 
 Embed the Codex agent in your workflows and apps.
 
-The TypeScript SDK wraps the `codex` CLI from `@openai/codex`. It spawns the CLI and exchanges JSONL events over stdin/stdout.
+The TypeScript SDK wraps a local `mcodex` CLI. Install `mcodex` first with
+the OSS installer from `https://downloads.mcodex.sota.wiki/install.sh` or
+`https://downloads.mcodex.sota.wiki/install.ps1`, or pass an explicit CLI
+executable path when constructing the client. The SDK spawns the CLI and
+exchanges JSONL events over stdin/stdout.
 
 ## Installation
 
@@ -97,7 +101,7 @@ const turn = await thread.run([
 
 ### Resuming an existing thread
 
-Threads are persisted in `~/.codex/sessions`. If you lose the in-memory `Thread` object, reconstruct it with `resumeThread()` and keep going.
+Threads are persisted in `~/.mcodex/sessions` by default. If you lose the in-memory `Thread` object, reconstruct it with `resumeThread()` and keep going.
 
 ```typescript
 const savedThreadId = process.env.CODEX_THREAD_ID!;
@@ -116,9 +120,9 @@ const thread = codex.startThread({
 });
 ```
 
-### Controlling the Codex CLI environment
+### Controlling the mcodex CLI environment
 
-By default, the Codex CLI inherits the Node.js process environment. Provide the optional `env` parameter when instantiating the
+By default, the mcodex CLI inherits the Node.js process environment. Provide the optional `env` parameter when instantiating the
 `Codex` client to fully control which variables the CLI receives—useful for sandboxed hosts like Electron apps.
 
 ```typescript

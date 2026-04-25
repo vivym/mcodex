@@ -232,7 +232,7 @@ INSERT INTO account_pool_membership (
     Ok(())
 }
 
-async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> {
+async fn seed_busy_and_rate_limited_pool_state(codex_home: &TempDir) -> Result<()> {
     let pool = SqlitePool::connect(&format!(
         "sqlite://{}",
         state_db_path(codex_home.path()).display()
@@ -241,7 +241,9 @@ async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    let expires_at = now + 300;
+    let lease_expires_at = now + 300;
+    let quota_blocked_until = now + 300;
+    let quota_probe_after = now + 240;
 
     sqlx::query(
         r#"
@@ -265,42 +267,45 @@ INSERT INTO account_leases (
     .bind(0_i64)
     .bind(now)
     .bind(now)
-    .bind(expires_at)
+    .bind(lease_expires_at)
     .bind(Option::<i64>::None)
     .execute(&pool)
     .await?;
 
     sqlx::query(
         r#"
-INSERT INTO account_runtime_state (
+INSERT INTO account_quota_state (
     account_id,
-    pool_id,
-    health_state,
-    last_health_event_sequence,
-    last_health_event_at,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
     updated_at
-) VALUES (?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind("acct-2")
-    .bind("team-main")
-    .bind("rate_limited")
-    .bind(1_i64)
+    .bind("codex")
+    .bind(100.0_f64)
+    .bind(quota_blocked_until)
+    .bind(Option::<f64>::None)
+    .bind(Option::<i64>::None)
     .bind(now)
+    .bind(now.saturating_mul(1_000_000_000))
+    .bind("primary")
+    .bind(quota_blocked_until)
+    .bind(quota_probe_after)
+    .bind(0_i64)
+    .bind(Option::<String>::None)
     .bind(now)
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-UPDATE account_registry
-SET healthy = 0,
-    updated_at = ?
-WHERE account_id = ?
-        "#,
-    )
-    .bind(now)
-    .bind("acct-2")
     .execute(&pool)
     .await?;
 
@@ -1129,7 +1134,7 @@ async fn accounts_status_json_does_not_infer_migrated_from_legacy_default_pool_i
 #[tokio::test]
 async fn accounts_status_json_suppressed_preserves_hard_ineligibility_reasons() -> Result<()> {
     let codex_home = prepared_home().await?;
-    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+    seed_busy_and_rate_limited_pool_state(&codex_home).await?;
 
     let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
@@ -1177,7 +1182,7 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
         },
     )
     .await?;
-    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+    seed_busy_and_rate_limited_pool_state(&codex_home).await?;
 
     let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
@@ -1222,13 +1227,14 @@ async fn accounts_status_json_preserves_preferred_rate_limited_reason() -> Resul
         },
     )
     .await?;
-    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+    seed_busy_and_rate_limited_pool_state(&codex_home).await?;
 
     let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
-    assert_eq!(json["healthState"], "healthy");
+    assert_eq!(json["healthState"], "coolingDown");
+    assert!(json["nextEligibleAt"].as_str().is_some());
 
     let accounts = json["accounts"].as_array().expect("accounts array");
     assert_eq!(accounts[0]["accountId"], "acct-2");

@@ -4,14 +4,20 @@ use crate::StartupPoolInventory;
 use crate::StartupPreferredAccountOutcome;
 use crate::StartupSelectionFacts;
 use crate::backend::AccountPoolExecutionBackend;
+use crate::quota::ProbeOutcome;
 use crate::types::LeaseGrant;
 use async_trait::async_trait;
 use chrono::DateTime;
+use chrono::Duration;
 use chrono::Utc;
 use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountLeaseError;
+use codex_state::AccountQuotaProbeBackoff;
+use codex_state::AccountQuotaProbeObservation;
+use codex_state::AccountQuotaProbeStillBlocked;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionState;
 use codex_state::LeaseKey;
@@ -20,6 +26,14 @@ use std::sync::Arc;
 
 #[async_trait]
 impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
+    async fn plan_runtime_selection(
+        &self,
+        request: &crate::types::SelectionRequest,
+        holder_instance_id: &str,
+    ) -> anyhow::Result<(String, crate::SelectionPlan)> {
+        LocalAccountPoolBackend::plan_runtime_selection(self, request, holder_instance_id).await
+    }
+
     async fn acquire_lease(
         &self,
         pool_id: &str,
@@ -27,6 +41,28 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
     ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
         self.acquire_lease_excluding(pool_id, holder_instance_id, &[])
             .await
+    }
+
+    async fn read_active_holder_lease(
+        &self,
+        holder_instance_id: &str,
+    ) -> anyhow::Result<Option<LeaseGrant>> {
+        let Some(lease) = self
+            .runtime
+            .read_active_holder_lease(holder_instance_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        self.grant_for_lease_record(&lease)
+            .await
+            .map(Some)
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to rehydrate active holder lease {holder_instance_id}: {err}"
+                )
+            })
     }
 
     async fn acquire_lease_excluding(
@@ -44,43 +80,130 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
                 excluded_account_ids,
             )
             .await?;
-        let registered_account = match self
+        self.grant_for_lease_record(&lease).await
+    }
+
+    async fn acquire_preferred_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        selection_family: &str,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let lease = self
             .runtime
-            .read_registered_account(lease.account_id.as_str())
-            .await
-        {
-            Ok(Some(registered_account)) => registered_account,
-            Ok(None) => {
-                self.release_failed_acquisition(&lease, None).await;
-                return Err(AccountLeaseError::Storage(
-                    "registered account missing for acquired lease".to_string(),
-                ));
+            .acquire_preferred_account_lease(
+                pool_id,
+                account_id,
+                selection_family,
+                holder_instance_id,
+                self.lease_ttl,
+            )
+            .await?;
+        self.grant_for_lease_record(&lease).await
+    }
+
+    async fn acquire_probe_lease(
+        &self,
+        pool_id: &str,
+        account_id: &str,
+        reservation: &crate::backend::ProbeReservation,
+        holder_instance_id: &str,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let lease = self
+            .runtime
+            .acquire_quota_probe_account_lease(
+                pool_id,
+                account_id,
+                reservation.limit_id.as_str(),
+                reservation.reserved_until,
+                holder_instance_id,
+                self.lease_ttl,
+            )
+            .await?;
+        self.grant_for_lease_record(&lease).await
+    }
+
+    async fn reserve_quota_probe(
+        &self,
+        account_id: &str,
+        selection_family: &str,
+        now: DateTime<Utc>,
+        reserved_for: Duration,
+    ) -> anyhow::Result<Option<crate::backend::ProbeReservation>> {
+        let Some(quota_state) = self
+            .runtime
+            .read_selection_quota_state(account_id, selection_family)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let reserved_until = now + reserved_for;
+        let reserved_limit_id = quota_state.limit_id;
+
+        let reserved = self
+            .runtime
+            .reserve_account_quota_probe(
+                account_id,
+                reserved_limit_id.as_str(),
+                now,
+                reserved_until,
+            )
+            .await?;
+        if reserved {
+            Ok(Some(crate::backend::ProbeReservation {
+                limit_id: reserved_limit_id,
+                reserved_until,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn refresh_quota_probe(
+        &self,
+        lease: &LeaseGrant,
+        reservation: &crate::backend::ProbeReservation,
+    ) -> anyhow::Result<Option<ProbeOutcome>> {
+        let observed_at = Utc::now();
+        let quota_state = self
+            .runtime
+            .read_account_quota_state(lease.account_id(), reservation.limit_id.as_str())
+            .await?;
+        if lease.auth_session.ensure_current().is_err() {
+            if let Some(quota_state) = quota_state {
+                let backoff_until = observed_at + Duration::seconds(30);
+                let recorded = self
+                    .runtime
+                    .record_account_quota_probe_ambiguous(
+                        lease.account_id(),
+                        quota_state.limit_id.as_str(),
+                        AccountQuotaProbeObservation {
+                            observed_at,
+                            reserved_until: reservation.reserved_until,
+                        },
+                        AccountQuotaProbeBackoff {
+                            predicted_blocked_until: backoff_until,
+                            next_probe_after: backoff_until,
+                        },
+                    )
+                    .await?;
+                return Ok(recorded.then_some(ProbeOutcome::Ambiguous));
             }
-            Err(err) => {
-                self.release_failed_acquisition(&lease, None).await;
-                return Err(AccountLeaseError::Storage(err.to_string()));
-            }
+            return Ok(None);
         };
 
-        let binding = LeaseAuthBinding {
-            account_id: lease.account_id.clone(),
-            backend_account_handle: registered_account.backend_account_handle,
-            lease_epoch: lease.lease_epoch as u64,
+        let Some(quota_state) = quota_state else {
+            return Ok(None);
         };
-        if let Err(err) = self
-            .write_backend_private_lease_epoch(
-                binding.backend_account_handle.as_str(),
-                binding.lease_epoch,
-            )
-            .await
-        {
-            self.release_failed_acquisition(&lease, Some(&binding.backend_account_handle))
-                .await;
-            return Err(AccountLeaseError::Storage(err.to_string()));
-        }
-        let auth_home = self.backend_private_auth_home(&binding.backend_account_handle);
-        let auth_session = Arc::new(LocalLeaseScopedAuthSession::new(binding, auth_home));
-        Ok(LeaseGrant::from_record(lease, auth_session, None))
+
+        self.record_probe_refresh(
+            lease.account_id(),
+            quota_state,
+            observed_at,
+            reservation.reserved_until,
+        )
+        .await
     }
 
     async fn renew_lease(
@@ -186,6 +309,93 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
             any_eligible_account: predicted_account_id.is_some(),
             predicted_account_id,
         })
+    }
+}
+
+impl LocalAccountPoolBackend {
+    async fn grant_for_lease_record(
+        &self,
+        lease: &codex_state::AccountLeaseRecord,
+    ) -> std::result::Result<LeaseGrant, AccountLeaseError> {
+        let registered_account = match self
+            .runtime
+            .read_registered_account(lease.account_id.as_str())
+            .await
+        {
+            Ok(Some(registered_account)) => registered_account,
+            Ok(None) => {
+                self.release_failed_acquisition(lease, None).await;
+                return Err(AccountLeaseError::Storage(
+                    "registered account missing for acquired lease".to_string(),
+                ));
+            }
+            Err(err) => {
+                self.release_failed_acquisition(lease, None).await;
+                return Err(AccountLeaseError::Storage(err.to_string()));
+            }
+        };
+
+        let binding = LeaseAuthBinding {
+            account_id: lease.account_id.clone(),
+            backend_account_handle: registered_account.backend_account_handle,
+            lease_epoch: lease.lease_epoch as u64,
+        };
+        if let Err(err) = self
+            .write_backend_private_lease_epoch(
+                binding.backend_account_handle.as_str(),
+                binding.lease_epoch,
+            )
+            .await
+        {
+            self.release_failed_acquisition(lease, Some(&binding.backend_account_handle))
+                .await;
+            return Err(AccountLeaseError::Storage(err.to_string()));
+        }
+        let auth_home = self.backend_private_auth_home(&binding.backend_account_handle);
+        let auth_session = Arc::new(LocalLeaseScopedAuthSession::new(binding, auth_home));
+        Ok(LeaseGrant::from_record(lease.clone(), auth_session, None))
+    }
+
+    async fn record_probe_refresh(
+        &self,
+        account_id: &str,
+        quota_state: AccountQuotaStateRecord,
+        observed_at: DateTime<Utc>,
+        reserved_until: DateTime<Utc>,
+    ) -> anyhow::Result<Option<ProbeOutcome>> {
+        if !quota_state.exhausted_windows.is_exhausted() {
+            let recorded = self
+                .runtime
+                .record_account_quota_probe_success(
+                    account_id,
+                    quota_state.limit_id.as_str(),
+                    AccountQuotaProbeObservation {
+                        observed_at,
+                        reserved_until,
+                    },
+                )
+                .await?;
+            return Ok(recorded.then_some(ProbeOutcome::Success));
+        }
+
+        let next_probe_after = observed_at + Duration::seconds(30);
+        let recorded = self
+            .runtime
+            .record_account_quota_probe_still_blocked(
+                account_id,
+                quota_state.limit_id.as_str(),
+                AccountQuotaProbeObservation {
+                    observed_at,
+                    reserved_until,
+                },
+                AccountQuotaProbeStillBlocked {
+                    exhausted_windows: quota_state.exhausted_windows,
+                    predicted_blocked_until: quota_state.predicted_blocked_until,
+                    next_probe_after,
+                },
+            )
+            .await?;
+        Ok(recorded.then_some(ProbeOutcome::StillBlocked))
     }
 }
 

@@ -12,6 +12,8 @@ use crate::rollout::RolloutRecorder;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::thread_manager::RuntimeLeaseInheritance;
+use crate::thread_manager::RuntimeLeaseInheritanceSource;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use codex_features::Feature;
@@ -33,6 +35,7 @@ use codex_rollout::state_db;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -66,6 +69,12 @@ pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
     pub(crate) last_task_message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAgentReference {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) metadata: AgentMetadata,
 }
 
 fn default_agent_nickname_list() -> Vec<&'static str> {
@@ -148,6 +157,7 @@ impl AgentControl {
     }
 
     /// Spawn a new agent thread and submit the initial prompt.
+    #[cfg(test)]
     pub(crate) async fn spawn_agent(
         &self,
         config: crate::config::Config,
@@ -160,6 +170,45 @@ impl AgentControl {
                 initial_operation,
                 session_source,
                 SpawnAgentOptions::default(),
+                RuntimeLeaseInheritanceSource::None,
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn spawn_agent_from_parent_thread(
+        &self,
+        parent_thread_id: ThreadId,
+        config: crate::config::Config,
+        initial_operation: Op,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .spawn_agent_internal(
+                config,
+                initial_operation,
+                session_source,
+                SpawnAgentOptions::default(),
+                RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id),
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn spawn_agent_with_runtime_lease_inheritance(
+        &self,
+        inheritance: RuntimeLeaseInheritance,
+        config: crate::config::Config,
+        initial_operation: Op,
+        session_source: Option<SessionSource>,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .spawn_agent_internal(
+                config,
+                initial_operation,
+                session_source,
+                SpawnAgentOptions::default(),
+                RuntimeLeaseInheritanceSource::Explicit(inheritance),
             )
             .await?
             .thread_id)
@@ -173,8 +222,14 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions, // TODO(jif) drop with new fork.
     ) -> CodexResult<LiveAgent> {
-        self.spawn_agent_internal(config, initial_operation, session_source, options)
-            .await
+        self.spawn_agent_internal(
+            config,
+            initial_operation,
+            session_source,
+            options,
+            RuntimeLeaseInheritanceSource::None,
+        )
+        .await
     }
 
     async fn spawn_agent_internal(
@@ -183,6 +238,7 @@ impl AgentControl {
         initial_operation: Op,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
     ) -> CodexResult<LiveAgent> {
         let state = self.upgrade()?;
         let mut reservation = self.state.reserve_spawn_slot(config.agent_max_threads)?;
@@ -230,10 +286,11 @@ impl AgentControl {
             }
             (Some(session_source), None) => {
                 state
-                    .spawn_new_thread_with_source(
+                    .spawn_new_thread_with_source_and_runtime_parent(
                         config,
                         self.clone(),
                         session_source,
+                        runtime_lease_inheritance,
                         /*persist_extended_history*/ false,
                         /*metrics_service_name*/ None,
                         inherited_shell_snapshot,
@@ -694,7 +751,9 @@ impl AgentControl {
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
     async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
-        let descendant_ids = self.live_thread_spawn_descendants(agent_id).await?;
+        let descendant_ids = self
+            .live_thread_spawn_descendants_from_roots(&[agent_id])
+            .await?;
         let result = self.shutdown_live_agent(agent_id).await;
         for descendant_id in descendant_ids {
             match self.shutdown_live_agent(descendant_id).await {
@@ -731,13 +790,47 @@ impl AgentControl {
         self.state.agent_metadata_for_thread(agent_id)
     }
 
-    pub(crate) async fn list_live_agent_subtree_thread_ids(
+    pub(crate) fn get_agent_metadata_for_explicit_thread_target(
         &self,
         agent_id: ThreadId,
+    ) -> Option<AgentMetadata> {
+        self.state
+            .root_agent_metadata_for_thread(agent_id)
+            .or_else(|| self.state.agent_metadata_for_thread(agent_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_spawned_agent_for_test(
+        &self,
+        thread_id: ThreadId,
+        agent_path: AgentPath,
+        agent_nickname: Option<String>,
+        agent_role: Option<String>,
+        last_task_message: Option<String>,
+    ) {
+        let mut reservation = self
+            .state
+            .reserve_spawn_slot(/*max_threads*/ None)
+            .expect("test spawn slot should reserve");
+        reservation
+            .reserve_agent_path(&agent_path)
+            .expect("test agent path should reserve");
+        reservation.commit(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(agent_path),
+            root_thread_id: None,
+            agent_nickname,
+            agent_role,
+            last_task_message,
+        });
+    }
+
+    pub(crate) async fn list_live_agent_descendant_thread_ids_from_roots(
+        &self,
+        root_thread_ids: &[ThreadId],
     ) -> CodexResult<Vec<ThreadId>> {
-        let mut thread_ids = vec![agent_id];
-        thread_ids.extend(self.live_thread_spawn_descendants(agent_id).await?);
-        Ok(thread_ids)
+        self.live_thread_spawn_descendants_from_roots(root_thread_ids)
+            .await
     }
 
     pub(crate) async fn get_agent_config_snapshot(
@@ -753,20 +846,46 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    #[cfg(test)]
     pub(crate) async fn resolve_agent_reference(
+        &self,
+        current_thread_id: ThreadId,
+        current_session_source: &SessionSource,
+        agent_reference: &str,
+    ) -> CodexResult<ThreadId> {
+        Ok(self
+            .resolve_agent_reference_with_metadata(
+                current_thread_id,
+                current_session_source,
+                agent_reference,
+            )
+            .await?
+            .thread_id)
+    }
+
+    pub(crate) async fn resolve_agent_reference_with_metadata(
         &self,
         _current_thread_id: ThreadId,
         current_session_source: &SessionSource,
         agent_reference: &str,
-    ) -> CodexResult<ThreadId> {
+    ) -> CodexResult<ResolvedAgentReference> {
         let current_agent_path = current_session_source
             .get_agent_path()
             .unwrap_or_else(AgentPath::root);
         let agent_path = current_agent_path
             .resolve(agent_reference)
             .map_err(CodexErr::UnsupportedOperation)?;
-        if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
-            return Ok(thread_id);
+        if let Some(metadata) = self.state.agent_metadata_for_path(&agent_path) {
+            let Some(thread_id) = metadata.agent_id else {
+                return Err(CodexErr::UnsupportedOperation(format!(
+                    "live agent path `{}` is not bound to a thread",
+                    agent_path.as_str()
+                )));
+            };
+            return Ok(ResolvedAgentReference {
+                thread_id,
+                metadata,
+            });
         }
         Err(CodexErr::UnsupportedOperation(format!(
             "live agent path `{}` not found",
@@ -984,6 +1103,14 @@ impl AgentControl {
         if depth == 1 {
             self.state.register_root_thread(parent_thread_id);
         }
+        let root_thread_id = if depth == 1 {
+            parent_thread_id
+        } else {
+            self.state
+                .agent_metadata_for_thread(parent_thread_id)
+                .and_then(|metadata| metadata.root_thread_id)
+                .unwrap_or(parent_thread_id)
+        };
         if let Some(agent_path) = agent_path.as_ref() {
             reservation.reserve_agent_path(agent_path)?;
         }
@@ -1003,6 +1130,7 @@ impl AgentControl {
         let agent_metadata = AgentMetadata {
             agent_id: None,
             agent_path,
+            root_thread_id: Some(root_thread_id),
             agent_nickname,
             agent_role,
             last_task_message: None,
@@ -1133,21 +1261,88 @@ impl AgentControl {
         }
     }
 
-    async fn live_thread_spawn_descendants(
+    async fn live_thread_spawn_descendants_from_roots(
         &self,
-        root_thread_id: ThreadId,
+        root_thread_ids: &[ThreadId],
     ) -> CodexResult<Vec<ThreadId>> {
         let mut children_by_parent = self.live_thread_spawn_children().await?;
         let mut descendants = Vec::new();
-        let mut stack = children_by_parent
-            .remove(&root_thread_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(child_thread_id, _)| child_thread_id)
-            .rev()
-            .collect::<Vec<_>>();
+        let root_thread_id_set = root_thread_ids.iter().copied().collect::<HashSet<_>>();
+        let mut seen_thread_ids = root_thread_id_set.clone();
+        let mut stack = Vec::new();
+        for root_thread_id in root_thread_ids.iter().rev() {
+            stack.extend(
+                children_by_parent
+                    .remove(root_thread_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(child_thread_id, _)| child_thread_id)
+                    .rev(),
+            );
+        }
 
+        Self::drain_live_thread_spawn_descendants_stack(
+            &mut stack,
+            &mut children_by_parent,
+            &mut seen_thread_ids,
+            &mut descendants,
+        );
+
+        let state = self.upgrade()?;
+        let mut orphan_descendants = Vec::new();
+        for thread_id in state.list_thread_ids().await {
+            if seen_thread_ids.contains(&thread_id) || root_thread_id_set.contains(&thread_id) {
+                continue;
+            }
+            let Some(metadata) = self.state.agent_metadata_for_thread(thread_id) else {
+                continue;
+            };
+            if metadata
+                .root_thread_id
+                .is_some_and(|root_thread_id| root_thread_id_set.contains(&root_thread_id))
+            {
+                orphan_descendants.push((thread_id, metadata));
+            }
+        }
+        orphan_descendants.sort_by(|left, right| {
+            left.1
+                .agent_path
+                .as_deref()
+                .unwrap_or_default()
+                .cmp(right.1.agent_path.as_deref().unwrap_or_default())
+                .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+        });
+        descendants.extend(orphan_descendants.into_iter().filter_map(|(thread_id, _)| {
+            if !seen_thread_ids.insert(thread_id) {
+                return None;
+            }
+            if let Some(children) = children_by_parent.remove(&thread_id) {
+                for (child_thread_id, _) in children.into_iter().rev() {
+                    stack.push(child_thread_id);
+                }
+            }
+            Some(thread_id)
+        }));
+        Self::drain_live_thread_spawn_descendants_stack(
+            &mut stack,
+            &mut children_by_parent,
+            &mut seen_thread_ids,
+            &mut descendants,
+        );
+
+        Ok(descendants)
+    }
+
+    fn drain_live_thread_spawn_descendants_stack(
+        stack: &mut Vec<ThreadId>,
+        children_by_parent: &mut HashMap<ThreadId, Vec<(ThreadId, AgentMetadata)>>,
+        seen_thread_ids: &mut HashSet<ThreadId>,
+        descendants: &mut Vec<ThreadId>,
+    ) {
         while let Some(thread_id) = stack.pop() {
+            if !seen_thread_ids.insert(thread_id) {
+                continue;
+            }
             descendants.push(thread_id);
             if let Some(children) = children_by_parent.remove(&thread_id) {
                 for (child_thread_id, _) in children.into_iter().rev() {
@@ -1155,8 +1350,6 @@ impl AgentControl {
                 }
             }
         }
-
-        Ok(descendants)
     }
 }
 

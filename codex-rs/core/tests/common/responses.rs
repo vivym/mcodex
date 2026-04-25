@@ -1352,8 +1352,24 @@ pub async fn start_websocket_server_with_headers(
             if close_after_requests {
                 let _ = ws_stream.close(None).await;
             } else {
-                let _ = shutdown_rx.await;
-                return;
+                loop {
+                    let next_message = tokio::select! {
+                        _ = &mut shutdown_rx => return,
+                        next_message = ws_stream.next() => next_message,
+                    };
+                    match next_message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_)))
+                        | Some(Ok(Message::Text(_)))
+                        | Some(Ok(Message::Binary(_)))
+                        | Some(Ok(Message::Frame(_))) => {}
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    }
+                }
             }
 
             if connections.lock().unwrap().is_empty() {

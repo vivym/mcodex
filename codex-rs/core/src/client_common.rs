@@ -156,8 +156,35 @@ fn strip_total_output_header(output: &str) -> Option<(&str, u32)> {
     Some((remainder, total_lines))
 }
 
+struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct ResponseStream {
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    _abort_handle: Option<AbortTaskOnDrop>,
+}
+
+impl ResponseStream {
+    pub(crate) fn new(
+        rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+        abort_handle: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            rx_event,
+            _abort_handle: abort_handle.map(AbortTaskOnDrop::new),
+        }
+    }
 }
 
 impl Stream for ResponseStream {

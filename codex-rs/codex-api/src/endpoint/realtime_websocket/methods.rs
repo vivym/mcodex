@@ -1,3 +1,4 @@
+use crate::TransportError;
 use crate::endpoint::realtime_websocket::methods_common::conversation_handoff_append_message;
 use crate::endpoint::realtime_websocket::methods_common::conversation_item_create_message;
 use crate::endpoint::realtime_websocket::methods_common::normalized_session_mode;
@@ -576,7 +577,7 @@ impl RealtimeWebsocketClient {
             connector,
         )
         .await
-        .map_err(|err| ApiError::Stream(format!("failed to connect realtime websocket: {err}")))?;
+        .map_err(|err| map_realtime_ws_error(err, &ws_url))?;
         info!(
             ws_url = %ws_url,
             status = %response.status(),
@@ -599,6 +600,30 @@ impl RealtimeWebsocketClient {
             )
             .await?;
         Ok(connection)
+    }
+}
+
+fn map_realtime_ws_error(err: WsError, url: &Url) -> ApiError {
+    match err {
+        WsError::Http(response) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response
+                .body()
+                .as_ref()
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+            ApiError::Transport(TransportError::Http {
+                status,
+                url: Some(url.to_string()),
+                headers: Some(headers),
+                body,
+            })
+        }
+        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            ApiError::Stream("websocket closed".to_string())
+        }
+        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
+        other => ApiError::Transport(TransportError::Network(other.to_string())),
     }
 }
 

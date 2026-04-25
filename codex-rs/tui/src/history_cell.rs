@@ -505,16 +505,28 @@ impl HistoryCell for PlainHistoryCell {
 #[derive(Debug)]
 pub(crate) struct UpdateAvailableHistoryCell {
     latest_version: String,
+    latest_notes_url: Option<String>,
     update_action: Option<UpdateAction>,
 }
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
 impl UpdateAvailableHistoryCell {
-    pub(crate) fn new(latest_version: String, update_action: Option<UpdateAction>) -> Self {
+    pub(crate) fn new(
+        latest_version: String,
+        latest_notes_url: Option<String>,
+        update_action: Option<UpdateAction>,
+    ) -> Self {
         Self {
             latest_version,
+            latest_notes_url,
             update_action,
         }
+    }
+
+    fn latest_notes_url(&self) -> &str {
+        self.latest_notes_url
+            .as_deref()
+            .unwrap_or(MCODEX.release_notes_url)
     }
 }
 
@@ -542,7 +554,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             update_instruction,
             "",
             "See full release notes:",
-            MCODEX.release_notes_url.cyan().underlined(),
+            self.latest_notes_url().to_string().cyan().underlined(),
         ];
 
         let inner_width = content
@@ -3270,6 +3282,24 @@ mod tests {
         );
         let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn update_available_history_cell_uses_script_install_command_only() {
+        let cell = UpdateAvailableHistoryCell::new(
+            "9.9.9".to_string(),
+            Some("https://example.com/releases/9.9.9".to_string()),
+            Some(UpdateAction::ScriptManagedLatest),
+        );
+
+        let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
+
+        assert!(rendered.contains(UpdateAction::ScriptManagedLatest.command_str().as_str()));
+        assert!(rendered.contains("https://example.com/releases/9.9.9"));
+        assert!(!rendered.contains(MCODEX.release_notes_url));
+        assert!(!rendered.contains("npm"));
+        assert!(!rendered.contains("bun"));
+        assert!(!rendered.contains("brew"));
     }
 
     #[tokio::test]

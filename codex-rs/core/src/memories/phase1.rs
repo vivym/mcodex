@@ -35,6 +35,7 @@ use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub(in crate::memories) struct RequestContext {
+    pub(in crate::memories) turn_id: String,
     pub(in crate::memories) model_info: ModelInfo,
     pub(in crate::memories) session_telemetry: SessionTelemetry,
     pub(in crate::memories) reasoning_effort: Option<ReasoningEffortConfig>,
@@ -167,6 +168,7 @@ impl RequestContext {
         model_info: ModelInfo,
     ) -> Self {
         Self {
+            turn_id: turn_context.sub_id.clone(),
             model_info,
             turn_metadata_header,
             session_telemetry: turn_context.session_telemetry.clone(),
@@ -352,6 +354,7 @@ mod job {
                 stage_one_context.reasoning_effort,
                 stage_one_context.reasoning_summary,
                 stage_one_context.service_tier,
+                Some(&stage_one_context.turn_id),
                 stage_one_context.turn_metadata_header.as_deref(),
             )
             .await?;

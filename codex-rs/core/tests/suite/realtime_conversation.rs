@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsVersion;
-use codex_config::types::AccountsConfigToml;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
@@ -605,27 +604,18 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
 
     skip_if_no_network!(Ok(()));
 
-    let server = start_websocket_server(vec![vec![vec![json!({
+    let session_updated = vec![json!({
         "type": "session.updated",
         "session": { "id": "sess_env", "instructions": "backend prompt" }
-    })]]])
-    .await;
+    })];
+    // Startup prewarm is optional when runtime lease plumbing is present. Make
+    // either the optional prewarm or the realtime start connection usable; the
+    // assertion below still targets the realtime handshake that carries the env
+    // API key.
+    let server =
+        start_websocket_server(vec![vec![session_updated.clone()], vec![session_updated]]).await;
 
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            // Suppress responses-websocket startup prewarm so this server only services realtime.
-            config.accounts = Some(AccountsConfigToml {
-                backend: None,
-                default_pool: None,
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: None,
-            });
-        });
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build_with_websocket_server(&server).await?;
 
     test.codex

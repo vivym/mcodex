@@ -98,7 +98,6 @@ impl ThreadState {
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
-        self.last_account_lease_notification = None;
     }
 
     pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
@@ -237,6 +236,18 @@ impl ThreadStateManager {
         state.threads.entry(thread_id).or_default().state.clone()
     }
 
+    pub(crate) async fn thread_state_if_exists(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<Mutex<ThreadState>>> {
+        self.state
+            .lock()
+            .await
+            .threads
+            .get(&thread_id)
+            .map(|thread_entry| thread_entry.state.clone())
+    }
+
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
         let thread_state = {
             let mut state = self.state.lock().await;
@@ -259,6 +270,28 @@ impl ThreadStateManager {
                 had_listener = thread_state.cancel_tx.is_some(),
                 had_active_turn = thread_state.active_turn_snapshot().is_some(),
                 "clearing thread listener during thread-state teardown"
+            );
+            thread_state.clear_listener();
+        }
+    }
+
+    pub(crate) async fn clear_thread_listener(&self, thread_id: ThreadId) {
+        let thread_state = {
+            let state = self.state.lock().await;
+            state
+                .threads
+                .get(&thread_id)
+                .map(|thread_entry| thread_entry.state.clone())
+        };
+
+        if let Some(thread_state) = thread_state {
+            let mut thread_state = thread_state.lock().await;
+            tracing::debug!(
+                thread_id = %thread_id,
+                listener_generation = thread_state.listener_generation,
+                had_listener = thread_state.cancel_tx.is_some(),
+                had_active_turn = thread_state.active_turn_snapshot().is_some(),
+                "clearing thread listener"
             );
             thread_state.clear_listener();
         }

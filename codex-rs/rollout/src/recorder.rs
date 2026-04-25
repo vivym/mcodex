@@ -697,6 +697,11 @@ impl RolloutRecorder {
             }
         }
 
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+            && let Some((_created_at, uuid)) = parse_timestamp_uuid_from_filename(file_name)
+        {
+            thread_id = ThreadId::from_string(&uuid.to_string()).ok();
+        }
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),

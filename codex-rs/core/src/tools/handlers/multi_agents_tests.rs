@@ -1,7 +1,7 @@
 use super::*;
 use crate::CodexThread;
 use crate::ThreadManager;
-use crate::codex::make_session_and_context;
+use crate::codex::make_session_and_context as make_base_session_and_context;
 use crate::config::AgentRoleConfig;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
@@ -70,6 +70,7 @@ fn invocation(
         tracker: Arc::new(Mutex::new(TurnDiffTracker::default())),
         call_id: "call-1".to_string(),
         tool_name: codex_tools::ToolName::plain(tool_name),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
         payload,
     }
 }
@@ -85,10 +86,19 @@ fn parse_agent_id(id: &str) -> ThreadId {
 }
 
 fn thread_manager() -> ThreadManager {
-    ThreadManager::with_models_provider_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
-    )
+    let mut provider =
+        built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
+    provider.supports_websockets = false;
+    ThreadManager::with_models_provider_for_tests(CodexAuth::from_api_key("dummy"), provider)
+}
+
+async fn make_session_and_context() -> (crate::codex::Session, TurnContext) {
+    let (session, mut turn) = make_base_session_and_context().await;
+    Arc::make_mut(&mut turn.config)
+        .model_provider
+        .supports_websockets = false;
+    turn.provider.supports_websockets = false;
+    (session, turn)
 }
 
 async fn install_role_with_model_override(turn: &mut TurnContext) -> String {
@@ -3221,6 +3231,57 @@ async fn multi_agent_v2_close_agent_rejects_root_target_and_id() {
     assert_eq!(
         root_id_error,
         FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_close_agent_rejects_root_uuid_when_spawned_metadata_shares_thread_id() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.conversation_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    turn.config = Arc::new(config);
+    session
+        .services
+        .agent_control
+        .register_session_root(session.conversation_id, &turn.session_source);
+    session
+        .services
+        .agent_control
+        .register_spawned_agent_for_test(
+            root.thread_id,
+            AgentPath::try_from("/root/duplicate").expect("agent path"),
+            Some("Duplicate".to_string()),
+            Some("worker".to_string()),
+            Some("duplicate task".to_string()),
+        );
+
+    let err = CloseAgentHandlerV2
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": root.thread_id.to_string()})),
+        ))
+        .await
+        .expect_err("close_agent should still reject the root thread id");
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("root is not a spawned agent".to_string())
+    );
+    assert_ne!(
+        manager.agent_control().get_status(root.thread_id).await,
+        AgentStatus::NotFound
     );
 }
 

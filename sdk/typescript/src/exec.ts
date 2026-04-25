@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
@@ -53,6 +54,16 @@ const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
 };
 
 const moduleRequire = createRequire(import.meta.url);
+const MCODEX_NAMES = ["mcodex"] as const;
+const WINDOWS_MCODEX_NAMES = ["mcodex.exe", "mcodex.ps1", "mcodex"] as const;
+
+type FindCodexPathOptions = {
+  envPath?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  pathExists?: (candidate: string) => boolean;
+  resolvePackageJson?: (specifier: string, from?: string) => string;
+};
 
 export class CodexExec {
   private executablePath: string;
@@ -161,7 +172,8 @@ export class CodexExec {
       env.CODEX_API_KEY = args.apiKey;
     }
 
-    const child = spawn(this.executablePath, commandArgs, {
+    const spawnCommand = getSpawnCommand(this.executablePath, commandArgs);
+    const child = spawn(spawnCommand.executablePath, spawnCommand.args, {
       env,
       signal: args.signal,
     });
@@ -314,8 +326,52 @@ function isPlainObject(value: unknown): value is CodexConfigObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function getSpawnCommand(
+  executablePath: string,
+  args: string[],
+): { executablePath: string; args: string[] } {
+  if (process.platform === "win32" && executablePath.toLowerCase().endsWith(".ps1")) {
+    return {
+      executablePath: "powershell.exe",
+      args: [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        executablePath,
+        ...args,
+      ],
+    };
+  }
+
+  return { executablePath, args };
+}
+
 function findCodexPath() {
-  const { platform, arch } = process;
+  return _findCodexPathForTesting();
+}
+
+export function _findCodexPathForTesting(options: FindCodexPathOptions = {}) {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const envPath = options.envPath ?? process.env.PATH;
+  const pathExists = options.pathExists ?? fs.existsSync;
+  const resolvePackageJson = options.resolvePackageJson ?? defaultResolvePackageJson;
+  const pathModule = platform === "win32" ? path.win32 : path.posix;
+  const delimiter = platform === "win32" ? ";" : ":";
+  const executableNames = platform === "win32" ? WINDOWS_MCODEX_NAMES : MCODEX_NAMES;
+
+  const pathDirectories = envPath?.split(delimiter).filter(Boolean) ?? [];
+
+  for (const directory of pathDirectories) {
+    for (const executableName of executableNames) {
+      const candidate = pathModule.join(directory, executableName);
+      if (pathExists(candidate)) {
+        return candidate;
+      }
+    }
+  }
 
   let targetTriple = null;
   switch (platform) {
@@ -361,29 +417,50 @@ function findCodexPath() {
   }
 
   if (!targetTriple) {
-    throw new Error(`Unsupported platform: ${platform} (${arch})`);
+    throw new Error(getUnsupportedTargetErrorMessage(platform, arch));
   }
 
   const platformPackage = PLATFORM_PACKAGE_BY_TARGET[targetTriple];
   if (!platformPackage) {
-    throw new Error(`Unsupported target triple: ${targetTriple}`);
+    throw new Error(getMissingCliErrorMessage());
   }
 
   let vendorRoot: string;
   try {
-    const codexPackageJsonPath = moduleRequire.resolve(`${CODEX_NPM_NAME}/package.json`);
-    const codexRequire = createRequire(codexPackageJsonPath);
-    const platformPackageJsonPath = codexRequire.resolve(`${platformPackage}/package.json`);
-    vendorRoot = path.join(path.dirname(platformPackageJsonPath), "vendor");
-  } catch {
-    throw new Error(
-      `Unable to locate Codex CLI binaries. Ensure ${CODEX_NPM_NAME} is installed with optional dependencies.`,
+    const codexPackageJsonPath = resolvePackageJson(`${CODEX_NPM_NAME}/package.json`);
+    const platformPackageJsonPath = resolvePackageJson(
+      `${platformPackage}/package.json`,
+      codexPackageJsonPath,
     );
+    vendorRoot = pathModule.join(pathModule.dirname(platformPackageJsonPath), "vendor");
+  } catch {
+    throw new Error(getMissingCliErrorMessage());
   }
 
-  const archRoot = path.join(vendorRoot, targetTriple);
-  const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-  const binaryPath = path.join(archRoot, "codex", codexBinaryName);
+  const archRoot = pathModule.join(vendorRoot, targetTriple);
+  const codexBinaryName = platform === "win32" ? "codex.exe" : "codex";
+  const binaryPath = pathModule.join(archRoot, "codex", codexBinaryName);
 
   return binaryPath;
+}
+
+function defaultResolvePackageJson(specifier: string, from?: string): string {
+  if (from) {
+    return createRequire(from).resolve(specifier);
+  }
+
+  return moduleRequire.resolve(specifier);
+}
+
+function getMissingCliErrorMessage(): string {
+  return (
+    "Unable to locate the mcodex CLI. Install it with " +
+    "https://downloads.mcodex.sota.wiki/install.sh on macOS/Linux or " +
+    "https://downloads.mcodex.sota.wiki/install.ps1 on Windows, " +
+    "or pass an explicit executable path to the CodexExec constructor."
+  );
+}
+
+function getUnsupportedTargetErrorMessage(platform: NodeJS.Platform, arch: string): string {
+  return `Unsupported platform or architecture for the mcodex CLI: ${platform}/${arch}.`;
 }

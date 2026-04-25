@@ -1,4 +1,5 @@
 use crate::SkillsManager;
+use crate::StateDbHandle;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnArgs;
@@ -11,6 +12,8 @@ use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
+use crate::runtime_lease::CollaborationTreeId;
+use crate::runtime_lease::RuntimeLeaseHost;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills_watcher::SkillsWatcher;
 use crate::skills_watcher::SkillsWatcherEvent;
@@ -40,11 +43,13 @@ use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -71,6 +76,19 @@ static FORCE_TEST_THREAD_MANAGER_BEHAVIOR: AtomicBool = AtomicBool::new(false);
 
 type CapturedOps = Vec<(ThreadId, Op)>;
 type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
+
+#[derive(Clone)]
+pub(crate) struct RuntimeLeaseInheritance {
+    pub(crate) host: Option<RuntimeLeaseHost>,
+    pub(crate) collaboration_tree_id: CollaborationTreeId,
+}
+
+#[derive(Clone)]
+pub(crate) enum RuntimeLeaseInheritanceSource {
+    None,
+    LookupThread(ThreadId),
+    Explicit(RuntimeLeaseInheritance),
+}
 
 pub(crate) fn set_thread_manager_test_mode_for_tests(enabled: bool) {
     FORCE_TEST_THREAD_MANAGER_BEHAVIOR.store(enabled, Ordering::Relaxed);
@@ -418,38 +436,67 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let thread = self.state.get_thread(thread_id).await?;
+        let root_thread = self.state.get_thread(thread_id).await;
+        let root_missing = root_thread.is_err();
 
         let mut subtree_thread_ids = Vec::new();
         let mut seen_thread_ids = HashSet::new();
         subtree_thread_ids.push(thread_id);
         seen_thread_ids.insert(thread_id);
 
-        if let Some(state_db_ctx) = thread.state_db() {
-            for status in [
-                DirectionalThreadSpawnEdgeStatus::Open,
-                DirectionalThreadSpawnEdgeStatus::Closed,
-            ] {
-                for descendant_id in state_db_ctx
-                    .list_thread_spawn_descendants_with_status(thread_id, status)
-                    .await
-                    .map_err(|err| {
+        let state_db_contexts = match &root_thread {
+            Ok(thread) => thread.state_db().into_iter().collect(),
+            Err(_) => self.live_state_db_contexts().await,
+        };
+
+        let mut found_persisted_root = false;
+        let mut pending_persisted_lookup_error = None;
+        for state_db_ctx in state_db_contexts {
+            let root_known = match state_db_ctx.get_thread(thread_id).await {
+                Ok(root_known) => root_known,
+                Err(err) if root_missing => {
+                    pending_persisted_lookup_error.get_or_insert_with(|| {
+                        CodexErr::Fatal(format!("failed to load thread metadata: {err}"))
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "failed to load thread metadata: {err}"
+                    )));
+                }
+            };
+            let persisted_descendants = match state_db_ctx
+                .list_thread_spawn_descendants(thread_id)
+                .await
+            {
+                Ok(persisted_descendants) => persisted_descendants,
+                Err(err) if root_missing && root_known.is_none() => {
+                    pending_persisted_lookup_error.get_or_insert_with(|| {
                         CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
-                    })?
-                {
-                    if seen_thread_ids.insert(descendant_id) {
-                        subtree_thread_ids.push(descendant_id);
-                    }
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "failed to load thread-spawn descendants: {err}"
+                    )));
+                }
+            };
+            if root_known.is_none() && persisted_descendants.is_empty() {
+                continue;
+            }
+            found_persisted_root = true;
+            for descendant_id in persisted_descendants {
+                if seen_thread_ids.insert(descendant_id) {
+                    subtree_thread_ids.push(descendant_id);
                 }
             }
         }
 
-        for descendant_id in thread
-            .codex
-            .session
-            .services
-            .agent_control
-            .list_live_agent_subtree_thread_ids(thread_id)
+        for descendant_id in self
+            .agent_control()
+            .list_live_agent_descendant_thread_ids_from_roots(&subtree_thread_ids)
             .await?
         {
             if seen_thread_ids.insert(descendant_id) {
@@ -457,7 +504,68 @@ impl ThreadManager {
             }
         }
 
+        if root_missing
+            && !found_persisted_root
+            && let Some(err) = pending_persisted_lookup_error
+        {
+            return Err(err);
+        }
+
+        if subtree_thread_ids.len() == 1 && root_missing && !found_persisted_root {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+
         Ok(subtree_thread_ids)
+    }
+
+    /// List `thread_id` plus currently live descendants, without consulting persisted edges.
+    ///
+    /// This is for runtime-ownership decisions where protecting live subagents is more important
+    /// than returning archived or closed descendants. Completeness-sensitive callers should use
+    /// [`Self::list_agent_subtree_thread_ids`].
+    pub async fn list_live_agent_subtree_thread_ids(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let root_missing = self.state.get_thread(thread_id).await.is_err();
+        let mut subtree_thread_ids = vec![thread_id];
+        let mut seen_thread_ids = HashSet::from([thread_id]);
+
+        for descendant_id in self
+            .agent_control()
+            .list_live_agent_descendant_thread_ids_from_roots(&subtree_thread_ids)
+            .await?
+        {
+            if seen_thread_ids.insert(descendant_id) {
+                subtree_thread_ids.push(descendant_id);
+            }
+        }
+
+        if subtree_thread_ids.len() == 1 && root_missing {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+
+        Ok(subtree_thread_ids)
+    }
+
+    async fn live_state_db_contexts(&self) -> Vec<StateDbHandle> {
+        let mut state_db_contexts = Vec::new();
+        for candidate_thread_id in self.state.list_thread_ids().await {
+            let Ok(thread) = self.state.get_thread(candidate_thread_id).await else {
+                continue;
+            };
+            let Some(state_db_ctx) = thread.state_db() else {
+                continue;
+            };
+            if state_db_contexts
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &state_db_ctx))
+            {
+                continue;
+            }
+            state_db_contexts.push(state_db_ctx);
+        }
+        state_db_contexts
     }
 
     pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
@@ -667,6 +775,11 @@ impl ThreadManager {
     {
         let snapshot = snapshot.into();
         let history = RolloutRecorder::get_rollout_history(&path).await?;
+        let source_thread_id = match &history {
+            InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+            InitialHistory::Forked(_) => history.forked_from_id(),
+            InitialHistory::New | InitialHistory::Cleared => None,
+        };
         let snapshot_state = snapshot_turn_state(&history);
         let history = match snapshot {
             ForkSnapshot::TruncateBeforeNthUserMessage(nth_user_message) => {
@@ -686,6 +799,7 @@ impl ThreadManager {
                 }
             }
         };
+        let history = ensure_fork_history_preserves_source_thread_id(history, source_thread_id);
         Box::pin(self.state.spawn_thread(
             config,
             history,
@@ -784,12 +898,38 @@ impl ThreadManagerState {
         inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
     ) -> CodexResult<NewThread> {
+        Box::pin(self.spawn_new_thread_with_source_and_runtime_parent(
+            config,
+            agent_control,
+            session_source,
+            RuntimeLeaseInheritanceSource::None,
+            persist_extended_history,
+            metrics_service_name,
+            inherited_shell_snapshot,
+            inherited_exec_policy,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_new_thread_with_source_and_runtime_parent(
+        &self,
+        config: Config,
+        agent_control: AgentControl,
+        session_source: SessionSource,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
+        persist_extended_history: bool,
+        metrics_service_name: Option<String>,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+    ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            runtime_lease_inheritance,
             Vec::new(),
             persist_extended_history,
             metrics_service_name,
@@ -817,6 +957,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            RuntimeLeaseInheritanceSource::None,
             Vec::new(),
             /*persist_extended_history*/ false,
             /*metrics_service_name*/ None,
@@ -845,6 +986,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            RuntimeLeaseInheritanceSource::None,
             Vec::new(),
             persist_extended_history,
             /*metrics_service_name*/ None,
@@ -876,6 +1018,7 @@ impl ThreadManagerState {
             auth_manager,
             agent_control,
             self.session_source.clone(),
+            RuntimeLeaseInheritanceSource::None,
             dynamic_tools,
             persist_extended_history,
             metrics_service_name,
@@ -895,6 +1038,7 @@ impl ThreadManagerState {
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
+        runtime_lease_inheritance: RuntimeLeaseInheritanceSource,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
@@ -911,9 +1055,71 @@ impl ThreadManagerState {
                 self.plugins_manager.as_ref(),
             )
             .await;
-        let CodexSpawnOk {
-            codex, thread_id, ..
-        } = Codex::spawn(CodexSpawnArgs {
+        let parent_runtime_thread_id = match &session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => RuntimeLeaseInheritanceSource::LookupThread(*parent_thread_id),
+            SessionSource::SubAgent(_) => runtime_lease_inheritance,
+            SessionSource::Cli
+            | SessionSource::VSCode
+            | SessionSource::Exec
+            | SessionSource::Mcp
+            | SessionSource::Custom(_)
+            | SessionSource::Unknown => RuntimeLeaseInheritanceSource::None,
+        };
+        let (runtime_lease_host, initial_collaboration_tree_id) = match parent_runtime_thread_id {
+            RuntimeLeaseInheritanceSource::None => (None, None),
+            RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => {
+                let parent_thread = self
+                    .threads
+                    .read()
+                    .await
+                    .get(&parent_thread_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CodexErr::Fatal(format!(
+                            "runtime lease parent thread {parent_thread_id} is not loaded; cannot inherit runtime lease authority"
+                        ))
+                    })?;
+                (
+                    parent_thread
+                        .codex
+                        .session
+                        .services
+                        .runtime_lease_host
+                        .clone(),
+                    Some(
+                        parent_thread
+                            .codex
+                            .session
+                            .services
+                            .model_client
+                            .current_collaboration_tree_id(),
+                    ),
+                )
+            }
+            RuntimeLeaseInheritanceSource::Explicit(inheritance) => {
+                (inheritance.host, Some(inheritance.collaboration_tree_id))
+            }
+        };
+        let mut runtime_lease_startup_reservation =
+            if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
+                Some(
+                host.try_reserve_startup_for_child(format!(
+                    "threadspawn-subagent-startup-{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to reserve runtime lease startup for thread-spawn child: {err:#}"
+                    ))
+                })?,
+            )
+            } else {
+                None
+            };
+        let spawn_result = Codex::spawn(CodexSpawnArgs {
             config,
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
@@ -930,12 +1136,45 @@ impl ThreadManagerState {
             metrics_service_name,
             inherited_shell_snapshot,
             inherited_exec_policy,
-            inherited_lease_auth_session: None,
+            compat_inherited_lease_auth_session: None,
+            runtime_lease_host,
             user_shell_override,
             parent_trace,
             analytics_events_client: self.analytics_events_client.clone(),
         })
-        .await?;
+        .await;
+        let CodexSpawnOk {
+            codex, thread_id, ..
+        } = match spawn_result {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                if let Some(reservation) = runtime_lease_startup_reservation.take()
+                    && let Err(rollback_err) = reservation.rollback().await
+                {
+                    warn!(
+                        "failed to roll back runtime lease startup reservation after thread spawn failure: {rollback_err:#}"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        if let Some(tree_id) = initial_collaboration_tree_id {
+            codex
+                .session
+                .services
+                .model_client
+                .set_collaboration_tree_id(tree_id);
+        }
+        if let Some(reservation) = runtime_lease_startup_reservation.take()
+            && let Err(err) = reservation
+                .promote_to_session(&codex.session.conversation_id.to_string())
+                .await
+        {
+            let _ = codex.shutdown_and_wait().await;
+            return Err(CodexErr::Fatal(format!(
+                "failed to promote runtime lease startup reservation: {err:#}"
+            )));
+        }
         self.finalize_thread_spawn(codex, thread_id, watch_registration)
             .await
     }
@@ -1007,6 +1246,46 @@ fn truncate_before_nth_user_message(
         InitialHistory::New
     } else {
         InitialHistory::Forked(rolled)
+    }
+}
+
+fn ensure_fork_history_preserves_source_thread_id(
+    history: InitialHistory,
+    source_thread_id: Option<ThreadId>,
+) -> InitialHistory {
+    let Some(source_thread_id) = source_thread_id else {
+        return history;
+    };
+    match history {
+        InitialHistory::Forked(mut items) => {
+            if let Some(session_meta_index) = items.iter().position(|item| {
+                matches!(
+                    item,
+                    RolloutItem::SessionMeta(SessionMetaLine {
+                        meta: SessionMeta { id, .. },
+                        ..
+                    }) if *id == source_thread_id
+                )
+            }) {
+                if session_meta_index != 0 {
+                    let session_meta = items.remove(session_meta_index);
+                    items.insert(0, session_meta);
+                }
+            } else {
+                items.insert(
+                    0,
+                    RolloutItem::SessionMeta(SessionMetaLine {
+                        meta: SessionMeta {
+                            id: source_thread_id,
+                            ..Default::default()
+                        },
+                        git: None,
+                    }),
+                );
+            }
+            InitialHistory::Forked(items)
+        }
+        InitialHistory::New | InitialHistory::Cleared | InitialHistory::Resumed(_) => history,
     }
 }
 

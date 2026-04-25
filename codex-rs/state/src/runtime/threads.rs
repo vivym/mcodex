@@ -143,6 +143,17 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
             .await
     }
 
+    /// List all spawned descendants of `root_thread_id`, regardless of edge status.
+    ///
+    /// Descendants are returned breadth-first by depth, then by thread id for stable ordering.
+    pub async fn list_thread_spawn_descendants(
+        &self,
+        root_thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<ThreadId>> {
+        self.list_thread_spawn_descendants_matching(root_thread_id, None)
+            .await
+    }
+
     /// Find a direct spawned child of `parent_thread_id` by canonical agent path.
     pub async fn find_thread_spawn_child_by_path(
         &self,
@@ -230,22 +241,29 @@ LIMIT 2
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
-        let status_filter = if status.is_some() {
+        let anchor_status_filter = if status.is_some() {
             " AND status = ?"
+        } else {
+            ""
+        };
+        let recursive_status_filter = if status.is_some() {
+            " AND edge.status = ?"
         } else {
             ""
         };
         let query = format!(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth) AS (
-    SELECT child_thread_id, 1
+WITH RECURSIVE subtree(child_thread_id, depth, path) AS (
+    SELECT child_thread_id, 1, ',' || child_thread_id || ','
     FROM thread_spawn_edges
-    WHERE parent_thread_id = ?{status_filter}
+    WHERE parent_thread_id = ?{anchor_status_filter}
+      AND child_thread_id != ?
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT edge.child_thread_id, subtree.depth + 1, subtree.path || edge.child_thread_id || ','
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE 1 = 1{status_filter}
+    WHERE edge.child_thread_id != ?
+      AND instr(subtree.path, ',' || edge.child_thread_id || ',') = 0{recursive_status_filter}
 )
 SELECT child_thread_id
 FROM subtree
@@ -254,9 +272,13 @@ ORDER BY depth ASC, child_thread_id ASC
         );
 
         let mut sql = sqlx::query(query.as_str()).bind(root_thread_id.to_string());
+        if let Some(status) = status.as_ref() {
+            sql = sql.bind(status.to_string());
+        }
+        sql = sql.bind(root_thread_id.to_string());
+        sql = sql.bind(root_thread_id.to_string());
         if let Some(status) = status {
-            let status = status.to_string();
-            sql = sql.bind(status.clone()).bind(status);
+            sql = sql.bind(status.to_string());
         }
 
         let rows = sql.fetch_all(self.pool.as_ref()).await?;
@@ -814,6 +836,8 @@ ON CONFLICT(thread_id, position) DO NOTHING
             self.upsert_thread(&metadata).await
         };
         upsert_result?;
+        self.upsert_thread_config_baseline_from_rollout_items(builder, items)
+            .await?;
         if let Some(memory_mode) = extract_memory_mode(items)
             && let Err(err) = self
                 .set_thread_memory_mode(builder.id, memory_mode.as_str())
@@ -929,7 +953,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
     })
 }
 
-fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
+pub(super) fn thread_spawn_parent_thread_id_from_source_str(source: &str) -> Option<ThreadId> {
     let parsed_source = serde_json::from_str(source)
         .or_else(|_| serde_json::from_value::<SessionSource>(Value::String(source.to_string())));
     match parsed_source.ok() {
@@ -1514,5 +1538,31 @@ mod tests {
             .await
             .expect("open descendants from child should load");
         assert_eq!(open_descendants_from_child, vec![grandchild_thread_id]);
+
+        let mixed_status_descendants = runtime
+            .list_thread_spawn_descendants(parent_thread_id)
+            .await
+            .expect("mixed-status descendants should load");
+        assert_eq!(
+            mixed_status_descendants,
+            vec![child_thread_id, grandchild_thread_id]
+        );
+
+        runtime
+            .upsert_thread_spawn_edge(
+                grandchild_thread_id,
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("root back-edge insert should succeed");
+        let cyclic_descendants = runtime
+            .list_thread_spawn_descendants(parent_thread_id)
+            .await
+            .expect("cyclic mixed-status descendants should load");
+        assert_eq!(
+            cyclic_descendants,
+            vec![child_thread_id, grandchild_thread_id]
+        );
     }
 }

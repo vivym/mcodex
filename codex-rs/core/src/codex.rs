@@ -46,6 +46,7 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
 use crate::turn_metadata::TurnMetadataState;
 use crate::util::error_or_panic;
+use anyhow::Context;
 use async_channel::Receiver;
 use async_channel::Sender;
 use chrono::Local;
@@ -440,7 +441,8 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
-    pub(crate) inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
@@ -495,7 +497,8 @@ impl Codex {
             inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
+            runtime_lease_host,
             parent_trace: _,
             analytics_events_client,
         } = args;
@@ -687,7 +690,8 @@ impl Codex {
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
+            runtime_lease_host,
             environment,
             analytics_events_client,
         )
@@ -819,10 +823,15 @@ impl Codex {
     }
 
     pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
+        if let Some(runtime_lease_host) = self.session.services.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+        {
+            return runtime_lease_host.account_lease_snapshot().await;
+        }
         let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
         let snapshot_seed = {
             let account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.snapshot_seed()
+            account_pool_manager.snapshot_seed().await
         };
         Some(snapshot_seed.snapshot().await)
     }
@@ -831,7 +840,7 @@ impl Codex {
         self.session.current_auth().await
     }
 
-    pub(crate) async fn current_lease_bridge_account_id(&self) -> Option<String> {
+    pub(crate) async fn current_auth_account_id(&self) -> Option<String> {
         self.current_auth()
             .await
             .and_then(|auth| auth.get_account_id())
@@ -1108,9 +1117,11 @@ impl TurnContext {
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
+            approvals_reviewer: Some(self.config.approvals_reviewer),
             sandbox_policy: self.sandbox_policy.get().clone(),
             network: self.turn_context_network_item(),
             model: self.model_info.slug.clone(),
+            service_tier: self.config.service_tier,
             personality: self.personality,
             collaboration_mode: Some(self.collaboration_mode.clone()),
             realtime_active: Some(self.realtime_active),
@@ -1673,7 +1684,8 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
-        inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
         environment: Option<Arc<Environment>>,
         analytics_events_client: Option<AnalyticsEventsClient>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -1682,6 +1694,7 @@ impl Session {
             session_configuration.collaboration_mode.model(),
             session_configuration.provider
         );
+        let session_source_for_runtime_host = session_source.clone();
         let forked_from_id = initial_history.forked_from_id();
 
         let (conversation_id, rollout_params) = match &initial_history {
@@ -2059,10 +2072,61 @@ impl Session {
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
+        let runtime_lease_host = if runtime_lease_host.is_some()
+            || matches!(session_source_for_runtime_host, SessionSource::SubAgent(_))
+        {
+            runtime_lease_host
+        } else {
+            SessionServices::build_root_runtime_lease_host(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                &account_pool_holder_instance_id,
+            )
+            .await?
+        };
+        let inherited_pooled_runtime_host = matches!(
+            (&session_source_for_runtime_host, runtime_lease_host.as_ref()),
+            (
+                SessionSource::SubAgent(_),
+                Some(host)
+            ) if host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
+        );
+        let pooled_runtime_host_active = runtime_lease_host
+            .as_ref()
+            .is_some_and(crate::runtime_lease::RuntimeLeaseHost::is_pooled);
+        let pooled_root_needs_authority = pooled_runtime_host_active
+            && !inherited_pooled_runtime_host
+            && runtime_lease_host
+                .as_ref()
+                .is_some_and(|host| host.pooled_authority().is_none());
+        debug_assert!(
+            !(inherited_pooled_runtime_host && compat_inherited_lease_auth_session.is_some()),
+            "inherited pooled runtime host must not be combined with static inherited lease auth"
+        );
+        if inherited_pooled_runtime_host && let Some(host) = runtime_lease_host.as_ref() {
+            host.ensure_child_startup_ready().map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "inherited pooled runtime host is not usable for child session: {err:#}"
+                ))
+            })?;
+        }
+        // Static lease inheritance remains as compatibility for children that do
+        // not receive a pooled runtime host.
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
-        lease_auth.replace_current(inherited_lease_auth_session.clone());
+        lease_auth.replace_current(compat_inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let account_pool_manager = if inherited_lease_auth_session.is_some() {
+        let authority_owned_runtime_lease = if pooled_root_needs_authority {
+            SessionServices::build_root_runtime_lease_authority(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                config.codex_home.clone().to_path_buf(),
+                account_pool_holder_instance_id.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
+        let account_pool_manager = if pooled_runtime_host_active {
             None
         } else {
             SessionServices::build_account_pool_manager(
@@ -2073,6 +2137,12 @@ impl Session {
             )
             .await?
         };
+        let session_id = conversation_id.to_string();
+        agent_control.register_session_root(conversation_id, &session_configuration.session_source);
+        let root_collaboration_tree_binding =
+            Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
+                crate::runtime_lease::CollaborationTreeId::root_for_session(&session_id),
+            ));
         let analytics_events_client = analytics_events_client.unwrap_or_else(|| {
             AnalyticsEventsClient::new_with_auth_provider(
                 lease_auth_provider,
@@ -2119,10 +2189,17 @@ impl Session {
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             account_pool_manager,
+            runtime_lease_host: runtime_lease_host.clone(),
             lease_auth: Arc::clone(&lease_auth),
-            model_client: ModelClient::new(
+            model_client: ModelClient::new_with_runtime_lease(
                 Some(Arc::clone(&auth_manager)),
                 Some(lease_auth),
+                runtime_lease_host,
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runtime_lease::SessionLeaseView::new(),
+                ))),
+                session_id,
+                root_collaboration_tree_binding,
                 conversation_id,
                 installation_id,
                 session_configuration.provider.clone(),
@@ -2199,7 +2276,6 @@ impl Session {
         for event in events {
             sess.send_event_raw(event).await;
         }
-
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
         sess.start_skills_watcher_listener();
         // Construct sandbox_state before MCP startup so it can be sent to each
@@ -2278,7 +2354,21 @@ impl Session {
                 ));
             }
         }
-        if sess.services.account_pool_manager.is_none() {
+        if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+            && runtime_lease_host.pooled_authority().is_none()
+            && let Some(runtime_lease_authority) = authority_owned_runtime_lease.as_ref()
+        {
+            runtime_lease_host
+                .install_authority(runtime_lease_authority.clone())
+                .with_context(|| {
+                    format!(
+                        "failed to publish runtime lease authority for session {}",
+                        sess.conversation_id
+                    )
+                })?;
+        }
+        if !sess.services.pooled_runtime_active() {
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
         }
@@ -2302,6 +2392,9 @@ impl Session {
             Arc::clone(&config),
             &session_configuration.session_source,
         );
+        sess.services
+            .attach_runtime_lease_session(&sess.conversation_id.to_string())
+            .await;
 
         Ok(sess)
     }
@@ -2445,6 +2538,11 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                self
+                    .clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+                        turn_context.as_ref(),
+                    )
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -2481,6 +2579,11 @@ impl Session {
             }
             InitialHistory::Forked(rollout_items) => {
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                    .await;
+                self
+                    .clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+                        turn_context.as_ref(),
+                    )
                     .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -2523,6 +2626,53 @@ impl Session {
         self.set_previous_turn_settings(previous_turn_settings.clone())
             .await;
         previous_turn_settings
+    }
+
+    async fn clear_reference_context_when_reconstructed_history_misses_developer_instructions(
+        &self,
+        turn_context: &TurnContext,
+    ) {
+        let Some(expected_developer_instructions) = turn_context
+            .developer_instructions
+            .as_deref()
+            .filter(|instructions| !instructions.is_empty())
+        else {
+            return;
+        };
+
+        let mut state = self.state.lock().await;
+        let history_contains_expected_developer_instructions =
+            state.history.raw_items().iter().any(|item| match item {
+                ResponseItem::Message { role, content, .. } if role == "developer" => {
+                    content.iter().any(|content_item| {
+                        matches!(
+                            content_item,
+                            ContentItem::InputText { text }
+                                if text.contains(expected_developer_instructions)
+                        )
+                    })
+                }
+                ResponseItem::Message { .. }
+                | ResponseItem::Reasoning { .. }
+                | ResponseItem::FunctionCall { .. }
+                | ResponseItem::FunctionCallOutput { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::ToolSearchOutput { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::CustomToolCallOutput { .. }
+                | ResponseItem::Compaction { .. }
+                | ResponseItem::GhostSnapshot { .. }
+                | ResponseItem::Other => false,
+            });
+        if history_contains_expected_developer_instructions {
+            return;
+        }
+
+        state.history.strip_pre_turn_context_updates();
+        state.set_reference_context_item(None);
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -2801,6 +2951,11 @@ impl Session {
             .session_configuration
             .original_config_do_not_use
             .clone()
+    }
+
+    pub(crate) async fn session_source(&self) -> SessionSource {
+        let state = self.state.lock().await;
+        state.session_configuration.session_source.clone()
     }
 
     pub(crate) async fn provider(&self) -> ModelProviderInfo {
@@ -4043,6 +4198,7 @@ impl Session {
         // context items. This keeps later runtime diffing aligned with the current turn state.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
+        drop(state);
     }
 
     pub(crate) async fn update_token_usage_info(
@@ -4095,15 +4251,6 @@ impl Session {
         turn_context: &TurnContext,
         new_rate_limits: RateLimitSnapshot,
     ) {
-        if let Some(account_pool_manager) = self.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            if let Err(err) = account_pool_manager
-                .report_rate_limits(&new_rate_limits)
-                .await
-            {
-                warn!("failed to record account-pool rate-limit snapshot: {err:#}");
-            }
-        }
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);
@@ -4938,12 +5085,12 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
     // Also drain cached guardian state if the submission loop exits because
     // the channel closed without receiving an explicit shutdown op.
     sess.guardian_review_session.shutdown().await;
-    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-        let mut account_pool_manager = account_pool_manager.lock().await;
-        if let Err(err) = account_pool_manager.release_for_shutdown().await {
-            warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
-        }
-        sess.services.lease_auth.clear();
+    if let Err(err) = sess
+        .services
+        .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+        .await
+    {
+        warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
     }
     debug!("Agent loop exited");
 }
@@ -5889,12 +6036,12 @@ mod handlers {
             .unified_exec_manager
             .terminate_all_processes()
             .await;
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            if let Err(err) = account_pool_manager.release_for_shutdown().await {
-                warn!("failed to release account-pool lease during shutdown: {err:#}");
-            }
-            sess.services.lease_auth.clear();
+        if let Err(err) = sess
+            .services
+            .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+            .await
+        {
+            warn!("failed to release account-pool lease during shutdown: {err:#}");
         }
         sess.guardian_review_session.shutdown().await;
         info!("Shutting down Codex instance");
@@ -6188,56 +6335,6 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
         .collect()
 }
 
-pub(crate) struct AccountLeaseHeartbeatGuard {
-    cancellation_token: CancellationToken,
-    task: JoinHandle<()>,
-}
-
-impl Drop for AccountLeaseHeartbeatGuard {
-    fn drop(&mut self) {
-        self.cancellation_token.cancel();
-        self.task.abort();
-    }
-}
-
-pub(crate) async fn start_account_pool_lease_heartbeat(
-    sess: &Arc<Session>,
-    lease_selected_for_turn: bool,
-    cancellation_token: &CancellationToken,
-) -> Option<AccountLeaseHeartbeatGuard> {
-    if !lease_selected_for_turn {
-        return None;
-    }
-    let account_pool_manager = sess.services.account_pool_manager.as_ref()?;
-    let heartbeat_interval = {
-        let account_pool_manager = account_pool_manager.lock().await;
-        account_pool_manager.heartbeat_interval()
-    };
-    let account_pool_manager = Arc::clone(account_pool_manager);
-    let heartbeat_cancellation_token = cancellation_token.child_token();
-    let heartbeat_task_cancellation = heartbeat_cancellation_token.clone();
-    let task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(heartbeat_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = heartbeat_task_cancellation.cancelled() => break,
-                _ = ticker.tick() => {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(err) = account_pool_manager.renew_active_lease().await {
-                        warn!("failed to renew account-pool lease heartbeat: {err:#}");
-                    }
-                }
-            }
-        }
-    });
-    Some(AccountLeaseHeartbeatGuard {
-        cancellation_token: heartbeat_cancellation_token,
-        task,
-    })
-}
-
 /// Takes a user message as input and runs a loop where, at each sampling request, the model
 /// replies with either:
 ///
@@ -6266,61 +6363,6 @@ pub(crate) async fn run_turn(
     let model_info = turn_context.model_info.clone();
     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
     let mut prewarmed_client_session = prewarmed_client_session;
-    let pooled_mode_enabled = sess.services.account_pool_manager.is_some();
-    let turn_account_selection =
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            match account_pool_manager.prepare_turn().await {
-                Ok(selection) => {
-                    sess.services.lease_auth.replace_current(
-                        selection
-                            .as_ref()
-                            .map(|selection| Arc::clone(&selection.auth_session)),
-                    );
-                    selection
-                }
-                Err(err) => {
-                    warn!("failed to prepare account-pool lease for turn: {err:#}");
-                    sess.services.lease_auth.clear();
-                    None
-                }
-            }
-        } else {
-            None
-        };
-    if pooled_mode_enabled && turn_account_selection.is_none() {
-        if let Some(mut client_session) = prewarmed_client_session.take() {
-            client_session.reset_websocket_session();
-        }
-        sess.send_event(
-            &turn_context,
-            EventMsg::Error(ErrorEvent {
-                message: "No eligible pooled account is available for this turn.".to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        )
-        .await;
-        return None;
-    }
-    let _account_pool_lease_heartbeat = start_account_pool_lease_heartbeat(
-        &sess,
-        turn_account_selection.is_some(),
-        &cancellation_token,
-    )
-    .await;
-    let turn_account_id_override = turn_account_selection
-        .as_ref()
-        .map(|selection| selection.account_id.clone());
-    let reset_remote_context_for_turn = turn_account_selection
-        .as_ref()
-        .is_some_and(|selection| selection.reset_remote_context);
-    if reset_remote_context_for_turn {
-        sess.services.model_client.reset_remote_session_identity();
-        if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-            let mut account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.record_remote_context_reset(&turn_context.sub_id);
-        }
-    }
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -6328,7 +6370,8 @@ pub(crate) async fn run_turn(
     let pre_sampling_compacted = match run_pre_sampling_compact(
         &sess,
         &turn_context,
-        turn_account_id_override.clone(),
+        None,
+        cancellation_token.child_token(),
     )
     .await
     {
@@ -6536,21 +6579,19 @@ pub(crate) async fn run_turn(
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut server_model_warning_emitted_for_turn = false;
-    if turn_account_selection.is_some()
-        && let Some(mut client_session) = prewarmed_client_session.take()
-    {
-        // Startup prewarm happens before turn lease selection, so reset websocket state before
-        // dropping the prewarmed session to avoid caching stale auth/routing context.
-        client_session.reset_websocket_session();
-    }
 
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    if let Some(turn_account_selection) = turn_account_selection {
-        client_session.set_account_id_override(Some(turn_account_selection.account_id));
-    }
+    let mut client_session = match prewarmed_client_session {
+        Some(mut client_session) => {
+            // Startup prewarm can create the session before the first real turn binds its
+            // collaboration tree. Refresh the admission context without discarding the
+            // prewarmed transport session.
+            client_session.rebind_collaboration_context_from_client();
+            client_session
+        }
+        None => sess.services.model_client.new_session(),
+    };
     // Pending input is drained into history before building the next model request.
     // However, we defer that drain until after sampling in two cases:
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
@@ -6673,9 +6714,10 @@ pub(crate) async fn run_turn(
                         &sess,
                         &turn_context,
                         InitialContextInjection::BeforeLastUserMessage,
-                        turn_account_id_override.clone(),
+                        None,
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        cancellation_token.child_token(),
                     )
                     .await
                     .is_err()
@@ -6891,6 +6933,7 @@ async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
@@ -6898,6 +6941,7 @@ async fn run_pre_sampling_compact(
         turn_context,
         total_usage_tokens_before_compaction,
         account_id_override.clone(),
+        cancellation_token.child_token(),
     )
     .await?;
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -6914,6 +6958,7 @@ async fn run_pre_sampling_compact(
             account_id_override,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            cancellation_token.child_token(),
         )
         .await?;
         pre_sampling_compacted = true;
@@ -6932,6 +6977,7 @@ async fn maybe_run_previous_model_inline_compact(
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -6963,6 +7009,7 @@ async fn maybe_run_previous_model_inline_compact(
             account_id_override,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
@@ -6977,6 +7024,7 @@ async fn run_auto_compact(
     account_id_override: Option<String>,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     if should_use_remote_compact_task(&turn_context.provider) {
         run_inline_remote_auto_compact_task(
@@ -6986,6 +7034,7 @@ async fn run_auto_compact(
             account_id_override,
             reason,
             phase,
+            cancellation_token.child_token(),
         )
         .await?;
     } else {
@@ -6995,6 +7044,7 @@ async fn run_auto_compact(
             initial_context_injection,
             reason,
             phase,
+            cancellation_token.child_token(),
         )
         .await?;
     }
@@ -7250,41 +7300,15 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(err) = account_pool_manager.report_usage_limit_reached().await {
-                        warn!("failed to record account-pool usage-limit event: {err:#}");
-                    }
-                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err @ CodexErr::RefreshTokenFailed(_)) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                        warn!(
-                            "failed to record account-pool unauthorized event after refresh failure: {report_err:#}"
-                        );
-                    }
-                }
-                return Err(err);
-            }
+            Err(err @ CodexErr::RefreshTokenFailed(_)) => return Err(err),
             Err(
                 err @ CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
                     status: http::StatusCode::UNAUTHORIZED,
                     ..
                 }),
-            ) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                        warn!(
-                            "failed to record account-pool unauthorized event after 401 response: {report_err:#}"
-                        );
-                    }
-                }
-                return Err(err);
-            }
+            ) => return Err(err),
             Err(err) => err,
         };
 
@@ -8035,6 +8059,7 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
+    client_session.set_request_cancellation_token(cancellation_token.child_token());
     let mut stream = client_session
         .stream(
             prompt,
@@ -8043,6 +8068,7 @@ async fn try_run_sampling_request(
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
             turn_context.config.service_tier,
+            Some(&turn_context.sub_id),
             turn_metadata_header,
         )
         .instrument(trace_span!("stream_request"))

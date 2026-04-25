@@ -25,10 +25,21 @@ pub(crate) async fn pooled_mode_is_enabled(config: &Config) -> Result<bool, JSON
     Ok(read_account_lease_startup_context(config).await?.is_some())
 }
 
-pub(crate) fn account_lease_updated_notification_from_runtime_snapshot(
+pub(crate) async fn account_lease_updated_notification_from_runtime_snapshot(
+    config: &Config,
     live_snapshot: &AccountLeaseRuntimeSnapshot,
-) -> AccountLeaseUpdatedNotification {
-    account_lease_response_from_runtime_snapshot(live_snapshot, None).into()
+) -> Result<AccountLeaseUpdatedNotification, JSONRPCErrorError> {
+    let startup_context = if live_snapshot_needs_startup_override(live_snapshot) {
+        read_account_lease_startup_context(config).await?
+    } else {
+        None
+    };
+
+    Ok(account_lease_response_from_runtime_snapshot(
+        live_snapshot,
+        startup_context.as_ref().map(|context| &context.startup),
+    )
+    .into())
 }
 
 pub(crate) async fn read_account_lease(
@@ -54,6 +65,7 @@ pub(crate) async fn read_account_lease(
 
 pub(crate) async fn resume_account_lease(
     config: &Config,
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
 ) -> Result<AccountLeaseUpdatedNotification, JSONRPCErrorError> {
     let state_db = init_state_db(config).await?;
 
@@ -78,6 +90,14 @@ pub(crate) async fn resume_account_lease(
     else {
         return Ok(empty_account_lease_response().into());
     };
+
+    if let Some(live_snapshot) = live_snapshot {
+        return Ok(account_lease_response_from_runtime_snapshot(
+            &live_snapshot,
+            Some(&startup_context.startup),
+        )
+        .into());
+    }
 
     Ok(account_lease_response_from_startup_status(startup_context.startup).into())
 }
@@ -239,6 +259,12 @@ fn account_lease_response_from_runtime_snapshot(
     live_snapshot: &AccountLeaseRuntimeSnapshot,
     startup: Option<&AccountStartupStatus>,
 ) -> AccountLeaseReadResponse {
+    if let Some(startup) = startup
+        && is_stale_startup_suppressed_live_snapshot(live_snapshot, startup)
+    {
+        return account_lease_response_from_startup_status(startup.clone());
+    }
+
     AccountLeaseReadResponse {
         active: live_snapshot.active,
         suppressed: live_snapshot.suppressed,
@@ -280,6 +306,19 @@ fn account_lease_response_from_runtime_snapshot(
         persisted_default_pool_id: startup
             .and_then(|startup| startup.persisted_default_pool_id.clone()),
     }
+}
+
+fn is_stale_startup_suppressed_live_snapshot(
+    live_snapshot: &AccountLeaseRuntimeSnapshot,
+    startup: &AccountStartupStatus,
+) -> bool {
+    live_snapshot_needs_startup_override(live_snapshot) && !startup.preview.suppressed
+}
+
+fn live_snapshot_needs_startup_override(live_snapshot: &AccountLeaseRuntimeSnapshot) -> bool {
+    !live_snapshot.active
+        && live_snapshot.suppressed
+        && live_snapshot.suppression_reason == Some(AccountLeaseRuntimeReason::StartupSuppressed)
 }
 
 fn account_lease_response_from_preview(
@@ -418,5 +457,146 @@ fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
         code: INTERNAL_ERROR_CODE,
         message: err.to_string(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_core::AccountLeaseRuntimeReason;
+    use codex_state::EffectivePoolResolutionSource;
+    use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
+
+    #[test]
+    fn runtime_response_uses_unsuppressed_startup_after_durable_suppression_is_cleared() {
+        let live_snapshot = AccountLeaseRuntimeSnapshot {
+            active: false,
+            suppressed: true,
+            account_id: None,
+            pool_id: Some("legacy-default".to_string()),
+            lease_id: None,
+            lease_epoch: None,
+            runtime_generation: None,
+            lease_acquired_at: None,
+            health_state: None,
+            switch_reason: None,
+            suppression_reason: Some(AccountLeaseRuntimeReason::StartupSuppressed),
+            transport_reset_generation: None,
+            last_remote_context_reset_turn_id: None,
+            min_switch_interval_secs: None,
+            proactive_switch_pending: None,
+            proactive_switch_suppressed: None,
+            proactive_switch_allowed_at: None,
+            next_eligible_at: None,
+        };
+        let startup = AccountStartupStatus {
+            preview: AccountStartupSelectionPreview {
+                effective_pool_id: Some("legacy-default".to_string()),
+                preferred_account_id: None,
+                suppressed: false,
+                predicted_account_id: Some("acct-1".to_string()),
+                eligibility: AccountStartupEligibility::AutomaticAccountSelected,
+            },
+            configured_default_pool_id: Some("legacy-default".to_string()),
+            persisted_default_pool_id: None,
+            effective_pool_resolution_source: EffectivePoolResolutionSource::ConfigDefault,
+            startup_availability: codex_state::AccountStartupAvailability::Available,
+            startup_resolution_issue: None,
+            candidate_pools: Vec::new(),
+        };
+
+        let response = account_lease_response_from_runtime_snapshot(&live_snapshot, Some(&startup));
+
+        assert_eq!(response.suppressed, false);
+        assert_eq!(response.suppression_reason, None);
+        assert_eq!(response.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+        assert_eq!(
+            response.effective_pool_resolution_source.as_deref(),
+            Some("configDefault")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_update_notification_uses_unsuppressed_startup_after_durable_suppression_is_cleared()
+    -> anyhow::Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let mut config =
+            codex_core::config::Config::load_default_with_cli_overrides_for_codex_home(
+                codex_home.path().to_path_buf(),
+                Vec::new(),
+            )?;
+        config.accounts = Some(codex_config::types::AccountsConfigToml {
+            backend: None,
+            default_pool: Some("pool-main".to_string()),
+            proactive_switch_threshold_percent: None,
+            lease_ttl_secs: None,
+            heartbeat_interval_secs: None,
+            min_switch_interval_secs: None,
+            allocation_mode: None,
+            pools: Some(HashMap::from([(
+                "pool-main".to_string(),
+                codex_config::types::AccountPoolDefinitionToml {
+                    allow_context_reuse: None,
+                    account_kinds: None,
+                },
+            )])),
+        });
+        let state_db = init_state_db(&config).await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to initialize test account lease state db: {}",
+                err.message
+            )
+        })?;
+        state_db
+            .upsert_account_registry_entry(codex_state::AccountRegistryEntryUpdate {
+                account_id: "acct-1".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: None,
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        state_db
+            .write_account_startup_selection(AccountStartupSelectionUpdate {
+                default_pool_id: Some("pool-main".to_string()),
+                preferred_account_id: Some("acct-1".to_string()),
+                suppressed: false,
+            })
+            .await?;
+        let live_snapshot = AccountLeaseRuntimeSnapshot {
+            active: false,
+            suppressed: true,
+            account_id: None,
+            pool_id: None,
+            lease_id: None,
+            lease_epoch: None,
+            runtime_generation: None,
+            lease_acquired_at: None,
+            health_state: None,
+            switch_reason: None,
+            suppression_reason: Some(AccountLeaseRuntimeReason::StartupSuppressed),
+            transport_reset_generation: None,
+            last_remote_context_reset_turn_id: None,
+            min_switch_interval_secs: None,
+            proactive_switch_pending: None,
+            proactive_switch_suppressed: None,
+            proactive_switch_allowed_at: None,
+            next_eligible_at: None,
+        };
+
+        let notification =
+            account_lease_updated_notification_from_runtime_snapshot(&config, &live_snapshot)
+                .await
+                .map_err(|err| anyhow::anyhow!(err.message))?;
+
+        assert_eq!(notification.suppressed, false);
+        assert_eq!(notification.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(notification.pool_id.as_deref(), Some("pool-main"));
+        Ok(())
     }
 }

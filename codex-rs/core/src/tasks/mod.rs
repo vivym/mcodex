@@ -27,6 +27,7 @@ use crate::hook_runtime::PendingInputHookDisposition;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
+use crate::runtime_lease::CollaborationTreeId;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
@@ -283,6 +284,17 @@ impl Session {
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);
         let task_cancellation_token = cancellation_token.child_token();
+        let collaboration_tree_id = self.collaboration_tree_id_for_task(turn_context.as_ref());
+        let collaboration_binding = self.services.bind_collaboration_tree(
+            collaboration_tree_id,
+            format!(
+                "{}:{}:{}",
+                self.conversation_id,
+                turn_context.sub_id,
+                uuid::Uuid::now_v7()
+            ),
+            task_cancellation_token.clone(),
+        );
         // Task-owned turn spans keep a core-owned span open for the
         // full task lifecycle after the submission dispatch span ends.
         let task_span = info_span!(
@@ -294,6 +306,7 @@ impl Session {
         );
         let handle = tokio::spawn(
             async move {
+                let _collaboration_binding = collaboration_binding;
                 let ctx_for_finish = Arc::clone(&ctx);
                 let last_agent_message = task_for_run
                     .run(
@@ -316,7 +329,13 @@ impl Session {
                     )
                     .await;
                 }
-                if !task_cancellation_token.is_cancelled() {
+                if task_cancellation_token.is_cancelled() {
+                    sess.on_task_cancelled(
+                        Arc::clone(&ctx_for_finish),
+                        TurnAbortReason::Interrupted,
+                    )
+                    .await;
+                } else {
                     // Emit completion uniformly from spawn site so all tasks share the same lifecycle.
                     sess.on_task_finished(Arc::clone(&ctx_for_finish), last_agent_message)
                         .await;
@@ -339,6 +358,22 @@ impl Session {
             _timer: timer,
         };
         turn.add_task(running_task);
+    }
+
+    fn collaboration_tree_id_for_task(&self, turn_context: &TurnContext) -> CollaborationTreeId {
+        match &turn_context.session_source {
+            codex_protocol::protocol::SessionSource::SubAgent(_) => {
+                self.services.model_client.current_collaboration_tree_id()
+            }
+            codex_protocol::protocol::SessionSource::Cli
+            | codex_protocol::protocol::SessionSource::Exec
+            | codex_protocol::protocol::SessionSource::Mcp
+            | codex_protocol::protocol::SessionSource::VSCode
+            | codex_protocol::protocol::SessionSource::Custom(_)
+            | codex_protocol::protocol::SessionSource::Unknown => {
+                CollaborationTreeId::for_turn(&turn_context.sub_id)
+            }
+        }
     }
 
     /// Starts a regular turn when the session is idle and pending work is waiting.
@@ -544,6 +579,58 @@ impl Session {
         self.send_event(turn_context.as_ref(), event).await;
 
         if should_clear_active_turn {
+            let session = Arc::clone(self);
+            let _scheduler = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    session.maybe_start_turn_for_pending_work().await;
+                });
+            });
+        }
+    }
+
+    pub async fn on_task_cancelled(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        reason: TurnAbortReason,
+    ) {
+        turn_context
+            .turn_metadata_state
+            .cancel_git_enrichment_task();
+
+        let mut should_clear_active_turn = false;
+        let turn_state = {
+            let mut active = self.active_turn.lock().await;
+            if let Some(at) = active.as_mut()
+                && at.tasks.contains_key(&turn_context.sub_id)
+            {
+                should_clear_active_turn = at.remove_task(&turn_context.sub_id);
+                let turn_state = Arc::clone(&at.turn_state);
+                if should_clear_active_turn {
+                    *active = None;
+                }
+                Some(turn_state)
+            } else {
+                None
+            }
+        };
+        let Some(turn_state) = turn_state else {
+            return;
+        };
+        turn_state.lock().await.clear_pending();
+
+        let (completed_at, duration_ms) = turn_context
+            .turn_timing_state
+            .completed_at_and_duration_ms()
+            .await;
+        let event = EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some(turn_context.sub_id.clone()),
+            reason: reason.clone(),
+            completed_at,
+            duration_ms,
+        });
+        self.send_event(turn_context.as_ref(), event).await;
+
+        if should_clear_active_turn && reason == TurnAbortReason::Interrupted {
             let session = Arc::clone(self);
             let _scheduler = tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(async move {

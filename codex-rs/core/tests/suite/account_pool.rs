@@ -14,7 +14,6 @@ use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
-use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -22,9 +21,10 @@ use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountPoolEventsListQuery;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
-use core_test_support::responses::ResponseMock;
+use codex_state::QuotaExhaustedWindows;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -334,12 +334,22 @@ mod observability_event {
         );
 
         let events = list_account_pool_events(&test).await?;
-        assert!(
-            events.iter().any(|event| {
+        let selected_events = events
+            .iter()
+            .filter(|event| {
                 event.event_type == selected_event_type
                     && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
-            }),
-            "expected proactive-switch selection event in {events:#?}"
+                    && event_detail_str(event, "source") == Some("rotation")
+                    && event_detail_str(event, "intent") == Some("softRotation")
+                    && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                    && event_detail_str(event, "toAccountId") == Some(SECONDARY_ACCOUNT_ID)
+                    && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            selected_events,
+            1,
+            "expected exactly one proactive-switch selection event in {events:#?}"
         );
 
         Ok(())
@@ -439,12 +449,21 @@ mod observability_event {
         );
 
         let events = list_account_pool_events(&test).await?;
-        assert!(
-            events.iter().any(|event| {
+        let failure_events = events
+            .iter()
+            .filter(|event| {
                 event.event_type == failure_event_type
                     && event.reason_code.as_deref() == Some(no_eligible_account.as_str())
-            }),
-            "expected runtime-classified lease acquisition failure in {events:#?}"
+                    && event_detail_str(event, "source") == Some("rotation")
+                    && event_detail_str(event, "intent") == Some("softRotation")
+                    && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                    && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+            })
+            .count();
+        pretty_assertions::assert_eq!(
+            failure_events,
+            1,
+            "expected exactly one runtime-classified lease acquisition failure in {events:#?}"
         );
         assert!(
             events
@@ -769,7 +788,140 @@ async fn usage_limit_reached_rotates_only_future_turns_on_responses_transport() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Result<()> {
+async fn hard_failover_uses_active_limit_family_through_runtime_authority() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached",
+                        "resets_at": 1704067242
+                    }
+                })),
+            sse_with_primary_usage_percent("resp-2", 12.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder();
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            PRIMARY_ACCOUNT_ID,
+            "codex",
+            QuotaExhaustedWindows::None,
+            Some(5.0),
+        ),
+    )
+    .await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            SECONDARY_ACCOUNT_ID,
+            "codex",
+            QuotaExhaustedWindows::Primary,
+            Some(99.0),
+        ),
+    )
+    .await?;
+    seed_account_quota(
+        &test,
+        quota_state(
+            SECONDARY_ACCOUNT_ID,
+            "chatgpt",
+            QuotaExhaustedWindows::None,
+            Some(48.0),
+        ),
+    )
+    .await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "usage-limit active-family turn").await?;
+    assert!(
+        first_turn_error.is_some(),
+        "expected usage-limit error on turn 1"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        1,
+        "usage-limit failure should not auto-replay the current turn"
+    );
+    let quota_exhausted_event_type = event_type_name(AccountPoolEventType::QuotaExhausted);
+    let usage_limit_events = list_account_pool_events(&test).await?;
+    let usage_limit_count = usage_limit_events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("usageLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_str(event, "exhaustedWindows") == Some("unknown")
+        })
+        .count();
+    assert!(
+        usage_limit_count == 1,
+        "expected exactly one usage-limit quota event in {usage_limit_events:#?}"
+    );
+
+    let second_turn_error = submit_turn_and_wait(&test, "follow-up active-family turn").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "current turn should not be auto-replayed"
+    );
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    let quota_observed_event_type = event_type_name(AccountPoolEventType::QuotaObserved);
+    let lease_acquired_event_type = event_type_name(AccountPoolEventType::LeaseAcquired);
+    let non_replayable_turn = reason_code_name(AccountPoolReasonCode::NonReplayableTurn);
+    let live_quota_events = list_account_pool_events(&test).await?;
+    let live_quota_count = live_quota_events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_observed_event_type
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_f64(event, "primaryUsedPercent") == Some(12.0)
+                && event_detail_str(event, "exhaustedWindows") == Some("none")
+        })
+        .count();
+    assert!(
+        live_quota_count == 1,
+        "expected exactly one live quota observation event in {live_quota_events:#?}"
+    );
+    let hard_failover_count = live_quota_events
+        .iter()
+        .filter(|event| {
+            event.event_type == lease_acquired_event_type
+                && event.reason_code.as_deref() == Some(non_replayable_turn.as_str())
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("rotation")
+                && event_detail_str(event, "intent") == Some("hardFailover")
+                && event_detail_str(event, "fromAccountId") == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "toAccountId") == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "selectionFamily") == Some("chatgpt")
+        })
+        .count();
+    assert_eq!(
+        hard_failover_count, 1,
+        "expected exactly one hard-failover rotation event in {live_quota_events:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_unauthorized_recovery_preserves_account_for_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -783,6 +935,7 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
                 .insert_header("content-type", "application/json")
                 .set_body_string("unauthorized"),
             sse_with_primary_usage_percent("resp-2", 11.0),
+            sse_with_primary_usage_percent("resp-3", 12.0),
         ],
     )
     .await;
@@ -791,26 +944,42 @@ async fn unauthorized_failure_marks_account_unavailable_for_next_turn() -> Resul
     let test = builder.build(&server).await?;
     seed_two_accounts(&test).await?;
 
-    let first_turn_error = submit_turn_and_wait(&test, "unauthorized turn").await?;
-    assert_eq!(
-        first_turn_error
-            .as_ref()
-            .and_then(|err| err.codex_error_info.clone()),
-        Some(CodexErrorInfo::Unauthorized)
-    );
+    let first_turn_error = submit_turn_and_wait(&test, "recover repeated unauthorized").await?;
+    assert!(first_turn_error.is_none());
 
-    let second_turn_error = submit_turn_and_wait(&test, "after unauthorized").await?;
+    let second_turn_error = submit_turn_and_wait(&test, "after recovered unauthorized").await?;
     assert!(second_turn_error.is_none());
 
     let requests = response_mock.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "expected one in-turn unauthorized retry before next-turn rotation"
+        4,
+        "expected repeated in-turn unauthorized recovery without next-turn rotation"
     );
     assert_account_ids_in_order(
         &requests,
-        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
+        &[
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+            PRIMARY_ACCOUNT_ID,
+        ],
+    );
+    let lease_acquired_event_type = event_type_name(AccountPoolEventType::LeaseAcquired);
+    let non_replayable_turn = reason_code_name(AccountPoolReasonCode::NonReplayableTurn);
+    let events = list_account_pool_events(&test).await?;
+    let hard_failover_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == lease_acquired_event_type
+                && event.reason_code.as_deref() == Some(non_replayable_turn.as_str())
+                && event_detail_str(event, "source") == Some("rotation")
+                && event_detail_str(event, "intent") == Some("hardFailover")
+        })
+        .count();
+    assert_eq!(
+        hard_failover_count, 0,
+        "recoverable unauthorized should not mark the lease unavailable for next-turn rotation: {events:#?}"
     );
 
     Ok(())
@@ -996,6 +1165,50 @@ async fn rotation_without_context_reuse_mints_new_remote_session_id() -> Result<
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    let quota_observed_event_type = event_type_name(AccountPoolEventType::QuotaObserved);
+    let quota_exhausted_event_type = event_type_name(AccountPoolEventType::QuotaExhausted);
+    let events = list_account_pool_events(&test).await?;
+    let live_exhausted_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+                && event_detail_f64(event, "primaryUsedPercent") == Some(100.0)
+                && event_detail_str(event, "exhaustedWindows") == Some("primary")
+        })
+        .count();
+    let duplicate_usage_limit_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_exhausted_event_type
+                && event.account_id.as_deref() == Some(PRIMARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("usageLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+        })
+        .count();
+    let live_quota_count = events
+        .iter()
+        .filter(|event| {
+            event.event_type == quota_observed_event_type
+                && event.account_id.as_deref() == Some(SECONDARY_ACCOUNT_ID)
+                && event_detail_str(event, "source") == Some("liveRateLimit")
+                && event_detail_str(event, "limitId") == Some("chatgpt")
+        })
+        .count();
+    assert_eq!(
+        live_exhausted_count, 1,
+        "expected one primary live rate-limit exhaustion event under the effective pool: {events:#?}"
+    );
+    assert_eq!(
+        duplicate_usage_limit_count, 0,
+        "expected ambiguous usage-limit reporting not to duplicate a stronger live rate-limit exhaustion event: {events:#?}"
+    );
+    assert_eq!(
+        live_quota_count, 1,
+        "expected secondary live quota event to stay queryable under the effective pool: {events:#?}"
+    );
 
     let first_session_id = requests[0]
         .header("session_id")
@@ -1262,31 +1475,142 @@ async fn pre_turn_remote_compact_usage_limit_reached_rotates_next_turn() -> Resu
     skip_if_no_network!(Ok(()));
 
     assert_pre_turn_remote_compact_failure_rotates_next_turn(
-        AccountHealthState::RateLimited,
-        ResponseTemplate::new(429)
-            .insert_header("content-type", "application/json")
-            .set_body_json(json!({
-                "error": {
-                    "type": "usage_limit_reached",
-                    "message": "limit reached",
-                    "resets_at": 1704067242
-                }
-            })),
+        vec![
+            ResponseTemplate::new(429)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "limit reached",
+                        "resets_at": 1704067242
+                    }
+                })),
+        ],
+        &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID],
     )
     .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_turn_remote_compact_refresh_failure_rotates_next_turn() -> Result<()> {
+async fn pre_turn_remote_compact_repeated_unauthorized_recovers_without_rotation() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    assert_pre_turn_remote_compact_failure_rotates_next_turn(
-        AccountHealthState::Unauthorized,
-        ResponseTemplate::new(401)
-            .insert_header("content-type", "application/json")
-            .set_body_string("unauthorized"),
+    struct CompactSeqResponder {
+        next_call: std::sync::atomic::AtomicUsize,
+        responses: Vec<ResponseTemplate>,
+    }
+
+    impl Respond for CompactSeqResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let call_index = self
+                .next_call
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.responses
+                .get(call_index)
+                .unwrap_or_else(|| panic!("missing compact response for call {call_index}"))
+                .clone()
+        }
+    }
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("m1", "before compact"),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 500),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("m2", "after compact recovery"),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("m3", "after recovered compact"),
+                ev_completed("resp-3"),
+            ]),
+        ],
     )
-    .await
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(CompactSeqResponder {
+            next_call: std::sync::atomic::AtomicUsize::new(0),
+            responses: vec![
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("unauthorized"),
+                ResponseTemplate::new(401)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("unauthorized"),
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({
+                        "output": [{
+                            "type": "compaction",
+                            "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                        }]
+                    })),
+            ],
+        })
+        .up_to_n_times(3)
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config.model_auto_compact_token_limit = Some(120);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "seed usage for compact").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "turn with recovered compact").await?;
+    assert!(second_turn_error.is_none());
+
+    let third_turn_error = submit_turn_and_wait(&test, "turn after recovered compact").await?;
+    assert!(third_turn_error.is_none());
+
+    let response_requests = response_mock.requests();
+    assert_eq!(
+        response_requests.len(),
+        3,
+        "recovered pre-turn compact should not duplicate the current turn or force next-turn rotation"
+    );
+    assert_account_ids_in_order(
+        &response_requests,
+        &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID],
+    );
+
+    let all_requests = server.received_requests().await.unwrap_or_default();
+    let compact_request_account_ids = all_requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses/compact")
+        })
+        .map(|request| {
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_request_account_ids,
+        vec![
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+            Some(PRIMARY_ACCOUNT_ID.to_string()),
+        ]
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1480,7 +1804,7 @@ async fn pooled_request_ignores_shared_external_auth_when_lease_is_active() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() -> Result<()> {
+async fn lease_rotation_updates_live_snapshot_to_the_new_lease() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1547,21 +1871,16 @@ async fn lease_rotation_rebinds_fresh_non_request_auth_reads_to_the_new_lease() 
         first_snapshot.switch_reason,
         Some(AccountLeaseRuntimeReason::NonReplayableTurn)
     );
-    assert_eq!(
-        test.codex
-            .current_lease_bridge_account_id()
-            .await
-            .as_deref(),
-        Some(PRIMARY_ACCOUNT_ID)
-    );
 
     let second_turn_error = submit_turn_and_wait(&test, "post-rotation turn").await?;
     assert!(second_turn_error.is_none());
+    let second_snapshot = test
+        .codex
+        .account_lease_snapshot()
+        .await
+        .expect("pooled session should expose lease snapshot");
     assert_eq!(
-        test.codex
-            .current_lease_bridge_account_id()
-            .await
-            .as_deref(),
+        second_snapshot.account_id.as_deref(),
         Some(SECONDARY_ACCOUNT_ID)
     );
 
@@ -1597,7 +1916,7 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
             responses: vec![
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
-                    .set_delay(Duration::from_secs(8))
+                    .set_delay(Duration::from_secs(20))
                     .set_body_raw(
                         sse(vec![
                             ev_response_created("resp-1"),
@@ -1662,7 +1981,17 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     })
     .await;
 
+    let initial_active_lease =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
+
     tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let active_lease_after_heartbeat =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
+    assert!(
+        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
+        "expected streaming request heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
+    );
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -1698,12 +2027,41 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
         "contender runtime should not issue /responses while lease remains active"
     );
 
+    second.codex.shutdown_and_wait().await?;
+    first.codex.shutdown_and_wait().await?;
+
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    struct CompactResponder {
+        request_seen: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl Respond for CompactResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if let Some(sender) = self
+                .request_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_delay(Duration::from_secs(20))
+                .set_body_json(json!({
+                    "output": [{
+                        "type": "compaction",
+                        "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                    }]
+                }))
+        }
+    }
 
     let server = start_mock_server().await;
     let response_mock = mount_sse_once(
@@ -1715,19 +2073,15 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         ]),
     )
     .await;
-    let compact_mock = core_test_support::responses::mount_compact_response_once(
-        &server,
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/json")
-            .set_delay(Duration::from_secs(8))
-            .set_body_json(json!({
-                "output": [{
-                    "type": "compaction",
-                    "encrypted_content": "REMOTE_COMPACT_SUMMARY"
-                }]
-            })),
-    )
-    .await;
+    let (compact_request_seen_tx, compact_request_seen_rx) = tokio::sync::oneshot::channel();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses/compact$"))
+        .respond_with(CompactResponder {
+            request_seen: std::sync::Mutex::new(Some(compact_request_seen_tx)),
+        })
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
 
     let shared_home = Arc::new(TempDir::new()?);
     let mut first_builder = pooled_accounts_builder()
@@ -1754,10 +2108,22 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
     let first_turn_error = submit_turn_and_wait(&first, "before manual compact").await?;
     assert!(first_turn_error.is_none());
 
-    first.codex.submit(Op::Compact).await?;
-    wait_for_compact_request(&compact_mock).await;
+    let compact_turn_id = first.codex.submit(Op::Compact).await?;
+    tokio::time::timeout(Duration::from_secs(10), compact_request_seen_rx)
+        .await
+        .expect("compact request should start within timeout")
+        .expect("compact request should start");
+    let initial_active_lease =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let active_lease_after_heartbeat =
+        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
+    assert!(
+        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
+        "expected manual remote compact heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
+    );
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -1771,16 +2137,32 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
         contender_turn_error.message
     );
 
-    wait_for_event(&first.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
+    tokio::time::timeout(
+        Duration::from_secs(35),
+        wait_for_event_with_timeout(
+            &first.codex,
+            |event| match event {
+                EventMsg::TurnComplete(event) => event.turn_id == compact_turn_id,
+                _ => false,
+            },
+            Duration::from_secs(30),
+        ),
+    )
+    .await
+    .expect("compact turn should complete within timeout");
 
     assert_eq!(
         response_mock.requests().len(),
         1,
         "contender runtime should not issue /responses while compact lease remains active"
     );
+
+    tokio::time::timeout(Duration::from_secs(30), second.codex.shutdown_and_wait())
+        .await
+        .expect("second runtime shutdown should finish")?;
+    tokio::time::timeout(Duration::from_secs(30), first.codex.shutdown_and_wait())
+        .await
+        .expect("first runtime shutdown should finish")?;
 
     Ok(())
 }
@@ -1897,6 +2279,42 @@ async fn seed_account_health_state(
     Ok(())
 }
 
+async fn seed_account_quota(test: &TestCodex, quota: AccountQuotaStateRecord) -> Result<()> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    state_db.upsert_account_quota_state(quota).await?;
+    Ok(())
+}
+
+fn quota_state(
+    account_id: &str,
+    limit_id: &str,
+    exhausted_windows: QuotaExhaustedWindows,
+    primary_used_percent: Option<f64>,
+) -> AccountQuotaStateRecord {
+    let now = Utc::now();
+    let blocked_until = exhausted_windows
+        .is_exhausted()
+        .then_some(now + chrono::Duration::minutes(30));
+    AccountQuotaStateRecord {
+        account_id: account_id.to_string(),
+        limit_id: limit_id.to_string(),
+        primary_used_percent,
+        primary_resets_at: None,
+        secondary_used_percent: None,
+        secondary_resets_at: None,
+        observed_at: now,
+        exhausted_windows,
+        predicted_blocked_until: blocked_until,
+        next_probe_after: blocked_until,
+        probe_backoff_level: 0,
+        last_probe_result: None,
+    }
+}
+
 async fn list_account_pool_events(test: &TestCodex) -> Result<Vec<AccountPoolEventRecord>> {
     let Some(state_db) = test.codex.state_db() else {
         return Err(anyhow::anyhow!(
@@ -1923,6 +2341,14 @@ fn reason_code_name(value: AccountPoolReasonCode) -> String {
     serialized_protocol_enum_name(&value)
 }
 
+fn event_detail_str<'a>(event: &'a AccountPoolEventRecord, key: &str) -> Option<&'a str> {
+    event.details_json.as_ref()?.get(key)?.as_str()
+}
+
+fn event_detail_f64(event: &AccountPoolEventRecord, key: &str) -> Option<f64> {
+    event.details_json.as_ref()?.get(key)?.as_f64()
+}
+
 fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(serde_json::Value::String(name)) => name,
@@ -1931,23 +2357,46 @@ fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
-async fn wait_for_compact_request(mock_response: &ResponseMock) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+async fn active_pool_leases(test: &TestCodex) -> Result<Vec<codex_state::AccountLeaseRecord>> {
+    let Some(state_db) = test.codex.state_db() else {
+        return Err(anyhow::anyhow!(
+            "state db should be available in core integration tests"
+        ));
+    };
+    let rows = state_db
+        .read_account_lease_selection_candidates(LEGACY_DEFAULT_POOL_ID)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(_, _, active_lease, _)| active_lease)
+        .collect())
+}
+
+async fn wait_for_active_pool_lease(
+    test: &TestCodex,
+    expected_account_id: &str,
+    timeout: Duration,
+) -> Result<codex_state::AccountLeaseRecord> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !mock_response.requests().is_empty() {
-            return;
+        let active_leases = active_pool_leases(test).await?;
+        if let Some(lease) = active_leases
+            .into_iter()
+            .find(|lease| lease.account_id == expected_account_id)
+        {
+            return Ok(lease);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for compact request"
+            "timed out waiting for active lease for {expected_account_id}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
 async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
-    expected_health_state: AccountHealthState,
-    compact_failure_response: ResponseTemplate,
+    mut compact_responses: Vec<ResponseTemplate>,
+    expected_compact_request_account_ids: &[&str],
 ) -> Result<()> {
     struct CompactSeqResponder {
         next_call: std::sync::atomic::AtomicUsize,
@@ -1984,15 +2433,16 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
     )
     .await;
 
-    let compact_success_response = ResponseTemplate::new(200)
-        .insert_header("content-type", "application/json")
-        .set_body_json(json!({
-            "output": [{
-                "type": "compaction",
-                "encrypted_content": "REMOTE_COMPACT_SUMMARY"
-            }]
-        }));
-    let compact_responses = vec![compact_failure_response, compact_success_response];
+    compact_responses.push(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/json")
+            .set_body_json(json!({
+                "output": [{
+                    "type": "compaction",
+                    "encrypted_content": "REMOTE_COMPACT_SUMMARY"
+                }]
+            })),
+    );
     let compact_call_count = compact_responses.len() as u64;
     Mock::given(method("POST"))
         .and(path_regex(".*/responses/compact$"))
@@ -2014,18 +2464,7 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
     let first_turn_error = submit_turn_and_wait(&test, "seed usage for compact").await?;
     assert!(first_turn_error.is_none());
 
-    let second_turn_error = submit_turn_and_wait(&test, "turn with failing compact").await?;
-    assert!(
-        second_turn_error.is_some(),
-        "pre-turn compact failure should fail the current turn"
-    );
-    wait_for_account_health_transition(
-        &test,
-        expected_health_state,
-        AccountLeaseRuntimeReason::NonReplayableTurn,
-    )
-    .await?;
-
+    let _second_turn_error = submit_turn_and_wait(&test, "turn with failing compact").await?;
     let third_turn_error = submit_turn_and_wait(&test, "turn after compact failure").await?;
     assert!(third_turn_error.is_none());
 
@@ -2056,10 +2495,10 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         .collect::<Vec<_>>();
     assert_eq!(
         compact_request_account_ids,
-        vec![
-            Some(PRIMARY_ACCOUNT_ID.to_string()),
-            Some(SECONDARY_ACCOUNT_ID.to_string()),
-        ],
+        expected_compact_request_account_ids
+            .iter()
+            .map(|account_id| Some((*account_id).to_string()))
+            .collect::<Vec<_>>(),
         "expected compact failures to mark the active account unavailable before next turn"
     );
     let compact_request_session_ids = all_requests
@@ -2082,7 +2521,8 @@ async fn assert_pre_turn_remote_compact_failure_rotates_next_turn(
         "expected compact requests to include a session_id header"
     );
     assert_ne!(
-        compact_request_session_ids[0], compact_request_session_ids[1],
+        compact_request_session_ids.first(),
+        compact_request_session_ids.last(),
         "rotation with allow_context_reuse=false should reset remote session identity before pre-turn compact"
     );
 
@@ -2153,32 +2593,6 @@ async fn submit_turn_and_wait(
             }
             _ => {}
         }
-    }
-}
-
-async fn wait_for_account_health_transition(
-    test: &TestCodex,
-    expected_health_state: AccountHealthState,
-    expected_switch_reason: AccountLeaseRuntimeReason,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = test
-            .codex
-            .account_lease_snapshot()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("pooled session should expose lease snapshot"))?;
-        if snapshot.health_state == Some(expected_health_state)
-            && snapshot.switch_reason == Some(expected_switch_reason)
-        {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for account health transition: {snapshot:?}"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

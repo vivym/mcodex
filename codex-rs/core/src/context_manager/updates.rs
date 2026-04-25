@@ -129,8 +129,8 @@ fn build_personality_update_item(
         && next.personality != previous.personality
     {
         let model_info = &next.model_info;
-        let personality_message = personality_message_for(model_info, personality);
-        personality_message.map(DeveloperInstructions::personality_spec_message)
+        personality_message_for(model_info, personality)
+            .map(DeveloperInstructions::personality_spec_message)
     } else {
         None
     }

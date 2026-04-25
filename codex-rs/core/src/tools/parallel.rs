@@ -86,6 +86,7 @@ impl ToolCallRuntime {
         let lock = Arc::clone(&self.parallel_execution);
         let started = Instant::now();
         let display_name = call.tool_name.display();
+        let dispatch_cancellation_token = cancellation_token.child_token();
 
         let dispatch_span = trace_span!(
             "dispatch_tool_call_with_code_mode_result",
@@ -117,6 +118,7 @@ impl ToolCallRuntime {
                                 tracker,
                                 call.clone(),
                                 source,
+                                dispatch_cancellation_token,
                             )
                             .instrument(dispatch_span.clone())
                             .await

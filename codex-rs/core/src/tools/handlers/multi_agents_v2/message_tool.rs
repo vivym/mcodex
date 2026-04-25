@@ -87,12 +87,9 @@ async fn handle_message_submission(
         call_id,
         ..
     } = invocation;
-    let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
-    let receiver_agent = session
-        .services
-        .agent_control
-        .get_agent_metadata(receiver_thread_id)
-        .unwrap_or_default();
+    let receiver = resolve_agent_target_with_metadata(&session, &turn, &target).await?;
+    let receiver_thread_id = receiver.thread_id;
+    let receiver_agent = receiver.metadata;
     if mode == MessageDeliveryMode::TriggerTurn
         && receiver_agent
             .agent_path
