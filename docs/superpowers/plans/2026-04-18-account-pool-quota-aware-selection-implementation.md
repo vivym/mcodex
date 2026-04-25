@@ -68,12 +68,20 @@ cargo test -p codex-app-server-protocol
 - Modify `codex-rs/account-pool/src/manager.rs` so soft-rotation reprobe keeps the active lease held, uses a dedicated verification lease, always releases that verification lease, and reruns the original intent before any real reselection.
 - Modify `codex-rs/account-pool/src/lib.rs` to export the new selector types without leaking more API than needed.
 - Create `codex-rs/account-pool/tests/quota_selection.rs` for pure policy coverage and update `codex-rs/account-pool/tests/lease_lifecycle.rs` for runtime manager integration coverage.
-- Modify `codex-rs/core/src/state/service.rs` to resolve `selection_family`, write live quota observations, trigger hard-failure quota writes, and adapt selector outcomes into runtime rotation/failover flows.
-- Modify `codex-rs/core/tests/suite/account_pool.rs` for startup selection, hard failover, reprobe, and early-reset behavior.
+- Runtime quota integration in `codex-rs/core/src/state/service.rs`,
+  `codex-rs/core/src/runtime_lease/**`, and
+  `codex-rs/core/tests/suite/account_pool.rs` is now provided by the merged
+  runtime authority plan. Do not reimplement the original Task 4 per-session
+  integration path.
 - Modify `codex-rs/state/src/model/account_pool_observability.rs`, `codex-rs/state/src/runtime/account_pool_observability.rs`, `codex-rs/account-pool/src/observability.rs`, and `codex-rs/account-pool/src/observability/conversions.rs` to surface typed `quotas` while keeping additive compatibility fields.
 - Modify `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server/src/account_pool_api.rs`, and `codex-rs/app-server/src/account_pool_api/conversions.rs` to publish the richer account-pool quota contract.
 - Modify `codex-rs/app-server/tests/suite/v2/account_pool.rs` and `codex-rs/app-server/README.md` to lock and document the additive API behavior.
-- Modify `codex-rs/cli/src/accounts/output.rs` and `codex-rs/cli/tests/accounts.rs` to print the new multi-family quota facts and selection explanations deterministically.
+- Modify existing CLI observability files
+  `codex-rs/cli/src/accounts/observability_types.rs`,
+  `codex-rs/cli/src/accounts/observability_output.rs`,
+  `codex-rs/cli/src/accounts/output.rs`, and
+  `codex-rs/cli/tests/accounts_observability.rs` to print the new multi-family
+  quota facts and selection explanations deterministically.
 - Modify `codex-rs/tui/src/status/account.rs`, `codex-rs/tui/src/status/rate_limits.rs`, `codex-rs/tui/src/status/card.rs`, `codex-rs/tui/src/status/tests.rs`, and affected snapshots so runtime status reflects the richer quota model.
 
 ### Task 1: Add Durable Quota-State Storage In `codex-state`
@@ -613,90 +621,63 @@ git add state/src/runtime/account_pool.rs account-pool/src/manager.rs account-po
 git commit -m "feat(account-pool): wire local quota-aware lease selection"
 ```
 
-### Task 4: Integrate Live Quota Observation And Runtime Failover In `codex-core`
+### Task 4: Superseded By RuntimeLeaseAuthority Integration
 
-**Files:**
-- Modify: `codex-rs/core/src/state/service.rs`
-- Modify: `codex-rs/core/tests/suite/account_pool.rs`
-- Modify: `codex-rs/account-pool/src/backend.rs`
+**Status:** Superseded and completed by
+`docs/superpowers/plans/2026-04-19-runtime-lease-authority-for-subagents-implementation.md`
+after that branch merged to `main`.
 
-- [ ] **Step 1: Write failing runtime tests for family resolution, hard-failure writes, and early-reset reprobe**
+Do not execute the original per-session `codex-core` implementation steps from
+this plan. The runtime authority branch intentionally replaced this task so
+quota-aware selection is integrated through `RuntimeLeaseAuthority` and
+`RuntimeLeaseHost`, not through a parallel session-local failover path.
 
-Extend `codex-rs/core/tests/suite/account_pool.rs`:
+The replacement implementation already establishes these invariants:
 
-```rust
-#[tokio::test]
-async fn hard_failover_uses_active_limit_family_before_falling_back_to_codex() {
-    let harness = runtime_fixture_with_limit_family("chatgpt").await;
-    harness.seed_quota("acct-a", "chatgpt", exhausted_primary()).await;
-    harness.seed_quota("acct-b", "chatgpt", healthy_primary(12.0)).await;
+- pooled runtimes share one `RuntimeLeaseHost` across the top-level thread and
+  child subagents
+- every pooled provider request is admitted with a `LeaseSnapshot`
+- live rate-limit reports write quota state using the admitted snapshot's
+  `selection_family`
+- `usage_limit_reached` reports close the current generation, let admitted work
+  drain, and rotate only through the runtime authority
+- app-server `accountLease/read` and `accountLease/updated` report live runtime
+  host state after per-session pooled managers are removed
 
-    let next = harness.trigger_usage_limit_reached().await.unwrap();
+Remaining work in this quota-aware plan should treat these as baseline behavior.
+Future changes must preserve the runtime authority boundary and should add
+regression coverage there rather than reintroducing the original Task 4
+session-local integration.
 
-    assert_eq!(next.account_id, "acct-b");
-}
+- [x] **Step 1: Replace the original `codex-core` runtime integration task**
 
-#[tokio::test]
-async fn successful_probe_clears_stale_secondary_block_before_retrying_original_intent() {
-    let harness = runtime_fixture_with_early_reset_probe().await;
+The original tests:
 
-    let outcome = harness.trigger_soft_rotation_without_ordinary_candidates().await.unwrap();
+- `hard_failover_uses_active_limit_family_before_falling_back_to_codex`
+- `successful_probe_clears_stale_secondary_block_before_retrying_original_intent`
 
-    assert_eq!(outcome.selection_reason, "probeRecoveredThenReselected");
-    assert_eq!(outcome.account_id, "acct-recovered");
-}
-```
+were ported conceptually to host-backed runtime-authority coverage. The
+remaining verification matrix in Task 7 should run the current runtime authority
+and account-pool tests as regressions, not as a new implementation slice.
 
-- [ ] **Step 2: Run the runtime suite to verify `codex-core` still depends on legacy quota handling**
+- [x] **Step 2: Continue with observability and UI work on top of main**
 
-Run:
+After syncing with `main`, the next executable quota-aware task is Task 5.
+Task 5 should add typed multi-family quota observability fields to the existing
+state/account-pool/app-server protocol surfaces. Task 6 should update existing
+CLI observability and TUI consumers to render those fields.
 
-```bash
-cd codex-rs
-cargo test -p codex-core account_pool -- --nocapture
-```
+### Task 5: Expand Observability And App-Server Protocol Surfaces For Multi-Family Quota Facts
 
-Expected: FAIL because live runtime paths still persist/read coarse rate-limited state and do not execute the new reprobe contract.
+**Current baseline after syncing with `main`:**
 
-- [ ] **Step 3: Implement runtime family resolution and selector integration**
-
-Implement in `core/src/state/service.rs`:
-
-- resolve `selection_family` per attempt:
-  - `Startup` -> `codex`
-  - `SoftRotation` / `HardFailover` -> active family when known, otherwise `codex`
-- write live rate-limit observations into `account_quota_state`
-- map ambiguous `usage_limit_reached` without a known active family into the `codex` row with `exhausted_windows = unknown`
-- route proactive switch and hard failover through the shared selector
-- keep switch damping as a separate runtime-local concern
-- rerun the original non-probe intent after a successful probe instead of directly promoting the verification lease
-- append structured account-pool events for live quota observation, exhausted-window transitions, probe reservation outcomes, and probe recovery details so observability readers have the required `details_json`
-- ensure fresh non-exhausted live observations immediately clear previously blocked quota rows instead of waiting for `predicted_blocked_until` to expire
-
-- [ ] **Step 4: Re-run core runtime tests**
-
-Run:
-
-```bash
-cd codex-rs
-cargo test -p codex-core account_pool -- --nocapture
-```
-
-Expected: PASS for family-aware failover, reprobe, and early-reset recovery coverage.
-
-- [ ] **Step 5: Format, lint, and commit the core slice**
-
-Run:
-
-```bash
-cd codex-rs
-just fmt
-just fix -p codex-core
-git add core/src/state/service.rs core/tests/suite/account_pool.rs account-pool/src/backend.rs
-git commit -m "feat(core): use quota-aware pooled selection"
-```
-
-### Task 5: Expand Observability And App-Server Protocol Surfaces
+- runtime quota writes already flow through `RuntimeLeaseAuthority`
+- app-server account-pool responses still expose only the legacy singular
+  `quota` field on each account row
+- local CLI observability commands already exist, but they consume the same
+  singular quota projection
+- this task must be additive and must preserve the existing singular `quota`
+  field for compatibility
 
 **Files:**
 - Modify: `codex-rs/state/src/model/account_pool_observability.rs`
@@ -780,8 +761,12 @@ Implement:
   - `next_probe_after`
   - `observed_at`
 - singular `quota` projected only from the `codex` row, or `null` if absent
-- richer `details_json` payloads for probe/exhausted-window explanation without adding new top-level event enums in this slice
-- event-write plumbing in the runtime/state paths that already append account-pool events, so quota/probe details are durably persisted rather than only projected at read time
+- preserve and, where needed, enrich existing `details_json` payloads for
+  probe/exhausted-window explanation without adding new top-level event enums in
+  this slice
+- do not reimplement runtime event-write plumbing from Task 4; only update
+  observability readers/conversions so persisted quota/probe details are
+  surfaced durably instead of being projected ad hoc
 - README examples that show both `quota` and `quotas`
 
 - [ ] **Step 4: Regenerate schema fixtures and re-run protocol/app-server tests**
@@ -815,11 +800,13 @@ git add state/src/model/account_pool_observability.rs state/src/runtime/account_
 git commit -m "feat(app-server): expose quota-aware pool observability"
 ```
 
-### Task 6: Update CLI And TUI Consumers
+### Task 6: Update Existing CLI And TUI Consumers
 
 **Files:**
+- Modify: `codex-rs/cli/src/accounts/observability_types.rs`
+- Modify: `codex-rs/cli/src/accounts/observability_output.rs`
 - Modify: `codex-rs/cli/src/accounts/output.rs`
-- Modify: `codex-rs/cli/tests/accounts.rs`
+- Modify: `codex-rs/cli/tests/accounts_observability.rs`
 - Modify: `codex-rs/tui/src/status/account.rs`
 - Modify: `codex-rs/tui/src/status/rate_limits.rs`
 - Modify: `codex-rs/tui/src/status/card.rs`
@@ -828,7 +815,10 @@ git commit -m "feat(app-server): expose quota-aware pool observability"
 
 - [ ] **Step 1: Write failing CLI/TUI tests for multi-family quota rendering and selection explanations**
 
-Add focused assertions in `codex-rs/cli/tests/accounts.rs` and `codex-rs/tui/src/status/tests.rs`:
+The CLI observability command surface already exists on `main`; do not add a
+second command layer. Add focused assertions in
+`codex-rs/cli/tests/accounts_observability.rs` and
+`codex-rs/tui/src/status/tests.rs`:
 
 ```rust
 #[test]
@@ -864,7 +854,8 @@ Expected: FAIL with missing `quotas` handling and outdated copy/snapshots.
 
 Implement:
 
-- CLI output that renders `quotas` deterministically by family
+- existing CLI observability view models and output that render `quotas`
+  deterministically by family
 - selection explanations that distinguish:
   - blocked by secondary window
   - blocked by probe throttle
@@ -895,7 +886,7 @@ cd codex-rs
 just fmt
 just fix -p codex-cli
 just fix -p codex-tui
-git add cli/src/accounts/output.rs cli/tests/accounts.rs tui/src/status/account.rs tui/src/status/rate_limits.rs tui/src/status/card.rs tui/src/status/tests.rs tui/src/status/snapshots
+git add cli/src/accounts/observability_types.rs cli/src/accounts/observability_output.rs cli/src/accounts/output.rs cli/tests/accounts_observability.rs tui/src/status/account.rs tui/src/status/rate_limits.rs tui/src/status/card.rs tui/src/status/tests.rs tui/src/status/snapshots
 git commit -m "feat(ui): render quota-aware account selection state"
 ```
 
@@ -908,7 +899,7 @@ git commit -m "feat(ui): render quota-aware account selection state"
 - Verify: `codex-rs/core/tests/suite/account_pool.rs`
 - Verify: `codex-rs/app-server-protocol/tests/account_pool_observability.rs`
 - Verify: `codex-rs/app-server/tests/suite/v2/account_pool.rs`
-- Verify: `codex-rs/cli/tests/accounts.rs`
+- Verify: `codex-rs/cli/tests/accounts_observability.rs`
 - Verify: `codex-rs/tui/src/status/tests.rs`
 - Verify: `codex-rs/app-server/README.md`
 
