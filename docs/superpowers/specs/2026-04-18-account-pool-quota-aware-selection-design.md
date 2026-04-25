@@ -654,10 +654,12 @@ The account-pool crate should provide:
 Observability should stop collapsing quota state into one opaque remaining
 percentage.
 
-Account-pool account surfaces should eventually expose a collection of quota
-families rather than one singular quota projection:
+Account-pool account surfaces should eventually expose a required, non-null
+collection of quota families rather than one singular quota projection:
 
 - `quotas: Vec<AccountPoolQuotaFamily>`
+
+When no durable quota rows exist for an account, `quotas` is an empty array.
 
 Where each `AccountPoolQuotaFamily` contains:
 

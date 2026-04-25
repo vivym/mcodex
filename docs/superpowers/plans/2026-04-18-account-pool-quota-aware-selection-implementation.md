@@ -771,6 +771,10 @@ fn account_pool_account_response_serializes_quota_families() {
 }
 ```
 
+Also extend schema coverage so `AccountPoolAccountResponse.quotas` is a
+required, non-null array field and the new accounts-list request filter is
+optional/nullable on the TypeScript side.
+
 State/app-server integration coverage must prove account-row reads expose
 sorted multi-family quota rows through `accountPool/accounts/list`, not
 `accountPool/read`:
@@ -808,8 +812,13 @@ Implement:
 
 - quota-family read models in `state` / `account-pool` observability layers that carry the full typed family payload shape expected by the spec
 - typed `AccountPoolQuotaFamilyResponse` payloads in `protocol/v2.rs`
-- additive `quotas` on account responses while keeping the singular `quota`
-- optional `account_id` filtering on `AccountPoolAccountsListParams`, so active-account consumers such as the TUI can hydrate exactly the currently leased account row without scanning a full pool page
+- additive `quotas: Vec<AccountPoolQuotaFamilyResponse>` on account responses
+  while keeping the singular `quota`; `quotas` is always serialized as a
+  required non-null array and is empty when no quota rows exist
+- optional `account_id` filtering on `AccountPoolAccountsListParams`, annotated
+  with `#[ts(optional = nullable)]` and exposed on the wire as `accountId`, so
+  active-account consumers such as the TUI can hydrate exactly the currently
+  leased account row without scanning a full pool page
 - thread that filter through the protocol params, app-server handler/conversions, account-pool observability query structs, and state SQL query before adding TUI hydration that depends on it
 - deterministic `limit_id` ascending ordering
 - full typed family payloads for:
