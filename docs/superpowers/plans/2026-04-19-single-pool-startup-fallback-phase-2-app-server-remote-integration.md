@@ -2,20 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expose the Phase 1 startup-resolution model through app-server v2 and remote startup probing without changing the runtime lease authority.
+**Goal:** Expose the Phase 1 startup-resolution model through app-server v2 and remote startup probing on top of the merged runtime lease authority baseline, without introducing a second lease control plane.
 
-**Architecture:** Add an authoritative `AccountStartupSnapshot` to app-server read/notification surfaces, then wire local default-pool mutations through app-server using the same helper as CLI. Core turn-time lease acquisition is intentionally assigned to the runtime-lease-authority implementation plan after its host seam lands, so this plan remains executable without creating a second lease control plane.
+**Architecture:** Add an authoritative nested `AccountStartupSnapshot` to app-server read/notification surfaces, keep the existing flattened startup-resolution fields as compatibility projection, then wire local default-pool mutations through app-server using the same helper as CLI. Runtime lease ownership already lives behind `RuntimeLeaseHost`; this plan consumes that baseline and must not add an alternate acquisition, rotation, or failover path.
 
 **Tech Stack:** Rust, Tokio, app-server v2 JSON-RPC protocol, `ts-rs`, schemars, `codex-app-server`, `codex-app-server-protocol`, `codex-account-pool`, `app_test_support`, @superpowers:test-driven-development.
 
 ---
 
-## Dependencies And Parallelism
+## Dependencies And Main Baseline
 
 Prerequisites:
 
 - Phase 1 plan is merged or available in the current branch:
   `docs/superpowers/plans/2026-04-19-single-pool-startup-fallback-phase-1-implementation.md`
+- Runtime lease authority is merged into `main`, including `RuntimeLeaseHost`,
+  request admission, app-server pooled scope guards, and live lease snapshot
+  projection.
+- App-server currently has a preliminary flattened startup projection on
+  `AccountLeaseReadResponse` (`effectivePoolResolutionSource`,
+  `configuredDefaultPoolId`, `persistedDefaultPoolId`) but no authoritative
+  nested `AccountStartupSnapshot` and no startup parity on
+  `AccountLeaseUpdatedNotification`.
 - The shared startup model exposes:
   - `startup_availability`
   - `startup_resolution_issue`
@@ -24,11 +32,14 @@ Prerequisites:
   - `singleVisiblePool`
   - shared default-pool mutation helper
 
-Parallelism with `docs/superpowers/specs/2026-04-18-runtime-lease-authority-for-subagents-design.md`:
+Runtime lease boundary:
 
-- All tasks in this plan can run after Phase 1 while runtime-lease work continues.
-- This plan does not modify `codex-rs/core` or prove turn-time lease acquisition.
-- The runtime-lease implementation plan must later add the core tests proving `singleVisiblePool` acquisition and multi-pool blockers at the authoritative runtime lease seam.
+- This plan may read existing live lease snapshots exposed through app-server.
+- This plan must not add a second runtime lease owner, per-session fallback
+  manager, or independent turn-time acquisition path.
+- If a Phase 2 test exposes missing runtime-lease startup coverage, add the
+  smallest regression against the existing `RuntimeLeaseHost` path before
+  continuing protocol work; do not resurrect pre-host manager behavior.
 
 ## File Structure
 
@@ -78,16 +89,16 @@ rg -n "AccountStartupAvailability|AccountStartupResolutionIssue|SingleVisiblePoo
 
 Expected: all symbols exist. If not, stop and complete Phase 1 first.
 
-- [ ] **Step 2: Confirm this plan will not touch runtime lease authority**
+- [ ] **Step 2: Confirm runtime lease authority is the current baseline**
 
 Run:
 
 ```bash
 git status --short codex-rs/core
-rg -n "RuntimeLeaseHost|RuntimeLeaseAuthority|LeaseAdmissionGuard|acquire_request_lease" codex-rs/core/src || true
+rg -n "RuntimeLeaseHost|RuntimeLeaseAuthority|LeaseAdmissionGuard" codex-rs/core/src/runtime_lease codex-rs/core/src/state/service.rs
 ```
 
-Expected: no `codex-rs/core` changes are required by this plan. Any runtime lease host work belongs to the runtime-lease implementation plan.
+Expected: `RuntimeLeaseHost`, `RuntimeLeaseAuthority`, and request admission are present. `git status` may show only the current merge or intentional follow-up edits; no Phase 2 step should add an alternate runtime lease authority.
 
 - [ ] **Step 3: Confirm app-server protocol baseline**
 
@@ -97,7 +108,7 @@ Run:
 rg -n "AccountLeaseReadResponse|AccountLeaseUpdatedNotification|AccountLeaseRead|AccountLeaseResume" codex-rs/app-server-protocol/src/protocol
 ```
 
-Expected: current protocol has `accountLease/read`, `accountLease/resume`, and notification, but no `AccountStartupSnapshot`.
+Expected: current protocol has `accountLease/read`, `accountLease/resume`, and notification. It may already have flattened startup-resolution compatibility fields, but it must not yet have the nested `AccountStartupSnapshot` contract required by this plan.
 
 ## Task 1: Add App-Server V2 Startup Snapshot Types
 
@@ -364,7 +375,7 @@ Run:
 
 ```bash
 cd codex-rs
-cargo test -p codex-app-server --test suite account_lease_read_includes_startup_snapshot -- --nocapture
+cargo test -p codex-app-server account_lease_read_includes_startup_snapshot -- --nocapture
 ```
 
 Expected: FAIL because response has no startup snapshot.
@@ -407,7 +418,7 @@ Run:
 
 ```bash
 cd codex-rs
-cargo test -p codex-app-server --test suite account_lease -- --nocapture
+cargo test -p codex-app-server account_lease -- --nocapture
 ```
 
 Expected: PASS.
@@ -480,7 +491,7 @@ Run:
 
 ```bash
 cd codex-rs
-cargo test -p codex-app-server --test suite account_pool_default -- --nocapture
+cargo test -p codex-app-server account_pool_default -- --nocapture
 ```
 
 Expected: FAIL because the RPCs do not exist.
@@ -534,8 +545,8 @@ Run:
 
 ```bash
 cd codex-rs
-cargo test -p codex-app-server --test suite account_pool_default -- --nocapture
-cargo test -p codex-app-server --test suite account_lease_resume -- --nocapture
+cargo test -p codex-app-server account_pool_default -- --nocapture
+cargo test -p codex-app-server account_lease_resume -- --nocapture
 ```
 
 Expected: PASS, and `accountLease/resume` remains behaviorally identical to CLI `accounts resume`.
@@ -663,15 +674,12 @@ git add codex-rs/tui/src/startup_access.rs
 git commit -m "feat(tui): use remote startup snapshots"
 ```
 
-## Runtime Lease Handoff
+## Runtime Lease Baseline Validation
 
-This plan intentionally does not implement core turn-time lease acquisition.
-That work belongs in the runtime-lease implementation plan after
-`RuntimeLeaseHost`/`RuntimeLeaseAuthority` owns the authoritative acquisition
-path.
-
-The runtime-lease plan must add the following coverage when it reaches the core
-integration task:
+Runtime lease authority has already landed in `main`; Phase 2 must consume that
+path instead of adding another core lease owner. Before adding app-server protocol
+surface area, verify the existing runtime lease path still covers or can be
+extended with focused regressions for:
 
 - a state-only home with one visible pool and no configured/persisted default
   acquires a pooled lease for a real turn
@@ -681,6 +689,11 @@ integration task:
 - suppressed single-pool fallback does not acquire until resumed
 - request admission still flows through the runtime lease host; no per-session
   fallback manager is introduced
+
+If any of those facts are missing, add targeted coverage against the existing
+`RuntimeLeaseHost` implementation before proceeding. Do not move the app-server
+startup snapshot work into `codex-rs/core` unless the missing coverage proves a
+real host integration bug.
 
 ## Task 5: Docs, Schema Generation, And Final Verification
 
@@ -724,7 +737,7 @@ Run:
 ```bash
 cd codex-rs
 cargo test -p codex-app-server-protocol
-cargo test -p codex-app-server --test suite account_lease
+cargo test -p codex-app-server account_lease
 cargo test -p codex-tui startup_access
 ```
 

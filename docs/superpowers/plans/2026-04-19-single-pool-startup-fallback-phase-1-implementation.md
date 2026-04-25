@@ -20,6 +20,12 @@ This phase is safe to develop in parallel with `docs/superpowers/specs/2026-04-1
 
 Do not modify the existing untracked runtime lease plan file unless the user explicitly asks.
 
+Post-merge note, 2026-04-25: runtime lease authority is now merged into `main`.
+The coordination bullets above describe this Phase 1 plan's original execution
+boundary. Current app-server/remote follow-up work should use
+`docs/superpowers/plans/2026-04-19-single-pool-startup-fallback-phase-2-app-server-remote-integration.md`
+as the active baseline.
+
 ## File Structure
 
 - Modify: `codex-rs/state/src/model/account_pool.rs`

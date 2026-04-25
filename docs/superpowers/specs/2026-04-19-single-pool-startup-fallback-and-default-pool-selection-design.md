@@ -701,6 +701,19 @@ not introduce partial pagination or list truncation for this field.
 
 #### App-server v2 fields
 
+Current `main` already exposes a preliminary flattened startup projection on
+`AccountLeaseReadResponse` for compatibility:
+
+- `effectivePoolResolutionSource`
+- `configuredDefaultPoolId`
+- `persistedDefaultPoolId`
+
+Those fields should remain additive compatibility fields. They are not the
+authoritative remote-startup contract because they cannot carry startup
+availability, structured blocker issues, candidate pools, or read/notification
+parity. This slice therefore adds the nested `AccountStartupSnapshot` below
+without removing or repurposing the flattened fields.
+
 Define a new additive v2 type:
 
 - `AccountStartupSnapshot`
@@ -850,6 +863,11 @@ These methods update only durable startup-selection state. They must not
 retarget or interrupt an already active pooled lease. The nested `startup`
 snapshot may change immediately, while live top-level lease/account fields
 continue to follow existing runtime transitions.
+
+Because runtime lease authority now lives behind `RuntimeLeaseHost`, these
+methods must not acquire, rotate, drain, or replace the active runtime lease
+host. They only change future startup/default intent and then reproject the
+current live snapshot plus the updated nested startup snapshot.
 
 `accountLease/updated` notifications are required when the resulting
 observable `startup` snapshot or live lease fields change. Successful no-op
