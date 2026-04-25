@@ -355,7 +355,7 @@ impl RuntimeLeaseAuthority {
         };
         let snapshot_seed = {
             let manager = manager.lock().await;
-            manager.snapshot_seed()
+            manager.snapshot_seed().await
         };
         snapshot_seed.snapshot().await
     }

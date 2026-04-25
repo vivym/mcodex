@@ -330,7 +330,6 @@ use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
 use codex_rollout::state_db::reconcile_rollout;
-use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::StateRuntime;
 use codex_state::ThreadConfigBaselineSnapshot;
 use codex_state::ThreadMetadata;
@@ -6968,51 +6967,6 @@ impl CodexMessageProcessor {
             seen_thread_ids.insert(root_thread_id);
         }
 
-        let state_db_ctx = {
-            let mut state_db_ctx = None;
-            for thread_id in thread_manager.list_thread_ids().await {
-                let Ok(thread) = thread_manager.get_thread(thread_id).await else {
-                    continue;
-                };
-                if let Some(ctx) = thread.state_db() {
-                    state_db_ctx = Some(ctx);
-                    break;
-                }
-            }
-            state_db_ctx
-        };
-
-        if let Some(state_db_ctx) = state_db_ctx {
-            for status in [
-                DirectionalThreadSpawnEdgeStatus::Open,
-                DirectionalThreadSpawnEdgeStatus::Closed,
-            ] {
-                match state_db_ctx
-                    .list_thread_spawn_descendants_with_status(root_thread_id, status)
-                    .await
-                {
-                    Ok(descendant_thread_ids) => {
-                        for descendant_thread_id in descendant_thread_ids {
-                            if seen_thread_ids.insert(descendant_thread_id)
-                                && thread_manager
-                                    .get_thread(descendant_thread_id)
-                                    .await
-                                    .is_ok()
-                            {
-                                candidate_thread_ids.push(descendant_thread_id);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            "failed to list pooled runtime descendants under {root_thread_id}: {err}"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
         if let Ok(subtree_thread_ids) = thread_manager
             .list_agent_subtree_thread_ids(root_thread_id)
             .await
@@ -9735,22 +9689,14 @@ impl CodexMessageProcessor {
                         );
                         let mut thread_ids = vec![conversation_id];
                         if let Some(state_db_ctx) = state_db_ctx.as_ref() {
-                            for status in [
-                                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
-                                codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
-                            ] {
-                                match state_db_ctx
-                                    .list_thread_spawn_descendants_with_status(
-                                        conversation_id,
-                                        status,
-                                    )
-                                    .await
-                                {
-                                    Ok(descendant_ids) => thread_ids.extend(descendant_ids),
-                                    Err(err) => warn!(
-                                        "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
-                                    ),
-                                }
+                            match state_db_ctx
+                                .list_thread_spawn_descendants(conversation_id)
+                                .await
+                            {
+                                Ok(descendant_ids) => thread_ids.extend(descendant_ids),
+                                Err(err) => warn!(
+                                    "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
+                                ),
                             }
                         }
                         thread_ids

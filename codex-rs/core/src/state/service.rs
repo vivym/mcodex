@@ -507,7 +507,7 @@ mod tests {
 
         assert!(selection.is_none());
         assert_eq!(
-            manager.snapshot_seed().snapshot().await,
+            manager.snapshot_seed().await.snapshot().await,
             AccountLeaseRuntimeSnapshot {
                 active: false,
                 suppressed: false,
@@ -1137,14 +1137,28 @@ impl AccountPoolManager {
         }))
     }
 
-    pub(crate) fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
-        let proactive_switch_snapshot = self.active_lease.as_ref().map(|_| {
+    pub(crate) async fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
+        let active_lease = if let Some(active_lease) = self.active_lease.as_ref()
+            && self
+                .state_db
+                .read_active_holder_lease(&self.holder_instance_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|current_lease| {
+                    current_lease.lease_key() == active_lease.record.lease_key()
+                }) {
+            Some(active_lease.record.clone())
+        } else {
+            None
+        };
+        let proactive_switch_snapshot = active_lease.as_ref().map(|_| {
             let mut proactive_switch_state = self.proactive_switch_state.clone();
             proactive_switch_state.snapshot(Utc::now())
         });
         AccountPoolManagerSnapshotSeed {
             state_db: Arc::clone(&self.state_db),
-            active_lease: self.active_lease.as_ref().map(|lease| lease.record.clone()),
+            active_lease,
             min_switch_interval_secs: self.min_switch_interval.num_seconds().max(0) as u64,
             proactive_switch_snapshot,
             switch_reason: self.switch_reason,

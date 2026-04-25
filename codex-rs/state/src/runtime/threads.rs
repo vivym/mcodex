@@ -241,22 +241,29 @@ LIMIT 2
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
-        let status_filter = if status.is_some() {
+        let anchor_status_filter = if status.is_some() {
             " AND status = ?"
+        } else {
+            ""
+        };
+        let recursive_status_filter = if status.is_some() {
+            " AND edge.status = ?"
         } else {
             ""
         };
         let query = format!(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth) AS (
-    SELECT child_thread_id, 1
+WITH RECURSIVE subtree(child_thread_id, depth, path) AS (
+    SELECT child_thread_id, 1, ',' || child_thread_id || ','
     FROM thread_spawn_edges
-    WHERE parent_thread_id = ?{status_filter}
+    WHERE parent_thread_id = ?{anchor_status_filter}
+      AND child_thread_id != ?
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT edge.child_thread_id, subtree.depth + 1, subtree.path || edge.child_thread_id || ','
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE 1 = 1{status_filter}
+    WHERE edge.child_thread_id != ?
+      AND instr(subtree.path, ',' || edge.child_thread_id || ',') = 0{recursive_status_filter}
 )
 SELECT child_thread_id
 FROM subtree
@@ -265,9 +272,13 @@ ORDER BY depth ASC, child_thread_id ASC
         );
 
         let mut sql = sqlx::query(query.as_str()).bind(root_thread_id.to_string());
+        if let Some(status) = status.as_ref() {
+            sql = sql.bind(status.to_string());
+        }
+        sql = sql.bind(root_thread_id.to_string());
+        sql = sql.bind(root_thread_id.to_string());
         if let Some(status) = status {
-            let status = status.to_string();
-            sql = sql.bind(status.clone()).bind(status);
+            sql = sql.bind(status.to_string());
         }
 
         let rows = sql.fetch_all(self.pool.as_ref()).await?;
@@ -1534,6 +1545,23 @@ mod tests {
             .expect("mixed-status descendants should load");
         assert_eq!(
             mixed_status_descendants,
+            vec![child_thread_id, grandchild_thread_id]
+        );
+
+        runtime
+            .upsert_thread_spawn_edge(
+                grandchild_thread_id,
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("root back-edge insert should succeed");
+        let cyclic_descendants = runtime
+            .list_thread_spawn_descendants(parent_thread_id)
+            .await
+            .expect("cyclic mixed-status descendants should load");
+        assert_eq!(
+            cyclic_descendants,
             vec![child_thread_id, grandchild_thread_id]
         );
     }

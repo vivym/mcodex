@@ -831,7 +831,7 @@ impl Codex {
         let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
         let snapshot_seed = {
             let account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.snapshot_seed()
+            account_pool_manager.snapshot_seed().await
         };
         Some(snapshot_seed.snapshot().await)
     }

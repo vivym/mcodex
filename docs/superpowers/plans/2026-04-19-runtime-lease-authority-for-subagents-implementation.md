@@ -2437,7 +2437,7 @@ Latest review-fix verification ledger, 2026-04-25:
 
 Latest reviewer-loop verification ledger, 2026-04-25:
 
-- PASS before fix: reviewer reproduced gaps in mixed-status persisted subtree traversal, remote reset state across host reuse, manager snapshot generation/identity consistency, and state DB fallback selection.
+- REVIEW/REPRO before fix: reviewer identified gaps in mixed-status persisted subtree traversal, remote reset state across host reuse, manager snapshot generation/identity consistency, and state DB fallback selection.
 - PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 3 targeted tests, including `list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants`.
 - PASS: `cargo test -p codex-state thread_spawn_edges_track_directional_status -- --nocapture` passed, including status-agnostic mixed-status descendant coverage.
 - PASS: `cargo test -p codex-core runtime_lease_host_reuse_clears_remote_reset_state -- --nocapture` passed.
@@ -2450,6 +2450,27 @@ Latest reviewer-loop verification ledger, 2026-04-25:
 - PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
 - PASS: `git diff --check`.
 - Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+
+Latest gpt-5.5 reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: two `gpt-5.5` `xhigh` reviewers identified stale active-lease snapshots after external disable, mixed-status recursive traversal cycle risk, status-filtered app-server fallback traversal, and misleading plan-ledger wording.
+- RED: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` failed before the active-holder revalidation fix because `snapshot.active` stayed `true` after external disable released the durable lease.
+- RED: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` failed after the first attempted fix because validating inside `AccountPoolManagerSnapshotSeed::snapshot()` broke point-in-time seed semantics.
+- GREEN: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` passed after moving active-holder validation to `AccountPoolManager::snapshot_seed().await`.
+- GREEN: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` passed after the seed-creation revalidation fix.
+- PASS: `cargo test -p codex-state thread_spawn_edges_track_directional_status -- --nocapture` passed, including the new mixed-status cycle guard coverage.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 3 targeted tests.
+- PASS: `cargo test -p codex-app-server account_lease_read_reports_live_active_lease_fields_after_turn_start -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server thread_archive_clears_stale_subscriptions_before_resume -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-state`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not run in this reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
 
 - [ ] **Step 5: Run scoped lints**
 
