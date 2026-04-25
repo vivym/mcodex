@@ -1932,6 +1932,54 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_pare
 }
 
 #[tokio::test]
+async fn list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let state_db_path = codex_state::state_db_path(harness.config.codex_home.as_ref());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject persisted subtree lookup failure");
+    pool.close().await;
+
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("live subtree should still load when persisted lookup fails");
+    subtree_thread_ids.sort_by_key(ToString::to_string);
+    let mut expected_thread_ids = vec![root_thread_id, child_thread_id];
+    expected_thread_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(subtree_thread_ids, expected_thread_ids);
+    let _ = harness.manager.remove_thread(&child_thread_id).await;
+    let _ = harness.manager.remove_thread(&root_thread_id).await;
+}
+
+#[tokio::test]
 async fn list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants() {
     let harness = AgentControlHarness::new().await;
     let (root_thread_id, root_thread) = harness.start_thread().await;

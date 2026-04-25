@@ -587,6 +587,38 @@ mod tests {
         assert_eq!(snapshot.runtime_generation, Some(1));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn snapshot_seed_preserves_cached_lease_when_holder_read_fails() -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: "acct-seed-error".to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        let lease = state_db
+            .acquire_account_lease("pool-main", "holder-seed-error", Duration::seconds(300))
+            .await?;
+
+        assert_eq!(
+            validated_active_snapshot_lease(
+                Some(&lease),
+                Err(anyhow::anyhow!("injected holder read failure"))
+            ),
+            Some(lease)
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,17 +1170,13 @@ impl AccountPoolManager {
     }
 
     pub(crate) async fn snapshot_seed(&self) -> AccountPoolManagerSnapshotSeed {
-        let active_lease = if let Some(active_lease) = self.active_lease.as_ref()
-            && self
-                .state_db
-                .read_active_holder_lease(&self.holder_instance_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|current_lease| {
-                    current_lease.lease_key() == active_lease.record.lease_key()
-                }) {
-            Some(active_lease.record.clone())
+        let active_lease = if let Some(active_lease) = self.active_lease.as_ref() {
+            validated_active_snapshot_lease(
+                Some(&active_lease.record),
+                self.state_db
+                    .read_active_holder_lease(&self.holder_instance_id)
+                    .await,
+            )
         } else {
             None
         };
@@ -2368,6 +2396,25 @@ fn quota_reset_prediction(
             (None, None) => None,
         },
         QuotaExhaustedWindows::Unknown => primary_resets_at.or(secondary_resets_at),
+    }
+}
+
+fn validated_active_snapshot_lease(
+    cached_lease: Option<&AccountLeaseRecord>,
+    holder_read: anyhow::Result<Option<AccountLeaseRecord>>,
+) -> Option<AccountLeaseRecord> {
+    let cached_lease = cached_lease?;
+    match holder_read {
+        Ok(Some(current_lease)) if current_lease.lease_key() == cached_lease.lease_key() => {
+            Some(cached_lease.clone())
+        }
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(
+                "failed to revalidate active account lease snapshot; preserving cached lease: {err}"
+            );
+            Some(cached_lease.clone())
+        }
     }
 }
 

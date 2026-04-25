@@ -2472,6 +2472,25 @@ Latest gpt-5.5 reviewer-loop verification ledger, 2026-04-25:
 - Not rerun after final `just fmt` / `just fix`, per repository instruction.
 - Not run in this reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
 
+Latest gpt-5.5 follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: `gpt-5.5` `xhigh` reviewer identified two Medium issues: snapshot revalidation swallowed DB read errors as inactive, and ThreadManager aborted before live subtree traversal when persisted subtree reads failed.
+- RED: `cargo test -p codex-core snapshot_seed_preserves_cached_lease_when_holder_read_fails -- --nocapture` failed to compile before the tri-state validation helper existed.
+- GREEN: `cargo test -p codex-core snapshot_seed_preserves_cached_lease_when_holder_read_fails -- --nocapture` passed after preserving cached active lease on holder-read errors.
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails -- --nocapture` failed with `Fatal(\"failed to load thread-spawn descendants...\")` before persisted lookup errors were downgraded.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails -- --nocapture` passed after logging persisted lookup failures and still running live traversal.
+- PASS: `cargo test -p codex-core snapshot_seed -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test.
+- PASS: `just bazel-lock-update`.
+- PASS: `just bazel-lock-check`.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+- Not run in this follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
 - [ ] **Step 5: Run scoped lints**
 
 Run:
