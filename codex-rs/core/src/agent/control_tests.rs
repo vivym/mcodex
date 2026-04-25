@@ -1833,6 +1833,67 @@ async fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants
 }
 
 #[tokio::test]
+async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let grandchild_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello grandchild"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("grandchild spawn should succeed");
+
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed");
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("root subtree should still load from live descendants");
+    subtree_thread_ids.sort_by_key(ToString::to_string);
+    let mut expected_thread_ids = vec![root_thread_id, child_thread_id, grandchild_thread_id];
+    expected_thread_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(subtree_thread_ids, expected_thread_ids);
+    harness
+        .control
+        .shutdown_agent_tree(child_thread_id)
+        .await
+        .expect("child subtree shutdown");
+    root_thread
+        .shutdown_and_wait()
+        .await
+        .expect("root shutdown");
+}
+
+#[tokio::test]
 async fn shutdown_agent_tree_closes_live_descendants() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;

@@ -184,6 +184,58 @@ async fn pooled_host_snapshot_preserves_last_turn_reset_after_background_reset()
 }
 
 #[tokio::test]
+async fn pooled_host_snapshot_ignores_remote_reset_from_previous_generation() {
+    let authority = RuntimeLeaseAuthority::for_test_accepting("acct-a", 11);
+    let host = RuntimeLeaseHost::pooled_with_authority_for_test(
+        RuntimeLeaseHostId::new("runtime-snapshot".to_string()),
+        authority.clone(),
+    );
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-a".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        request_id: "req-turn".to_string(),
+        lease_generation: 11,
+        transport_reset_generation: 7,
+    });
+
+    authority.install_replacement_for_test("acct-b", 12).await;
+    let snapshot_after_replacement = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should expose the replacement authority snapshot");
+    assert_eq!(
+        snapshot_after_replacement.account_id.as_deref(),
+        Some("acct-b")
+    );
+    assert_eq!(snapshot_after_replacement.lease_epoch, Some(12));
+    assert_eq!(snapshot_after_replacement.transport_reset_generation, None);
+    assert_eq!(
+        snapshot_after_replacement.last_remote_context_reset_turn_id,
+        None
+    );
+
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-a".to_string(),
+        turn_id: None,
+        request_id: "req-background".to_string(),
+        lease_generation: 12,
+        transport_reset_generation: 8,
+    });
+    let snapshot_after_background_reset = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should expose the replacement authority snapshot");
+    assert_eq!(
+        snapshot_after_background_reset.transport_reset_generation,
+        Some(8)
+    );
+    assert_eq!(
+        snapshot_after_background_reset.last_remote_context_reset_turn_id,
+        None
+    );
+}
+
+#[tokio::test]
 async fn pooled_host_release_for_shutdown_releases_authority_owned_lease() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =

@@ -2135,7 +2135,7 @@ git commit -m "feat(core): scope pooled lease faults to collaboration trees"
 - Modify: `codex-rs/app-server/tests/suite/v2/account_pool.rs`
 - Modify: `codex-rs/app-server/README.md`
 
-- [ ] **Step 1: Write failing app-server boundary tests**
+- [x] **Step 1: Write failing app-server boundary tests**
 
 Add tests:
 
@@ -2191,7 +2191,7 @@ async fn websocket_app_server_rejects_pooled_runtime_host_creation() -> anyhow::
 }
 ```
 
-- [ ] **Step 2: Run app-server tests and verify failure**
+- [x] **Step 2: Run app-server tests and verify failure**
 
 Run:
 
@@ -2202,7 +2202,7 @@ cargo test -p codex-app-server account_pool -- --nocapture
 
 Expected: FAIL because the app-server guard does not yet cover all start/resume/fork/load/unload host boundaries.
 
-- [ ] **Step 3: Implement top-level pooled host scope**
+- [x] **Step 3: Implement top-level pooled host scope**
 
 In `message_processor.rs`, preserve and pass `AppServerTransport` into `CodexMessageProcessor` for every `thread/start`, `thread/resume`, and `thread/fork` path that can create a runtime host. In `codex_message_processor.rs`, keep the runtime lease host scoped to the loaded top-level thread or pooled-selection context, not the process-global `ThreadManagerState`.
 
@@ -2218,11 +2218,11 @@ Apply the gate to:
 
 Subagent `ThreadSpawn` inside the loaded top-level context is allowed and shares the same runtime host.
 
-- [ ] **Step 4: Update app-server README**
+- [x] **Step 4: Update app-server README**
 
 Document that pooled mode in stdio app-server supports only one loaded/running top-level thread context at a time; child subagents under that context share its runtime lease host.
 
-- [ ] **Step 5: Run app-server tests**
+- [x] **Step 5: Run app-server tests**
 
 Run:
 
@@ -2233,7 +2233,7 @@ cargo test -p codex-app-server account_pool -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -2258,7 +2258,7 @@ git commit -m "feat(app-server): scope pooled lease host to top-level thread"
 - Test: `codex-rs/core/src/codex_delegate_tests.rs`
 - Test: `codex-rs/core/tests/suite/account_pool.rs`
 
-- [ ] **Step 1: Write failing no-static-inheritance regression tests**
+- [x] **Step 1: Write failing no-static-inheritance regression tests**
 
 Add tests:
 
@@ -2288,7 +2288,7 @@ async fn child_session_follows_rotation_after_creation() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify failure if compatibility path still wins**
+- [x] **Step 2: Run tests and verify failure if compatibility path still wins**
 
 Run:
 
@@ -2300,7 +2300,7 @@ cargo test -p codex-core child_session_follows_rotation_after_creation -- --noca
 
 Expected: FAIL until all primary child paths use runtime host admission instead of static inherited lease auth.
 
-- [ ] **Step 3: Narrow `inherited_lease_auth_session`**
+- [x] **Step 3: Narrow `inherited_lease_auth_session`**
 
 Remove `inherited_lease_auth_session` from normal `ThreadSpawn`, review, and guardian call paths. If it is still required for a non-pooled compatibility case, rename the field to make that narrowness explicit:
 
@@ -2310,7 +2310,7 @@ compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
 
 Do not leave ambiguous primary-path callsites passing inherited lease auth.
 
-- [ ] **Step 4: Remove `ModelClientSession` creation-time lease snapshots**
+- [x] **Step 4: Remove `ModelClientSession` creation-time lease snapshots**
 
 Remove this pattern from `new_session()`:
 
@@ -2324,7 +2324,7 @@ lease_auth_session: self
 
 `ModelClientSession` must not cache pooled auth as a turn-scoped capability. It can keep non-pooled shared auth behavior and request-scoped `LeaseSnapshot` data only for in-flight provider work.
 
-- [ ] **Step 5: Run pooled child behavior tests**
+- [x] **Step 5: Run pooled child behavior tests**
 
 Run:
 
@@ -2337,7 +2337,7 @@ cargo test -p codex-core client_tests -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -2396,7 +2396,7 @@ cargo test -p codex-cli --test accounts_observability -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 4: Run formatting**
+- [x] **Step 4: Run formatting**
 
 Run:
 
@@ -2406,6 +2406,19 @@ just fmt
 ```
 
 Expected: no remaining rustfmt changes, or only expected formatting changes from this plan.
+
+Latest verification ledger, 2026-04-25:
+
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed -- --nocapture` failed with `ThreadNotFound(root)` before the live-descendant fallback fix.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed -- --nocapture` passed after the fix.
+- RED: `cargo test -p codex-core pooled_host_snapshot_ignores_remote_reset_from_previous_generation -- --nocapture` failed because generation 11 reset metadata was exposed on generation 12.
+- GREEN: `cargo test -p codex-core pooled_host_snapshot_ignores_remote_reset_from_previous_generation -- --nocapture` passed after the generation match fix.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 3 targeted tests.
+- PASS: `cargo test -p codex-app-server account_pool -- --nocapture` passed 19 targeted tests.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- Not run in this pass: the full Task 11 core matrix, app-server `account_lease` and `thread_archive`, CLI focused suites, and full workspace `cargo test`.
 
 - [ ] **Step 5: Run scoped lints**
 

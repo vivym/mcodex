@@ -266,9 +266,9 @@ impl RuntimeLeaseHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if record.turn_id.is_none()
-            && let Some(turn_id) = latest_remote_context_reset
-                .as_ref()
-                .and_then(|latest| latest.turn_id.clone())
+            && let Some(latest) = latest_remote_context_reset.as_ref()
+            && latest.lease_generation == record.lease_generation
+            && let Some(turn_id) = latest.turn_id.clone()
         {
             record.turn_id = Some(turn_id);
         }
@@ -294,7 +294,12 @@ impl RuntimeLeaseHost {
         } else {
             return None;
         };
-        if let Some(remote_context_reset) = self.latest_remote_context_reset() {
+        if let Some(remote_context_reset) = self.latest_remote_context_reset()
+            && snapshot
+                .lease_epoch
+                .and_then(|lease_epoch| u64::try_from(lease_epoch).ok())
+                == Some(remote_context_reset.lease_generation)
+        {
             snapshot.transport_reset_generation =
                 Some(remote_context_reset.transport_reset_generation);
             snapshot.last_remote_context_reset_turn_id = remote_context_reset.turn_id;
