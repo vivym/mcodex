@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
@@ -100,6 +102,7 @@ pub struct McpProcess {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     pending_messages: VecDeque<JSONRPCMessage>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
@@ -191,10 +194,16 @@ impl McpProcess {
 
         // Forward child's stderr to our stderr so failures are visible even
         // when stdout/stderr are captured by the test harness.
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = process.stderr.take() {
             let mut stderr_reader = BufReader::new(stderr).lines();
+            let captured_stderr_lines = stderr_lines.clone();
             tokio::spawn(async move {
                 while let Ok(Some(line)) = stderr_reader.next_line().await {
+                    captured_stderr_lines
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(line.clone());
                     eprintln!("[mcp stderr] {line}");
                 }
             });
@@ -205,7 +214,15 @@ impl McpProcess {
             stdin: Some(stdin),
             stdout,
             pending_messages: VecDeque::new(),
+            stderr_lines,
         })
+    }
+
+    pub fn stderr_lines(&self) -> Vec<String> {
+        self.stderr_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Performs the initialization handshake with the MCP server.

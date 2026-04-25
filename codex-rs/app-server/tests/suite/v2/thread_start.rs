@@ -22,9 +22,11 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::set_project_trust_level;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -407,6 +409,11 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let runtime =
+        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".to_string()).await?;
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -442,6 +449,20 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         thread_json.get("ephemeral").and_then(Value::as_bool),
         Some(true),
         "ephemeral threads should serialize `ephemeral: true`"
+    );
+    assert_eq!(
+        runtime
+            .get_thread_config_baseline(ThreadId::from_string(&thread.id)?)
+            .await?,
+        None,
+        "ephemeral thread/start should not persist a durable config baseline"
+    );
+    let stderr_lines = mcp.stderr_lines();
+    assert!(
+        !stderr_lines
+            .iter()
+            .any(|line| line.contains("failed to persist thread config baseline")),
+        "ephemeral thread/start should not attempt durable baseline persistence: {stderr_lines:?}"
     );
 
     Ok(())
