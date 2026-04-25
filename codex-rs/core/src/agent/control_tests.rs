@@ -1932,6 +1932,73 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_pare
 }
 
 #[tokio::test]
+async fn list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let grandchild_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello grandchild"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("grandchild spawn should succeed");
+    let state_db_ctx = root_thread.state_db().expect("root should expose state DB");
+    state_db_ctx
+        .set_thread_spawn_edge_status(child_thread_id, DirectionalThreadSpawnEdgeStatus::Closed)
+        .await
+        .expect("child edge should be closed");
+
+    harness
+        .manager
+        .remove_thread(&child_thread_id)
+        .await
+        .expect("child should be removed");
+    harness
+        .manager
+        .remove_thread(&grandchild_thread_id)
+        .await
+        .expect("grandchild should be removed");
+
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("root subtree should load from persisted mixed-status edges");
+    subtree_thread_ids.sort_by_key(ToString::to_string);
+    let mut expected_thread_ids = vec![root_thread_id, child_thread_id, grandchild_thread_id];
+    expected_thread_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(subtree_thread_ids, expected_thread_ids);
+    root_thread
+        .shutdown_and_wait()
+        .await
+        .expect("root shutdown");
+}
+
+#[tokio::test]
 async fn shutdown_agent_tree_closes_live_descendants() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;

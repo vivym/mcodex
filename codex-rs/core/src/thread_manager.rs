@@ -1,4 +1,5 @@
 use crate::SkillsManager;
+use crate::StateDbHandle;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
 use crate::codex::CodexSpawnArgs;
@@ -49,7 +50,6 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -444,38 +444,30 @@ impl ThreadManager {
         subtree_thread_ids.push(thread_id);
         seen_thread_ids.insert(thread_id);
 
-        let state_db_ctx = match &root_thread {
-            Ok(thread) => thread.state_db(),
-            Err(_) => {
-                let mut state_db_ctx = None;
-                for candidate_thread_id in self.state.list_thread_ids().await {
-                    let Ok(thread) = self.state.get_thread(candidate_thread_id).await else {
-                        continue;
-                    };
-                    if let Some(ctx) = thread.state_db() {
-                        state_db_ctx = Some(ctx);
-                        break;
-                    }
-                }
-                state_db_ctx
-            }
+        let state_db_contexts = match &root_thread {
+            Ok(thread) => thread.state_db().into_iter().collect(),
+            Err(_) => self.live_state_db_contexts().await,
         };
 
-        if let Some(state_db_ctx) = state_db_ctx {
-            for status in [
-                DirectionalThreadSpawnEdgeStatus::Open,
-                DirectionalThreadSpawnEdgeStatus::Closed,
-            ] {
-                for descendant_id in state_db_ctx
-                    .list_thread_spawn_descendants_with_status(thread_id, status)
-                    .await
-                    .map_err(|err| {
-                        CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
-                    })?
-                {
-                    if seen_thread_ids.insert(descendant_id) {
-                        subtree_thread_ids.push(descendant_id);
-                    }
+        let mut found_persisted_root = false;
+        for state_db_ctx in state_db_contexts {
+            let root_known = state_db_ctx
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| CodexErr::Fatal(format!("failed to load thread metadata: {err}")))?;
+            let persisted_descendants = state_db_ctx
+                .list_thread_spawn_descendants(thread_id)
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
+                })?;
+            if root_known.is_none() && persisted_descendants.is_empty() {
+                continue;
+            }
+            found_persisted_root = true;
+            for descendant_id in persisted_descendants {
+                if seen_thread_ids.insert(descendant_id) {
+                    subtree_thread_ids.push(descendant_id);
                 }
             }
         }
@@ -490,11 +482,31 @@ impl ThreadManager {
             }
         }
 
-        if subtree_thread_ids.len() == 1 && root_missing {
+        if subtree_thread_ids.len() == 1 && root_missing && !found_persisted_root {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
 
         Ok(subtree_thread_ids)
+    }
+
+    async fn live_state_db_contexts(&self) -> Vec<StateDbHandle> {
+        let mut state_db_contexts = Vec::new();
+        for candidate_thread_id in self.state.list_thread_ids().await {
+            let Ok(thread) = self.state.get_thread(candidate_thread_id).await else {
+                continue;
+            };
+            let Some(state_db_ctx) = thread.state_db() else {
+                continue;
+            };
+            if state_db_contexts
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, &state_db_ctx))
+            {
+                continue;
+            }
+            state_db_contexts.push(state_db_ctx);
+        }
+        state_db_contexts
     }
 
     pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {

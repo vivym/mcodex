@@ -2435,6 +2435,22 @@ Latest review-fix verification ledger, 2026-04-25:
 - PASS: `git diff --check`.
 - Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
 
+Latest reviewer-loop verification ledger, 2026-04-25:
+
+- PASS before fix: reviewer reproduced gaps in mixed-status persisted subtree traversal, remote reset state across host reuse, manager snapshot generation/identity consistency, and state DB fallback selection.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 3 targeted tests, including `list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants`.
+- PASS: `cargo test -p codex-state thread_spawn_edges_track_directional_status -- --nocapture` passed, including status-agnostic mixed-status descendant coverage.
+- PASS: `cargo test -p codex-core runtime_lease_host_reuse_clears_remote_reset_state -- --nocapture` passed.
+- PASS: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` passed.
+- PASS: `cargo test -p codex-core runtime_lease_host_reuse -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: reran `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` after the fixes; 3 targeted tests passed.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-state`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+
 - [ ] **Step 5: Run scoped lints**
 
 Run:

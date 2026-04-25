@@ -231,6 +231,7 @@ impl RuntimeLeaseHost {
                 self.id()
             );
         }
+        self.clear_remote_context_reset();
         *stored_authority = Some(authority);
         Ok(())
     }
@@ -283,6 +284,14 @@ impl RuntimeLeaseHost {
             .clone()
     }
 
+    fn clear_remote_context_reset(&self) {
+        *self
+            .0
+            .latest_remote_context_reset
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     pub(crate) async fn account_lease_snapshot(
         &self,
     ) -> Option<crate::state::AccountLeaseRuntimeSnapshot> {
@@ -308,6 +317,7 @@ impl RuntimeLeaseHost {
         if let Some(authority) = self.pooled_authority() {
             authority.release_for_shutdown().await?;
         }
+        self.clear_remote_context_reset();
         Ok(())
     }
 
@@ -398,6 +408,7 @@ impl RuntimeLeaseHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.clear_remote_context_reset();
         lifecycle.pending_startups.remove(reservation_id);
         Ok(())
     }
@@ -446,6 +457,7 @@ impl RuntimeLeaseHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.clear_remote_context_reset();
         lifecycle.attached_sessions.remove(session_id);
         Ok(())
     }

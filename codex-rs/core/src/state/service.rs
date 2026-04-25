@@ -531,6 +531,62 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity()
+    -> anyhow::Result<()> {
+        let home = TempDir::new()?;
+        let state_db =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
+                .await?;
+        for (position, account_id) in ["acct-seed-a", "acct-seed-b"].into_iter().enumerate() {
+            state_db
+                .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                    account_id: account_id.to_string(),
+                    pool_id: "pool-main".to_string(),
+                    position: position as i64,
+                    account_kind: "chatgpt".to_string(),
+                    backend_family: "local".to_string(),
+                    workspace_id: Some("workspace-main".to_string()),
+                    enabled: true,
+                    healthy: true,
+                })
+                .await?;
+        }
+        let lease_a = state_db
+            .acquire_account_lease("pool-main", "holder-seed-snapshot", Duration::seconds(300))
+            .await?;
+        let stale_seed = AccountPoolManagerSnapshotSeed {
+            state_db: Arc::clone(&state_db),
+            active_lease: Some(lease_a.clone()),
+            min_switch_interval_secs: 0,
+            proactive_switch_snapshot: None,
+            switch_reason: None,
+            suppression_reason: None,
+            transport_reset_generation: 0,
+            last_remote_context_reset_turn_id: None,
+            active_lease_generation: 1,
+        };
+
+        state_db
+            .release_account_lease(&lease_a.lease_key(), Utc::now())
+            .await?;
+        let lease_b = state_db
+            .acquire_account_lease_excluding(
+                "pool-main",
+                "holder-seed-snapshot",
+                Duration::seconds(300),
+                std::slice::from_ref(&lease_a.account_id),
+            )
+            .await?;
+        assert_eq!(lease_b.account_id, "acct-seed-b");
+
+        let snapshot = stale_seed.snapshot().await;
+
+        assert_eq!(snapshot.account_id.as_deref(), Some("acct-seed-a"));
+        assert_eq!(snapshot.runtime_generation, Some(1));
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -621,7 +677,6 @@ pub(crate) struct AccountPoolManager {
 
 pub(crate) struct AccountPoolManagerSnapshotSeed {
     state_db: StateDbHandle,
-    holder_instance_id: String,
     active_lease: Option<AccountLeaseRecord>,
     min_switch_interval_secs: u64,
     proactive_switch_snapshot: Option<ProactiveSwitchSnapshot>,
@@ -1089,7 +1144,6 @@ impl AccountPoolManager {
         });
         AccountPoolManagerSnapshotSeed {
             state_db: Arc::clone(&self.state_db),
-            holder_instance_id: self.holder_instance_id.clone(),
             active_lease: self.active_lease.as_ref().map(|lease| lease.record.clone()),
             min_switch_interval_secs: self.min_switch_interval.num_seconds().max(0) as u64,
             proactive_switch_snapshot,
@@ -2324,16 +2378,8 @@ impl AccountPoolManagerSnapshotSeed {
     pub(crate) async fn snapshot(self) -> AccountLeaseRuntimeSnapshot {
         let mut health_state = None;
         let mut next_eligible_at = None;
-        let active_lease = if self.active_lease.is_some() {
-            self.state_db
-                .read_active_holder_lease(&self.holder_instance_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        if let Some(diagnostic_lease) = active_lease.as_ref()
+        let active_lease = self.active_lease.as_ref();
+        if let Some(diagnostic_lease) = active_lease
             && let Ok(diagnostic) = self
                 .state_db
                 .read_account_pool_diagnostic(
@@ -2352,7 +2398,6 @@ impl AccountPoolManagerSnapshotSeed {
                 next_eligible_at = account_diagnostic.next_eligible_at.or(next_eligible_at);
             }
         }
-        let active_lease = active_lease.as_ref();
         let proactive_switch_snapshot = active_lease.and(self.proactive_switch_snapshot.as_ref());
         AccountLeaseRuntimeSnapshot {
             active: active_lease.is_some(),

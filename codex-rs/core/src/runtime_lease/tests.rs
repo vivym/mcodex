@@ -444,6 +444,52 @@ async fn runtime_lease_host_reuse_after_successful_shutdown_republishes_authorit
 }
 
 #[tokio::test]
+async fn runtime_lease_host_reuse_clears_remote_reset_state() -> anyhow::Result<()> {
+    let runtime_lease_host = RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
+        "runtime-reuse-reset".to_string(),
+    ));
+
+    runtime_lease_host
+        .install_authority(RuntimeLeaseAuthority::for_test_accepting("acct-old", 1))?;
+    runtime_lease_host.attach_session("session-old").await;
+    runtime_lease_host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-old".to_string(),
+        turn_id: Some("turn-old".to_string()),
+        request_id: "req-old".to_string(),
+        lease_generation: 1,
+        transport_reset_generation: 7,
+    });
+    runtime_lease_host.detach_session("session-old").await?;
+
+    runtime_lease_host
+        .install_authority(RuntimeLeaseAuthority::for_test_accepting("acct-new", 1))?;
+    runtime_lease_host.attach_session("session-new").await;
+    let snapshot = runtime_lease_host
+        .account_lease_snapshot()
+        .await
+        .expect("new authority should expose active snapshot");
+    assert_eq!(snapshot.account_id.as_deref(), Some("acct-new"));
+    assert_eq!(snapshot.transport_reset_generation, None);
+    assert_eq!(snapshot.last_remote_context_reset_turn_id, None);
+
+    runtime_lease_host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-new".to_string(),
+        turn_id: None,
+        request_id: "req-new-background".to_string(),
+        lease_generation: 1,
+        transport_reset_generation: 8,
+    });
+    let background_snapshot = runtime_lease_host
+        .account_lease_snapshot()
+        .await
+        .expect("new authority should expose background reset snapshot");
+    assert_eq!(background_snapshot.transport_reset_generation, Some(8));
+    assert_eq!(background_snapshot.last_remote_context_reset_turn_id, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn admission_guard_releases_exactly_once() {
     let authority = RuntimeLeaseAuthority::for_test_accepting("acct-a", 11);
     let request_context = LeaseRequestContext::for_test(
