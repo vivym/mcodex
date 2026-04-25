@@ -147,6 +147,13 @@ pub(crate) fn unsupported_transport_error() -> JSONRPCErrorError {
     )
 }
 
+pub(crate) fn already_loaded_top_level_thread_error(thread_id: ThreadId) -> JSONRPCErrorError {
+    pooled_runtime_error(
+        POOLED_RUNTIME_ALREADY_LOADED,
+        format!("pooled runtime cannot start while top-level thread {thread_id} is loaded"),
+    )
+}
+
 fn already_loaded_error(current: &PooledRuntimeContext) -> JSONRPCErrorError {
     let message = match current {
         PooledRuntimeContext::Starting { .. } => {

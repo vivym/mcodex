@@ -457,7 +457,7 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         None,
         "ephemeral thread/start should not persist a durable config baseline"
     );
-    let stderr_lines = mcp.stderr_lines();
+    let stderr_lines = mcp.stderr_lines_after_quiet_period().await;
     assert!(
         !stderr_lines
             .iter()

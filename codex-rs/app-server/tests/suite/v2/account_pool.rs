@@ -281,6 +281,34 @@ async fn stdio_pooled_mode_uses_effective_request_config_for_top_level_gate() ->
 }
 
 #[tokio::test]
+async fn stdio_pooled_mode_rejects_request_config_after_non_pooled_top_level_loaded() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let runtime = seed_two_accounts(codex_home.path()).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    create_config_toml_without_accounts(codex_home.path(), &server.uri())?;
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    mcp.initialize().await?;
+
+    let first = start_thread(&mut mcp).await?;
+    let error = start_thread_error_with_config(&mut mcp, pooled_accounts_request_config()).await?;
+
+    assert_eq!(
+        pooled_runtime_error_code(&error),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+    assert!(!first.id.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn stdio_pooled_mode_blocks_request_config_resume_and_fork_as_second_top_level_context()
 -> Result<()> {
     let codex_home = TempDir::new()?;

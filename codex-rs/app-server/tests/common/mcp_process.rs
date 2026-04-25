@@ -225,6 +225,30 @@ impl McpProcess {
             .clone()
     }
 
+    pub async fn stderr_lines_after_quiet_period(&self) -> Vec<String> {
+        let quiet_period = std::time::Duration::from_millis(25);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut stable_intervals = 0;
+        let mut lines = self.stderr_lines();
+
+        loop {
+            tokio::time::sleep(quiet_period).await;
+            let next_lines = self.stderr_lines();
+            if next_lines.len() == lines.len() {
+                stable_intervals += 1;
+                if stable_intervals >= 2 || tokio::time::Instant::now() >= deadline {
+                    return next_lines;
+                }
+            } else {
+                stable_intervals = 0;
+                lines = next_lines;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return lines;
+            }
+        }
+    }
+
     /// Performs the initialization handshake with the MCP server.
     pub async fn initialize(&mut self) -> anyhow::Result<()> {
         let initialized = self

@@ -1805,6 +1805,7 @@ async fn thread_resume_by_thread_id_preserves_zero_turn_start_config_baseline_af
 -> Result<()> {
     assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
         ResumeSource::ThreadId,
+        BackfillStateBeforeResume::Complete,
     )
     .await
 }
@@ -1814,6 +1815,17 @@ async fn thread_resume_by_path_preserves_zero_turn_start_config_baseline_after_c
 -> Result<()> {
     assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
         ResumeSource::Path,
+        BackfillStateBeforeResume::Complete,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn thread_resume_by_thread_id_preserves_zero_turn_start_config_baseline_while_backfill_running()
+-> Result<()> {
+    assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
+        ResumeSource::ThreadId,
+        BackfillStateBeforeResume::Running,
     )
     .await
 }
@@ -1823,8 +1835,14 @@ enum ResumeSource {
     Path,
 }
 
+enum BackfillStateBeforeResume {
+    Complete,
+    Running,
+}
+
 async fn assert_thread_resume_preserves_zero_turn_start_config_baseline_after_config_changes(
     source: ResumeSource,
+    backfill_state_before_resume: BackfillStateBeforeResume,
 ) -> Result<()> {
     let source_server = responses::start_mock_server().await;
     let current_server = responses::start_mock_server().await;
@@ -1850,6 +1868,19 @@ async fn assert_thread_resume_preserves_zero_turn_start_config_baseline_after_co
             current_server_uri: &current_server.uri(),
         },
     )?;
+    let runtime = StateRuntime::init(
+        codex_home.path().to_path_buf(),
+        "source_provider".to_string(),
+    )
+    .await?;
+    if matches!(
+        backfill_state_before_resume,
+        BackfillStateBeforeResume::Running
+    ) {
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await?;
+    }
 
     let mut primary = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
@@ -1872,6 +1903,12 @@ async fn assert_thread_resume_preserves_zero_turn_start_config_baseline_after_co
         anyhow::bail!("source thread path missing");
     };
     drop(primary);
+    if matches!(
+        backfill_state_before_resume,
+        BackfillStateBeforeResume::Running
+    ) {
+        runtime.mark_backfill_running().await?;
+    }
 
     write_dual_provider_config_toml(
         codex_home.path(),

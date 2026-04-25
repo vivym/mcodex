@@ -43,6 +43,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource as RolloutSessionSource;
 use codex_protocol::protocol::TurnContextItem;
+use codex_state::StateRuntime;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -355,6 +356,7 @@ async fn thread_fork_by_thread_id_preserves_unloaded_zero_turn_start_config_base
 -> Result<()> {
     assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
         ForkSource::ThreadId,
+        BackfillStateBeforeFork::Complete,
     )
     .await
 }
@@ -364,12 +366,29 @@ async fn thread_fork_by_path_preserves_unloaded_zero_turn_start_config_baseline_
 -> Result<()> {
     assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
         ForkSource::Path,
+        BackfillStateBeforeFork::Complete,
     )
     .await
 }
 
+#[tokio::test]
+async fn thread_fork_by_path_preserves_unloaded_zero_turn_start_config_baseline_while_backfill_running()
+-> Result<()> {
+    assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
+        ForkSource::Path,
+        BackfillStateBeforeFork::Running,
+    )
+    .await
+}
+
+enum BackfillStateBeforeFork {
+    Complete,
+    Running,
+}
+
 async fn assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_after_config_changes(
     source: ForkSource,
+    backfill_state_before_fork: BackfillStateBeforeFork,
 ) -> Result<()> {
     let source_server = responses::start_mock_server().await;
     let source_mock = responses::mount_sse_once(
@@ -395,6 +414,16 @@ async fn assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_a
             current_server_uri: &current_server.uri(),
         },
     )?;
+    let runtime = StateRuntime::init(
+        codex_home.path().to_path_buf(),
+        "source_provider".to_string(),
+    )
+    .await?;
+    if matches!(backfill_state_before_fork, BackfillStateBeforeFork::Running) {
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await?;
+    }
 
     let mut primary = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, primary.initialize()).await??;
@@ -418,6 +447,9 @@ async fn assert_thread_fork_preserves_unloaded_zero_turn_start_config_baseline_a
         anyhow::bail!("source thread path missing");
     };
     drop(primary);
+    if matches!(backfill_state_before_fork, BackfillStateBeforeFork::Running) {
+        runtime.mark_backfill_running().await?;
+    }
 
     write_dual_provider_config_toml(
         codex_home.path(),

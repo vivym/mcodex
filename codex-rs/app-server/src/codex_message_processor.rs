@@ -20,6 +20,7 @@ use crate::outgoing_message::RequestContext;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::pooled_runtime_scope::PooledRuntimeReservation;
 use crate::pooled_runtime_scope::PooledRuntimeScope;
+use crate::pooled_runtime_scope::already_loaded_top_level_thread_error;
 use crate::pooled_runtime_scope::unsupported_transport_error;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
@@ -1852,6 +1853,19 @@ impl CodexMessageProcessor {
             return Ok(PooledRuntimeAdmission::NotPooled);
         }
 
+        for thread_id in thread_manager.list_thread_ids().await {
+            let Ok(thread) = thread_manager.get_thread(thread_id).await else {
+                continue;
+            };
+            let config_snapshot = thread.config_snapshot().await;
+            if !matches!(
+                config_snapshot.session_source,
+                codex_protocol::protocol::SessionSource::SubAgent(_)
+            ) {
+                return Err(already_loaded_top_level_thread_error(thread_id));
+            }
+        }
+
         pooled_runtime_scope
             .reserve()
             .await
@@ -2956,7 +2970,45 @@ impl CodexMessageProcessor {
                     ))
                     .await;
                 if !config_snapshot.ephemeral && session_configured.rollout_path.is_some() {
-                    thread.ensure_rollout_materialized().await;
+                    if let Err(err) = thread.try_ensure_rollout_materialized().await {
+                        Self::cleanup_failed_top_level_thread_setup_for_context(
+                            ThreadUnloadContext {
+                                thread_manager: listener_task_context.thread_manager.clone(),
+                                outgoing: listener_task_context.outgoing.clone(),
+                                pending_thread_unloads: listener_task_context
+                                    .pending_thread_unloads
+                                    .clone(),
+                                pooled_runtime_scope: listener_task_context
+                                    .pooled_runtime_scope
+                                    .clone(),
+                                config: listener_task_context.config.clone(),
+                                thread_state_manager: listener_task_context
+                                    .thread_state_manager
+                                    .clone(),
+                                thread_watch_manager: listener_task_context
+                                    .thread_watch_manager
+                                    .clone(),
+                            },
+                            thread_id,
+                            thread.clone(),
+                            FailedSetupArtifactCleanup::DeleteCreatedRollout,
+                        )
+                        .await;
+                        listener_task_context
+                            .outgoing
+                            .send_error(
+                                request_id,
+                                JSONRPCErrorError {
+                                    code: INTERNAL_ERROR_CODE,
+                                    message: format!(
+                                        "failed to materialize rollout for thread {thread_id}: {err}"
+                                    ),
+                                    data: None,
+                                },
+                            )
+                            .await;
+                        return;
+                    }
                     let effective_config = thread.effective_config().await;
                     let start_config_baseline = thread_config_baseline_snapshot(
                         thread_id,
@@ -4783,7 +4835,7 @@ impl CodexMessageProcessor {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
-        let state_db_ctx = get_state_db(&self.config).await?;
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
         state_db_ctx
             .get_thread(resumed_history.conversation_id)
             .await
@@ -4798,7 +4850,7 @@ impl CodexMessageProcessor {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
-        let state_db_ctx = get_state_db(&self.config).await?;
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
         state_db_ctx
             .get_thread_config_baseline(resumed_history.conversation_id)
             .await
@@ -4810,7 +4862,7 @@ impl CodexMessageProcessor {
         &self,
         thread_id: Option<ThreadId>,
     ) -> Option<ThreadMetadata> {
-        let state_db_ctx = get_state_db(&self.config).await?;
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
         let thread_id = thread_id?;
         state_db_ctx.get_thread(thread_id).await.ok().flatten()
     }
@@ -4819,7 +4871,7 @@ impl CodexMessageProcessor {
         &self,
         thread_id: Option<ThreadId>,
     ) -> Option<ThreadConfigBaselineSnapshot> {
-        let state_db_ctx = get_state_db(&self.config).await?;
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
         let thread_id = thread_id?;
         state_db_ctx
             .get_thread_config_baseline(thread_id)
@@ -4839,7 +4891,7 @@ impl CodexMessageProcessor {
         config: &Config,
         snapshot: &ThreadConfigBaselineSnapshot,
     ) {
-        let Some(state_db_ctx) = get_state_db(config).await else {
+        let Some(state_db_ctx) = open_state_db_for_direct_thread_lookup(config).await else {
             return;
         };
         if let Err(err) = state_db_ctx.upsert_thread_config_baseline(snapshot).await {
