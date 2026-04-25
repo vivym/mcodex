@@ -2819,9 +2819,7 @@ fn parent_thread_id_header_value(session_source: &SessionSource) -> Option<Strin
 
 fn map_lease_admission_error(err: LeaseAdmissionError) -> CodexErr {
     match err {
-        LeaseAdmissionError::NoEligibleAccount => CodexErr::Io(std::io::Error::other(
-            "No eligible pooled account is available for this turn.",
-        )),
+        LeaseAdmissionError::NoEligibleAccount => CodexErr::NoEligiblePooledAccount,
         _ => CodexErr::Io(std::io::Error::other(err.to_string())),
     }
 }

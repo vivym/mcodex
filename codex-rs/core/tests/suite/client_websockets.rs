@@ -68,6 +68,19 @@ const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
 const WS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 const X_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_pooled_websocket_test(test: impl std::future::Future<Output = ()>) {
+    // Pooled websocket turns exercise the same large async path as production,
+    // whose entrypoint configures a larger Tokio worker stack.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .enable_all()
+        .build()
+        .expect("build production-like tokio runtime for pooled websocket test")
+        .block_on(test);
+}
 
 fn assert_request_trace_matches(body: &serde_json::Value, expected_trace: &W3cTraceContext) {
     let client_metadata = body["client_metadata"]
@@ -357,8 +370,12 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
+#[test]
+fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
+    run_pooled_websocket_test(pooled_mode_does_not_schedule_startup_prewarm_websocket_inner());
+}
+
+async fn pooled_mode_does_not_schedule_startup_prewarm_websocket_inner() {
     skip_if_no_network!();
 
     let pooled_account_id = "account_id_b";
@@ -460,8 +477,14 @@ async fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused() {
+#[test]
+fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused() {
+    run_pooled_websocket_test(
+        pooled_websocket_rotation_opens_new_connection_when_context_is_reused_inner(),
+    );
+}
+
+async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused_inner() {
     skip_if_no_network!();
 
     let near_limit_event = json!({
@@ -593,8 +616,14 @@ async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused()
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket() {
+#[test]
+fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket() {
+    run_pooled_websocket_test(
+        pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket_inner(),
+    );
+}
+
+async fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket_inner() {
     skip_if_no_network!();
 
     let pooled_account_id = "account_id_b";
@@ -934,10 +963,10 @@ async fn responses_websocket_request_prewarm_is_reused_even_with_header_changes(
 async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets() {
     skip_if_no_network!();
 
-    let server = start_websocket_server(vec![vec![vec![
-        ev_response_created("resp-1"),
-        ev_completed("resp-1"),
-    ]]])
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
+    ]])
     .await;
 
     let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ false).await;
@@ -974,16 +1003,24 @@ async fn responses_websocket_prewarm_uses_v2_when_provider_supports_websockets()
     stream_until_complete(&mut client_session, &harness, &prompt).await;
     assert_eq!(server.handshakes().len(), 1);
     let connection = server.single_connection();
-    assert_eq!(connection.len(), 1);
+    assert_eq!(connection.len(), 2);
     let prewarm = connection
         .first()
         .expect("missing prewarm request")
         .body_json();
+    let follow_up = connection
+        .get(1)
+        .expect("missing follow-up request")
+        .body_json();
     assert_eq!(prewarm["type"].as_str(), Some("response.create"));
+    assert_eq!(prewarm["generate"].as_bool(), Some(false));
     assert_eq!(
         prewarm["input"],
         serde_json::to_value(&prompt.input).unwrap()
     );
+    assert_eq!(follow_up["type"].as_str(), Some("response.create"));
+    assert_eq!(follow_up["previous_response_id"].as_str(), Some("warm-1"));
+    assert_eq!(follow_up["input"], serde_json::json!([]));
 
     server.shutdown().await;
 }
