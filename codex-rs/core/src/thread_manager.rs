@@ -451,25 +451,16 @@ impl ThreadManager {
 
         let mut found_persisted_root = false;
         for state_db_ctx in state_db_contexts {
-            let root_known = match state_db_ctx.get_thread(thread_id).await {
-                Ok(root_known) => root_known,
-                Err(err) => {
-                    warn!("failed to load thread metadata for subtree root {thread_id}: {err}");
-                    continue;
-                }
-            };
-            let persisted_descendants = match state_db_ctx
+            let root_known = state_db_ctx
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| CodexErr::Fatal(format!("failed to load thread metadata: {err}")))?;
+            let persisted_descendants = state_db_ctx
                 .list_thread_spawn_descendants(thread_id)
                 .await
-            {
-                Ok(persisted_descendants) => persisted_descendants,
-                Err(err) => {
-                    warn!(
-                        "failed to load thread-spawn descendants for subtree root {thread_id}: {err}"
-                    );
-                    continue;
-                }
-            };
+                .map_err(|err| {
+                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
+                })?;
             if root_known.is_none() && persisted_descendants.is_empty() {
                 continue;
             }
@@ -492,6 +483,36 @@ impl ThreadManager {
         }
 
         if subtree_thread_ids.len() == 1 && root_missing && !found_persisted_root {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+
+        Ok(subtree_thread_ids)
+    }
+
+    /// List `thread_id` plus currently live descendants, without consulting persisted edges.
+    ///
+    /// This is for runtime-ownership decisions where protecting live subagents is more important
+    /// than returning archived or closed descendants. Completeness-sensitive callers should use
+    /// [`Self::list_agent_subtree_thread_ids`].
+    pub async fn list_live_agent_subtree_thread_ids(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let root_missing = self.state.get_thread(thread_id).await.is_err();
+        let mut subtree_thread_ids = vec![thread_id];
+        let mut seen_thread_ids = HashSet::from([thread_id]);
+
+        for descendant_id in self
+            .agent_control()
+            .list_live_agent_descendant_thread_ids_from_roots(&subtree_thread_ids)
+            .await?
+        {
+            if seen_thread_ids.insert(descendant_id) {
+                subtree_thread_ids.push(descendant_id);
+            }
+        }
+
+        if subtree_thread_ids.len() == 1 && root_missing {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
 

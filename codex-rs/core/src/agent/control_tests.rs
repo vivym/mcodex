@@ -1932,7 +1932,7 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_pare
 }
 
 #[tokio::test]
-async fn list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails() {
+async fn list_agent_subtree_thread_ids_returns_error_when_persisted_lookup_fails() {
     let harness = AgentControlHarness::new().await;
     let (root_thread_id, _root_thread) = harness.start_thread().await;
     let child_thread_id = harness
@@ -1965,9 +1965,20 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_look
         .expect("test should inject persisted subtree lookup failure");
     pool.close().await;
 
-    let mut subtree_thread_ids = harness
+    let err = harness
         .manager
         .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect_err("complete subtree should fail when persisted lookup fails");
+    assert_matches!(
+        err,
+        codex_protocol::error::CodexErr::Fatal(message)
+            if message.contains("failed to load thread-spawn descendants")
+    );
+
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_live_agent_subtree_thread_ids(root_thread_id)
         .await
         .expect("live subtree should still load when persisted lookup fails");
     subtree_thread_ids.sort_by_key(ToString::to_string);
@@ -1977,6 +1988,45 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_look
     assert_eq!(subtree_thread_ids, expected_thread_ids);
     let _ = harness.manager.remove_thread(&child_thread_id).await;
     let _ = harness.manager.remove_thread(&root_thread_id).await;
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_reports_persisted_error_for_known_unloaded_root() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let (other_thread_id, _other_thread) = harness.start_thread().await;
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed from live manager");
+
+    let state_db_path = codex_state::state_db_path(harness.config.codex_home.as_ref());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject persisted subtree lookup failure");
+    pool.close().await;
+
+    let err = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect_err("known persisted root should report persisted lookup error");
+    assert_matches!(
+        err,
+        codex_protocol::error::CodexErr::Fatal(message)
+            if message.contains("failed to load thread-spawn descendants")
+    );
+
+    let _ = harness.manager.remove_thread(&other_thread_id).await;
 }
 
 #[tokio::test]

@@ -6968,7 +6968,7 @@ impl CodexMessageProcessor {
         }
 
         if let Ok(subtree_thread_ids) = thread_manager
-            .list_agent_subtree_thread_ids(root_thread_id)
+            .list_live_agent_subtree_thread_ids(root_thread_id)
             .await
         {
             for subtree_thread_id in subtree_thread_ids {

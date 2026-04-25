@@ -2491,6 +2491,20 @@ Latest gpt-5.5 follow-up reviewer-loop verification ledger, 2026-04-25:
 - Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
 - Not run in this follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
 
+Latest gpt-5.5 second follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: `gpt-5.5` `xhigh` reviewers identified that degrading persisted lookup failures inside `list_agent_subtree_thread_ids` made the complete subtree API silently partial and could still misclassify a known persisted root as not found.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 5 targeted tests after splitting complete and live-only subtree APIs.
+- GREEN detail: complete `list_agent_subtree_thread_ids` now reports persisted lookup errors instead of returning partial results.
+- GREEN detail: new `list_live_agent_subtree_thread_ids` keeps app-server pooled-runtime ownership checks live-safe without affecting feedback/upload completeness semantics.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test after app-server switched to the live-only subtree API.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not run in this second follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
 - [ ] **Step 5: Run scoped lints**
 
 Run:
