@@ -97,7 +97,7 @@ After syncing this branch with `main`:
   `codex-rs/core/tests/suite/account_pool.rs` is now provided by the merged
   runtime authority plan. Do not reimplement the original Task 4 per-session
   integration path.
-- Modify `codex-rs/state/src/model/account_pool_observability.rs`, `codex-rs/state/src/model/mod.rs`, `codex-rs/state/src/lib.rs`, `codex-rs/state/src/runtime/account_pool_observability.rs`, `codex-rs/account-pool/src/observability.rs`, `codex-rs/account-pool/src/observability/conversions.rs`, `codex-rs/account-pool/src/backend.rs`, and `codex-rs/account-pool/src/lib.rs` to surface typed `quotas` while keeping additive compatibility fields.
+- Modify `codex-rs/state/src/model/account_pool_observability.rs`, `codex-rs/state/src/model/mod.rs`, `codex-rs/state/src/lib.rs`, `codex-rs/state/src/runtime/account_pool_observability.rs`, `codex-rs/account-pool/src/observability.rs`, `codex-rs/account-pool/src/observability/conversions.rs`, `codex-rs/account-pool/src/backend.rs`, `codex-rs/account-pool/src/lib.rs`, and `codex-rs/account-pool/tests/observability.rs` to surface typed `quotas` while keeping additive compatibility fields.
 - Modify `codex-rs/app-server-protocol/src/protocol/v2.rs`, `codex-rs/app-server/src/account_pool_api.rs`, and `codex-rs/app-server/src/account_pool_api/conversions.rs` to publish the richer account-pool quota contract on `accountPool/accounts/list`.
 - Modify `codex-rs/app-server/tests/suite/v2/account_pool.rs` and `codex-rs/app-server/README.md` to lock and document the additive API behavior.
 - Modify existing CLI observability files
@@ -725,6 +725,7 @@ CLI observability and TUI consumers to render those fields.
 - Modify: `codex-rs/account-pool/src/observability/conversions.rs`
 - Modify: `codex-rs/account-pool/src/backend.rs`
 - Modify: `codex-rs/account-pool/src/lib.rs`
+- Modify: `codex-rs/account-pool/tests/observability.rs`
 - Modify: `codex-rs/app-server-protocol/src/protocol/v2.rs`
 - Modify: `codex-rs/app-server-protocol/tests/account_pool_observability.rs`
 - Modify: `codex-rs/app-server/src/account_pool_api.rs`
@@ -736,8 +737,14 @@ CLI observability and TUI consumers to render those fields.
 
 - [ ] **Step 1: Write failing protocol and app-server tests for additive `quotas` fields**
 
-Extend `codex-rs/app-server/tests/suite/v2/account_pool.rs` and
+Extend `codex-rs/account-pool/tests/observability.rs`,
+`codex-rs/app-server/tests/suite/v2/account_pool.rs`, and
 `codex-rs/app-server-protocol/tests/account_pool_observability.rs`.
+
+Account-pool crate coverage should assert that
+`LocalAccountPoolBackend::list_accounts` preserves the same `quotas` vector and
+singular `quota` compatibility projection returned by the state runtime after
+quota rows are attached.
 
 Protocol serialization coverage should validate the typed quota-family payload
 shape without pretending that serde itself sorts the vector:
@@ -876,7 +883,7 @@ just fix -p codex-app-server-protocol
 just fix -p codex-app-server
 just fix -p codex-state
 just fix -p codex-account-pool
-git add state/src/model/account_pool_observability.rs state/src/model/mod.rs state/src/lib.rs state/src/runtime/account_pool_observability.rs account-pool/src/observability.rs account-pool/src/observability/conversions.rs account-pool/src/backend.rs account-pool/src/lib.rs app-server-protocol/src/protocol/v2.rs app-server/tests/suite/v2/account_pool.rs app-server/src/account_pool_api.rs app-server/src/account_pool_api/conversions.rs app-server/README.md app-server-protocol/schema/json app-server-protocol/schema/typescript app-server-protocol/tests/account_pool_observability.rs
+git add state/src/model/account_pool_observability.rs state/src/model/mod.rs state/src/lib.rs state/src/runtime/account_pool_observability.rs account-pool/src/observability.rs account-pool/src/observability/conversions.rs account-pool/src/backend.rs account-pool/src/lib.rs account-pool/tests/observability.rs app-server-protocol/src/protocol/v2.rs app-server/tests/suite/v2/account_pool.rs app-server/src/account_pool_api.rs app-server/src/account_pool_api/conversions.rs app-server/README.md app-server-protocol/schema/json app-server-protocol/schema/typescript app-server-protocol/tests/account_pool_observability.rs
 git commit -m "feat(app-server): expose quota-aware pool observability"
 ```
 
@@ -1006,6 +1013,7 @@ git commit -m "feat(ui): render quota-aware account selection state"
 - Verify: `codex-rs/state/tests/account_pool_quota.rs`
 - Verify: `codex-rs/account-pool/tests/quota_selection.rs`
 - Verify: `codex-rs/account-pool/tests/lease_lifecycle.rs`
+- Verify: `codex-rs/account-pool/tests/observability.rs`
 - Verify: `codex-rs/core/tests/suite/account_pool.rs`
 - Verify: runtime-authority probe handoff coverage if Task 5/6 changes any probe or lease handoff behavior
 - Verify: `codex-rs/app-server-protocol/tests/account_pool_observability.rs`
