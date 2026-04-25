@@ -12,6 +12,11 @@ enum ThreadConfigBaselineUpdateKind {
     HistoricalReplay,
 }
 
+enum ThreadConfigBaselineConflictPolicy {
+    ReplaceAll,
+    PreserveOverrideOnlyFields,
+}
+
 impl StateRuntime {
     pub(crate) async fn upsert_thread_config_baseline_from_rollout_items(
         &self,
@@ -61,7 +66,15 @@ impl StateRuntime {
         {
             restore_override_only_fields_from_existing(&mut snapshot, existing);
         }
-        self.upsert_thread_config_baseline(&snapshot).await
+        match kind {
+            ThreadConfigBaselineUpdateKind::LiveIncremental => {
+                self.upsert_thread_config_baseline(&snapshot).await
+            }
+            ThreadConfigBaselineUpdateKind::HistoricalReplay => {
+                self.upsert_thread_config_baseline_preserving_override_only_fields(&snapshot)
+                    .await
+            }
+        }
     }
 }
 
@@ -281,7 +294,66 @@ WHERE thread_id = ?
         &self,
         snapshot: &ThreadConfigBaselineSnapshot,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        self.upsert_thread_config_baseline_with_conflict_policy(
+            snapshot,
+            ThreadConfigBaselineConflictPolicy::ReplaceAll,
+        )
+        .await
+    }
+
+    async fn upsert_thread_config_baseline_preserving_override_only_fields(
+        &self,
+        snapshot: &ThreadConfigBaselineSnapshot,
+    ) -> anyhow::Result<()> {
+        self.upsert_thread_config_baseline_with_conflict_policy(
+            snapshot,
+            ThreadConfigBaselineConflictPolicy::PreserveOverrideOnlyFields,
+        )
+        .await
+    }
+
+    async fn upsert_thread_config_baseline_with_conflict_policy(
+        &self,
+        snapshot: &ThreadConfigBaselineSnapshot,
+        conflict_policy: ThreadConfigBaselineConflictPolicy,
+    ) -> anyhow::Result<()> {
+        let conflict_assignments = match conflict_policy {
+            ThreadConfigBaselineConflictPolicy::ReplaceAll => {
+                r#"
+    model = excluded.model,
+    model_provider_id = excluded.model_provider_id,
+    service_tier = excluded.service_tier,
+    approval_policy = excluded.approval_policy,
+    approvals_reviewer = excluded.approvals_reviewer,
+    sandbox_policy = excluded.sandbox_policy,
+    cwd = excluded.cwd,
+    reasoning_effort = excluded.reasoning_effort,
+    personality = excluded.personality,
+    personality_overrides_rollout = excluded.personality_overrides_rollout,
+    base_instructions = excluded.base_instructions,
+    developer_instructions = excluded.developer_instructions,
+    developer_instructions_overrides_rollout = excluded.developer_instructions_overrides_rollout
+                "#
+            }
+            ThreadConfigBaselineConflictPolicy::PreserveOverrideOnlyFields => {
+                r#"
+    model = excluded.model,
+    model_provider_id = excluded.model_provider_id,
+    service_tier = excluded.service_tier,
+    approval_policy = excluded.approval_policy,
+    approvals_reviewer = excluded.approvals_reviewer,
+    sandbox_policy = excluded.sandbox_policy,
+    cwd = excluded.cwd,
+    reasoning_effort = excluded.reasoning_effort,
+    personality = thread_config_baselines.personality,
+    personality_overrides_rollout = thread_config_baselines.personality_overrides_rollout,
+    base_instructions = thread_config_baselines.base_instructions,
+    developer_instructions = thread_config_baselines.developer_instructions,
+    developer_instructions_overrides_rollout = thread_config_baselines.developer_instructions_overrides_rollout
+                "#
+            }
+        };
+        let sql = format!(
             r#"
 INSERT INTO thread_config_baselines (
     thread_id,
@@ -300,52 +372,41 @@ INSERT INTO thread_config_baselines (
     developer_instructions_overrides_rollout
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
-    model = excluded.model,
-    model_provider_id = excluded.model_provider_id,
-    service_tier = excluded.service_tier,
-    approval_policy = excluded.approval_policy,
-    approvals_reviewer = excluded.approvals_reviewer,
-    sandbox_policy = excluded.sandbox_policy,
-    cwd = excluded.cwd,
-    reasoning_effort = excluded.reasoning_effort,
-    personality = excluded.personality,
-    personality_overrides_rollout = excluded.personality_overrides_rollout,
-    base_instructions = excluded.base_instructions,
-    developer_instructions = excluded.developer_instructions,
-    developer_instructions_overrides_rollout = excluded.developer_instructions_overrides_rollout
+{conflict_assignments}
             "#,
-        )
-        .bind(snapshot.thread_id.to_string())
-        .bind(snapshot.model.as_str())
-        .bind(snapshot.model_provider_id.as_str())
-        .bind(
-            snapshot
-                .service_tier
-                .as_ref()
-                .map(crate::extract::enum_to_string),
-        )
-        .bind(crate::extract::enum_to_string(&snapshot.approval_policy))
-        .bind(crate::extract::enum_to_string(&snapshot.approvals_reviewer))
-        .bind(crate::extract::enum_to_string(&snapshot.sandbox_policy))
-        .bind(snapshot.cwd.display().to_string())
-        .bind(
-            snapshot
-                .reasoning_effort
-                .as_ref()
-                .map(crate::extract::enum_to_string),
-        )
-        .bind(
-            snapshot
-                .personality
-                .as_ref()
-                .map(crate::extract::enum_to_string),
-        )
-        .bind(snapshot.personality_overrides_rollout)
-        .bind(snapshot.base_instructions.as_deref())
-        .bind(snapshot.developer_instructions.as_deref())
-        .bind(snapshot.developer_instructions_overrides_rollout)
-        .execute(self.pool.as_ref())
-        .await?;
+        );
+        sqlx::query(sql.as_str())
+            .bind(snapshot.thread_id.to_string())
+            .bind(snapshot.model.as_str())
+            .bind(snapshot.model_provider_id.as_str())
+            .bind(
+                snapshot
+                    .service_tier
+                    .as_ref()
+                    .map(crate::extract::enum_to_string),
+            )
+            .bind(crate::extract::enum_to_string(&snapshot.approval_policy))
+            .bind(crate::extract::enum_to_string(&snapshot.approvals_reviewer))
+            .bind(crate::extract::enum_to_string(&snapshot.sandbox_policy))
+            .bind(snapshot.cwd.display().to_string())
+            .bind(
+                snapshot
+                    .reasoning_effort
+                    .as_ref()
+                    .map(crate::extract::enum_to_string),
+            )
+            .bind(
+                snapshot
+                    .personality
+                    .as_ref()
+                    .map(crate::extract::enum_to_string),
+            )
+            .bind(snapshot.personality_overrides_rollout)
+            .bind(snapshot.base_instructions.as_deref())
+            .bind(snapshot.developer_instructions.as_deref())
+            .bind(snapshot.developer_instructions_overrides_rollout)
+            .execute(self.pool.as_ref())
+            .await?;
         Ok(())
     }
 }
@@ -653,6 +714,56 @@ mod tests {
                 developer_instructions: Some("rollout developer instructions".to_string()),
                 developer_instructions_overrides_rollout: false,
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_backfill_preserves_override_only_fields_when_stale_snapshot_conflicts_with_live_row()
+    -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let thread_id = ThreadId::from_string("af8e76c7-8e49-4a50-92f4-973ac9e80f8a")?;
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        runtime.upsert_thread(&metadata).await?;
+
+        let mut stale_historical_snapshot = test_snapshot(thread_id);
+        stale_historical_snapshot.model = "historical-model".to_string();
+        stale_historical_snapshot.personality = Some(Personality::Pragmatic);
+        stale_historical_snapshot.personality_overrides_rollout = false;
+        stale_historical_snapshot.base_instructions =
+            Some("historical base instructions".to_string());
+        stale_historical_snapshot.developer_instructions =
+            Some("historical developer instructions".to_string());
+        stale_historical_snapshot.developer_instructions_overrides_rollout = false;
+
+        let mut live_snapshot = test_snapshot(thread_id);
+        live_snapshot.model = "live-model".to_string();
+        live_snapshot.personality = Some(Personality::Friendly);
+        live_snapshot.personality_overrides_rollout = true;
+        live_snapshot.base_instructions = Some("live base instructions".to_string());
+        live_snapshot.developer_instructions = Some("live developer instructions".to_string());
+        live_snapshot.developer_instructions_overrides_rollout = true;
+        runtime
+            .upsert_thread_config_baseline(&live_snapshot)
+            .await?;
+
+        runtime
+            .upsert_thread_config_baseline_preserving_override_only_fields(
+                &stale_historical_snapshot,
+            )
+            .await?;
+
+        let mut expected = stale_historical_snapshot;
+        expected.personality = live_snapshot.personality;
+        expected.personality_overrides_rollout = live_snapshot.personality_overrides_rollout;
+        expected.base_instructions = live_snapshot.base_instructions;
+        expected.developer_instructions = live_snapshot.developer_instructions;
+        expected.developer_instructions_overrides_rollout =
+            live_snapshot.developer_instructions_overrides_rollout;
+        assert_eq!(
+            runtime.get_thread_config_baseline(thread_id).await?,
+            Some(expected)
         );
         Ok(())
     }

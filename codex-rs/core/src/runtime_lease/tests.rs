@@ -151,6 +151,39 @@ async fn pooled_host_snapshot_uses_authority_state_without_session_local_manager
 }
 
 #[tokio::test]
+async fn pooled_host_snapshot_preserves_last_turn_reset_after_background_reset() {
+    let host = RuntimeLeaseHost::pooled_with_authority_for_test(
+        RuntimeLeaseHostId::new("runtime-snapshot".to_string()),
+        RuntimeLeaseAuthority::for_test_accepting("acct-a", 11),
+    );
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-a".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        request_id: "req-turn".to_string(),
+        lease_generation: 11,
+        transport_reset_generation: 7,
+    });
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-a".to_string(),
+        turn_id: None,
+        request_id: "req-background".to_string(),
+        lease_generation: 11,
+        transport_reset_generation: 8,
+    });
+
+    let snapshot = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should expose a live authority snapshot");
+
+    assert_eq!(snapshot.transport_reset_generation, Some(8));
+    assert_eq!(
+        snapshot.last_remote_context_reset_turn_id.as_deref(),
+        Some("turn-1")
+    );
+}
+
+#[tokio::test]
 async fn pooled_host_release_for_shutdown_releases_authority_owned_lease() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =

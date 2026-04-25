@@ -46,8 +46,10 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_protocol::ThreadId;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountStartupSelectionUpdate;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
 use core_test_support::responses;
@@ -494,11 +496,11 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     mcp.initialize().await?;
 
     let parent = start_thread(&mut mcp).await?;
-    let child_thread_ids = spawn_two_children_and_wait_parent_completed(
+    let child_thread_ids = spawn_children_and_wait_parent_completed(
         &mut mcp,
         parent.id.as_str(),
         PARENT_PROMPT,
-        [SPAWN_A_CALL_ID, SPAWN_B_CALL_ID],
+        &[SPAWN_A_CALL_ID, SPAWN_B_CALL_ID],
     )
     .await?;
     let mut child_thread_ids = child_thread_ids;
@@ -538,6 +540,90 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
         parent_follow_up_after_spawn_b_only.requests().is_empty(),
         "parent should not receive a follow-up after only spawn B returns"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_pooled_mode_transfers_owner_using_live_subtree_when_persisted_spawn_edge_is_stale()
+-> Result<()> {
+    const PARENT_PROMPT: &str = "spawn pooled child with stale edge";
+    const CHILD_PROMPT: &str = "child stale edge pooled work";
+    const SPAWN_CALL_ID: &str = "spawn-pooled-stale-edge";
+
+    let codex_home = TempDir::new()?;
+    let runtime = seed_two_accounts(codex_home.path()).await?;
+    let server = responses::start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({ "message": CHILD_PROMPT }))?;
+    let _parent_turn = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, PARENT_PROMPT),
+        responses::sse(vec![
+            responses::ev_response_created("resp-parent-stale"),
+            responses::ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+            responses::ev_completed("resp-parent-stale"),
+        ]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(|req: &wiremock::Request| {
+            body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+        })
+        .respond_with(delayed_sse_response(responses::sse(vec![
+            responses::ev_response_created("resp-child-stale"),
+            responses::ev_assistant_message("msg-child-stale", "child done"),
+            responses::ev_completed("resp-child-stale"),
+        ])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let parent_follow_up = responses::mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            request_function_call_output_agent_id(req, SPAWN_CALL_ID).is_some()
+        },
+        responses::sse(vec![
+            responses::ev_response_created("resp-parent-stale-2"),
+            responses::ev_assistant_message("msg-parent-stale-2", "parent done"),
+            responses::ev_completed("resp-parent-stale-2"),
+        ]),
+    )
+    .await;
+    create_pooled_collab_config_toml(codex_home.path(), &server.uri())?;
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    mcp.initialize().await?;
+
+    let parent = start_thread(&mut mcp).await?;
+    let mut child_thread_ids = spawn_children_and_wait_parent_completed(
+        &mut mcp,
+        parent.id.as_str(),
+        PARENT_PROMPT,
+        &[SPAWN_CALL_ID],
+    )
+    .await?;
+    let child_thread_id = child_thread_ids
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("spawned child missing"))?;
+    runtime
+        .upsert_thread_spawn_edge(
+            ThreadId::new(),
+            ThreadId::from_string(&child_thread_id)?,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await?;
+
+    archive_thread(&mut mcp, parent.id.as_str()).await?;
+    let blocked_by_live_child = start_thread_error(&mut mcp).await?;
+    assert_eq!(
+        pooled_runtime_error_code(&blocked_by_live_child),
+        Some("pooledRuntimeAlreadyLoaded")
+    );
+
+    wait_for_child_turns_completed(&mut mcp, std::slice::from_ref(&child_thread_id)).await?;
+    archive_thread(&mut mcp, child_thread_id.as_str()).await?;
+    let next_top_level = start_thread(&mut mcp).await?;
+    assert!(!next_top_level.id.is_empty());
+    assert_eq!(parent_follow_up.requests().len(), 1);
     Ok(())
 }
 
@@ -949,11 +1035,11 @@ async fn start_turn_and_wait_completed(mcp: &mut McpProcess, thread_id: &str) ->
     Ok(())
 }
 
-async fn spawn_two_children_and_wait_parent_completed(
+async fn spawn_children_and_wait_parent_completed(
     mcp: &mut McpProcess,
     thread_id: &str,
     prompt: &str,
-    spawn_call_ids: [&str; 2],
+    spawn_call_ids: &[&str],
 ) -> Result<Vec<String>> {
     let request_id = mcp
         .send_turn_start_request(TurnStartParams {

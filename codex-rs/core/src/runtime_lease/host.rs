@@ -259,12 +259,20 @@ impl RuntimeLeaseHost {
             .clone()
     }
 
-    pub(crate) fn record_remote_context_reset(&self, record: RemoteContextResetRecord) {
-        *self
+    pub(crate) fn record_remote_context_reset(&self, mut record: RemoteContextResetRecord) {
+        let mut latest_remote_context_reset = self
             .0
             .latest_remote_context_reset
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if record.turn_id.is_none()
+            && let Some(turn_id) = latest_remote_context_reset
+                .as_ref()
+                .and_then(|latest| latest.turn_id.clone())
+        {
+            record.turn_id = Some(turn_id);
+        }
+        *latest_remote_context_reset = Some(record);
     }
 
     pub(crate) fn latest_remote_context_reset(&self) -> Option<RemoteContextResetRecord> {

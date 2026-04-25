@@ -7011,7 +7011,9 @@ impl CodexMessageProcessor {
                     }
                 }
             }
-        } else if let Ok(subtree_thread_ids) = thread_manager
+        }
+
+        if let Ok(subtree_thread_ids) = thread_manager
             .list_agent_subtree_thread_ids(root_thread_id)
             .await
         {
