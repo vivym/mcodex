@@ -814,12 +814,13 @@ async fn account_pool_accounts_list_account_id_filter_returns_single_row_without
 }
 ```
 
-- [ ] **Step 2: Run protocol and app-server tests to verify the wire contract is still singular**
+- [ ] **Step 2: Run account-pool, protocol, and app-server tests to verify the wire contract is still singular**
 
 Run:
 
 ```bash
 cd codex-rs
+cargo test -p codex-account-pool observability -- --nocapture
 cargo test -p codex-app-server-protocol --test account_pool_observability -- --nocapture
 cargo test -p codex-app-server account_pool -- --nocapture
 ```
@@ -884,10 +885,13 @@ cargo test -p codex-state account_pool_observability -- --nocapture
 cargo test -p codex-account-pool observability -- --nocapture
 cargo test -p codex-app-server-protocol --test account_pool_observability -- --nocapture
 cargo test -p codex-app-server-protocol --test schema_fixtures -- --nocapture
+cargo test -p codex-app-server-protocol
 cargo test -p codex-app-server account_pool -- --nocapture
 ```
 
-Expected: PASS for crate-local observability coverage, schema fixtures, protocol serialization, and app-server integration coverage.
+Expected: PASS for crate-local observability coverage, schema fixtures, full
+protocol crate coverage, protocol serialization, and app-server integration
+coverage.
 
 - [ ] **Step 5: Format, lint, and commit the observability/API slice**
 
@@ -1054,6 +1058,7 @@ cargo test -p codex-account-pool observability -- --nocapture
 cargo test -p codex-core account_pool -- --nocapture
 cargo test -p codex-app-server-protocol --test account_pool_observability -- --nocapture
 cargo test -p codex-app-server-protocol --test schema_fixtures -- --nocapture
+cargo test -p codex-app-server-protocol
 cargo test -p codex-app-server account_pool -- --nocapture
 cargo test -p codex-cli accounts -- --nocapture
 cargo test -p codex-tui status -- --nocapture
