@@ -1184,15 +1184,14 @@ impl ModelClient {
                     let ActiveStreamingRequest {
                         reporter,
                         _guard: guard,
-                        cancellation_token,
+                        ..
                     } = active_request;
                     return Ok(RealtimeWebrtcCallStart {
                         sdp: response.sdp,
                         call_id: response.call_id,
                         reporter,
                         guard,
-                        lease_cancellation_token: cancellation_token
-                            .expect("realtime call start always carries a cancellation token"),
+                        lease_cancellation_token: request_cancellation_token,
                     });
                 }
                 Err(ApiError::Transport(
