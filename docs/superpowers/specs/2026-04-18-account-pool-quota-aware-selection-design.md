@@ -685,6 +685,9 @@ First-slice observability boundary:
   pool summary returned by `accountPool/read`
 - `accountPool/accounts/list` may add an optional `accountId` filter so
   active-account consumers can hydrate one row without scanning a full pool page
+- the `accountId` filter is a point lookup scoped by `poolId`; apply it before
+  cursor/limit pagination, return at most one account row, and return
+  `nextCursor = null` for that point-lookup response
 - app-server compatibility is additive in the first slice: the existing
   singular `quota` field remains, and the new `quotas` field is added beside it
 - the singular compatibility `quota` field is projected only from the `codex`
@@ -696,8 +699,9 @@ First-slice observability boundary:
   remains the row's `observed_at`
 - observability readers must not join every quota row directly into the account
   page query because that would multiply account rows and break cursor
-  pagination; page account rows first, then batch-load quota rows for the
-  visible account ids and attach sorted families in memory
+  pagination; apply account filters first, page the filtered account rows, then
+  batch-load quota rows for the visible account ids and attach sorted families
+  in memory
 - new CLI/TUI and app-server consumers should migrate to `quotas`; legacy
   consumers may continue reading `quota` during the transition
 - diagnostics and selection explanations may still project one family-specific

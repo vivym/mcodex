@@ -801,6 +801,19 @@ async fn account_pool_accounts_list_returns_additive_quota_and_quotas_fields() {
 }
 ```
 
+Add point-lookup coverage for the new `accountId` filter:
+
+```rust
+#[tokio::test]
+async fn account_pool_accounts_list_account_id_filter_returns_single_row_without_cursor() {
+    let response = call_account_pool_accounts_list_filtered_by_account_id("acct-b").await;
+
+    assert_eq!(response["data"].as_array().unwrap().len(), 1);
+    assert_eq!(response["data"][0]["accountId"], "acct-b");
+    assert!(response["nextCursor"].is_null());
+}
+```
+
 - [ ] **Step 2: Run protocol and app-server tests to verify the wire contract is still singular**
 
 Run:
@@ -826,6 +839,9 @@ Implement:
   with `#[ts(optional = nullable)]` and exposed on the wire as `accountId`, so
   active-account consumers such as the TUI can hydrate exactly the currently
   leased account row without scanning a full pool page
+- implement `account_id` as a point lookup scoped by `pool_id`: apply it before
+  cursor/limit pagination, return at most one account row, and return
+  `next_cursor = None` for that point-lookup response
 - thread that filter through the protocol params, app-server handler/conversions, account-pool observability query structs, and state SQL query before adding TUI hydration that depends on it
 - deterministic `limit_id` ascending ordering
 - full typed family payloads for:
@@ -849,7 +865,8 @@ Implement:
   observability readers/conversions so persisted quota/probe details are
   surfaced durably instead of being projected ad hoc
 - implement the state read without multiplying account rows:
-  - page and filter account rows first
+  - apply pool/account filters before pagination
+  - page the filtered account rows first
   - collect visible account ids from that page
   - load all `account_quota_state` rows for those ids ordered by `account_id, limit_id`
   - attach sorted `quotas` to each account row in memory
