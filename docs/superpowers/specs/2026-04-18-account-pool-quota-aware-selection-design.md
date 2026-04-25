@@ -679,11 +679,23 @@ tests, and snapshots remain deterministic.
 First-slice observability boundary:
 
 - account-row quota facts are expanded as typed `quotas` collection fields in
-  scope
+  scope; for app-server v2 this applies to `accountPool/accounts/list`, not the
+  pool summary returned by `accountPool/read`
+- `accountPool/accounts/list` may add an optional `accountId` filter so
+  active-account consumers can hydrate one row without scanning a full pool page
 - app-server compatibility is additive in the first slice: the existing
   singular `quota` field remains, and the new `quotas` field is added beside it
 - the singular compatibility `quota` field is projected only from the `codex`
   family row; if no `codex` row exists, `quota` is `null`
+- when a `codex` row exists, the compatibility `quota` projection chooses the
+  populated primary or secondary window with the lowest remaining percentage;
+  `remaining_percent` is `100 - used_percent` clamped to `0..=100`,
+  `resets_at` comes from that chosen window when available, and `observed_at`
+  remains the row's `observed_at`
+- observability readers must not join every quota row directly into the account
+  page query because that would multiply account rows and break cursor
+  pagination; page account rows first, then batch-load quota rows for the
+  visible account ids and attach sorted families in memory
 - new CLI/TUI and app-server consumers should migrate to `quotas`; legacy
   consumers may continue reading `quota` during the transition
 - diagnostics and selection explanations may still project one family-specific
