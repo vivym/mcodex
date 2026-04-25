@@ -1934,7 +1934,7 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_pare
 #[tokio::test]
 async fn list_agent_subtree_thread_ids_returns_error_when_persisted_lookup_fails() {
     let harness = AgentControlHarness::new().await;
-    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
     let child_thread_id = harness
         .control
         .spawn_agent(
@@ -1951,7 +1951,8 @@ async fn list_agent_subtree_thread_ids_returns_error_when_persisted_lookup_fails
         .await
         .expect("child spawn should succeed");
 
-    let state_db_path = codex_state::state_db_path(harness.config.codex_home.as_ref());
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let state_db_path = codex_state::state_db_path(root_state_db.codex_home());
     let pool = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new()
             .filename(state_db_path)
@@ -1993,15 +1994,17 @@ async fn list_agent_subtree_thread_ids_returns_error_when_persisted_lookup_fails
 #[tokio::test]
 async fn list_agent_subtree_thread_ids_reports_persisted_error_for_known_unloaded_root() {
     let harness = AgentControlHarness::new().await;
-    let (root_thread_id, _root_thread) = harness.start_thread().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
     let (other_thread_id, _other_thread) = harness.start_thread().await;
     harness
         .manager
         .remove_thread(&root_thread_id)
         .await
         .expect("root should be removed from live manager");
+    assert!(harness.manager.get_thread(root_thread_id).await.is_err());
 
-    let state_db_path = codex_state::state_db_path(harness.config.codex_home.as_ref());
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let state_db_path = codex_state::state_db_path(root_state_db.codex_home());
     let pool = sqlx::SqlitePool::connect_with(
         sqlx::sqlite::SqliteConnectOptions::new()
             .filename(state_db_path)
@@ -2027,6 +2030,85 @@ async fn list_agent_subtree_thread_ids_reports_persisted_error_for_known_unloade
     );
 
     let _ = harness.manager.remove_thread(&other_thread_id).await;
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let (same_db_thread_id, same_db_thread) = harness.start_thread().await;
+    let (_other_home, other_config) = test_config().await;
+    let other_thread = harness
+        .manager
+        .start_thread(other_config)
+        .await
+        .expect("other-home thread should start");
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let other_state_db = other_thread
+        .thread
+        .state_db()
+        .expect("other-home thread should expose state DB");
+    assert_ne!(root_state_db.codex_home(), other_state_db.codex_home());
+    assert!(
+        other_state_db
+            .get_thread(root_thread_id)
+            .await
+            .expect("unrelated state DB metadata read should succeed")
+            .is_none(),
+        "unrelated state DB should not know the root thread"
+    );
+    persist_thread_for_tree_resume(&root_thread, "root persisted").await;
+    assert!(
+        root_state_db
+            .get_thread(root_thread_id)
+            .await
+            .expect("owning state DB metadata read should succeed")
+            .is_some(),
+        "owning state DB should know the root thread"
+    );
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed from live manager");
+
+    let other_state_db_path = codex_state::state_db_path(other_state_db.codex_home());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(other_state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open unrelated state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject unrelated persisted lookup failure");
+    pool.close().await;
+    root_state_db
+        .list_thread_spawn_descendants(root_thread_id)
+        .await
+        .expect("owning state DB descendant lookup should remain healthy");
+    assert!(
+        other_state_db
+            .list_thread_spawn_descendants(root_thread_id)
+            .await
+            .is_err(),
+        "unrelated state DB descendant lookup should be broken"
+    );
+
+    let subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("unrelated broken candidate DB should not poison the owning DB");
+    assert_eq!(subtree_thread_ids, vec![root_thread_id]);
+
+    let _ = harness.manager.remove_thread(&same_db_thread_id).await;
+    let _ = harness.manager.remove_thread(&other_thread.thread_id).await;
+    let _ = same_db_thread.shutdown_and_wait().await;
+    let _ = other_thread.thread.shutdown_and_wait().await;
+    let _ = root_thread.shutdown_and_wait().await;
 }
 
 #[tokio::test]

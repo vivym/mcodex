@@ -450,17 +450,39 @@ impl ThreadManager {
         };
 
         let mut found_persisted_root = false;
+        let mut pending_persisted_lookup_error = None;
         for state_db_ctx in state_db_contexts {
-            let root_known = state_db_ctx
-                .get_thread(thread_id)
-                .await
-                .map_err(|err| CodexErr::Fatal(format!("failed to load thread metadata: {err}")))?;
-            let persisted_descendants = state_db_ctx
+            let root_known = match state_db_ctx.get_thread(thread_id).await {
+                Ok(root_known) => root_known,
+                Err(err) if root_missing => {
+                    pending_persisted_lookup_error.get_or_insert_with(|| {
+                        CodexErr::Fatal(format!("failed to load thread metadata: {err}"))
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "failed to load thread metadata: {err}"
+                    )));
+                }
+            };
+            let persisted_descendants = match state_db_ctx
                 .list_thread_spawn_descendants(thread_id)
                 .await
-                .map_err(|err| {
-                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
-                })?;
+            {
+                Ok(persisted_descendants) => persisted_descendants,
+                Err(err) if root_missing && root_known.is_none() => {
+                    pending_persisted_lookup_error.get_or_insert_with(|| {
+                        CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    return Err(CodexErr::Fatal(format!(
+                        "failed to load thread-spawn descendants: {err}"
+                    )));
+                }
+            };
             if root_known.is_none() && persisted_descendants.is_empty() {
                 continue;
             }
@@ -480,6 +502,13 @@ impl ThreadManager {
             if seen_thread_ids.insert(descendant_id) {
                 subtree_thread_ids.push(descendant_id);
             }
+        }
+
+        if root_missing
+            && !found_persisted_root
+            && let Some(err) = pending_persisted_lookup_error
+        {
+            return Err(err);
         }
 
         if subtree_thread_ids.len() == 1 && root_missing && !found_persisted_root {

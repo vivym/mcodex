@@ -9677,31 +9677,10 @@ impl CodexMessageProcessor {
             }
             let state_db_ctx = get_state_db(&self.config).await;
             let feedback_thread_ids = match conversation_id {
-                Some(conversation_id) => match self
-                    .thread_manager
-                    .list_agent_subtree_thread_ids(conversation_id)
-                    .await
-                {
-                    Ok(thread_ids) => thread_ids,
-                    Err(err) => {
-                        warn!(
-                            "failed to list feedback subtree for thread_id={conversation_id}: {err}"
-                        );
-                        let mut thread_ids = vec![conversation_id];
-                        if let Some(state_db_ctx) = state_db_ctx.as_ref() {
-                            match state_db_ctx
-                                .list_thread_spawn_descendants(conversation_id)
-                                .await
-                            {
-                                Ok(descendant_ids) => thread_ids.extend(descendant_ids),
-                                Err(err) => warn!(
-                                    "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
-                                ),
-                            }
-                        }
-                        thread_ids
-                    }
-                },
+                Some(conversation_id) => {
+                    self.feedback_thread_ids_for_upload(conversation_id, state_db_ctx.as_ref())
+                        .await
+                }
                 None => Vec::new(),
             };
             let sqlite_feedback_logs = if let Some(state_db_ctx) = state_db_ctx.as_ref()
@@ -9896,6 +9875,88 @@ impl CodexMessageProcessor {
                 warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
                 None
             })
+    }
+
+    async fn feedback_thread_ids_for_upload(
+        &self,
+        conversation_id: ThreadId,
+        state_db_ctx: Option<&StateDbHandle>,
+    ) -> Vec<ThreadId> {
+        let complete_result = self
+            .thread_manager
+            .list_agent_subtree_thread_ids(conversation_id)
+            .await;
+        self.feedback_thread_ids_for_upload_with_complete_result(
+            conversation_id,
+            state_db_ctx,
+            complete_result,
+        )
+        .await
+    }
+
+    async fn feedback_thread_ids_for_upload_with_complete_result(
+        &self,
+        conversation_id: ThreadId,
+        state_db_ctx: Option<&StateDbHandle>,
+        complete_result: CodexResult<Vec<ThreadId>>,
+    ) -> Vec<ThreadId> {
+        match complete_result {
+            Ok(thread_ids) => thread_ids,
+            Err(err) => {
+                warn!("failed to list feedback subtree for thread_id={conversation_id}: {err}");
+                self.fallback_feedback_thread_ids_for_upload(conversation_id, state_db_ctx)
+                    .await
+            }
+        }
+    }
+
+    async fn fallback_feedback_thread_ids_for_upload(
+        &self,
+        conversation_id: ThreadId,
+        state_db_ctx: Option<&StateDbHandle>,
+    ) -> Vec<ThreadId> {
+        let mut thread_ids = Vec::new();
+        let mut seen_thread_ids = HashSet::new();
+        let mut push_thread_id = |thread_id| {
+            if seen_thread_ids.insert(thread_id) {
+                thread_ids.push(thread_id);
+            }
+        };
+
+        push_thread_id(conversation_id);
+
+        match self
+            .thread_manager
+            .list_live_agent_subtree_thread_ids(conversation_id)
+            .await
+        {
+            Ok(live_thread_ids) => {
+                for thread_id in live_thread_ids {
+                    push_thread_id(thread_id);
+                }
+            }
+            Err(err) => {
+                warn!("failed to list live feedback subtree for thread_id={conversation_id}: {err}")
+            }
+        }
+
+        if let Some(state_db_ctx) = state_db_ctx {
+            match state_db_ctx
+                .list_thread_spawn_descendants(conversation_id)
+                .await
+            {
+                Ok(descendant_ids) => {
+                    for thread_id in descendant_ids {
+                        push_thread_id(thread_id);
+                    }
+                }
+                Err(err) => warn!(
+                    "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
+                ),
+            }
+        }
+
+        thread_ids
     }
 }
 
@@ -11736,6 +11797,7 @@ mod tests {
     use crate::outgoing_message::OutgoingMessage;
     use anyhow::Result;
     use app_test_support::create_mock_responses_server_repeating_assistant;
+    use app_test_support::create_mock_responses_server_sequence_unchecked;
     use app_test_support::write_mock_responses_config_toml;
     use codex_analytics::AnalyticsEventsClient;
     use codex_app_server_protocol::ServerRequestPayload;
@@ -11757,6 +11819,7 @@ mod tests {
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
     use codex_protocol::protocol::TurnContextItem;
+    use core_test_support::responses;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -12294,8 +12357,26 @@ mod tests {
     impl TestCodexMessageProcessorHarness {
         async fn new() -> Result<Self> {
             let server = create_mock_responses_server_repeating_assistant("Done").await;
+            Self::with_server(server).await
+        }
+
+        async fn with_server(server: MockServer) -> Result<Self> {
+            Self::with_server_and_features(server, &[]).await
+        }
+
+        async fn with_server_and_features(
+            server: MockServer,
+            enabled_features: &[Feature],
+        ) -> Result<Self> {
             let codex_home = TempDir::new()?;
-            let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
+            let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
+            for feature in enabled_features {
+                config
+                    .features
+                    .enable(*feature)
+                    .expect("test feature should be known");
+            }
+            let config = Arc::new(config);
             let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
             let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
             let auth_manager = AuthManager::shared_from_config(
@@ -12462,6 +12543,120 @@ mod tests {
         })
         .await
         .expect("timed out waiting for failed setup reaper to remove thread");
+    }
+
+    #[tokio::test]
+    async fn feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error()
+    -> Result<()> {
+        const PARENT_PROMPT: &str = "spawn child for feedback";
+        const CHILD_PROMPT: &str = "child should be included in feedback";
+        const SPAWN_CALL_ID: &str = "spawn-feedback-child";
+
+        let spawn_args = serde_json::to_string(&json!({ "message": CHILD_PROMPT }))?;
+        let server = create_mock_responses_server_sequence_unchecked(vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-feedback-parent-1"),
+                responses::ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+                responses::ev_completed("resp-feedback-parent-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-feedback-child-1"),
+                responses::ev_assistant_message("msg-feedback-child-1", "child done"),
+                responses::ev_completed("resp-feedback-child-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("resp-feedback-parent-2"),
+                responses::ev_assistant_message("msg-feedback-parent-2", "parent done"),
+                responses::ev_completed("resp-feedback-parent-2"),
+            ]),
+        ])
+        .await;
+        let harness =
+            TestCodexMessageProcessorHarness::with_server_and_features(server, &[Feature::Collab])
+                .await?;
+        let started = harness
+            .thread_manager
+            .start_thread(harness.config.as_ref().clone())
+            .await?;
+        let root_thread_id = started.thread_id;
+
+        started
+            .thread
+            .submit(Op::UserInput {
+                items: vec![CoreInputItem::Text {
+                    text: PARENT_PROMPT.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+            })
+            .await?;
+
+        let live_thread_ids = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(thread_ids) = harness
+                    .thread_manager
+                    .list_live_agent_subtree_thread_ids(root_thread_id)
+                    .await
+                    && thread_ids.len() == 2
+                {
+                    return thread_ids;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for live child agent");
+        let live_child_thread_id = live_thread_ids
+            .iter()
+            .copied()
+            .find(|thread_id| *thread_id != root_thread_id)
+            .expect("live subtree should include child");
+        let state_db_ctx = get_state_db(harness.config.as_ref())
+            .await
+            .expect("state DB should exist after root thread start");
+        let persisted_only_thread_id = ThreadId::new();
+        state_db_ctx
+            .upsert_thread_spawn_edge(
+                root_thread_id,
+                live_child_thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await?;
+        state_db_ctx
+            .upsert_thread_spawn_edge(
+                root_thread_id,
+                persisted_only_thread_id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await?;
+
+        let feedback_thread_ids = harness
+            .processor
+            .feedback_thread_ids_for_upload_with_complete_result(
+                root_thread_id,
+                Some(&state_db_ctx),
+                Err(CodexErr::Fatal(
+                    "forced complete lookup failure".to_string(),
+                )),
+            )
+            .await;
+        assert_eq!(
+            feedback_thread_ids,
+            vec![
+                root_thread_id,
+                live_child_thread_id,
+                persisted_only_thread_id
+            ]
+        );
+
+        for thread_id in [root_thread_id, live_child_thread_id] {
+            if let Ok(thread) = harness.thread_manager.get_thread(thread_id).await {
+                let _ = thread.shutdown_and_wait().await;
+            }
+            let _ = harness.thread_manager.remove_thread(&thread_id).await;
+        }
+        Ok(())
     }
 
     #[tokio::test]

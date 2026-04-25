@@ -2496,7 +2496,7 @@ Latest gpt-5.5 second follow-up reviewer-loop verification ledger, 2026-04-25:
 - REVIEW/REPRO before fix: `gpt-5.5` `xhigh` reviewers identified that degrading persisted lookup failures inside `list_agent_subtree_thread_ids` made the complete subtree API silently partial and could still misclassify a known persisted root as not found.
 - GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 5 targeted tests after splitting complete and live-only subtree APIs.
 - GREEN detail: complete `list_agent_subtree_thread_ids` now reports persisted lookup errors instead of returning partial results.
-- GREEN detail: new `list_live_agent_subtree_thread_ids` keeps app-server pooled-runtime ownership checks live-safe without affecting feedback/upload completeness semantics.
+- GREEN detail: new `list_live_agent_subtree_thread_ids` keeps app-server pooled-runtime ownership checks live-safe. A later reviewer loop found feedback/upload still needed a live-subtree fallback when complete lookup fails; see the next ledger.
 - PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test after app-server switched to the live-only subtree API.
 - PASS: `just fmt`.
 - PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
@@ -2504,6 +2504,25 @@ Latest gpt-5.5 second follow-up reviewer-loop verification ledger, 2026-04-25:
 - PASS: `git diff --check`.
 - Not rerun after final `just fmt` / `just fix`, per repository instruction.
 - Not run in this second follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
+Latest gpt-5.5 third follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: two `gpt-5.5` `xhigh` reviewers identified that `feedback/upload` fallback still dropped live subagent thread ids when complete persisted subtree lookup failed, and that complete subtree lookup could be poisoned by an unrelated broken live State DB candidate.
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db -- --nocapture` failed with `Fatal("failed to load thread-spawn descendants... no such table: thread_spawn_edges")` before candidate DB errors were treated as tentative.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db -- --nocapture` passed after complete lookup continued scanning candidates and only returned tentative persisted errors when no DB proved ownership of the root/subtree.
+- INITIAL GREEN: `cargo test -p codex-app-server feedback_thread_ids_fallback_includes_live_subagents_without_persisted_subtree -- --nocapture` passed after `feedback/upload` fallback was changed to seed from the live subtree and then merge persisted descendants when available; this test was later strengthened and renamed in the next review item.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 6 targeted tests.
+- REVIEW/REPRO after initial fix: two `gpt-5.5` `xhigh` reviewers found the app-server test only called the fallback helper directly and did not cover the production wrapper's complete-lookup-error branch, persisted merge, dedupe, or preserved order.
+- RED: `cargo test -p codex-app-server feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error -- --nocapture` failed to compile before the wrapper seam existed.
+- GREEN: `cargo test -p codex-app-server feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error -- --nocapture` passed after adding a wrapper seam for the complete lookup result and asserting root/live/persisted-only order with live/persisted dedupe.
+- REVIEW: two additional `gpt-5.5` `xhigh` reviewers reported no blocking/high/medium findings after the wrapper seam and strengthened app-server test.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Design note: app-server did not add a `sqlx` dev-dependency. Direct `DROP TABLE thread_spawn_edges` fault injection remains in `codex-core`; app-server covers fallback behavior at its own boundary.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not yet run in this third follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
 
 - [ ] **Step 5: Run scoped lints**
 
