@@ -5427,6 +5427,12 @@
               }
             ]
           },
+          "quotas": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountPoolQuotaFamilyResponse"
+            },
+            "type": "array"
+          },
           "selection": {
             "anyOf": [
               {
@@ -5468,6 +5474,7 @@
           "healthState",
           "operationalState",
           "quota",
+          "quotas",
           "selection",
           "statusMessage",
           "statusReasonCode",
@@ -5478,6 +5485,12 @@
       "AccountPoolAccountsListParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "accountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "accountKinds": {
             "items": {
               "type": "string"
@@ -5866,6 +5879,50 @@
         ],
         "type": "object"
       },
+      "AccountPoolQuotaFamilyResponse": {
+        "properties": {
+          "exhaustedWindows": {
+            "type": "string"
+          },
+          "limitId": {
+            "type": "string"
+          },
+          "nextProbeAfter": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "observedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "predictedBlockedUntil": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "primary": {
+            "$ref": "#/definitions/v2/AccountPoolQuotaWindowResponse"
+          },
+          "secondary": {
+            "$ref": "#/definitions/v2/AccountPoolQuotaWindowResponse"
+          }
+        },
+        "required": [
+          "exhaustedWindows",
+          "limitId",
+          "nextProbeAfter",
+          "observedAt",
+          "predictedBlockedUntil",
+          "primary",
+          "secondary"
+        ],
+        "type": "object"
+      },
       "AccountPoolQuotaResponse": {
         "properties": {
           "observedAt": {
@@ -5891,6 +5948,29 @@
           "observedAt",
           "remainingPercent",
           "resetsAt"
+        ],
+        "type": "object"
+      },
+      "AccountPoolQuotaWindowResponse": {
+        "properties": {
+          "resetsAt": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "usedPercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "resetsAt",
+          "usedPercent"
         ],
         "type": "object"
       },

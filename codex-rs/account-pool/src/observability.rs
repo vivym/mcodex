@@ -15,6 +15,7 @@ pub struct AccountPoolReadRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountPoolAccountsListRequest {
     pub pool_id: String,
+    pub account_id: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     pub states: Option<Vec<AccountOperationalState>>,
@@ -205,6 +206,7 @@ pub struct AccountPoolAccount {
     pub status_message: Option<String>,
     pub current_lease: Option<AccountPoolLease>,
     pub quota: Option<AccountPoolQuota>,
+    pub quotas: Vec<AccountPoolQuotaFamily>,
     pub selection: Option<AccountPoolSelection>,
     pub updated_at: DateTime<Utc>,
 }
@@ -230,6 +232,23 @@ pub struct AccountPoolQuota {
     pub remaining_percent: Option<f64>,
     pub resets_at: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountPoolQuotaFamily {
+    pub limit_id: String,
+    pub primary: AccountPoolQuotaWindow,
+    pub secondary: AccountPoolQuotaWindow,
+    pub exhausted_windows: String,
+    pub predicted_blocked_until: Option<DateTime<Utc>>,
+    pub next_probe_after: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountPoolQuotaWindow {
+    pub used_percent: Option<f64>,
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

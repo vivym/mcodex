@@ -1808,6 +1808,8 @@ pub struct AccountPoolReadParams {
 pub struct AccountPoolAccountsListParams {
     pub pool_id: String,
     #[ts(optional = nullable)]
+    pub account_id: Option<String>,
+    #[ts(optional = nullable)]
     pub cursor: Option<String>,
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
@@ -1947,6 +1949,7 @@ pub struct AccountPoolAccountResponse {
         schema_with = "nullable_field_schema::<AccountPoolQuotaResponse>"
     )]
     pub quota: Option<AccountPoolQuotaResponse>,
+    pub quotas: Vec<AccountPoolQuotaFamilyResponse>,
     #[schemars(
         required,
         schema_with = "nullable_field_schema::<AccountPoolSelectionResponse>"
@@ -1976,6 +1979,31 @@ pub struct AccountPoolQuotaResponse {
     #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
     pub resets_at: Option<i64>,
     pub observed_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolQuotaFamilyResponse {
+    pub limit_id: String,
+    pub primary: AccountPoolQuotaWindowResponse,
+    pub secondary: AccountPoolQuotaWindowResponse,
+    pub exhausted_windows: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub predicted_blocked_until: Option<i64>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub next_probe_after: Option<i64>,
+    pub observed_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolQuotaWindowResponse {
+    #[schemars(required, schema_with = "nullable_field_schema::<f64>")]
+    pub used_percent: Option<f64>,
+    #[schemars(required, schema_with = "nullable_field_schema::<i64>")]
+    pub resets_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

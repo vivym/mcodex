@@ -73,6 +73,12 @@
             }
           ]
         },
+        "quotas": {
+          "items": {
+            "$ref": "#/definitions/AccountPoolQuotaFamilyResponse"
+          },
+          "type": "array"
+        },
         "selection": {
           "anyOf": [
             {
@@ -114,6 +120,7 @@
         "healthState",
         "operationalState",
         "quota",
+        "quotas",
         "selection",
         "statusMessage",
         "statusReasonCode",
@@ -157,6 +164,50 @@
       ],
       "type": "object"
     },
+    "AccountPoolQuotaFamilyResponse": {
+      "properties": {
+        "exhaustedWindows": {
+          "type": "string"
+        },
+        "limitId": {
+          "type": "string"
+        },
+        "nextProbeAfter": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observedAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "predictedBlockedUntil": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "primary": {
+          "$ref": "#/definitions/AccountPoolQuotaWindowResponse"
+        },
+        "secondary": {
+          "$ref": "#/definitions/AccountPoolQuotaWindowResponse"
+        }
+      },
+      "required": [
+        "exhaustedWindows",
+        "limitId",
+        "nextProbeAfter",
+        "observedAt",
+        "predictedBlockedUntil",
+        "primary",
+        "secondary"
+      ],
+      "type": "object"
+    },
     "AccountPoolQuotaResponse": {
       "properties": {
         "observedAt": {
@@ -182,6 +233,29 @@
         "observedAt",
         "remainingPercent",
         "resetsAt"
+      ],
+      "type": "object"
+    },
+    "AccountPoolQuotaWindowResponse": {
+      "properties": {
+        "resetsAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "usedPercent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "resetsAt",
+        "usedPercent"
       ],
       "type": "object"
     },

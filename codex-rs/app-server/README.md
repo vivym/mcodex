@@ -1412,7 +1412,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `accountLease/read` — read pooled lease status for the current process. When stdio app-server has one loaded top-level pooled context, the response prefers that context's live lease snapshot and otherwise falls back to startup-selection preview state. Live snapshots also expose proactive switch damping state via `leaseAcquiredAt`, `minSwitchIntervalSecs`, `proactiveSwitchPending`, `proactiveSwitchSuppressed`, and `proactiveSwitchAllowedAt`. Pooled mode remains stdio-only; websocket is rejected, and if a stdio process uses pooled mode it must do so from the first loaded top-level context. A later top-level context cannot enable pooled mode after another top-level context is loaded, while child subagents under the pooled context share its runtime lease host.
 - `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`.
 - `accountPool/read` — read the current summary and configured policy for a known account pool.
-- `accountPool/accounts/list` — list accounts in a known pool, with optional cursor, limit, operational-state, and account-kind filters.
+- `accountPool/accounts/list` — list accounts in a known pool, with optional account-id, cursor, limit, operational-state, and account-kind filters. When `accountId` is provided, the request is a pool-scoped point lookup and returns at most one row with `nextCursor: null`.
 - `accountPool/events/list` — list recent append-only pool events, with optional account, event-type, cursor, and limit filters.
 - `accountPool/diagnostics/read` — read derived diagnostics for a known account pool.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
@@ -1587,6 +1587,7 @@ List accounts in the pool:
 ```json
 { "method": "accountPool/accounts/list", "id": 10, "params": {
     "poolId": "legacy-default",
+    "accountId": null,
     "cursor": null,
     "limit": 50,
     "states": ["available", "leased"],
@@ -1614,7 +1615,43 @@ List accounts in the pool:
           "renewedAt": 1710000030,
           "expiresAt": 1710000300
         },
-        "quota": null,
+        "quota": {
+          "remainingPercent": 18.0,
+          "resetsAt": 1710001200,
+          "observedAt": 1710000000
+        },
+        "quotas": [
+          {
+            "limitId": "chatgpt",
+            "primary": {
+              "usedPercent": 72.0,
+              "resetsAt": 1710001800
+            },
+            "secondary": {
+              "usedPercent": null,
+              "resetsAt": null
+            },
+            "exhaustedWindows": "none",
+            "predictedBlockedUntil": null,
+            "nextProbeAfter": null,
+            "observedAt": 1710000000
+          },
+          {
+            "limitId": "codex",
+            "primary": {
+              "usedPercent": 82.0,
+              "resetsAt": 1710001200
+            },
+            "secondary": {
+              "usedPercent": 10.0,
+              "resetsAt": 1710003600
+            },
+            "exhaustedWindows": "primary",
+            "predictedBlockedUntil": 1710001200,
+            "nextProbeAfter": 1710000600,
+            "observedAt": 1710000000
+          }
+        ],
         "selection": {
           "eligible": false,
           "nextEligibleAt": 1710000300,
@@ -1628,6 +1665,8 @@ List accounts in the pool:
   }
 }
 ```
+
+`quota` is the legacy nullable compatibility projection and is derived only from the `codex` quota family when present. `quotas` is always present as a non-null array, sorted by `limitId`, and contains one entry for each persisted quota family.
 
 List event history. Pagination uses only `cursor` and `limit`; omit or set optional filters to `null` when not needed:
 
