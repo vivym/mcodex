@@ -1112,6 +1112,7 @@ just test
 If Step 3 changed any docs or bookkeeping files, run:
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 git add docs/superpowers/specs/2026-04-18-account-pool-quota-aware-selection-design.md docs/superpowers/plans/2026-04-18-account-pool-quota-aware-selection-implementation.md codex-rs/app-server/README.md
 git commit -m "chore: record quota-aware selection verification"
 ```
