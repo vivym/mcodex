@@ -1,5 +1,6 @@
 import * as child_process from "node:child_process";
 import { EventEmitter } from "node:events";
+import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, it } from "@jest/globals";
@@ -12,6 +13,26 @@ jest.mock("node:child_process", () => {
 const _actualChildProcess =
   jest.requireActual<typeof import("node:child_process")>("node:child_process");
 const spawnMock = child_process.spawn as jest.MockedFunction<typeof _actualChildProcess.spawn>;
+
+function pathDelimiterFor(platform: NodeJS.Platform): string {
+  return platform === "win32" ? ";" : ":";
+}
+
+async function withMockedPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", {
+    configurable: true,
+    value: platform,
+  });
+
+  try {
+    return await fn();
+  } finally {
+    if (originalDescriptor) {
+      Object.defineProperty(process, "platform", originalDescriptor);
+    }
+  }
+}
 
 class FakeChildProcess extends EventEmitter {
   stdin = new PassThrough();
@@ -41,6 +62,157 @@ function createEarlyExitChild(exitCode = 2): FakeChildProcess {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
+  describe("_findCodexPathForTesting", () => {
+    it("prefers mcodex from PATH when no explicit executable is provided", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const platform = "darwin";
+      const envPath = ["/usr/local/bin", "/opt/homebrew/bin"].join(pathDelimiterFor(platform));
+      const expected = path.posix.join("/opt/homebrew/bin", "mcodex");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform,
+        arch: "arm64",
+        pathExists: (candidate: string) => candidate === expected,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("reports script-install guidance when no CLI can be found", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+
+      expect(() =>
+        _findCodexPathForTesting({
+          envPath: "/usr/local/bin:/opt/homebrew/bin",
+          platform: "linux",
+          arch: "x64",
+          pathExists: () => false,
+          resolvePackageJson: () => {
+            throw new Error("missing package");
+          },
+        }),
+      ).toThrow(/install\.sh.*install\.ps1.*explicit executable path/i);
+    });
+
+    it("prefers mcodex.exe on Windows", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const platform = "win32";
+      const envPath = ["C:\\wrapper", "D:\\bin"].join(pathDelimiterFor(platform));
+      const expected = path.win32.join("C:\\wrapper", "mcodex.exe");
+      const wrapperPath = path.win32.join("C:\\wrapper", "mcodex.ps1");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform,
+        arch: "x64",
+        pathExists: (candidate: string) => candidate === expected || candidate === wrapperPath,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex.exe");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("finds mcodex.ps1 on Windows when mcodex.exe is absent", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const platform = "win32";
+      const envPath = ["C:\\Users\\me\\AppData\\Local\\Programs\\Mcodex\\bin"].join(
+        pathDelimiterFor(platform),
+      );
+      const expected = path.win32.join(
+        "C:\\Users\\me\\AppData\\Local\\Programs\\Mcodex\\bin",
+        "mcodex.ps1",
+      );
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform,
+        arch: "x64",
+        pathExists: (candidate: string) => candidate === expected,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex.ps1");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("honors Windows PATH order before falling back to later executable names", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const platform = "win32";
+      const envPath = ["C:\\wrapper", "D:\\old-bin"].join(pathDelimiterFor(platform));
+      const expected = path.win32.join("C:\\wrapper", "mcodex.ps1");
+      const staleExe = path.win32.join("D:\\old-bin", "mcodex.exe");
+
+      const result = _findCodexPathForTesting({
+        envPath,
+        platform,
+        arch: "x64",
+        pathExists: (candidate: string) => candidate === expected || candidate === staleExe,
+        resolvePackageJson: () => {
+          throw new Error("npm fallback should not be used when PATH contains mcodex.ps1");
+        },
+      });
+
+      expect(result).toBe(expected);
+    });
+
+    it("falls back to the legacy npm package when PATH lookup fails", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+      const resolvePackageJson = jest.fn((specifier: string, from?: string) => {
+        if (specifier === "@openai/codex/package.json" && from === undefined) {
+          return "/repo/node_modules/@openai/codex/package.json";
+        }
+        if (
+          specifier === "@openai/codex-linux-x64/package.json" &&
+          from === "/repo/node_modules/@openai/codex/package.json"
+        ) {
+          return "/repo/node_modules/@openai/codex-linux-x64/package.json";
+        }
+        throw new Error(`Unexpected package lookup: ${specifier} from ${from}`);
+      });
+
+      const result = _findCodexPathForTesting({
+        envPath: "/usr/local/bin:/opt/bin",
+        platform: "linux",
+        arch: "x64",
+        pathExists: () => false,
+        resolvePackageJson,
+      });
+
+      expect(result).toBe(
+        "/repo/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+      );
+      expect(resolvePackageJson).toHaveBeenNthCalledWith(1, "@openai/codex/package.json");
+      expect(resolvePackageJson).toHaveBeenNthCalledWith(
+        2,
+        "@openai/codex-linux-x64/package.json",
+        "/repo/node_modules/@openai/codex/package.json",
+      );
+    });
+
+    it("throws a distinct unsupported-platform error for unsupported targets", async () => {
+      const { _findCodexPathForTesting } = await import("../src/exec");
+
+      expect(() =>
+        _findCodexPathForTesting({
+          envPath: "/usr/local/bin:/opt/homebrew/bin",
+          platform: "freebsd",
+          arch: "x64",
+          pathExists: () => false,
+          resolvePackageJson: () => {
+            throw new Error("package lookup should not be used for unsupported targets");
+          },
+        }),
+      ).toThrow(/unsupported.*freebsd.*x64/i);
+    });
+  });
+
   it("rejects when exit happens before stdout closes", async () => {
     const { CodexExec } = await import("../src/exec");
     const child = createEarlyExitChild();
@@ -141,5 +313,45 @@ describe("CodexExec", () => {
     } finally {
       delete process.env.CODEX_ENV_SHOULD_NOT_LEAK;
     }
+  });
+
+  it("uses powershell.exe for Windows wrapper paths", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    setImmediate(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit("exit", 0, null);
+    });
+
+    await withMockedPlatform("win32", async () => {
+      const exec = new CodexExec(
+        "C:\\Users\\me\\AppData\\Local\\Programs\\Mcodex\\bin\\mcodex.ps1",
+      );
+      for await (const _ of exec.run({ input: "hello world" })) {
+        // no-op
+      }
+    });
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledWith(
+      "powershell.exe",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "C:\\Users\\me\\AppData\\Local\\Programs\\Mcodex\\bin\\mcodex.ps1",
+        "exec",
+        "--experimental-json",
+      ],
+      expect.objectContaining({
+        signal: undefined,
+      }),
+    );
   });
 });

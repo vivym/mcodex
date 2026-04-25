@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Stage and optionally package the @openai/codex npm module."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -15,6 +16,20 @@ REPO_ROOT = CODEX_CLI_ROOT.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
+CLI_NPM_PACKAGE_BLOCKED_ERROR = (
+    "CLI npm package is no longer published; use scripts/stage_cli_archives.py"
+)
+BLOCKED_CLI_NPM_PACKAGES = frozenset(
+    {
+        "codex",
+        "codex-linux-x64",
+        "codex-linux-arm64",
+        "codex-darwin-x64",
+        "codex-darwin-arm64",
+        "codex-win32-x64",
+        "codex-win32-arm64",
+    }
+)
 
 # `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
 # The underlying package published to npm is always `@openai/codex`.
@@ -140,10 +155,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def raise_for_blocked_cli_npm_package(package: str) -> None:
+    if package in BLOCKED_CLI_NPM_PACKAGES:
+        raise RuntimeError(CLI_NPM_PACKAGE_BLOCKED_ERROR)
+
+
 def main() -> int:
     args = parse_args()
 
     package = args.package
+    raise_for_blocked_cli_npm_package(package)
     version = args.version
     release_version = args.release_version
     if release_version:
@@ -316,12 +337,6 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         scripts = package_json.get("scripts")
         if isinstance(scripts, dict):
             scripts.pop("prepare", None)
-
-        dependencies = package_json.get("dependencies")
-        if not isinstance(dependencies, dict):
-            dependencies = {}
-        dependencies[CODEX_NPM_NAME] = version
-        package_json["dependencies"] = dependencies
 
     with open(staging_dir / "package.json", "w", encoding="utf-8") as out:
         json.dump(package_json, out, indent=2)
