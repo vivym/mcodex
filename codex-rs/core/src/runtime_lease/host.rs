@@ -295,10 +295,7 @@ impl RuntimeLeaseHost {
             return None;
         };
         if let Some(remote_context_reset) = self.latest_remote_context_reset()
-            && snapshot
-                .lease_epoch
-                .and_then(|lease_epoch| u64::try_from(lease_epoch).ok())
-                == Some(remote_context_reset.lease_generation)
+            && snapshot.runtime_generation == Some(remote_context_reset.lease_generation)
         {
             snapshot.transport_reset_generation =
                 Some(remote_context_reset.transport_reset_generation);

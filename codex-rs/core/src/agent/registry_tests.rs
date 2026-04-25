@@ -305,6 +305,7 @@ fn register_root_thread_indexes_root_path() {
         Some(AgentMetadata {
             agent_id: Some(root_thread_id),
             agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(root_thread_id),
             ..Default::default()
         })
     );
@@ -329,6 +330,7 @@ fn release_spawned_thread_keeps_root_placeholder_for_same_thread_id() {
         Some(&AgentMetadata {
             agent_id: Some(thread_id),
             agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(thread_id),
             ..Default::default()
         })
     );
@@ -349,6 +351,7 @@ fn thread_metadata_prefers_spawned_agent_over_root_placeholder_for_same_thread_i
     let spawned_metadata = AgentMetadata {
         agent_id: Some(thread_id),
         agent_path: Some(agent_path("/root/researcher")),
+        root_thread_id: Some(thread_id),
         agent_nickname: Some("Researcher".to_string()),
         agent_role: Some("worker".to_string()),
         last_task_message: Some("initial task".to_string()),
@@ -384,6 +387,7 @@ fn path_metadata_keeps_root_distinct_from_spawned_duplicate_thread_id() {
     let spawned_metadata = AgentMetadata {
         agent_id: Some(thread_id),
         agent_path: Some(agent_path("/root/researcher")),
+        root_thread_id: Some(thread_id),
         agent_nickname: Some("Researcher".to_string()),
         agent_role: Some("worker".to_string()),
         last_task_message: Some("initial task".to_string()),
@@ -400,6 +404,7 @@ fn path_metadata_keeps_root_distinct_from_spawned_duplicate_thread_id() {
         Some(AgentMetadata {
             agent_id: Some(thread_id),
             agent_path: Some(AgentPath::root()),
+            root_thread_id: Some(thread_id),
             ..Default::default()
         })
     );

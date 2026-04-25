@@ -236,6 +236,101 @@ async fn pooled_host_snapshot_ignores_remote_reset_from_previous_generation() {
 }
 
 #[tokio::test]
+async fn pooled_host_snapshot_matches_remote_reset_by_manager_generation_not_lease_epoch()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let state_db =
+        codex_state::StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into())
+            .await?;
+    for account_id in ["acct-manager-a", "acct-manager-b"] {
+        state_db
+            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+                account_id: account_id.to_string(),
+                pool_id: "pool-main".to_string(),
+                position: 0,
+                account_kind: "chatgpt".to_string(),
+                backend_family: "local".to_string(),
+                workspace_id: Some("workspace-main".to_string()),
+                enabled: true,
+                healthy: true,
+            })
+            .await?;
+        save_auth(
+            &pooled_auth_home(codex_home.path(), account_id),
+            &auth_dot_json_for_account(account_id),
+            AuthCredentialsStoreMode::File,
+        )?;
+    }
+    state_db
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("pool-main".to_string()),
+            preferred_account_id: Some("acct-manager-a".to_string()),
+            suppressed: false,
+        })
+        .await?;
+    let manager = SessionServices::build_account_pool_manager(
+        Some(state_db),
+        Some(test_accounts_config()),
+        codex_home.path().to_path_buf(),
+        "holder-manager-generation-snapshot".to_string(),
+    )
+    .await?
+    .expect("test manager should build");
+    let authority = RuntimeLeaseAuthority::owned_manager(Arc::clone(&manager));
+    let host = RuntimeLeaseHost::pooled_with_authority_for_test(
+        RuntimeLeaseHostId::new("runtime-manager-snapshot".to_string()),
+        authority.clone(),
+    );
+    let request_context = LeaseRequestContext::for_test(
+        RequestBoundaryKind::ResponsesHttp,
+        "session-manager-generation-snapshot",
+        CollaborationTreeId::for_test("tree-manager-generation-snapshot"),
+    );
+
+    let first = authority
+        .acquire_request_lease_for_test(request_context.clone())
+        .await?;
+    assert_eq!(first.snapshot.account_id(), "acct-manager-a");
+    {
+        let mut manager = manager.lock().await;
+        manager.report_unauthorized().await?;
+    }
+    drop(first.guard);
+    let second = authority
+        .acquire_request_lease_for_test(request_context)
+        .await?;
+    assert_eq!(second.snapshot.account_id(), "acct-manager-b");
+    assert!(second.snapshot.generation() > 1);
+    host.record_remote_context_reset(RemoteContextResetRecord {
+        session_id: "session-manager-generation-snapshot".to_string(),
+        turn_id: Some("turn-manager-generation-snapshot".to_string()),
+        request_id: "req-manager-generation-snapshot".to_string(),
+        lease_generation: second.snapshot.generation(),
+        transport_reset_generation: 42,
+    });
+
+    let snapshot = host
+        .account_lease_snapshot()
+        .await
+        .expect("pooled host should expose the manager authority snapshot");
+
+    assert_eq!(snapshot.account_id.as_deref(), Some("acct-manager-b"));
+    assert_ne!(
+        snapshot
+            .lease_epoch
+            .and_then(|lease_epoch| u64::try_from(lease_epoch).ok()),
+        Some(second.snapshot.generation()),
+        "test must exercise manager runtime generation diverging from durable lease epoch"
+    );
+    assert_eq!(snapshot.transport_reset_generation, Some(42));
+    assert_eq!(
+        snapshot.last_remote_context_reset_turn_id.as_deref(),
+        Some("turn-manager-generation-snapshot")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn pooled_host_release_for_shutdown_releases_authority_owned_lease() -> anyhow::Result<()> {
     let codex_home = tempfile::tempdir()?;
     let state_db =

@@ -515,6 +515,7 @@ mod tests {
                 pool_id: None,
                 lease_id: None,
                 lease_epoch: None,
+                runtime_generation: None,
                 lease_acquired_at: None,
                 health_state: None,
                 switch_reason: None,
@@ -540,6 +541,7 @@ pub struct AccountLeaseRuntimeSnapshot {
     pub pool_id: Option<String>,
     pub lease_id: Option<String>,
     pub lease_epoch: Option<i64>,
+    pub runtime_generation: Option<u64>,
     pub lease_acquired_at: Option<DateTime<Utc>>,
     pub health_state: Option<AccountHealthState>,
     pub switch_reason: Option<AccountLeaseRuntimeReason>,
@@ -627,6 +629,7 @@ pub(crate) struct AccountPoolManagerSnapshotSeed {
     suppression_reason: Option<AccountLeaseRuntimeReason>,
     transport_reset_generation: u64,
     last_remote_context_reset_turn_id: Option<String>,
+    active_lease_generation: u64,
 }
 
 #[derive(Clone)]
@@ -1094,6 +1097,7 @@ impl AccountPoolManager {
             suppression_reason: self.suppression_reason,
             transport_reset_generation: self.transport_reset_generation,
             last_remote_context_reset_turn_id: self.last_remote_context_reset_turn_id.clone(),
+            active_lease_generation: self.active_lease_generation,
         }
     }
 
@@ -2358,6 +2362,7 @@ impl AccountPoolManagerSnapshotSeed {
             pool_id: active_lease.map(|lease| lease.pool_id.clone()),
             lease_id: active_lease.map(|lease| lease.lease_id.clone()),
             lease_epoch: active_lease.map(|lease| lease.lease_epoch),
+            runtime_generation: active_lease.map(|_| self.active_lease_generation),
             lease_acquired_at: active_lease.map(|lease| lease.acquired_at),
             health_state,
             switch_reason: self.switch_reason,

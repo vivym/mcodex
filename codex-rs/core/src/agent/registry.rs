@@ -53,6 +53,7 @@ impl ActiveAgents {
 pub(crate) struct AgentMetadata {
     pub(crate) agent_id: Option<ThreadId>,
     pub(crate) agent_path: Option<AgentPath>,
+    pub(crate) root_thread_id: Option<ThreadId>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
     pub(crate) last_task_message: Option<String>,
@@ -147,6 +148,7 @@ impl AgentRegistry {
             .or_insert_with(|| AgentMetadata {
                 agent_id: Some(thread_id),
                 agent_path: Some(AgentPath::root()),
+                root_thread_id: Some(thread_id),
                 ..Default::default()
             });
     }

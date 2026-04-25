@@ -436,26 +436,32 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let thread = match self.state.get_thread(thread_id).await {
-            Ok(thread) => thread,
-            Err(err) => {
-                let live_thread_ids = self
-                    .agent_control()
-                    .list_live_agent_subtree_thread_ids(thread_id)
-                    .await?;
-                if live_thread_ids.len() == 1 && live_thread_ids[0] == thread_id {
-                    return Err(err);
-                }
-                return Ok(live_thread_ids);
-            }
-        };
+        let root_thread = self.state.get_thread(thread_id).await;
+        let root_missing = root_thread.is_err();
 
         let mut subtree_thread_ids = Vec::new();
         let mut seen_thread_ids = HashSet::new();
         subtree_thread_ids.push(thread_id);
         seen_thread_ids.insert(thread_id);
 
-        if let Some(state_db_ctx) = thread.state_db() {
+        let state_db_ctx = match &root_thread {
+            Ok(thread) => thread.state_db(),
+            Err(_) => {
+                let mut state_db_ctx = None;
+                for candidate_thread_id in self.state.list_thread_ids().await {
+                    let Ok(thread) = self.state.get_thread(candidate_thread_id).await else {
+                        continue;
+                    };
+                    if let Some(ctx) = thread.state_db() {
+                        state_db_ctx = Some(ctx);
+                        break;
+                    }
+                }
+                state_db_ctx
+            }
+        };
+
+        if let Some(state_db_ctx) = state_db_ctx {
             for status in [
                 DirectionalThreadSpawnEdgeStatus::Open,
                 DirectionalThreadSpawnEdgeStatus::Closed,
@@ -474,17 +480,18 @@ impl ThreadManager {
             }
         }
 
-        for descendant_id in thread
-            .codex
-            .session
-            .services
-            .agent_control
-            .list_live_agent_subtree_thread_ids(thread_id)
+        for descendant_id in self
+            .agent_control()
+            .list_live_agent_descendant_thread_ids_from_roots(&subtree_thread_ids)
             .await?
         {
             if seen_thread_ids.insert(descendant_id) {
                 subtree_thread_ids.push(descendant_id);
             }
+        }
+
+        if subtree_thread_ids.len() == 1 && root_missing {
+            return Err(CodexErr::ThreadNotFound(thread_id));
         }
 
         Ok(subtree_thread_ids)

@@ -24,6 +24,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::Duration;
@@ -1833,7 +1834,7 @@ async fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants
 }
 
 #[tokio::test]
-async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed() {
+async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed() {
     let harness = AgentControlHarness::new().await;
     let (root_thread_id, root_thread) = harness.start_thread().await;
     let child_thread_id = harness
@@ -1866,27 +1867,64 @@ async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed(
         )
         .await
         .expect("grandchild spawn should succeed");
+    let grandchild_thread = harness
+        .manager
+        .get_thread(grandchild_thread_id)
+        .await
+        .expect("grandchild should be loaded");
+    let state_db_ctx = grandchild_thread
+        .state_db()
+        .expect("grandchild should expose state DB");
+    state_db_ctx
+        .upsert_thread_spawn_edge(
+            root_thread_id,
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("root child edge should be written");
+    state_db_ctx
+        .upsert_thread_spawn_edge(
+            ThreadId::new(),
+            grandchild_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("stale persisted grandchild edge should be written");
 
     harness
         .manager
         .remove_thread(&root_thread_id)
         .await
         .expect("root should be removed");
-    let mut subtree_thread_ids = harness
+    harness
+        .manager
+        .remove_thread(&child_thread_id)
+        .await
+        .expect("child should be removed");
+    let subtree_thread_ids = harness
         .manager
         .list_agent_subtree_thread_ids(root_thread_id)
         .await
-        .expect("root subtree should still load from live descendants");
-    subtree_thread_ids.sort_by_key(ToString::to_string);
-    let mut expected_thread_ids = vec![root_thread_id, child_thread_id, grandchild_thread_id];
-    expected_thread_ids.sort_by_key(ToString::to_string);
-
-    assert_eq!(subtree_thread_ids, expected_thread_ids);
+        .expect("root subtree should still load from live deeper descendants");
+    assert!(
+        subtree_thread_ids.contains(&root_thread_id),
+        "root id should remain the subtree anchor: {subtree_thread_ids:?}"
+    );
+    assert!(
+        subtree_thread_ids.contains(&child_thread_id),
+        "persisted child should be preserved for mixed live/archived subtree feedback: {subtree_thread_ids:?}"
+    );
+    assert!(
+        subtree_thread_ids.contains(&grandchild_thread_id),
+        "live grandchild should be recovered even after root and parent are removed: {subtree_thread_ids:?}"
+    );
+    assert_eq!(subtree_thread_ids.len(), 3);
     harness
         .control
-        .shutdown_agent_tree(child_thread_id)
+        .shutdown_live_agent(grandchild_thread_id)
         .await
-        .expect("child subtree shutdown");
+        .expect("grandchild shutdown");
     root_thread
         .shutdown_and_wait()
         .await

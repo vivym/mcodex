@@ -2420,6 +2420,21 @@ Latest verification ledger, 2026-04-25:
 - PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
 - Not run in this pass: the full Task 11 core matrix, app-server `account_lease` and `thread_archive`, CLI focused suites, and full workspace `cargo test`.
 
+Latest review-fix verification ledger, 2026-04-25:
+
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed -- --nocapture` failed because the root-missing fallback only returned the root anchor and persisted child, not the live grandchild.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed -- --nocapture` passed after merging persisted subtree seeds with live `SessionSource` descendants.
+- RED: `cargo test -p codex-core pooled_host_snapshot_matches_remote_reset_by_manager_generation_not_lease_epoch -- --nocapture` failed because manager-backed runtime generation 2 was compared against durable lease epoch 1.
+- GREEN: `cargo test -p codex-core pooled_host_snapshot_matches_remote_reset_by_manager_generation_not_lease_epoch -- --nocapture` passed after adding `runtime_generation` to the live snapshot and matching remote resets against it.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 2 targeted tests after the final live traversal cleanup.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core agent::registry -- --nocapture` passed 18 targeted tests after updating root metadata expectations.
+- PASS: `cargo test -p codex-app-server account_lease_api -- --nocapture` passed 2 targeted tests for runtime snapshot construction.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+
 - [ ] **Step 5: Run scoped lints**
 
 Run:
