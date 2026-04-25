@@ -973,7 +973,7 @@ cd codex-rs
 cargo test -p codex-cli accounts -- --nocapture
 cargo test -p codex-tui status -- --nocapture
 cargo insta accept -p codex-tui
-cargo insta pending-snapshots --manifest-path tui/Cargo.toml
+cargo insta pending-snapshots -p codex-tui
 ```
 
 Expected: PASS for CLI/TUI tests and `No pending snapshots` after accepting intentional snapshot updates.
@@ -1036,7 +1036,7 @@ cd codex-rs
 just write-app-server-schema
 git diff --check
 git diff --exit-code -- app-server-protocol/schema/json app-server-protocol/schema/typescript
-cargo insta pending-snapshots --manifest-path tui/Cargo.toml
+cargo insta pending-snapshots -p codex-tui
 ```
 
 Expected: no generated-schema drift that was not intentionally committed,
