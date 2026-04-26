@@ -2,6 +2,7 @@ use super::connection_handling_websocket::DEFAULT_READ_TIMEOUT;
 use super::connection_handling_websocket::WsClient;
 use super::connection_handling_websocket::connect_websocket;
 use super::connection_handling_websocket::read_jsonrpc_message;
+use super::connection_handling_websocket::read_notification_for_method;
 use super::connection_handling_websocket::read_response_for_id;
 use super::connection_handling_websocket::send_initialize_request;
 use super::connection_handling_websocket::send_request;
@@ -20,6 +21,9 @@ use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AccountLeaseUpdatedNotification;
+use codex_app_server_protocol::AccountStartupAvailability;
+use codex_app_server_protocol::AccountStartupResolutionIssueSource;
+use codex_app_server_protocol::AccountStartupResolutionIssueType;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -36,6 +40,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::LegacyAccountImport;
 use codex_state::StateRuntime;
@@ -55,6 +60,176 @@ use wiremock::matchers::path_regex;
 const PRIMARY_ACCOUNT_ID: &str = "acct-1";
 const SECONDARY_ACCOUNT_ID: &str = "acct-2";
 const ACCOUNT_LEASE_ROTATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[tokio::test]
+async fn account_lease_read_includes_startup_snapshot_for_single_pool_fallback() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_policy_only_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_account_in_pool(codex_home.path(), PRIMARY_ACCOUNT_ID, "legacy-default", 0).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(
+        response.startup.effective_pool_id.as_deref(),
+        Some("legacy-default")
+    );
+    assert_eq!(
+        response.startup.effective_pool_resolution_source,
+        "singleVisiblePool"
+    );
+    assert_eq!(
+        response.startup.startup_availability,
+        AccountStartupAvailability::Available
+    );
+    assert_eq!(
+        response.startup.selection_eligibility,
+        "automaticAccountSelected"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_preserves_candidate_pools_for_multi_pool_blocker() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_without_default(
+        codex_home.path(),
+        &server.uri(),
+        &["team-main", "team-other"],
+    )?;
+    seed_account_in_pool(codex_home.path(), "acct-team-main", "team-main", 0).await?;
+    seed_account_in_pool(codex_home.path(), "acct-team-other", "team-other", 1).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(
+        response.startup.startup_availability,
+        AccountStartupAvailability::MultiplePoolsRequireDefault
+    );
+    let issue = response
+        .startup
+        .startup_resolution_issue
+        .expect("startup resolution issue should be present");
+    assert_eq!(
+        issue.r#type,
+        AccountStartupResolutionIssueType::MultiplePoolsRequireDefault
+    );
+    assert_eq!(issue.source, AccountStartupResolutionIssueSource::None);
+    assert_eq!(issue.candidate_pool_count, Some(2));
+    let candidate_pool_ids = issue
+        .candidate_pools
+        .expect("candidate pools should be present")
+        .into_iter()
+        .map(|pool| pool.pool_id)
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_pool_ids, vec!["team-main", "team-other"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_preserves_candidate_pools_for_invalid_config_default() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_with_default_pool(codex_home.path(), &server.uri(), "missing-pool")?;
+    seed_account_in_pool(codex_home.path(), "acct-team-main", "team-main", 0).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(
+        response.startup.startup_availability,
+        AccountStartupAvailability::InvalidExplicitDefault
+    );
+    let issue = response
+        .startup
+        .startup_resolution_issue
+        .expect("startup resolution issue should be present");
+    assert_eq!(
+        issue.r#type,
+        AccountStartupResolutionIssueType::ConfigDefaultPoolUnavailable
+    );
+    assert_eq!(
+        issue.source,
+        AccountStartupResolutionIssueSource::ConfigDefault
+    );
+    let candidate_pool_ids = issue
+        .candidate_pools
+        .expect("candidate pools should be present")
+        .into_iter()
+        .map(|pool| pool.pool_id)
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_pool_ids, vec!["team-main"]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_lease_read_keeps_live_top_level_fields_separate_from_startup_snapshot()
+-> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_without_default(
+        codex_home.path(),
+        &server.uri(),
+        &["legacy-default", "config-default"],
+    )?;
+    let runtime = seed_default_pool_state(codex_home.path()).await?;
+    seed_account_in_pool(codex_home.path(), SECONDARY_ACCOUNT_ID, "config-default", 1).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread = start_thread(&mut mcp).await?;
+    let _turn = start_turn(&mut mcp, &thread.id, "lease legacy default").await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("config-default".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        })
+        .await?;
+
+    let response: AccountLeaseReadResponse = to_response(mcp.read_account_lease().await?)?;
+    assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
+    assert_eq!(
+        response.startup.effective_pool_id.as_deref(),
+        Some("config-default")
+    );
+    assert_eq!(
+        response.startup.effective_pool_resolution_source,
+        "persistedSelection"
+    );
+    assert_eq!(response.startup.configured_default_pool_id, None);
+    assert_eq!(
+        response.startup.persisted_default_pool_id.as_deref(),
+        Some("config-default")
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn account_lease_read_reports_process_local_pool_state() -> Result<()> {
@@ -648,10 +823,11 @@ async fn account_lease_read_reports_shared_startup_selection_without_accounts_co
 }
 
 #[tokio::test]
-async fn policy_only_config_rejects_websocket_account_lease_runtime() -> Result<()> {
+async fn policy_only_config_allows_websocket_account_lease_read_startup_snapshot() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_policy_only_pooled_config_toml(codex_home.path(), &server.uri())?;
+    seed_account_in_pool(codex_home.path(), PRIMARY_ACCOUNT_ID, "legacy-default", 0).await?;
 
     let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
     let mut ws = connect_websocket(bind_addr).await?;
@@ -671,13 +847,96 @@ async fn policy_only_config_rejects_websocket_account_lease_runtime() -> Result<
         /*params*/ None,
     )
     .await?;
-    let error = read_error_for_id(&mut ws, /*id*/ 2).await?;
+    let response: AccountLeaseReadResponse =
+        to_response(read_response_for_id(&mut ws, /*id*/ 2).await?)?;
+    assert_eq!(
+        response.startup.startup_availability,
+        AccountStartupAvailability::Available
+    );
+    assert_eq!(
+        response.startup.effective_pool_id.as_deref(),
+        Some("legacy-default")
+    );
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_only_config_allows_websocket_account_lease_resume_startup_intent() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_policy_only_pooled_config_toml(codex_home.path(), &server.uri())?;
+    let runtime = seed_default_pool_state(codex_home.path()).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: Some("legacy-default".to_string()),
+            preferred_account_id: Some(PRIMARY_ACCOUNT_ID.to_string()),
+            suppressed: true,
+        })
+        .await?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut ws = connect_websocket(bind_addr).await?;
+    send_initialize_request(
+        &mut ws,
+        /*id*/ 1,
+        "ws_policy_only_account_lease_resume_client",
+    )
+    .await?;
+    let init = read_response_for_id(&mut ws, /*id*/ 1).await?;
+    assert_eq!(init.id, RequestId::Integer(1));
+
+    send_request(
+        &mut ws,
+        "accountLease/resume",
+        /*id*/ 2,
+        /*params*/ None,
+    )
+    .await?;
+    let response = read_response_for_id(&mut ws, /*id*/ 2).await?;
+    assert_eq!(response.id, RequestId::Integer(2));
+    let notification = read_notification_for_method(&mut ws, "accountLease/updated").await?;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(
+        updated.startup.startup_availability,
+        AccountStartupAvailability::Available
+    );
+    assert_eq!(
+        updated.startup.selection_eligibility,
+        "automaticAccountSelected"
+    );
+
+    send_request(
+        &mut ws,
+        "thread/list",
+        /*id*/ 3,
+        Some(json!({
+            "cursor": null,
+            "limit": null,
+            "sortKey": null,
+            "modelProviders": null,
+            "sourceKinds": null,
+            "archived": null,
+            "cwd": null,
+            "searchTerm": null
+        })),
+    )
+    .await?;
+    let thread_list: codex_app_server_protocol::ThreadListResponse =
+        to_response(read_response_for_id(&mut ws, /*id*/ 3).await?)?;
+    assert_eq!(thread_list.data, Vec::new());
+    let candidates = runtime
+        .read_account_lease_selection_candidates("legacy-default")
+        .await?;
     assert!(
-        error
-            .error
-            .message
-            .contains("pooled lease mode is only supported for stdio"),
-        "unexpected websocket error: {error:?}"
+        candidates
+            .into_iter()
+            .all(|(_, _, active_lease, _)| active_lease.is_none())
     );
 
     process
@@ -877,9 +1136,9 @@ async fn pooled_mode_rejects_websocket_runtime() -> Result<()> {
 
     send_request(
         &mut ws,
-        "accountLease/read",
+        "thread/start",
         /*id*/ 2,
-        /*params*/ None,
+        Some(json!(ThreadStartParams::default())),
     )
     .await?;
     let error = read_error_for_id(&mut ws, /*id*/ 2).await?;
@@ -949,6 +1208,29 @@ async fn seed_default_pool_state(codex_home: &std::path::Path) -> Result<Arc<Sta
         })
         .await?;
     write_pooled_auth(codex_home, PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID)?;
+    Ok(runtime)
+}
+
+async fn seed_account_in_pool(
+    codex_home: &std::path::Path,
+    account_id: &str,
+    pool_id: &str,
+    position: i64,
+) -> Result<Arc<StateRuntime>> {
+    let runtime = StateRuntime::init(codex_home.to_path_buf(), "mock_provider".to_string()).await?;
+    runtime
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: account_id.to_string(),
+            pool_id: pool_id.to_string(),
+            position,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    write_pooled_auth(codex_home, account_id, account_id)?;
     Ok(runtime)
 }
 
@@ -1175,6 +1457,50 @@ request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
 "#
+        ),
+    )
+}
+
+fn create_pooled_config_toml_without_default(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    pool_ids: &[&str],
+) -> std::io::Result<()> {
+    let pool_sections = pool_ids
+        .iter()
+        .map(|pool_id| {
+            format!(
+                r#"
+[accounts.pools.{pool_id}]
+allow_context_reuse = false
+account_kinds = ["chatgpt"]
+"#
+            )
+        })
+        .collect::<String>();
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "mock-model"
+approval_policy = "never"
+sandbox_mode = "read-only"
+
+model_provider = "mock_provider"
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+
+[accounts]
+backend = "local"
+allocation_mode = "exclusive"
+{pool_sections}"#
         ),
     )
 }

@@ -12,34 +12,36 @@ use codex_core::AccountLeaseRuntimeReason;
 use codex_core::AccountLeaseRuntimeSnapshot;
 use codex_core::config::Config;
 use codex_state::AccountHealthState;
+use codex_state::AccountStartupAvailability;
 use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionPreview;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::AccountStartupStatus;
-use codex_state::EffectivePoolResolutionSource;
 use codex_state::StateRuntime;
 
+use crate::account_startup_snapshot::effective_pool_resolution_source_to_wire_string;
+use crate::account_startup_snapshot::snapshot_from_startup_status;
+use crate::account_startup_snapshot::unavailable_snapshot;
 use crate::error_code::INTERNAL_ERROR_CODE;
 
 pub(crate) async fn pooled_mode_is_enabled(config: &Config) -> Result<bool, JSONRPCErrorError> {
-    Ok(read_account_lease_startup_context(config).await?.is_some())
+    Ok(
+        read_account_lease_startup_context_for_runtime_admission(config)
+            .await?
+            .is_some(),
+    )
 }
 
 pub(crate) async fn account_lease_updated_notification_from_runtime_snapshot(
     config: &Config,
     live_snapshot: &AccountLeaseRuntimeSnapshot,
 ) -> Result<AccountLeaseUpdatedNotification, JSONRPCErrorError> {
-    let startup_context = if live_snapshot_needs_startup_override(live_snapshot) {
-        read_account_lease_startup_context(config).await?
-    } else {
-        None
-    };
+    let startup_context = read_account_lease_startup_context(config).await?;
 
-    Ok(account_lease_response_from_runtime_snapshot(
-        live_snapshot,
-        startup_context.as_ref().map(|context| &context.startup),
+    Ok(
+        account_lease_response_from_runtime_snapshot(live_snapshot, Some(&startup_context.startup))
+            .into(),
     )
-    .into())
 }
 
 pub(crate) async fn read_account_lease(
@@ -50,13 +52,13 @@ pub(crate) async fn read_account_lease(
     if let Some(live_snapshot) = live_snapshot {
         return Ok(account_lease_response_from_runtime_snapshot(
             &live_snapshot,
-            startup_context.as_ref().map(|startup| &startup.startup),
+            Some(&startup_context.startup),
         ));
     }
 
-    let Some(startup_context) = startup_context else {
+    if startup_context.startup.startup_availability == AccountStartupAvailability::Unavailable {
         return Ok(empty_account_lease_response());
-    };
+    }
 
     Ok(account_lease_response_from_startup_status(
         startup_context.startup,
@@ -85,11 +87,8 @@ pub(crate) async fn resume_account_lease(
         .context("clear durable account startup selection suppression")
         .map_err(internal_error)?;
 
-    let Some(startup_context) =
-        read_account_lease_startup_context_with_state_db(config, state_db).await?
-    else {
-        return Ok(empty_account_lease_response().into());
-    };
+    let startup_context =
+        read_account_lease_startup_context_with_state_db(config, state_db).await?;
 
     if let Some(live_snapshot) = live_snapshot {
         return Ok(account_lease_response_from_runtime_snapshot(
@@ -97,6 +96,10 @@ pub(crate) async fn resume_account_lease(
             Some(&startup_context.startup),
         )
         .into());
+    }
+
+    if startup_context.startup.startup_availability == AccountStartupAvailability::Unavailable {
+        return Ok(empty_account_lease_response().into());
     }
 
     Ok(account_lease_response_from_startup_status(startup_context.startup).into())
@@ -117,7 +120,7 @@ pub(crate) async fn suppress_account_lease_on_logout(
     let has_startup_selection = selection.default_pool_id.is_some()
         || selection.preferred_account_id.is_some()
         || selection.suppressed;
-    if startup_context.is_none() && !has_startup_selection {
+    if !startup_context.pooled_applicable && !has_startup_selection {
         return Ok(None);
     }
 
@@ -131,9 +134,9 @@ pub(crate) async fn suppress_account_lease_on_logout(
         .context("write durable suppressed account startup selection")
         .map_err(internal_error)?;
 
-    if let Some(startup_context) =
-        read_account_lease_startup_context_with_state_db(config, state_db.clone()).await?
-    {
+    let startup_context =
+        read_account_lease_startup_context_with_state_db(config, state_db.clone()).await?;
+    if startup_context.pooled_applicable {
         return Ok(Some(
             account_lease_response_from_startup_status(startup_context.startup).into(),
         ));
@@ -157,7 +160,7 @@ async fn init_state_db(config: &Config) -> Result<Arc<StateRuntime>, JSONRPCErro
 
 async fn read_account_lease_startup_context(
     config: &Config,
-) -> Result<Option<SharedStartupStatus>, JSONRPCErrorError> {
+) -> Result<SharedStartupStatus, JSONRPCErrorError> {
     let state_db = init_state_db(config).await?;
     read_account_lease_startup_context_with_state_db(config, state_db).await
 }
@@ -165,7 +168,26 @@ async fn read_account_lease_startup_context(
 async fn read_account_lease_startup_context_with_state_db(
     config: &Config,
     state_db: Arc<StateRuntime>,
+) -> Result<SharedStartupStatus, JSONRPCErrorError> {
+    read_account_lease_startup_context_inner(config, state_db).await
+}
+
+async fn read_account_lease_startup_context_for_runtime_admission(
+    config: &Config,
 ) -> Result<Option<SharedStartupStatus>, JSONRPCErrorError> {
+    let state_db = init_state_db(config).await?;
+    let shared_status = read_account_lease_startup_context_inner(config, state_db).await?;
+    if !shared_status.pooled_applicable {
+        return Ok(None);
+    }
+
+    Ok(Some(shared_status))
+}
+
+async fn read_account_lease_startup_context_inner(
+    config: &Config,
+    state_db: Arc<StateRuntime>,
+) -> Result<SharedStartupStatus, JSONRPCErrorError> {
     let lease_ttl_secs = config
         .accounts
         .as_ref()
@@ -180,11 +202,7 @@ async fn read_account_lease_startup_context_with_state_db(
             .await
             .context("read shared account startup status")
             .map_err(internal_error)?;
-    if !shared_status.pooled_applicable {
-        return Ok(None);
-    }
-
-    Ok(Some(shared_status))
+    Ok(shared_status)
 }
 
 fn configured_default_pool_id(config: &Config) -> Option<&str> {
@@ -216,12 +234,14 @@ fn empty_account_lease_response() -> AccountLeaseReadResponse {
         effective_pool_resolution_source: None,
         configured_default_pool_id: None,
         persisted_default_pool_id: None,
+        startup: unavailable_snapshot(),
     }
 }
 
 fn account_lease_response_from_startup_status(
     startup: AccountStartupStatus,
 ) -> AccountLeaseReadResponse {
+    let startup_snapshot = snapshot_from_startup_status(&startup);
     let preview = startup.preview;
     let active = !preview.suppressed && preview.predicted_account_id.is_some();
     let (switch_reason, suppression_reason) = selection_reasons(&preview.eligibility);
@@ -252,6 +272,7 @@ fn account_lease_response_from_startup_status(
         ),
         configured_default_pool_id: startup.configured_default_pool_id,
         persisted_default_pool_id: startup.persisted_default_pool_id,
+        startup: startup_snapshot,
     }
 }
 
@@ -259,12 +280,6 @@ fn account_lease_response_from_runtime_snapshot(
     live_snapshot: &AccountLeaseRuntimeSnapshot,
     startup: Option<&AccountStartupStatus>,
 ) -> AccountLeaseReadResponse {
-    if let Some(startup) = startup
-        && is_stale_startup_suppressed_live_snapshot(live_snapshot, startup)
-    {
-        return account_lease_response_from_startup_status(startup.clone());
-    }
-
     AccountLeaseReadResponse {
         active: live_snapshot.active,
         suppressed: live_snapshot.suppressed,
@@ -305,20 +320,8 @@ fn account_lease_response_from_runtime_snapshot(
             .and_then(|startup| startup.configured_default_pool_id.clone()),
         persisted_default_pool_id: startup
             .and_then(|startup| startup.persisted_default_pool_id.clone()),
+        startup: startup.map_or_else(unavailable_snapshot, snapshot_from_startup_status),
     }
-}
-
-fn is_stale_startup_suppressed_live_snapshot(
-    live_snapshot: &AccountLeaseRuntimeSnapshot,
-    startup: &AccountStartupStatus,
-) -> bool {
-    live_snapshot_needs_startup_override(live_snapshot) && !startup.preview.suppressed
-}
-
-fn live_snapshot_needs_startup_override(live_snapshot: &AccountLeaseRuntimeSnapshot) -> bool {
-    !live_snapshot.active
-        && live_snapshot.suppressed
-        && live_snapshot.suppression_reason == Some(AccountLeaseRuntimeReason::StartupSuppressed)
 }
 
 fn account_lease_response_from_preview(
@@ -348,6 +351,7 @@ fn account_lease_response_from_preview(
         effective_pool_resolution_source: None,
         configured_default_pool_id: None,
         persisted_default_pool_id: None,
+        startup: unavailable_snapshot(),
     }
 }
 
@@ -404,18 +408,6 @@ fn health_state_for_preview(
     }
 }
 
-fn effective_pool_resolution_source_to_wire_string(
-    source: EffectivePoolResolutionSource,
-) -> &'static str {
-    match source {
-        EffectivePoolResolutionSource::Override => "override",
-        EffectivePoolResolutionSource::ConfigDefault => "configDefault",
-        EffectivePoolResolutionSource::PersistedSelection => "persistedSelection",
-        EffectivePoolResolutionSource::SingleVisiblePool => "singleVisiblePool",
-        EffectivePoolResolutionSource::None => "none",
-    }
-}
-
 fn live_snapshot_health_state(health_state: Option<AccountHealthState>) -> Option<String> {
     match health_state {
         Some(AccountHealthState::Healthy) => Some("healthy".to_string()),
@@ -469,7 +461,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn runtime_response_uses_unsuppressed_startup_after_durable_suppression_is_cleared() {
+    fn runtime_response_keeps_live_fields_when_startup_suppression_is_cleared() {
         let live_snapshot = AccountLeaseRuntimeSnapshot {
             active: false,
             suppressed: true,
@@ -508,18 +500,29 @@ mod tests {
 
         let response = account_lease_response_from_runtime_snapshot(&live_snapshot, Some(&startup));
 
-        assert_eq!(response.suppressed, false);
-        assert_eq!(response.suppression_reason, None);
-        assert_eq!(response.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(response.suppressed, true);
+        assert_eq!(
+            response.suppression_reason.as_deref(),
+            Some("durablySuppressed")
+        );
+        assert_eq!(response.account_id, None);
         assert_eq!(response.pool_id.as_deref(), Some("legacy-default"));
         assert_eq!(
             response.effective_pool_resolution_source.as_deref(),
             Some("configDefault")
         );
+        assert_eq!(
+            response.startup.effective_pool_id.as_deref(),
+            Some("legacy-default")
+        );
+        assert_eq!(
+            response.startup.selection_eligibility,
+            "automaticAccountSelected"
+        );
     }
 
     #[tokio::test]
-    async fn runtime_update_notification_uses_unsuppressed_startup_after_durable_suppression_is_cleared()
+    async fn runtime_update_notification_keeps_live_fields_when_startup_suppression_is_cleared()
     -> anyhow::Result<()> {
         let codex_home = tempfile::tempdir()?;
         let mut config =
@@ -594,9 +597,17 @@ mod tests {
                 .await
                 .map_err(|err| anyhow::anyhow!(err.message))?;
 
-        assert_eq!(notification.suppressed, false);
-        assert_eq!(notification.account_id.as_deref(), Some("acct-1"));
-        assert_eq!(notification.pool_id.as_deref(), Some("pool-main"));
+        assert_eq!(notification.suppressed, true);
+        assert_eq!(notification.account_id, None);
+        assert_eq!(notification.pool_id, None);
+        assert_eq!(
+            notification.startup.effective_pool_id.as_deref(),
+            Some("pool-main")
+        );
+        assert_eq!(
+            notification.startup.selection_eligibility,
+            "preferredAccountSelected"
+        );
         Ok(())
     }
 }

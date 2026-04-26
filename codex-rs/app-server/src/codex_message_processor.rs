@@ -1194,6 +1194,14 @@ impl CodexMessageProcessor {
                 self.account_pool_diagnostics_read(to_connection_request_id(request_id), params)
                     .await;
             }
+            ClientRequest::AccountPoolDefaultSet { request_id, .. }
+            | ClientRequest::AccountPoolDefaultClear { request_id, .. } => {
+                self.send_invalid_request_error(
+                    to_connection_request_id(request_id),
+                    "account pool default mutation is not available yet".to_string(),
+                )
+                .await;
+            }
             ClientRequest::CancelLoginAccount { request_id, params } => {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
                     .await;
@@ -1901,18 +1909,9 @@ impl CodexMessageProcessor {
     pub(crate) async fn account_lease_read(
         &self,
         request_id: ConnectionRequestId,
-        transport: AppServerTransport,
+        _transport: AppServerTransport,
     ) {
         let (config, live_snapshot) = self.loaded_or_process_account_lease_config().await;
-        if let Err(error) =
-            Self::pooled_runtime_scope_required_for_config(config.as_ref(), transport)
-                .await
-                .map(|_| ())
-        {
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        }
-
         match account_lease_api::read_account_lease(config.as_ref(), live_snapshot).await {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
@@ -1922,18 +1921,9 @@ impl CodexMessageProcessor {
     pub(crate) async fn account_lease_resume(
         &self,
         request_id: ConnectionRequestId,
-        transport: AppServerTransport,
+        _transport: AppServerTransport,
     ) {
         let (config, live_snapshot) = self.loaded_or_process_account_lease_config().await;
-        if let Err(error) =
-            Self::pooled_runtime_scope_required_for_config(config.as_ref(), transport)
-                .await
-                .map(|_| ())
-        {
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        }
-
         match account_lease_api::resume_account_lease(config.as_ref(), live_snapshot).await {
             Ok(notification) => {
                 self.outgoing
@@ -12521,6 +12511,19 @@ mod tests {
         }
     }
 
+    fn unavailable_startup_snapshot() -> codex_app_server_protocol::AccountStartupSnapshot {
+        codex_app_server_protocol::AccountStartupSnapshot {
+            effective_pool_id: None,
+            effective_pool_resolution_source: "none".to_string(),
+            configured_default_pool_id: None,
+            persisted_default_pool_id: None,
+            startup_availability:
+                codex_app_server_protocol::AccountStartupAvailability::Unavailable,
+            startup_resolution_issue: None,
+            selection_eligibility: "missingPool".to_string(),
+        }
+    }
+
     fn assert_no_outgoing_message(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
         assert!(matches!(
             outgoing_rx.try_recv(),
@@ -12965,6 +12968,7 @@ mod tests {
                 proactive_switch_pending: Some(false),
                 proactive_switch_suppressed: Some(false),
                 proactive_switch_allowed_at: None,
+                startup: unavailable_startup_snapshot(),
             };
         let thread_state = harness
             .processor
@@ -12984,6 +12988,7 @@ mod tests {
                     proactive_switch_pending: Some(false),
                     proactive_switch_suppressed: Some(false),
                     proactive_switch_allowed_at: None,
+                    startup: unavailable_startup_snapshot(),
                 })
             );
         }
@@ -13005,6 +13010,7 @@ mod tests {
                 proactive_switch_pending: None,
                 proactive_switch_suppressed: None,
                 proactive_switch_allowed_at: None,
+                startup: unavailable_startup_snapshot(),
             }
         );
         started.thread.shutdown_and_wait().await?;
@@ -13038,6 +13044,7 @@ mod tests {
                 proactive_switch_pending: Some(false),
                 proactive_switch_suppressed: Some(false),
                 proactive_switch_allowed_at: None,
+                startup: unavailable_startup_snapshot(),
             };
         let thread_state = harness
             .processor
@@ -13057,6 +13064,7 @@ mod tests {
                     proactive_switch_pending: Some(false),
                     proactive_switch_suppressed: Some(false),
                     proactive_switch_allowed_at: None,
+                    startup: unavailable_startup_snapshot(),
                 })
             );
         }
@@ -13079,6 +13087,7 @@ mod tests {
                 proactive_switch_pending: None,
                 proactive_switch_suppressed: None,
                 proactive_switch_allowed_at: None,
+                startup: unavailable_startup_snapshot(),
             }
         );
         Ok(())
