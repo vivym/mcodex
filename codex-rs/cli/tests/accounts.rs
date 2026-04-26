@@ -324,6 +324,29 @@ async fn seed_quota_blocked_accounts_for_status(codex_home: &TempDir) -> Result<
     Ok(())
 }
 
+async fn seed_stale_probe_secondary_quota_for_status(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    seed_quota_state(
+        &pool,
+        QuotaStateSeed {
+            account_id: "acct-1",
+            limit_id: "chatgpt",
+            exhausted_windows: "secondary",
+            predicted_blocked_until: now + 600,
+            next_probe_after: Some(now - 300),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 struct QuotaStateSeed {
     account_id: &'static str,
     limit_id: &'static str,
@@ -948,6 +971,44 @@ async fn accounts_status_distinguishes_quota_selection_explanations() -> Result<
     assert!(
         text.stdout
             .contains("eligibility=account is waiting for the next quota probe"),
+        "stdout: {}",
+        text.stdout
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_treats_stale_probe_timestamp_as_exhausted_window() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+    seed_stale_probe_secondary_quota_for_status(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["eligibility"]["code"], "secondaryWindowBlocked");
+    assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "account is blocked by the secondary quota window"
+    );
+
+    let text = run_codex(&codex_home, &["accounts", "status"]).await?;
+    assert!(text.success, "stderr: {}", text.stderr);
+    assert!(
+        text.stdout
+            .contains("eligibility=account is blocked by the secondary quota window"),
         "stdout: {}",
         text.stdout
     );

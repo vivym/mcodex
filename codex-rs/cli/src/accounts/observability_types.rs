@@ -63,6 +63,7 @@ pub(crate) struct PoolQuotaFamilyView {
     pub exhausted_windows: String,
     pub predicted_blocked_until: Option<String>,
     pub next_probe_after: Option<String>,
+    pub next_probe_after_is_future: bool,
     pub observed_at: String,
 }
 

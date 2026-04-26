@@ -8,6 +8,8 @@ use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::test_support::get_model_offline;
 use crate::status::StatusAccountDisplay;
 use crate::status::StatusAccountLeaseDisplay;
+use crate::status::StatusAccountQuotaFamilyDisplay;
+use crate::status::StatusAccountQuotaWindowDisplay;
 use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 use chrono::Duration as ChronoDuration;
@@ -124,7 +126,20 @@ fn test_probe_throttled_account_lease_display() -> Option<StatusAccountLeaseDisp
         next_eligible_at: None,
         next_probe_after: Some("03:24".to_string()),
         remote_reset: None,
-        quota_families: Vec::new(),
+        quota_families: vec![StatusAccountQuotaFamilyDisplay {
+            limit_id: "chatgpt".to_string(),
+            primary: StatusAccountQuotaWindowDisplay {
+                used_percent: Some("42% used".to_string()),
+                resets_at: None,
+            },
+            secondary: StatusAccountQuotaWindowDisplay {
+                used_percent: Some("100% used".to_string()),
+                resets_at: Some("04:04".to_string()),
+            },
+            exhausted_windows: "secondary".to_string(),
+            predicted_blocked_until: Some("04:04".to_string()),
+            next_probe_after: Some("03:24".to_string()),
+        }],
     })
 }
 
@@ -430,6 +445,8 @@ async fn status_snapshot_explains_probe_throttle_without_reusing_next_eligible_c
     }
     let sanitized = sanitize_directory(rendered_lines).join("\n");
     assert!(sanitized.contains("Next probe:"));
+    assert!(sanitized.contains("Quota state:"));
+    assert!(sanitized.contains("chatgpt, primary 42% used"));
     assert!(!sanitized.contains("Next eligible:"));
     assert_snapshot!(sanitized);
 }

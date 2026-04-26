@@ -494,7 +494,7 @@ fn quota_eligibility_from_families(
     if quotas.is_empty() {
         return None;
     }
-    if quotas.iter().any(|quota| quota.next_probe_after.is_some()) {
+    if quotas.iter().any(|quota| quota.next_probe_after_is_future) {
         return Some(quota_eligibility_view(
             is_preferred,
             "probeThrottle",

@@ -28,6 +28,8 @@ use codex_core::config::Config;
 use codex_state::StateRuntime;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::accounts::AccountsEventsCommand;
 use crate::accounts::PoolShowCommand;
@@ -411,6 +413,10 @@ fn sorted_quotas(mut quotas: Vec<AccountPoolQuotaFamily>) -> Vec<AccountPoolQuot
 }
 
 fn map_quota_family(quota: AccountPoolQuotaFamily) -> PoolQuotaFamilyView {
+    let next_probe_after_is_future = quota
+        .next_probe_after
+        .as_ref()
+        .is_some_and(|next_probe_after| next_probe_after.timestamp() > unix_now_secs());
     PoolQuotaFamilyView {
         limit_id: quota.limit_id,
         primary: map_quota_window(quota.primary),
@@ -422,8 +428,16 @@ fn map_quota_family(quota: AccountPoolQuotaFamily) -> PoolQuotaFamilyView {
         next_probe_after: quota
             .next_probe_after
             .map(|next_probe_after| next_probe_after.to_rfc3339()),
+        next_probe_after_is_future,
         observed_at: quota.observed_at.to_rfc3339(),
     }
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn map_quota_window(window: AccountPoolQuotaWindow) -> PoolQuotaWindowView {
