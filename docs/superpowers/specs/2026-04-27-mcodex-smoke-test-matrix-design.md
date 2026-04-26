@@ -266,31 +266,43 @@ helper that can create:
 The fixture should only write under the isolated `MCODEX_HOME`. It should not
 write to a developer's real `~/.mcodex` or `~/.codex`.
 
-Until that helper exists, P0 rows that require seeded pool state are runbook
-items, not guaranteed one-command checks. The runbook must point to the exact
-fixture command or manual setup used for that run.
+Until that helper exists, P0 rows that require seeded pool state belong to the
+fixture-dependent P0-B runbook. They are not guaranteed one-command checks. The
+runbook must point to the exact fixture command or manual setup used for that
+run.
 
 ### 4. Define a P0 manual smoke runbook
 
-P0 should be runnable immediately on a developer machine using an isolated
-`MCODEX_HOME`. It should prefer a local release binary or installed wrapper
-over direct internal helper binaries when the goal is product validation.
+P0 has two tiers:
+
+- P0-A rows are runnable immediately on a developer machine with an isolated
+  `MCODEX_HOME` and a known binary.
+- P0-B rows require the canonical local state fixture helper or an explicitly
+  documented manual fixture setup before they count as executable.
+
+P0 should prefer a local release binary or installed wrapper over direct
+internal helper binaries when the goal is product validation.
+
+Unless a row is specifically testing the installed wrapper, use `"$MCODEX_BIN"`
+instead of a bare `mcodex` command. Bare `mcodex` is allowed only for wrapper
+rows that also record `PATH`, `which mcodex`, and wrapper install metadata.
 
 Initial P0 rows:
 
-| ID | Scenario | Action | Expected Result |
-| --- | --- | --- | --- |
-| P0-01 | Isolated home | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN" accounts status --json` | The command uses the isolated home and does not read upstream `~/.codex` |
-| P0-02 | Empty home startup | Run `MCODEX_HOME=<tmp> mcodex` | Startup reaches the normal unauthenticated or no-account surface, not a pooled state |
-| P0-03 | Single pool, no default | Seed one local pool/account and launch TUI | Startup uses pooled access without `-c accounts.default_pool=...` |
-| P0-04 | Multiple pools, no default | Seed two visible pools and launch TUI | Startup shows the dedicated pooled access paused/default-required surface |
-| P0-05 | Set default pool | Run `mcodex accounts pool default set <pool>` | The persisted default is written and `accounts status` reports its source |
-| P0-06 | Clear default pool | Run `mcodex accounts pool default clear` | Multi-pool startup returns to default-required state |
-| P0-07 | Observability CLI | Run status, pool show, diagnostics, and events commands | Output explains startup, lease, and quota state without exposing credentials |
-| P0-08 | Config default precedence | Set config default and a different persisted default | Effective pool comes from config, with clear source reporting |
-| P0-09 | Home override conflict | Run with both `MCODEX_HOME=<a>` and `CODEX_HOME=<b>` | Runtime state comes from `<a>` and does not read `<b>` |
-| P0-10 | Subagent lease observation | Start a pooled parent session and spawn a subagent, then inspect events or lease rows | The child stays under the same runtime authority; no second random account allocation is observed |
-| P0-11 | Local installer wrapper | Install into an isolated root and run `mcodex --version` plus a CLI command | Wrapper forwards arguments, preserves exit code, and uses mcodex home identity |
+| ID | Tier | Scenario | Action | Expected Result |
+| --- | --- | --- | --- | --- |
+| P0-01 | P0-A | Direct binary identity | Run `"$MCODEX_BIN" --version` and `"$MCODEX_BIN" --help` | Version, help text, and product identity match the intended local build |
+| P0-02 | P0-A | Isolated home | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN" accounts status --json` | The command uses the isolated home and does not read upstream `~/.codex` |
+| P0-03 | P0-A | Empty home startup | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN"` | Startup reaches the normal unauthenticated or no-account surface, not a pooled state |
+| P0-04 | P0-A | Home override conflict | Run `MCODEX_HOME=<a> CODEX_HOME=<b> "$MCODEX_BIN" accounts status --json` | Runtime state comes from `<a>` and does not read `<b>` |
+| P0-05 | P0-B | Single pool, no default | Seed one local pool/account and launch TUI with `"$MCODEX_BIN"` | Startup uses pooled access without `-c accounts.default_pool=...` |
+| P0-06 | P0-B | Multiple pools, no default | Seed two visible pools and launch TUI with `"$MCODEX_BIN"` | Startup shows the dedicated pooled access paused/default-required surface |
+| P0-07 | P0-B | Set default pool | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN" accounts pool default set <pool>` | The persisted default is written and `accounts status` reports its source |
+| P0-08 | P0-B | Clear default pool | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN" accounts pool default clear` | Multi-pool startup returns to default-required state |
+| P0-09 | P0-B | Observability CLI | Run status, pool show, diagnostics, and events commands through `"$MCODEX_BIN"` | Output explains startup, lease, and quota state without exposing credentials |
+| P0-10 | P0-B | Config default precedence | Set config default and a different persisted default | Effective pool comes from config, with clear source reporting |
+| P0-11 | P0-B optional | Subagent lease observation | With a real-account or mock-backed fixture, start a pooled parent session and spawn a subagent, then inspect events or lease rows | The child stays under the same runtime authority; no second random account allocation is observed |
+| P0-12 | P0-A wrapper | Local installer wrapper | Install into an isolated root and run bare `mcodex --version` plus a CLI command | Wrapper forwards arguments, preserves exit code, and uses mcodex home identity |
 
 P0 should not attempt to exhaust a real account quota. Quota and switch behavior
 should be validated through seeded state or fake backends.
@@ -322,7 +334,9 @@ client, remote browser session, or production remote server.
 For runtime and subagent smoke, the first P1 implementation should use core test
 support and mock model responses. Real account P0 checks may validate that the
 interactive path launches, but runtime lease inheritance and quota behavior
-should be asserted through fake or seeded data.
+should be asserted through fake or seeded data. Subagent lease inheritance is a
+P1 requirement; the P0 subagent row is optional and only valid when its
+prerequisites and observation path are explicitly recorded.
 
 ### 6. Keep P0 and P1 data setup isolated
 
@@ -361,8 +375,12 @@ capture:
 - whether the ChatGPT login screen appears
 - whether the pooled access paused/default-required title appears
 - whether `accounts status --json` for the same `MCODEX_HOME` reports
-  `singleVisiblePool`, `multiplePoolsRequireDefault`,
-  `invalidExplicitDefault`, or another expected startup code
+  the exact expected JSON path, for example:
+  - `startup.effectivePoolResolutionSource == "singleVisiblePool"`
+  - `startup.startupAvailability == "multiplePoolsRequireDefault"`
+  - `startup.startupAvailability == "invalidExplicitDefault"`
+  - `startup.startupResolutionIssue.kind == "configDefaultPoolUnavailable"`
+  - `startup.startupResolutionIssue.kind == "persistedDefaultPoolUnavailable"`
 - a screenshot or terminal capture for any failure
 
 P1 should first validate the same states through shared startup-resolution
@@ -411,41 +429,43 @@ one pool, multiple pools without default, or an invalid configured default.
 
 | ID | Entry Point | State Scenario | Authority Source | Level | Expected Result |
 | --- | --- | --- | --- | --- | --- |
-| M-01 | CLI status | Empty home | `MCODEX_HOME` + local SQLite | P0/P1 | Reports no pooled startup without reading upstream home |
-| M-02 | CLI status | Conflicting `MCODEX_HOME` and `CODEX_HOME` | Product home resolver | P0/P1 | Uses `MCODEX_HOME`; does not read `CODEX_HOME` |
-| M-03 | Direct binary identity | Local build | Release/debug binary | P0/P1 | Version and product identity match the intended build |
-| M-04 | Installed wrapper identity | Local install root | Wrapper script | P0/P1 | Wrapper forwards args and exit codes to the intended binary |
-| M-05 | TUI startup | Empty home | `MCODEX_HOME` | P0 | Shows normal no-account/login path |
-| M-06 | CLI status | Single pool, no default | Local SQLite fixture | P0/P1 | Reports single-pool fallback source |
-| M-07 | TUI startup | Single pool, no default | Local SQLite fixture | P0 | Does not show ChatGPT login; status marker is single-pool fallback |
-| M-08 | CLI status | Multiple pools, no default | Local SQLite fixture | P0/P1 | Reports `multiplePoolsRequireDefault` |
-| M-09 | TUI startup | Multiple pools, no default | Startup snapshot | P0 | Shows pooled access paused/default-required surface |
-| M-10 | CLI default set | Multiple pools | Local SQLite fixture | P0/P1 | Persists default pool and reports source |
-| M-11 | CLI default clear | Multiple pools | Local SQLite fixture | P0/P1 | Clears persisted default and returns to default-required state |
-| M-12 | CLI status | Config default outranks persisted default | Config + local SQLite fixture | P0/P1 | Effective pool source is config |
-| M-13 | CLI status | Invalid config default | Config + local SQLite fixture | P0/P1 | Reports invalid explicit default without fallback |
-| M-14 | CLI status | Invalid persisted default | Local SQLite fixture | P0/P1 | Reports invalid persisted default with set/clear repair path |
+| M-01 | CLI status | Empty home | `MCODEX_HOME` + local SQLite | P0-A/P1 | Reports no pooled startup without reading upstream home |
+| M-02 | CLI status | Conflicting `MCODEX_HOME` and `CODEX_HOME` | Product home resolver | P0-A/P1 | Uses `MCODEX_HOME`; does not read `CODEX_HOME` |
+| M-03 | Direct binary identity | Local build | Release/debug binary | P0-A/P1 | Version and product identity match the intended build |
+| M-04 | Installed wrapper identity | Local install root | Wrapper script | P0-A/P1 | Wrapper forwards args and exit codes to the intended binary |
+| M-05 | TUI startup | Empty home | `MCODEX_HOME` | P0-A | Shows normal no-account/login path |
+| M-06 | CLI status | Single pool, no default | Local SQLite fixture | P0-B/P1 | `startup.effectivePoolResolutionSource == "singleVisiblePool"` |
+| M-07 | TUI startup | Single pool, no default | Local SQLite fixture | P0-B | Does not show ChatGPT login; status marker is `startup.effectivePoolResolutionSource == "singleVisiblePool"` |
+| M-08 | CLI status | Multiple pools, no default | Local SQLite fixture | P0-B/P1 | `startup.startupAvailability == "multiplePoolsRequireDefault"` |
+| M-09 | TUI startup | Multiple pools, no default | Startup snapshot | P0-B | Shows pooled access paused/default-required surface |
+| M-10 | CLI default set | Multiple pools | Local SQLite fixture | P0-B/P1 | Persists default pool and reports source |
+| M-11 | CLI default clear | Multiple pools | Local SQLite fixture | P0-B/P1 | Clears persisted default and returns to default-required state |
+| M-12 | CLI status | Config default outranks persisted default | Config + local SQLite fixture | P0-B/P1 | Effective pool source is config |
+| M-13 | CLI status | Invalid config default | Config + local SQLite fixture | P0-B/P1 | `startup.startupResolutionIssue.kind == "configDefaultPoolUnavailable"` without fallback |
+| M-14 | CLI status | Invalid persisted default | Local SQLite fixture | P0-B/P1 | `startup.startupResolutionIssue.kind == "persistedDefaultPoolUnavailable"` with set/clear repair path |
 | M-15 | App-server | Startup snapshot | Local backend fixture | P1 | Snapshot matches CLI startup facts |
 | M-16 | App-server | Default set/clear | Local backend fixture | P1 | Mutations update startup snapshot and notify clients |
-| M-17 | CLI observability | Pool with lease and quota rows | Local SQLite fixture | P0/P1 | Status/show/diagnostics/events expose facts without tokens |
+| M-17 | CLI observability | Pool with lease and quota rows | Local SQLite fixture | P0-B/P1 | Status/show/diagnostics/events expose facts without tokens |
 | M-18 | Runtime turn | Pooled account | Runtime lease authority fixture | P1 | Turn uses leased account and releases/renews correctly |
-| M-19 | Subagent | Parent has active pooled lease | Runtime lease authority fixture | P0/P1 | Child inherits authority; observed events or lease rows show no independent random allocation |
+| M-19 | Subagent | Parent has active pooled lease | Runtime lease authority fixture | P1, optional P0-B | Child inherits authority; observed events or lease rows show no independent random allocation |
 | M-20 | Runtime selection | Account busy in another holder | Local SQLite lease fixture | P1 | Selection skips account held by another instance |
 | M-21 | Runtime selection | Quota exhausted | Seeded quota fixture | P1 | Selection skips blocked account |
 | M-22 | Runtime selection | Quota near exhausted | Seeded quota fixture | P1 | Damping prevents per-turn account churn |
-| M-23 | Installer | Local install root | Install scripts + wrapper | P0/P1 | Wrapper forwards args, exit code, and mcodex home identity |
+| M-23 | Installer | Local install root | Install scripts + wrapper | P0-A/P1 | Wrapper forwards args, exit code, and mcodex home identity |
 | M-24 | Fake remote | Remote inventory and startup snapshot | Fake backend | Deferred P1 | Remote-shaped facts flow through same startup and observability surfaces |
 
 ## Execution Policy
 
 Suggested local use:
 
-1. Run P0 smoke after large merges into `main` or before using a fresh local
+1. Run P0-A smoke after large merges into `main` or before using a fresh local
    build as the daily driver.
-2. Run `cargo test` for code correctness separately.
-3. Promote a P0 row to P1 only after it has a stable setup path and does not
+2. Run P0-B smoke after the local state fixture helper exists or after the
+   manual fixture setup has been documented for that run.
+3. Run `cargo test` for code correctness separately.
+4. Promote a P0 row to P1 only after it has a stable setup path and does not
    require real account quota or fragile human interaction.
-4. Run `just smoke-mcodex-all` only for internal release candidates or major
+5. Run `just smoke-mcodex-all` only for internal release candidates or major
    branch consolidation.
 
 Suggested automation order:
