@@ -188,6 +188,7 @@ async fn account_pool_accounts_list_account_id_filter_returns_single_row_without
         json!({
             "poolId": LEGACY_DEFAULT_POOL_ID,
             "accountId": SECONDARY_ACCOUNT_ID,
+            "cursor": "not-a-cursor",
             "limit": 1,
         }),
     )

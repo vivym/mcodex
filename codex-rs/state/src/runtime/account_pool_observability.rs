@@ -117,11 +117,15 @@ WHERE membership.pool_id = ?
             MAX_ACCOUNT_PAGE_LIMIT,
         );
         let states = request.states.filter(|states| !states.is_empty());
-        let cursor = request
-            .cursor
-            .as_deref()
-            .map(decode_account_cursor)
-            .transpose()?;
+        let cursor = if request.account_id.is_none() {
+            request
+                .cursor
+                .as_deref()
+                .map(decode_account_cursor)
+                .transpose()?
+        } else {
+            None
+        };
 
         let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
             "selection_quota_state",
@@ -1440,6 +1444,29 @@ mod tests {
         assert_eq!(second.data.len(), 1);
         assert_eq!(second.data[0].account_id, "acct-2");
         assert_ne!(first.next_cursor, second.next_cursor);
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_account_id_lookup_ignores_malformed_cursor() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-2".to_string()),
+                cursor: Some("not-a-cursor".to_string()),
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 1);
+        assert_eq!(accounts.data[0].account_id, "acct-2");
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
