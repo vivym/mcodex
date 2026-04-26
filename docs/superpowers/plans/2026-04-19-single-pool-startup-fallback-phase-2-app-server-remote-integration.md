@@ -10,6 +10,40 @@
 
 ---
 
+## Status
+
+Completed on 2026-04-26.
+
+Final verification:
+
+- `just write-app-server-schema`
+- `cargo test -p codex-app-server-protocol`
+- `cargo test -p codex-app-server account_lease`
+- `cargo test -p codex-tui startup_access`
+- `cargo test -p codex-app-server`
+- `LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release cargo test -p codex-tui`
+- `just fmt`
+- `just fix -p codex-app-server-protocol`
+- `just fix -p codex-app-server`
+- `LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release just fix -p codex-tui`
+- `git diff --check`
+
+Review-fix verification for pooled blocked startup surfaces:
+
+- `cargo test -p codex-account-pool startup_status_multiple_pool_blocker_keeps_pooled_surface_applicable -- --nocapture`
+- `cargo test -p codex-app-server account_logout_suppresses_clean_multi_pool_startup_blocker -- --nocapture`
+- `cargo test -p codex-account-pool`
+- `cargo test -p codex-app-server account_lease -- --nocapture`
+- `cargo test -p codex-core build_account_pool_manager -- --nocapture`
+- `cargo test -p codex-core build_root_runtime_lease_host -- --nocapture`
+- `cargo test -p codex-core runtime_lease_host -- --nocapture`
+- `cargo test -p codex-core startup_selected_pool_without_context_reuse_mints_new_remote_session_id -- --nocapture`
+- `cargo test -p codex-core suppressed_startup_selection_blocks_fresh_runtime_pool_acquisition -- --nocapture`
+- `cargo test -p codex-core preferred_startup_selection_is_used_for_fresh_runtime -- --nocapture`
+- `just fmt`
+- `just fix -p codex-account-pool`
+- `just fix -p codex-app-server`
+
 ## Dependencies And Main Baseline
 
 Prerequisites:
@@ -89,7 +123,7 @@ Runtime lease boundary:
 - Read: `docs/superpowers/specs/2026-04-18-runtime-lease-authority-for-subagents-design.md`
 - Read: `docs/superpowers/plans/2026-04-19-single-pool-startup-fallback-phase-1-implementation.md`
 
-- [ ] **Step 1: Confirm Phase 1 symbols exist**
+- [x] **Step 1: Confirm Phase 1 symbols exist**
 
 Run:
 
@@ -99,7 +133,7 @@ rg -n "AccountStartupAvailability|AccountStartupResolutionIssue|SingleVisiblePoo
 
 Expected: all symbols exist. If not, stop and complete Phase 1 first.
 
-- [ ] **Step 2: Confirm runtime lease authority is the current baseline**
+- [x] **Step 2: Confirm runtime lease authority is the current baseline**
 
 Run:
 
@@ -110,7 +144,7 @@ rg -n "RuntimeLeaseHost|RuntimeLeaseAuthority|LeaseAdmissionGuard" codex-rs/core
 
 Expected: `RuntimeLeaseHost`, `RuntimeLeaseAuthority`, and request admission are present. `git status` may show only the current merge or intentional follow-up edits; no Phase 2 step should add an alternate runtime lease authority.
 
-- [ ] **Step 2a: Confirm runtime lease startup coverage before app-server protocol work**
+- [x] **Step 2a: Confirm runtime lease startup coverage before app-server protocol work**
 
 Run the existing baseline checks:
 
@@ -134,7 +168,7 @@ startup invariant they protect, for example:
 Do not move app-server startup snapshot work into `codex-rs/core` unless the
 missing coverage proves a real host integration bug.
 
-- [ ] **Step 3: Confirm app-server protocol baseline**
+- [x] **Step 3: Confirm app-server protocol baseline**
 
 Run:
 
@@ -152,7 +186,7 @@ Expected: current protocol has `accountLease/read`, `accountLease/resume`, and n
 - Test: `codex-rs/app-server-protocol/src/protocol/common.rs`
 - Test: `codex-rs/app-server-protocol/src/protocol/v2.rs`
 
-- [ ] **Step 1: Write failing serialization tests**
+- [x] **Step 1: Write failing serialization tests**
 
 Add or update protocol tests so this value serializes with required nullable fields:
 
@@ -178,7 +212,7 @@ Add method serialization tests for:
 - `accountPool/default/set`
 - `accountPool/default/clear`
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -190,7 +224,7 @@ cargo test -p codex-app-server-protocol account_pool_default -- --nocapture
 
 Expected: FAIL because types/methods do not exist.
 
-- [ ] **Step 3: Add v2 exported types**
+- [x] **Step 3: Add v2 exported types**
 
 In `v2.rs`, add:
 
@@ -281,7 +315,7 @@ pub struct AccountStartupSnapshot {
 
 Do not use `skip_serializing_if` on response/notification fields.
 
-- [ ] **Step 4: Add snapshot to read and notification types**
+- [x] **Step 4: Add snapshot to read and notification types**
 
 Add:
 
@@ -296,7 +330,7 @@ to both:
 
 Update `impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification`.
 
-- [ ] **Step 5: Add default mutation method types**
+- [x] **Step 5: Add default mutation method types**
 
 Add:
 
@@ -326,7 +360,7 @@ In `common.rs`, add methods:
 
 Use undefined params for clear if the request enum supports no-param methods.
 
-- [ ] **Step 6: Run protocol tests**
+- [x] **Step 6: Run protocol tests**
 
 Run:
 
@@ -337,7 +371,7 @@ cargo test -p codex-app-server-protocol
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/app-server-protocol/src/protocol/v2.rs codex-rs/app-server-protocol/src/protocol/common.rs
@@ -353,7 +387,7 @@ git commit -m "feat(app-server): add account startup snapshot protocol"
 - Modify: `codex-rs/app-server/src/thread_state.rs`
 - Test: `codex-rs/app-server/tests/suite/v2/account_lease.rs`
 
-- [ ] **Step 1: Add failing read-response tests**
+- [x] **Step 1: Add failing read-response tests**
 
 Add tests:
 
@@ -509,7 +543,7 @@ still returns the existing unsupported-transport error. This guards the
 read/mutation split: startup-intent APIs are transport-safe, runtime lease
 execution is not.
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -520,7 +554,7 @@ cargo test -p codex-app-server account_lease_read_includes_startup_snapshot -- -
 
 Expected: FAIL because response has no startup snapshot.
 
-- [ ] **Step 3: Implement conversion module**
+- [x] **Step 3: Implement conversion module**
 
 Create `account_startup_snapshot.rs` with conversion helpers:
 
@@ -540,23 +574,24 @@ Rules:
 - `multiplePoolsRequireDefault`, invalid defaults, and unavailable map `selectionEligibility = "missingPool"`
 - `suppressed` preserves underlying selection eligibility
 
-- [ ] **Step 4: Include snapshot in empty/startup/live responses**
+- [x] **Step 4: Include snapshot in empty/startup/live responses**
 
 In `account_lease_api.rs`:
 
 - split startup reads into two helpers:
   - one full startup-status reader used by `accountLease/read`, resume/default
     mutations, and notifications; it must return blocker states even when
-    `SharedStartupStatus.pooled_applicable == false`
-  - one runtime-admission helper used by `pooled_mode_is_enabled`; it may keep
-    the legacy `pooled_applicable` behavior
-- do not change `SharedStartupStatus.pooled_applicable` to make blockers visible
-  to app-server projection; doing so would alter runtime admission semantics
+    no effective pool is available yet
+  - one runtime-admission helper used by `pooled_mode_is_enabled`
+- keep `SharedStartupStatus.pooled_applicable` aligned with the design spec:
+  every startup availability except `Unavailable` represents a pooled startup
+  surface, including blocked states such as `multiplePoolsRequireDefault` and
+  `invalidExplicitDefault`
 - `empty_account_lease_response()` returns a snapshot with `startupAvailability = Unavailable`, source `none`, eligibility `missingPool`
 - `account_lease_response_from_startup_status()` uses no-live-lease legacy projection from the spec
 - `account_lease_response_from_runtime_snapshot()` keeps top-level live lease fields from `live_snapshot`, but sets nested `startup` from current startup status when available
 
-- [ ] **Step 4a: Allow startup-intent APIs over WebSocket without runtime admission**
+- [x] **Step 4a: Allow startup-intent APIs over WebSocket without runtime admission**
 
 In `codex_message_processor.rs`:
 
@@ -576,7 +611,7 @@ Expected behavior:
 - WebSocket runtime execution in pooled mode still returns the existing
   unsupported-transport error
 
-- [ ] **Step 5: Update notification dedupe expectations**
+- [x] **Step 5: Update notification dedupe expectations**
 
 Because `AccountLeaseUpdatedNotification` includes `startup`, existing whole-object dedupe in `thread_state.rs` should remain valid. Add a focused test if there is existing thread-state unit coverage; otherwise rely on app-server suite notification tests.
 
@@ -586,7 +621,7 @@ lease fields still come from `live_snapshot`; only the nested `startup` object
 comes from current startup/default state. Do not keep the current behavior where
 startup context is read only for stale startup-suppressed live snapshots.
 
-- [ ] **Step 6: Run app-server account lease tests**
+- [x] **Step 6: Run app-server account lease tests**
 
 Run:
 
@@ -597,7 +632,7 @@ cargo test -p codex-app-server account_lease -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/app-server/src/account_startup_snapshot.rs codex-rs/app-server/src/account_lease_api.rs codex-rs/app-server/src/codex_message_processor.rs codex-rs/app-server/src/thread_state.rs codex-rs/app-server/tests/suite/v2/account_lease.rs
@@ -614,7 +649,7 @@ git commit -m "feat(app-server): return startup snapshots with account lease sta
 - Optional: `codex-rs/app-server-test-client/src/lib.rs`
 - Modify: `codex-rs/app-server/tests/suite/v2/account_lease.rs`
 
-- [ ] **Step 1: Add failing mutation tests**
+- [x] **Step 1: Add failing mutation tests**
 
 Add tests:
 
@@ -689,7 +724,7 @@ Add the remaining mutation matrix tests before implementation:
   - assert response/notification succeeds
   - separately assert WebSocket pooled thread execution still rejects
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -700,7 +735,7 @@ cargo test -p codex-app-server account_pool_default -- --nocapture
 
 Expected: FAIL because the RPCs do not exist.
 
-- [ ] **Step 3: Implement API functions**
+- [x] **Step 3: Implement API functions**
 
 Add to `account_lease_api.rs`:
 
@@ -730,7 +765,7 @@ Rules:
   `INVALID_PARAMS_ERROR_CODE`; do not surface an invalid pool id as an internal
   server error
 
-- [ ] **Step 4: Dispatch JSON-RPC methods**
+- [x] **Step 4: Dispatch JSON-RPC methods**
 
 In `codex_message_processor.rs` and `message_processor.rs`, route:
 
@@ -744,7 +779,7 @@ Use the same startup-intent transport boundary as `accountLease/read` and
 `accountLease/resume`: WebSocket is allowed because these methods mutate only
 local startup/default intent and never reserve a pooled runtime lease.
 
-- [ ] **Step 5: Add test-client helpers**
+- [x] **Step 5: Add test-client helpers**
 
 Add helpers to `codex-rs/app-server/tests/common/mcp_process.rs`:
 
@@ -757,7 +792,7 @@ Only add equivalent helpers to `codex-rs/app-server-test-client/src/lib.rs` if a
 manual/live client workflow needs them. Do not add that crate to the required
 write set solely for app-server suite tests.
 
-- [ ] **Step 6: Run app-server mutation tests**
+- [x] **Step 6: Run app-server mutation tests**
 
 Run:
 
@@ -769,7 +804,7 @@ cargo test -p codex-app-server account_lease_resume -- --nocapture
 
 Expected: PASS, and `accountLease/resume` remains behaviorally identical to CLI `accounts resume`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/app-server/src/account_lease_api.rs codex-rs/app-server/src/codex_message_processor.rs codex-rs/app-server/src/message_processor.rs codex-rs/app-server/tests/common/mcp_process.rs codex-rs/app-server/tests/suite/v2/account_lease.rs
@@ -782,7 +817,7 @@ git commit -m "feat(app-server): add default pool mutation rpc"
 - Modify: `codex-rs/tui/src/startup_access.rs`
 - Test: `codex-rs/tui/src/startup_access.rs`
 
-- [ ] **Step 1: Add failing remote probe tests**
+- [x] **Step 1: Add failing remote probe tests**
 
 Add tests:
 
@@ -879,7 +914,7 @@ Add the `empty_account_lease_response_for_test()` helper first so the intended
 red test fails on legacy remote probing behavior rather than on a missing test
 builder.
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -890,7 +925,7 @@ cargo test -p codex-tui remote_startup_probe_uses_snapshot_multi_pool_blocker --
 
 Expected: FAIL because remote probe still uses legacy `pool_id`/`suppressed`.
 
-- [ ] **Step 3: Map remote snapshot availability**
+- [x] **Step 3: Map remote snapshot availability**
 
 Use `response.startup.startup_availability`:
 
@@ -911,7 +946,7 @@ Build `notice` from `response.startup.startup_resolution_issue`:
 
 Do not implement an inline remote pool picker in this phase.
 
-- [ ] **Step 4: Run TUI tests**
+- [x] **Step 4: Run TUI tests**
 
 Run:
 
@@ -922,7 +957,7 @@ cargo test -p codex-tui startup_access -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add codex-rs/tui/src/startup_access.rs
@@ -936,7 +971,7 @@ git commit -m "feat(tui): use remote startup snapshots"
 - Regenerate schema fixtures touched by `just write-app-server-schema`
 - All files touched above.
 
-- [ ] **Step 1: Update app-server docs**
+- [x] **Step 1: Update app-server docs**
 
 Document:
 
@@ -952,7 +987,7 @@ Document:
 - no-op mutation notification behavior
 - live top-level lease fields remaining separate from nested `startup`
 
-- [ ] **Step 2: Regenerate app-server schema**
+- [x] **Step 2: Regenerate app-server schema**
 
 Run:
 
@@ -969,7 +1004,7 @@ just write-app-server-schema --experimental
 
 Expected: schema files update cleanly.
 
-- [ ] **Step 3: Run verification**
+- [x] **Step 3: Run verification**
 
 Run:
 
@@ -999,7 +1034,7 @@ commands with:
 LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release
 ```
 
-- [ ] **Step 4: Format and fix**
+- [x] **Step 4: Format and fix**
 
 Run:
 
@@ -1013,7 +1048,7 @@ just fix -p codex-tui
 
 Expected: PASS. Do not rerun tests after `fmt`/`fix` unless code was manually changed afterward.
 
-- [ ] **Step 5: Final commit if needed**
+- [x] **Step 5: Final commit if needed**
 
 ```bash
 git status --short

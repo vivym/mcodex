@@ -1,6 +1,7 @@
 use crate::AccountPoolExecutionBackend;
 use crate::startup_resolution::StartupResolutionInput;
 use crate::startup_resolution::resolve_startup_status;
+use codex_state::AccountStartupAvailability;
 use codex_state::AccountStartupStatus;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub async fn read_shared_startup_status<B: AccountPoolExecutionBackend>(
     .await?;
 
     Ok(SharedStartupStatus {
-        pooled_applicable: startup.preview.effective_pool_id.is_some(),
+        pooled_applicable: startup.startup_availability != AccountStartupAvailability::Unavailable,
         startup,
     })
 }
@@ -168,7 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_status_multiple_pool_blocker_does_not_enable_pooled_mode_yet() {
+    async fn startup_status_multiple_pool_blocker_keeps_pooled_surface_applicable() {
         let backend = FakeStartupBackend {
             selection: AccountStartupSelectionState::default(),
             inventory: StartupPoolInventory {
@@ -196,7 +197,7 @@ mod tests {
             .await
             .expect("read shared startup status");
 
-        assert_eq!(status.pooled_applicable, false);
+        assert_eq!(status.pooled_applicable, true);
         assert_eq!(
             status.startup.startup_availability,
             AccountStartupAvailability::MultiplePoolsRequireDefault

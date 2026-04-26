@@ -101,7 +101,7 @@ async fn stale_holder_health_event_is_ignored_after_epoch_bump() {
 }
 
 #[tokio::test]
-async fn shared_startup_status_treats_invisible_config_default_as_invalid() {
+async fn shared_startup_status_treats_invisible_config_default_as_pooled_surface() {
     let harness = fixture_with_legacy_auth("acct-legacy").await;
     let backend = LocalAccountPoolBackend::new(
         harness.runtime.clone(),
@@ -112,7 +112,7 @@ async fn shared_startup_status_treats_invisible_config_default_as_invalid() {
         .await
         .expect("read shared startup status");
 
-    assert_eq!(status.pooled_applicable, false);
+    assert_eq!(status.pooled_applicable, true);
     assert_eq!(
         status.startup.effective_pool_resolution_source,
         EffectivePoolResolutionSource::ConfigDefault

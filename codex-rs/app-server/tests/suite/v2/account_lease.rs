@@ -197,6 +197,49 @@ async fn account_logout_preserves_candidate_pools_for_multi_pool_startup_blocker
 }
 
 #[tokio::test]
+async fn account_logout_suppresses_clean_multi_pool_startup_blocker() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_without_default(
+        codex_home.path(),
+        &server.uri(),
+        &["team-main", "team-other"],
+    )?;
+    let runtime = seed_account_in_pool(codex_home.path(), "acct-team-main", "team-main", 0).await?;
+    seed_account_in_pool(codex_home.path(), "acct-team-other", "team-other", 1).await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let logout_id = mcp.send_logout_account_request().await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(logout_id)),
+    )
+    .await??;
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("accountLease/updated"),
+    )
+    .await??;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(
+        updated.startup.startup_availability,
+        AccountStartupAvailability::MultiplePoolsRequireDefault
+    );
+    assert_eq!(updated.suppressed, true);
+
+    let selection = runtime.read_account_startup_selection().await?;
+    assert_eq!(selection.default_pool_id, None);
+    assert_eq!(selection.preferred_account_id, None);
+    assert_eq!(selection.suppressed, true);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_lease_read_preserves_candidate_pools_for_invalid_config_default() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
