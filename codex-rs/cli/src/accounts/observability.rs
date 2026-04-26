@@ -256,6 +256,7 @@ where
                 return StatusPoolObservabilityView {
                     pool_id: pool_id.to_string(),
                     summary: None,
+                    accounts: None,
                     diagnostics: None,
                     warning: Some(format!("account pool `{pool_id}` was not found")),
                 };
@@ -264,6 +265,7 @@ where
                 return StatusPoolObservabilityView {
                     pool_id: pool_id.to_string(),
                     summary: None,
+                    accounts: None,
                     diagnostics: None,
                     warning: Some(err.to_string()),
                 };
@@ -278,6 +280,19 @@ where
             .await
             .map(|snapshot| map_summary(snapshot.summary))
             .map_err(|err| anyhow::anyhow!("read pooled summary: {err}"));
+        let accounts = self
+            .reader
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: pool_id.to_string(),
+                account_id: None,
+                cursor: None,
+                limit: None,
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .map(|page| page.data.into_iter().map(map_account).collect())
+            .map_err(|err| anyhow::anyhow!("read pooled accounts: {err}"));
         let diagnostics = self
             .reader
             .read_diagnostics(AccountPoolDiagnosticsReadRequest {
@@ -287,7 +302,12 @@ where
             .map(map_diagnostics)
             .map_err(|err| anyhow::anyhow!("read pooled diagnostics: {err}"));
 
-        StatusPoolObservabilityView::from_results(pool_id.to_string(), summary, diagnostics)
+        StatusPoolObservabilityView::from_results(
+            pool_id.to_string(),
+            summary,
+            accounts,
+            diagnostics,
+        )
     }
 }
 

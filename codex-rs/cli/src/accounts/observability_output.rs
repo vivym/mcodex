@@ -523,6 +523,7 @@ mod tests {
         let text = render_status_pool_observability_text(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: Some(sample_summary()),
+            accounts: Some(Vec::new()),
             diagnostics: Some(sample_diagnostics(Vec::new())),
             warning: None,
         });
@@ -537,6 +538,7 @@ mod tests {
         let text = render_status_pool_observability_text(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: Some(sample_summary()),
+            accounts: Some(Vec::new()),
             diagnostics: Some(sample_diagnostics(vec![DiagnosticsIssueView {
                 severity: "warning".to_string(),
                 reason_code: "cooldownActive".to_string(),
@@ -559,6 +561,7 @@ mod tests {
         let text = render_status_pool_observability_text(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: None,
+            accounts: Some(Vec::new()),
             diagnostics: Some(sample_diagnostics(vec![DiagnosticsIssueView {
                 severity: "warning".to_string(),
                 reason_code: "cooldownActive".to_string(),
@@ -580,6 +583,7 @@ mod tests {
         let text = render_status_pool_observability_text(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: None,
+            accounts: Some(Vec::new()),
             diagnostics: Some(sample_diagnostics(vec![
                 DiagnosticsIssueView {
                     severity: "warning".to_string(),
@@ -611,6 +615,7 @@ mod tests {
         let text = render_status_pool_observability_text(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: Some(sample_summary()),
+            accounts: Some(Vec::new()),
             diagnostics: None,
             warning: Some("diagnostics unavailable".to_string()),
         });
@@ -625,6 +630,7 @@ mod tests {
         let json = status_pool_observability_json_value(Some(&StatusPoolObservabilityView {
             pool_id: "team-main".to_string(),
             summary: None,
+            accounts: Some(Vec::new()),
             diagnostics: None,
             warning: None,
         }));

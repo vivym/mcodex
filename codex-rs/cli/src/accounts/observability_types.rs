@@ -119,10 +119,11 @@ pub(crate) struct EventView {
     pub details: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatusPoolObservabilityView {
     pub pool_id: String,
     pub summary: Option<PoolSummaryView>,
+    pub accounts: Option<Vec<PoolAccountView>>,
     pub diagnostics: Option<DiagnosticsView>,
     pub warning: Option<String>,
 }
@@ -131,11 +132,19 @@ impl StatusPoolObservabilityView {
     pub(crate) fn from_results(
         pool_id: String,
         summary: anyhow::Result<PoolSummaryView>,
+        accounts: anyhow::Result<Vec<PoolAccountView>>,
         diagnostics: anyhow::Result<DiagnosticsView>,
     ) -> Self {
         let mut warnings = Vec::new();
         let summary = match summary {
             Ok(summary) => Some(summary),
+            Err(err) => {
+                warnings.push(err.to_string());
+                None
+            }
+        };
+        let accounts = match accounts {
+            Ok(accounts) => Some(accounts),
             Err(err) => {
                 warnings.push(err.to_string());
                 None
@@ -152,6 +161,7 @@ impl StatusPoolObservabilityView {
         Self {
             pool_id,
             summary,
+            accounts,
             diagnostics,
             warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         }
@@ -169,6 +179,7 @@ mod tests {
         let view = StatusPoolObservabilityView::from_results(
             "team-main".to_string(),
             Err(anyhow::anyhow!("summary unavailable")),
+            Ok(Vec::new()),
             Ok(sample_diagnostics()),
         );
 
@@ -177,6 +188,7 @@ mod tests {
             StatusPoolObservabilityView {
                 pool_id: "team-main".to_string(),
                 summary: None,
+                accounts: Some(Vec::new()),
                 diagnostics: Some(sample_diagnostics()),
                 warning: Some("summary unavailable".to_string()),
             }
@@ -188,6 +200,7 @@ mod tests {
         let view = StatusPoolObservabilityView::from_results(
             "team-main".to_string(),
             Err(anyhow::anyhow!("summary unavailable")),
+            Ok(Vec::new()),
             Err(anyhow::anyhow!("diagnostics unavailable")),
         );
 
@@ -196,6 +209,7 @@ mod tests {
             StatusPoolObservabilityView {
                 pool_id: "team-main".to_string(),
                 summary: None,
+                accounts: Some(Vec::new()),
                 diagnostics: None,
                 warning: Some("summary unavailable; diagnostics unavailable".to_string()),
             }

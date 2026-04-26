@@ -290,6 +290,91 @@ INSERT INTO account_quota_state (
     Ok(())
 }
 
+async fn seed_quota_blocked_accounts_for_status(codex_home: &TempDir) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    seed_quota_state(
+        &pool,
+        QuotaStateSeed {
+            account_id: "acct-1",
+            limit_id: "chatgpt",
+            exhausted_windows: "secondary",
+            predicted_blocked_until: now + 600,
+            next_probe_after: None,
+        },
+    )
+    .await?;
+    seed_quota_state(
+        &pool,
+        QuotaStateSeed {
+            account_id: "acct-2",
+            limit_id: "chatgpt",
+            exhausted_windows: "primary",
+            predicted_blocked_until: now + 600,
+            next_probe_after: Some(now + 300),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+struct QuotaStateSeed {
+    account_id: &'static str,
+    limit_id: &'static str,
+    exhausted_windows: &'static str,
+    predicted_blocked_until: i64,
+    next_probe_after: Option<i64>,
+}
+
+async fn seed_quota_state(pool: &SqlitePool, seed: QuotaStateSeed) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    sqlx::query(
+        r#"
+INSERT INTO account_quota_state (
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(seed.account_id)
+    .bind(seed.limit_id)
+    .bind(100.0_f64)
+    .bind(seed.predicted_blocked_until)
+    .bind(100.0_f64)
+    .bind(seed.predicted_blocked_until)
+    .bind(now)
+    .bind(now.saturating_mul(1_000_000_000))
+    .bind(seed.exhausted_windows)
+    .bind(seed.predicted_blocked_until)
+    .bind(seed.next_probe_after)
+    .bind(0_i64)
+    .bind(Option::<String>::None)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn login_status_reads_legacy_auth_view_only() -> Result<()> {
     let codex_home = prepared_home().await?;
@@ -757,10 +842,10 @@ async fn accounts_status_json_suppressed_preserves_hard_ineligibility_reasons() 
         "preferred account is currently leased by another runtime"
     );
     assert_eq!(accounts[1]["accountId"], "acct-2");
-    assert_eq!(accounts[1]["eligibility"]["code"], "rateLimited");
+    assert_eq!(accounts[1]["eligibility"]["code"], "probeThrottle");
     assert_eq!(
         accounts[1]["eligibility"]["reason"],
-        "account is rate limited"
+        "account is waiting for the next quota probe"
     );
     for account in accounts {
         let code = account["eligibility"]["code"]
@@ -810,10 +895,61 @@ async fn accounts_status_json_reports_pool_diagnostics_and_per_account_reasons()
     assert!(accounts[0]["nextEligibleAt"].as_str().is_some());
     assert_eq!(accounts[1]["accountId"], "acct-2");
     assert_eq!(accounts[1]["healthState"], "rateLimited");
-    assert_eq!(accounts[1]["eligibility"]["code"], "rateLimited");
+    assert_eq!(accounts[1]["eligibility"]["code"], "probeThrottle");
     assert_eq!(
         accounts[1]["eligibility"]["reason"],
-        "account is rate limited"
+        "account is waiting for the next quota probe"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn accounts_status_distinguishes_quota_selection_explanations() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    write_startup_selection(
+        &codex_home,
+        AccountStartupSelectionUpdate {
+            default_pool_id: Some("team-main".to_string()),
+            preferred_account_id: None,
+            suppressed: false,
+        },
+    )
+    .await?;
+    seed_quota_blocked_accounts_for_status(&codex_home).await?;
+
+    let output = run_codex(&codex_home, &["accounts", "status", "--json"]).await?;
+    assert!(output.success, "stderr: {}", output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
+    let accounts = json["accounts"].as_array().expect("accounts array");
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["accountId"], "acct-1");
+    assert_eq!(accounts[0]["eligibility"]["code"], "secondaryWindowBlocked");
+    assert_eq!(
+        accounts[0]["eligibility"]["reason"],
+        "account is blocked by the secondary quota window"
+    );
+    assert_eq!(accounts[1]["accountId"], "acct-2");
+    assert_eq!(accounts[1]["eligibility"]["code"], "probeThrottle");
+    assert_eq!(
+        accounts[1]["eligibility"]["reason"],
+        "account is waiting for the next quota probe"
+    );
+
+    let text = run_codex(&codex_home, &["accounts", "status"]).await?;
+    assert!(text.success, "stderr: {}", text.stderr);
+    assert!(
+        text.stdout
+            .contains("eligibility=account is blocked by the secondary quota window"),
+        "stdout: {}",
+        text.stdout
+    );
+    assert!(
+        text.stdout
+            .contains("eligibility=account is waiting for the next quota probe"),
+        "stdout: {}",
+        text.stdout
     );
 
     Ok(())
@@ -844,11 +980,11 @@ async fn accounts_status_json_preserves_preferred_rate_limited_reason() -> Resul
     assert_eq!(accounts[0]["accountId"], "acct-2");
     assert_eq!(
         accounts[0]["eligibility"]["code"],
-        "preferredAccountRateLimited"
+        "preferredAccountProbeThrottle"
     );
     assert_eq!(
         accounts[0]["eligibility"]["reason"],
-        "preferred account is rate limited"
+        "preferred account is waiting for the next quota probe"
     );
 
     Ok(())
