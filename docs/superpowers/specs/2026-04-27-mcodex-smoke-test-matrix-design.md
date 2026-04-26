@@ -33,6 +33,8 @@ The recommended direction is:
     commands
 - organize the matrix by entrypoint, state scenario, and authority source
   rather than by spec file
+- make each smoke row explicit about the binary under test, fixture source, and
+  observable pass/fail marker
 - reserve remote-backend smoke coverage from the beginning through a fake
   backend contract, without pretending a production remote pool is already
   available
@@ -201,7 +203,74 @@ Authority sources:
 | Fake remote backend | Covered by future P1 contract smoke |
 | Real account | Covered only by minimal P0 launch checks, not quota exhaustion |
 
-### 2. Define a P0 manual smoke runbook
+### 2. Make the tested binary explicit
+
+Every smoke run must record which executable is under test. The smoke matrix
+should not assume that `mcodex` on `PATH` is the build that was just produced.
+
+Each run should record:
+
+- `MCODEX_BIN`: absolute path to the executable used for product-entrypoint
+  checks
+- `which mcodex`, when testing the installed wrapper
+- `mcodex --version` output
+- the git commit SHA for local builds
+- whether the run is exercising:
+  - direct debug binary, for quick development checks
+  - direct release binary, for local daily-driver validation
+  - installed wrapper, for installer and distribution validation
+
+The P0 runbook may use a direct local binary for early validation, but installer
+and wrapper rows must use the installed wrapper. If a row is meant to validate
+the product launch path, prefer `target/release/mcodex` or the installed
+wrapper over `target/debug/codex`.
+
+The direct binary and installed wrapper should be separate matrix rows because
+they fail in different ways:
+
+- the direct binary validates compiled product behavior
+- the wrapper validates PATH resolution, argument forwarding, exit-code
+  forwarding, install-root selection, and packaged runtime assumptions
+
+### 3. Define fixture and seed strategy
+
+Each smoke row must say how state is created. "Seed one local pool/account" is
+not specific enough to be executable.
+
+Fixture classes:
+
+| Fixture Class | Use For | Allowed In P0 | Allowed In P1 |
+| --- | --- | --- | --- |
+| Empty isolated home | Identity and no-account startup | yes | yes |
+| Real account home | Minimal launch and status checks only | yes, explicitly | no by default |
+| Local state fixture | Pools, defaults, leases, quota, events, diagnostics | yes, via documented helper | yes |
+| Mock runtime fixture | Runtime turns, quota pressure, subagent lease assertions | no by default | yes |
+| Fake app-server client fixture | App-server v2 RPC checks | no by default | yes |
+| Fake remote backend | Remote contract shape and authority behavior | no | deferred P1 |
+| Installer fixture | Local install root and wrapper checks | yes | yes |
+
+The first implementation slice should provide one canonical local state fixture
+helper that can create:
+
+- one pool with one fake ChatGPT account
+- two pools with one fake account each
+- a persisted default pool
+- a conflicting config default
+- an invalid persisted default
+- an invalid config default
+- a suppressed startup state
+- a busy lease row owned by another holder
+- quota rows for exhausted and near-exhausted cases
+- representative diagnostics and events rows
+
+The fixture should only write under the isolated `MCODEX_HOME`. It should not
+write to a developer's real `~/.mcodex` or `~/.codex`.
+
+Until that helper exists, P0 rows that require seeded pool state are runbook
+items, not guaranteed one-command checks. The runbook must point to the exact
+fixture command or manual setup used for that run.
+
+### 4. Define a P0 manual smoke runbook
 
 P0 should be runnable immediately on a developer machine using an isolated
 `MCODEX_HOME`. It should prefer a local release binary or installed wrapper
@@ -211,7 +280,7 @@ Initial P0 rows:
 
 | ID | Scenario | Action | Expected Result |
 | --- | --- | --- | --- |
-| P0-01 | Isolated home | Run `MCODEX_HOME=<tmp> mcodex accounts status --json` | The command uses the isolated home and does not read upstream `~/.codex` |
+| P0-01 | Isolated home | Run `MCODEX_HOME=<tmp> "$MCODEX_BIN" accounts status --json` | The command uses the isolated home and does not read upstream `~/.codex` |
 | P0-02 | Empty home startup | Run `MCODEX_HOME=<tmp> mcodex` | Startup reaches the normal unauthenticated or no-account surface, not a pooled state |
 | P0-03 | Single pool, no default | Seed one local pool/account and launch TUI | Startup uses pooled access without `-c accounts.default_pool=...` |
 | P0-04 | Multiple pools, no default | Seed two visible pools and launch TUI | Startup shows the dedicated pooled access paused/default-required surface |
@@ -219,13 +288,14 @@ Initial P0 rows:
 | P0-06 | Clear default pool | Run `mcodex accounts pool default clear` | Multi-pool startup returns to default-required state |
 | P0-07 | Observability CLI | Run status, pool show, diagnostics, and events commands | Output explains startup, lease, and quota state without exposing credentials |
 | P0-08 | Config default precedence | Set config default and a different persisted default | Effective pool comes from config, with clear source reporting |
-| P0-09 | Subagent lease | Start a pooled parent session and spawn a subagent | The child inherits runtime lease authority and does not randomly allocate another account |
-| P0-10 | Local installer wrapper | Install into an isolated root and run `mcodex --version` plus a CLI command | Wrapper forwards arguments, preserves exit code, and uses mcodex home identity |
+| P0-09 | Home override conflict | Run with both `MCODEX_HOME=<a>` and `CODEX_HOME=<b>` | Runtime state comes from `<a>` and does not read `<b>` |
+| P0-10 | Subagent lease observation | Start a pooled parent session and spawn a subagent, then inspect events or lease rows | The child stays under the same runtime authority; no second random account allocation is observed |
+| P0-11 | Local installer wrapper | Install into an isolated root and run `mcodex --version` plus a CLI command | Wrapper forwards arguments, preserves exit code, and uses mcodex home identity |
 
 P0 should not attempt to exhaust a real account quota. Quota and switch behavior
 should be validated through seeded state or fake backends.
 
-### 3. Define P1 automated smoke groups
+### 5. Define P1 automated smoke groups
 
 P1 should turn stable P0 expectations into repeatable commands over time.
 
@@ -245,7 +315,16 @@ The first automated slice should prioritize `smoke-mcodex-local`,
 `smoke-mcodex-cli`, and `smoke-mcodex-app-server`. These give the best return
 without requiring real TUI automation or production account access.
 
-### 4. Keep P0 and P1 data setup isolated
+For app-server smoke, the first P1 implementation should use the existing
+app-server test client or in-process harness. It should not require a real UI
+client, remote browser session, or production remote server.
+
+For runtime and subagent smoke, the first P1 implementation should use core test
+support and mock model responses. Real account P0 checks may validate that the
+interactive path launches, but runtime lease inheritance and quota behavior
+should be asserted through fake or seeded data.
+
+### 6. Keep P0 and P1 data setup isolated
 
 Smoke checks must not mutate a developer's real account data by default.
 
@@ -256,13 +335,15 @@ Rules:
 - If a test process spawns child mcodex processes, pass `MCODEX_HOME` through
   deliberately and clear inherited `CODEX_HOME` when the product path should be
   isolated.
+- Include at least one explicit conflict row where `MCODEX_HOME` and
+  `CODEX_HOME` are both set to different directories.
 - Use seeded local state for pool membership, quota rows, and lease rows.
 - Use fake tokens or fake credentials for local startup and selection smoke
   unless the row explicitly says it is a real-account check.
 - Real-account P0 checks should validate launch and observability only; they
   must not intentionally drive usage limits.
 
-### 5. Treat TUI smoke as a layered problem
+### 7. Treat TUI smoke as a layered problem
 
 TUI startup is important, but it should not block the first automated smoke
 slice.
@@ -274,12 +355,22 @@ P0 should manually verify the TUI startup surfaces:
 - multi-pool default required
 - pooled access paused
 
+The manual TUI row must define observable markers before execution. At minimum,
+capture:
+
+- whether the ChatGPT login screen appears
+- whether the pooled access paused/default-required title appears
+- whether `accounts status --json` for the same `MCODEX_HOME` reports
+  `singleVisiblePool`, `multiplePoolsRequireDefault`,
+  `invalidExplicitDefault`, or another expected startup code
+- a screenshot or terminal capture for any failure
+
 P1 should first validate the same states through shared startup-resolution
 objects, CLI output, and app-server startup snapshots. Headless TUI smoke can
 come later and should be limited to a few snapshot-like startup surfaces rather
 than full interactive sessions.
 
-### 6. Reserve remote backend coverage without depending on production remote
+### 8. Reserve remote backend coverage without depending on production remote
 
 The matrix should include remote rows from the beginning, but those rows should
 use a fake backend until a production remote pool exists.
@@ -297,15 +388,18 @@ Local SQLite must not become the source of truth for remote-only facts. If a
 remote row cannot provide authoritative quota, pause, or drain information, the
 expected result should expose that absence rather than invent synthetic facts.
 
-### 7. Keep smoke output operator-oriented
+### 9. Keep smoke output operator-oriented
 
 Every smoke row should record:
 
 - command or action
+- binary path and version output
 - isolated home path
 - setup method
+- fixture class
 - expected source of truth
 - expected user-facing result
+- exact output marker or state marker used to decide pass/fail
 - whether credentials are real, fake, or absent
 - whether the row is manual, automated, or deferred
 
@@ -318,25 +412,29 @@ one pool, multiple pools without default, or an invalid configured default.
 | ID | Entry Point | State Scenario | Authority Source | Level | Expected Result |
 | --- | --- | --- | --- | --- | --- |
 | M-01 | CLI status | Empty home | `MCODEX_HOME` + local SQLite | P0/P1 | Reports no pooled startup without reading upstream home |
-| M-02 | TUI startup | Empty home | `MCODEX_HOME` | P0 | Shows normal no-account/login path |
-| M-03 | CLI status | Single pool, no default | Local SQLite | P0/P1 | Reports single-pool fallback source |
-| M-04 | TUI startup | Single pool, no default | Local SQLite | P0 | Enters pooled startup path |
-| M-05 | CLI status | Multiple pools, no default | Local SQLite | P0/P1 | Reports `multiplePoolsRequireDefault` |
-| M-06 | TUI startup | Multiple pools, no default | Startup snapshot | P0 | Shows pooled access paused/default-required surface |
-| M-07 | CLI default set | Multiple pools | Local SQLite | P0/P1 | Persists default pool and reports source |
-| M-08 | CLI default clear | Multiple pools | Local SQLite | P0/P1 | Clears persisted default and returns to default-required state |
-| M-09 | CLI status | Config default outranks persisted default | Config + local SQLite | P0/P1 | Effective pool source is config |
-| M-10 | CLI status | Invalid config default | Config + local SQLite | P0/P1 | Reports invalid explicit default without fallback |
-| M-11 | App-server | Startup snapshot | Local backend | P1 | Snapshot matches CLI startup facts |
-| M-12 | App-server | Default set/clear | Local backend | P1 | Mutations update startup snapshot and notify clients |
-| M-13 | CLI observability | Pool with lease and quota rows | Local SQLite | P0/P1 | Status/show/diagnostics/events expose facts without tokens |
-| M-14 | Runtime turn | Pooled account | Runtime lease authority | P1 | Turn uses leased account and releases/renews correctly |
-| M-15 | Subagent | Parent has active pooled lease | Runtime lease authority | P0/P1 | Child inherits authority and does not allocate independently |
-| M-16 | Runtime selection | Account busy in another holder | Local SQLite lease rows | P1 | Selection skips account held by another instance |
-| M-17 | Runtime selection | Quota exhausted | Seeded quota rows | P1 | Selection skips blocked account |
-| M-18 | Runtime selection | Quota near exhausted | Seeded quota rows | P1 | Damping prevents per-turn account churn |
-| M-19 | Installer | Local install root | Install scripts + wrapper | P0/P1 | Wrapper forwards args, exit code, and mcodex home identity |
-| M-20 | Fake remote | Remote inventory and startup snapshot | Fake backend | Deferred P1 | Remote-shaped facts flow through same startup and observability surfaces |
+| M-02 | CLI status | Conflicting `MCODEX_HOME` and `CODEX_HOME` | Product home resolver | P0/P1 | Uses `MCODEX_HOME`; does not read `CODEX_HOME` |
+| M-03 | Direct binary identity | Local build | Release/debug binary | P0/P1 | Version and product identity match the intended build |
+| M-04 | Installed wrapper identity | Local install root | Wrapper script | P0/P1 | Wrapper forwards args and exit codes to the intended binary |
+| M-05 | TUI startup | Empty home | `MCODEX_HOME` | P0 | Shows normal no-account/login path |
+| M-06 | CLI status | Single pool, no default | Local SQLite fixture | P0/P1 | Reports single-pool fallback source |
+| M-07 | TUI startup | Single pool, no default | Local SQLite fixture | P0 | Does not show ChatGPT login; status marker is single-pool fallback |
+| M-08 | CLI status | Multiple pools, no default | Local SQLite fixture | P0/P1 | Reports `multiplePoolsRequireDefault` |
+| M-09 | TUI startup | Multiple pools, no default | Startup snapshot | P0 | Shows pooled access paused/default-required surface |
+| M-10 | CLI default set | Multiple pools | Local SQLite fixture | P0/P1 | Persists default pool and reports source |
+| M-11 | CLI default clear | Multiple pools | Local SQLite fixture | P0/P1 | Clears persisted default and returns to default-required state |
+| M-12 | CLI status | Config default outranks persisted default | Config + local SQLite fixture | P0/P1 | Effective pool source is config |
+| M-13 | CLI status | Invalid config default | Config + local SQLite fixture | P0/P1 | Reports invalid explicit default without fallback |
+| M-14 | CLI status | Invalid persisted default | Local SQLite fixture | P0/P1 | Reports invalid persisted default with set/clear repair path |
+| M-15 | App-server | Startup snapshot | Local backend fixture | P1 | Snapshot matches CLI startup facts |
+| M-16 | App-server | Default set/clear | Local backend fixture | P1 | Mutations update startup snapshot and notify clients |
+| M-17 | CLI observability | Pool with lease and quota rows | Local SQLite fixture | P0/P1 | Status/show/diagnostics/events expose facts without tokens |
+| M-18 | Runtime turn | Pooled account | Runtime lease authority fixture | P1 | Turn uses leased account and releases/renews correctly |
+| M-19 | Subagent | Parent has active pooled lease | Runtime lease authority fixture | P0/P1 | Child inherits authority; observed events or lease rows show no independent random allocation |
+| M-20 | Runtime selection | Account busy in another holder | Local SQLite lease fixture | P1 | Selection skips account held by another instance |
+| M-21 | Runtime selection | Quota exhausted | Seeded quota fixture | P1 | Selection skips blocked account |
+| M-22 | Runtime selection | Quota near exhausted | Seeded quota fixture | P1 | Damping prevents per-turn account churn |
+| M-23 | Installer | Local install root | Install scripts + wrapper | P0/P1 | Wrapper forwards args, exit code, and mcodex home identity |
+| M-24 | Fake remote | Remote inventory and startup snapshot | Fake backend | Deferred P1 | Remote-shaped facts flow through same startup and observability surfaces |
 
 ## Execution Policy
 
@@ -379,6 +477,7 @@ The harness should avoid:
 
 - mutating a real `~/.mcodex` unless explicitly requested
 - relying on upstream `~/.codex`
+- treating `CODEX_HOME` as a fallback for active runtime state
 - using real account quota exhaustion as a test mechanism
 - running full workspace tests as part of smoke commands
 
@@ -386,9 +485,12 @@ The harness should avoid:
 
 - A developer can use the P0 matrix to manually validate a local mcodex build
   without touching their official Codex home.
+- Every smoke row identifies the binary under test, fixture class, authority
+  source, and pass/fail marker.
 - The matrix can answer why startup showed login, pooled access, or pooled
   access paused.
 - The matrix validates default-pool persistence and config precedence.
+- The matrix validates `MCODEX_HOME` precedence when `CODEX_HOME` is also set.
 - The matrix validates that CLI, TUI, and app-server agree on startup facts.
 - The matrix validates that subagents stay under runtime lease authority.
 - The matrix validates quota-blocked selection without consuming real quota.
@@ -412,6 +514,12 @@ P1 automation as soon as setup becomes deterministic.
 
 Mitigation: require explicit `MCODEX_HOME` isolation and fake seeded data for
 default smoke paths.
+
+### Risk: smoke validates the wrong binary
+
+Mitigation: require each run to record `MCODEX_BIN`, `which mcodex`, version
+output, and commit SHA where applicable. Keep direct-binary and wrapper smoke
+as separate rows.
 
 ### Risk: remote smoke is blocked by lack of production remote
 
