@@ -369,6 +369,24 @@ impl McpProcess {
             .await
     }
 
+    /// Send an `accountPool/default/set` JSON-RPC request.
+    pub async fn send_account_pool_default_set_request(
+        &mut self,
+        pool_id: &str,
+    ) -> anyhow::Result<i64> {
+        self.send_request(
+            "accountPool/default/set",
+            Some(serde_json::json!({ "poolId": pool_id })),
+        )
+        .await
+    }
+
+    /// Send an `accountPool/default/clear` JSON-RPC request.
+    pub async fn send_account_pool_default_clear_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountPool/default/clear", /*params*/ None)
+            .await
+    }
+
     /// Send `accountLease/read` and wait for the response.
     pub async fn read_account_lease(&mut self) -> anyhow::Result<JSONRPCResponse> {
         let request_id = self.send_account_lease_read_request().await?;
@@ -379,6 +397,23 @@ impl McpProcess {
     /// Send `accountLease/resume` and wait for the response.
     pub async fn account_lease_resume(&mut self) -> anyhow::Result<JSONRPCResponse> {
         let request_id = self.send_account_lease_resume_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    /// Send `accountPool/default/set` and wait for the response.
+    pub async fn account_pool_default_set(
+        &mut self,
+        pool_id: &str,
+    ) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_pool_default_set_request(pool_id).await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    /// Send `accountPool/default/clear` and wait for the response.
+    pub async fn account_pool_default_clear(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_pool_default_clear_request().await?;
         self.read_stream_until_response_message(RequestId::Integer(request_id))
             .await
     }

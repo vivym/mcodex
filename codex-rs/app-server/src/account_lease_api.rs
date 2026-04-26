@@ -1,7 +1,11 @@
 use chrono::Duration;
 use codex_account_pool::LocalAccountPoolBackend;
+use codex_account_pool::LocalDefaultPoolClearRequest;
+use codex_account_pool::LocalDefaultPoolSetRequest;
 use codex_account_pool::SharedStartupStatus;
+use codex_account_pool::clear_local_default_pool;
 use codex_account_pool::read_shared_startup_status;
+use codex_account_pool::set_local_default_pool;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -23,6 +27,7 @@ use crate::account_startup_snapshot::effective_pool_resolution_source_to_wire_st
 use crate::account_startup_snapshot::snapshot_from_startup_status;
 use crate::account_startup_snapshot::unavailable_snapshot;
 use crate::error_code::INTERNAL_ERROR_CODE;
+use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 
 pub(crate) async fn pooled_mode_is_enabled(config: &Config) -> Result<bool, JSONRPCErrorError> {
     Ok(
@@ -105,6 +110,59 @@ pub(crate) async fn resume_account_lease(
     Ok(account_lease_response_from_startup_status(startup_context.startup).into())
 }
 
+pub(crate) async fn set_account_pool_default(
+    config: &Config,
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
+    pool_id: String,
+) -> Result<Option<AccountLeaseUpdatedNotification>, JSONRPCErrorError> {
+    let state_db = init_state_db(config).await?;
+    let outcome = set_local_default_pool(
+        state_db.as_ref(),
+        LocalDefaultPoolSetRequest {
+            pool_id,
+            configured_default_pool_id: configured_default_pool_id(config).map(ToOwned::to_owned),
+        },
+    )
+    .await
+    .map_err(local_default_pool_set_error)?;
+    if !outcome.state_changed {
+        return Ok(None);
+    }
+
+    let startup_context =
+        read_account_lease_startup_context_with_state_db(config, state_db).await?;
+    Ok(Some(account_lease_notification_after_startup_mutation(
+        live_snapshot,
+        startup_context.startup,
+    )))
+}
+
+pub(crate) async fn clear_account_pool_default(
+    config: &Config,
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
+) -> Result<Option<AccountLeaseUpdatedNotification>, JSONRPCErrorError> {
+    let state_db = init_state_db(config).await?;
+    let outcome = clear_local_default_pool(
+        state_db.as_ref(),
+        LocalDefaultPoolClearRequest {
+            configured_default_pool_id: configured_default_pool_id(config).map(ToOwned::to_owned),
+        },
+    )
+    .await
+    .context("clear local default account pool")
+    .map_err(internal_error)?;
+    if !outcome.state_changed {
+        return Ok(None);
+    }
+
+    let startup_context =
+        read_account_lease_startup_context_with_state_db(config, state_db).await?;
+    Ok(Some(account_lease_notification_after_startup_mutation(
+        live_snapshot,
+        startup_context.startup,
+    )))
+}
+
 pub(crate) async fn suppress_account_lease_on_logout(
     config: &Config,
 ) -> Result<Option<AccountLeaseUpdatedNotification>, JSONRPCErrorError> {
@@ -151,6 +209,21 @@ pub(crate) async fn suppress_account_lease_on_logout(
         .map_err(internal_error)?;
 
     Ok(Some(account_lease_response_from_preview(preview).into()))
+}
+
+fn account_lease_notification_after_startup_mutation(
+    live_snapshot: Option<AccountLeaseRuntimeSnapshot>,
+    startup: AccountStartupStatus,
+) -> AccountLeaseUpdatedNotification {
+    if let Some(live_snapshot) = live_snapshot {
+        return account_lease_response_from_runtime_snapshot(&live_snapshot, Some(&startup)).into();
+    }
+
+    if startup.startup_availability == AccountStartupAvailability::Unavailable {
+        return empty_account_lease_response().into();
+    }
+
+    account_lease_response_from_startup_status(startup).into()
 }
 
 async fn init_state_db(config: &Config) -> Result<Arc<StateRuntime>, JSONRPCErrorError> {
@@ -452,6 +525,19 @@ fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
         message: err.to_string(),
         data: None,
     }
+}
+
+fn local_default_pool_set_error(err: anyhow::Error) -> JSONRPCErrorError {
+    let message = err.to_string();
+    if message.contains("is not visible in local startup inventory") {
+        return JSONRPCErrorError {
+            code: INVALID_PARAMS_ERROR_CODE,
+            message,
+            data: None,
+        };
+    }
+
+    internal_error(err.context("set local default account pool"))
 }
 
 #[cfg(test)]

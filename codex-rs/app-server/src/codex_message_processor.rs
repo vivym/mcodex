@@ -36,6 +36,9 @@ use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLeaseResumeResponse;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountPoolAccountsListParams;
+use codex_app_server_protocol::AccountPoolDefaultClearResponse;
+use codex_app_server_protocol::AccountPoolDefaultSetParams;
+use codex_app_server_protocol::AccountPoolDefaultSetResponse;
 use codex_app_server_protocol::AccountPoolDiagnosticsReadParams;
 use codex_app_server_protocol::AccountPoolEventsListParams;
 use codex_app_server_protocol::AccountPoolReadParams;
@@ -1194,13 +1197,16 @@ impl CodexMessageProcessor {
                 self.account_pool_diagnostics_read(to_connection_request_id(request_id), params)
                     .await;
             }
-            ClientRequest::AccountPoolDefaultSet { request_id, .. }
-            | ClientRequest::AccountPoolDefaultClear { request_id, .. } => {
-                self.send_invalid_request_error(
-                    to_connection_request_id(request_id),
-                    "account pool default mutation is not available yet".to_string(),
-                )
-                .await;
+            ClientRequest::AccountPoolDefaultSet { request_id, params } => {
+                self.account_pool_default_set(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::AccountPoolDefaultClear {
+                request_id,
+                params: _,
+            } => {
+                self.account_pool_default_clear(to_connection_request_id(request_id))
+                    .await;
             }
             ClientRequest::CancelLoginAccount { request_id, params } => {
                 self.cancel_login_v2(to_connection_request_id(request_id), params)
@@ -1936,6 +1942,54 @@ impl CodexMessageProcessor {
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
             }
+        }
+    }
+
+    pub(crate) async fn account_pool_default_set(
+        &self,
+        request_id: ConnectionRequestId,
+        params: AccountPoolDefaultSetParams,
+    ) {
+        let (config, live_snapshot) = self.loaded_or_process_account_lease_config().await;
+        match account_lease_api::set_account_pool_default(
+            config.as_ref(),
+            live_snapshot,
+            params.pool_id,
+        )
+        .await
+        {
+            Ok(notification) => {
+                self.outgoing
+                    .send_response(request_id, AccountPoolDefaultSetResponse {})
+                    .await;
+                if let Some(notification) = notification {
+                    self.outgoing
+                        .send_server_notification(ServerNotification::AccountLeaseUpdated(
+                            notification,
+                        ))
+                        .await;
+                }
+            }
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    pub(crate) async fn account_pool_default_clear(&self, request_id: ConnectionRequestId) {
+        let (config, live_snapshot) = self.loaded_or_process_account_lease_config().await;
+        match account_lease_api::clear_account_pool_default(config.as_ref(), live_snapshot).await {
+            Ok(notification) => {
+                self.outgoing
+                    .send_response(request_id, AccountPoolDefaultClearResponse {})
+                    .await;
+                if let Some(notification) = notification {
+                    self.outgoing
+                        .send_server_notification(ServerNotification::AccountLeaseUpdated(
+                            notification,
+                        ))
+                        .await;
+                }
+            }
+            Err(error) => self.outgoing.send_error(request_id, error).await,
         }
     }
 
