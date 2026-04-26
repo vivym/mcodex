@@ -1381,6 +1381,8 @@ mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
     use chrono::TimeZone;
+    use codex_app_server_protocol::AccountStartupAvailability;
+    use codex_app_server_protocol::AccountStartupSnapshot;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1393,6 +1395,25 @@ mod tests {
             .build()
             .await
             .expect("config should build")
+    }
+
+    fn startup_snapshot_for_test(
+        startup_availability: AccountStartupAvailability,
+        effective_pool_id: Option<&str>,
+        configured_default_pool_id: Option<&str>,
+        persisted_default_pool_id: Option<&str>,
+    ) -> AccountStartupSnapshot {
+        AccountStartupSnapshot {
+            effective_pool_id: effective_pool_id.map(str::to_owned),
+            effective_pool_resolution_source: effective_pool_id
+                .map(|_| "persistedSelection".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            configured_default_pool_id: configured_default_pool_id.map(str::to_owned),
+            persisted_default_pool_id: persisted_default_pool_id.map(str::to_owned),
+            startup_availability,
+            startup_resolution_issue: None,
+            selection_eligibility: "automaticAccountSelected".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -1684,6 +1705,12 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    None,
+                    None,
+                ),
             },
             captured_at,
         );
@@ -1723,6 +1750,12 @@ mod tests {
                 effective_pool_resolution_source: Some("persistedSelection".to_string()),
                 configured_default_pool_id: None,
                 persisted_default_pool_id: Some("legacy-default".to_string()),
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("legacy-default"),
+                    None,
+                    Some("legacy-default"),
+                ),
             },
             captured_at,
         );
@@ -1773,6 +1806,12 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    None,
+                    None,
+                ),
             },
             captured_at,
         );
@@ -1819,6 +1858,12 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    None,
+                    None,
+                ),
             },
             captured_at,
         );
@@ -1858,6 +1903,12 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    None,
+                    None,
+                ),
             },
             captured_at,
         );
@@ -1908,6 +1959,12 @@ mod tests {
                 effective_pool_resolution_source: Some("persistedSelection".to_string()),
                 configured_default_pool_id: None,
                 persisted_default_pool_id: Some("legacy-default".to_string()),
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("legacy-default"),
+                    None,
+                    Some("legacy-default"),
+                ),
             },
             captured_at,
         );
