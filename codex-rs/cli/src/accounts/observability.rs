@@ -16,6 +16,8 @@ use codex_account_pool::AccountPoolIssue;
 use codex_account_pool::AccountPoolLease;
 use codex_account_pool::AccountPoolObservabilityReader;
 use codex_account_pool::AccountPoolQuota;
+use codex_account_pool::AccountPoolQuotaFamily;
+use codex_account_pool::AccountPoolQuotaWindow;
 use codex_account_pool::AccountPoolReadRequest;
 use codex_account_pool::AccountPoolReasonCode;
 use codex_account_pool::AccountPoolSelection;
@@ -26,6 +28,8 @@ use codex_core::config::Config;
 use codex_state::StateRuntime;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::accounts::AccountsEventsCommand;
 use crate::accounts::PoolShowCommand;
@@ -36,7 +40,9 @@ use crate::accounts::observability_types::EventView;
 use crate::accounts::observability_types::EventsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
+use crate::accounts::observability_types::PoolQuotaFamilyView;
 use crate::accounts::observability_types::PoolQuotaView;
+use crate::accounts::observability_types::PoolQuotaWindowView;
 use crate::accounts::observability_types::PoolSelectionView;
 use crate::accounts::observability_types::PoolShowView;
 use crate::accounts::observability_types::PoolSummaryView;
@@ -252,6 +258,7 @@ where
                 return StatusPoolObservabilityView {
                     pool_id: pool_id.to_string(),
                     summary: None,
+                    accounts: None,
                     diagnostics: None,
                     warning: Some(format!("account pool `{pool_id}` was not found")),
                 };
@@ -260,6 +267,7 @@ where
                 return StatusPoolObservabilityView {
                     pool_id: pool_id.to_string(),
                     summary: None,
+                    accounts: None,
                     diagnostics: None,
                     warning: Some(err.to_string()),
                 };
@@ -274,6 +282,19 @@ where
             .await
             .map(|snapshot| map_summary(snapshot.summary))
             .map_err(|err| anyhow::anyhow!("read pooled summary: {err}"));
+        let accounts = self
+            .reader
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: pool_id.to_string(),
+                account_id: None,
+                cursor: None,
+                limit: None,
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .map(|page| page.data.into_iter().map(map_account).collect())
+            .map_err(|err| anyhow::anyhow!("read pooled accounts: {err}"));
         let diagnostics = self
             .reader
             .read_diagnostics(AccountPoolDiagnosticsReadRequest {
@@ -283,7 +304,12 @@ where
             .map(map_diagnostics)
             .map_err(|err| anyhow::anyhow!("read pooled diagnostics: {err}"));
 
-        StatusPoolObservabilityView::from_results(pool_id.to_string(), summary, diagnostics)
+        StatusPoolObservabilityView::from_results(
+            pool_id.to_string(),
+            summary,
+            accounts,
+            diagnostics,
+        )
     }
 }
 
@@ -341,6 +367,7 @@ fn map_account(account: codex_account_pool::AccountPoolAccount) -> PoolAccountVi
         account_id: account.account_id,
         backend_account_ref: account.backend_account_ref,
         account_kind: account.account_kind,
+        selection_family: account.selection_family,
         enabled: account.enabled,
         health_state: account.health_state,
         operational_state: account
@@ -353,6 +380,10 @@ fn map_account(account: codex_account_pool::AccountPoolAccount) -> PoolAccountVi
         status_message: account.status_message,
         current_lease: account.current_lease.map(map_lease),
         quota: account.quota.map(map_quota),
+        quotas: sorted_quotas(account.quotas)
+            .into_iter()
+            .map(map_quota_family)
+            .collect(),
         selection: account.selection.map(map_selection),
         updated_at: Some(account.updated_at.to_rfc3339()),
     }
@@ -374,6 +405,46 @@ fn map_quota(quota: AccountPoolQuota) -> PoolQuotaView {
         remaining_percent: quota.remaining_percent,
         resets_at: quota.resets_at.map(|resets_at| resets_at.to_rfc3339()),
         observed_at: quota.observed_at.to_rfc3339(),
+    }
+}
+
+fn sorted_quotas(mut quotas: Vec<AccountPoolQuotaFamily>) -> Vec<AccountPoolQuotaFamily> {
+    quotas.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+    quotas
+}
+
+fn map_quota_family(quota: AccountPoolQuotaFamily) -> PoolQuotaFamilyView {
+    let next_probe_after_is_future = quota
+        .next_probe_after
+        .as_ref()
+        .is_some_and(|next_probe_after| next_probe_after.timestamp() > unix_now_secs());
+    PoolQuotaFamilyView {
+        limit_id: quota.limit_id,
+        primary: map_quota_window(quota.primary),
+        secondary: map_quota_window(quota.secondary),
+        exhausted_windows: quota.exhausted_windows,
+        predicted_blocked_until: quota
+            .predicted_blocked_until
+            .map(|predicted_blocked_until| predicted_blocked_until.to_rfc3339()),
+        next_probe_after: quota
+            .next_probe_after
+            .map(|next_probe_after| next_probe_after.to_rfc3339()),
+        next_probe_after_is_future,
+        observed_at: quota.observed_at.to_rfc3339(),
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn map_quota_window(window: AccountPoolQuotaWindow) -> PoolQuotaWindowView {
+    PoolQuotaWindowView {
+        used_percent: window.used_percent,
+        resets_at: window.resets_at.map(|resets_at| resets_at.to_rfc3339()),
     }
 }
 

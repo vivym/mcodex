@@ -24,7 +24,9 @@ export type { AccountPoolEventsListParams } from "./AccountPoolEventsListParams"
 export type { AccountPoolEventsListResponse } from "./AccountPoolEventsListResponse";
 export type { AccountPoolLeaseResponse } from "./AccountPoolLeaseResponse";
 export type { AccountPoolPolicyResponse } from "./AccountPoolPolicyResponse";
+export type { AccountPoolQuotaFamilyResponse } from "./AccountPoolQuotaFamilyResponse";
 export type { AccountPoolQuotaResponse } from "./AccountPoolQuotaResponse";
+export type { AccountPoolQuotaWindowResponse } from "./AccountPoolQuotaWindowResponse";
 export type { AccountPoolReadParams } from "./AccountPoolReadParams";
 export type { AccountPoolReadResponse } from "./AccountPoolReadResponse";
 export type { AccountPoolReasonCode } from "./AccountPoolReasonCode";

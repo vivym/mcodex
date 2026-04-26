@@ -9,6 +9,27 @@ It intentionally focuses on account-pool selection and recovery semantics. It
 does not redesign the broader remote backend contract, introduce a background
 quota-recovery worker, or add a large account-management UI.
 
+## Post-RuntimeLeaseAuthority Baseline
+
+This spec was originally written before the runtime lease authority work landed.
+As of the main branch containing
+`runtime-lease-authority-for-subagents-implementation`, pooled runtime selection
+and live quota reporting no longer belong to a per-session failover path.
+
+The current integration boundary is:
+
+- `RuntimeLeaseAuthority` owns pooled lease generations, request admission,
+  hard-failure rotation, proactive soft rotation, and collaboration-tree scoped
+  invalidation.
+- `RuntimeLeaseHost` shares that authority across the top-level runtime and its
+  child subagents.
+- admitted provider requests carry a `LeaseSnapshot` with the resolved
+  `selection_family`; live rate-limit and usage-limit reports must write quota
+  state against that snapshot family instead of recomputing the family later.
+- the original quota-aware plan's `codex-core` runtime integration task is
+  superseded by the runtime authority implementation; remaining quota-aware
+  work should extend observability and UI consumers on top of that boundary.
+
 ## Summary
 
 The recommended direction is:
@@ -54,15 +75,17 @@ The recommended direction is:
 
 ## Constraints
 
-- Current runtime proactive switching only looks at `RateLimitSnapshot.primary`
-  usage percentage.
-- Current durable health state is too coarse for quota-aware selection:
+- Before the runtime authority and quota-state slices, runtime proactive
+  switching only looked at `RateLimitSnapshot.primary` usage percentage.
+- Before this design, durable health state was too coarse for quota-aware
+  selection:
   `Healthy`, `RateLimited`, and `Unauthorized`.
-- Current lease acquisition still chooses the first eligible account by pool
-  position.
-- The protocol already exposes `limit_id`, `primary`, and `secondary` windows,
-  but those windows are not yet modeled as first-class per-account durable
-  quota knowledge.
+- Before the runtime authority work, lease acquisition chose the first eligible
+  account by pool position. New runtime changes should preserve the authority
+  boundary rather than reintroducing a separate per-session manager path.
+- The provider protocol already exposes `limit_id`, `primary`, and `secondary`
+  windows; remaining app-server and UI work must expose the durable multi-family
+  quota model instead of only the legacy singular `quota` projection.
 - Provider behavior is not perfectly aligned with predicted reset times;
   provider-side early reset must be treated as real and must be discoverable.
 - Multiple runtime instances may share one product home, so any retry/probe
@@ -71,21 +94,22 @@ The recommended direction is:
 
 ## Problem Statement
 
-The current account-pool implementation has three mismatches:
+The original account-pool implementation had three mismatches:
 
-1. quota observations are session-local and not modeled per account
-2. quota exhaustion is collapsed into a coarse durable `RateLimited` health
+1. quota observations were session-local and not modeled per account
+2. quota exhaustion was collapsed into a coarse durable `RateLimited` health
    state
-3. selector logic does not use quota knowledge when choosing the next account
+3. selector logic did not use quota knowledge when choosing the next account
 
-That leaves several correctness and UX gaps:
+That left several correctness and UX gaps that this design addresses and that
+remaining observability/UI work must keep explainable:
 
-- proactive switching only sees the active account's primary window and ignores
+- proactive switching only saw the active account's primary window and ignored
   longer-window risk when choosing the next account
-- a weekly-exhausted account can only be represented as generically
+- a weekly-exhausted account could only be represented as generically
   `RateLimited`, with no durable notion of which window is exhausted
-- local predicted cooldown can become stale when the provider resets early
-- startup selection and runtime failover do not share a single explainable
+- local predicted cooldown could become stale when the provider resets early
+- startup selection and runtime failover did not share a single explainable
   decision model
 
 The design therefore needs a richer domain boundary:
@@ -630,10 +654,12 @@ The account-pool crate should provide:
 Observability should stop collapsing quota state into one opaque remaining
 percentage.
 
-Account-pool account surfaces should eventually expose a collection of quota
-families rather than one singular quota projection:
+Account-pool account surfaces should eventually expose a required, non-null
+collection of quota families rather than one singular quota projection:
 
 - `quotas: Vec<AccountPoolQuotaFamily>`
+
+When no durable quota rows exist for an account, `quotas` is an empty array.
 
 Where each `AccountPoolQuotaFamily` contains:
 
@@ -655,11 +681,30 @@ tests, and snapshots remain deterministic.
 First-slice observability boundary:
 
 - account-row quota facts are expanded as typed `quotas` collection fields in
-  scope
+  scope; for app-server v2 this applies to `accountPool/accounts/list`, not the
+  pool summary returned by `accountPool/read`
+- `accountPool/accounts/list` may add an optional `accountId` filter so
+  active-account consumers can hydrate one row without scanning a full pool page
+- the `accountId` filter is a point lookup scoped by `poolId`; apply it before
+  cursor/limit pagination, return at most one account row, and return
+  `nextCursor = null` for that point-lookup response
+- account rows expose the effective `selection_family` as wire
+  `selectionFamily`, normalized to `codex` when the backend family is absent,
+  so UI selection explanations use the same quota family as the selector
 - app-server compatibility is additive in the first slice: the existing
   singular `quota` field remains, and the new `quotas` field is added beside it
 - the singular compatibility `quota` field is projected only from the `codex`
   family row; if no `codex` row exists, `quota` is `null`
+- when a `codex` row exists, the compatibility `quota` projection chooses the
+  populated primary or secondary window with the lowest remaining percentage;
+  `remaining_percent` is `100 - used_percent` clamped to `0..=100`,
+  `resets_at` comes from that chosen window when available, and `observed_at`
+  remains the row's `observed_at`
+- observability readers must not join every quota row directly into the account
+  page query because that would multiply account rows and break cursor
+  pagination; apply account filters first, page the filtered account rows, then
+  batch-load quota rows for the visible account ids and attach sorted families
+  in memory
 - new CLI/TUI and app-server consumers should migrate to `quotas`; legacy
   consumers may continue reading `quota` during the transition
 - diagnostics and selection explanations may still project one family-specific

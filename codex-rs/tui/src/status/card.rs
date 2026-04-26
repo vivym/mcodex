@@ -689,6 +689,21 @@ impl HistoryCell for StatusHistoryCell {
         if self
             .account_lease
             .as_ref()
+            .and_then(|lease| lease.next_probe_after.as_ref())
+            .is_some()
+        {
+            push_label(&mut labels, &mut seen, "Next probe");
+        }
+        if self
+            .account_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.quota_families.is_empty())
+        {
+            push_label(&mut labels, &mut seen, "Quota state");
+        }
+        if self
+            .account_lease
+            .as_ref()
             .and_then(|lease| lease.remote_reset.as_ref())
             .is_some()
         {
@@ -777,6 +792,16 @@ impl HistoryCell for StatusHistoryCell {
                     formatter.line("Next eligible", vec![Span::from(next_eligible_at.clone())]),
                 );
             }
+            if let Some(next_probe_after) = account_lease.next_probe_after.as_ref() {
+                lines
+                    .push(formatter.line("Next probe", vec![Span::from(next_probe_after.clone())]));
+            }
+            if !account_lease.quota_families.is_empty() {
+                lines.push(formatter.line(
+                    "Quota state",
+                    vec![Span::from(account_quota_families_text(account_lease))],
+                ));
+            }
             if let Some(remote_reset) = account_lease.remote_reset.as_ref() {
                 lines.push(formatter.line("Remote reset", vec![Span::from(remote_reset.clone())]));
             }
@@ -817,6 +842,43 @@ impl HistoryCell for StatusHistoryCell {
             .collect();
 
         with_border_with_inner_width(truncated_lines, inner_width)
+    }
+}
+
+fn account_quota_families_text(account_lease: &StatusAccountLeaseDisplay) -> String {
+    account_lease
+        .quota_families
+        .iter()
+        .map(|quota| {
+            let exhausted = if quota.exhausted_windows == "none" {
+                "available".to_string()
+            } else {
+                format!("{} exhausted", quota.exhausted_windows)
+            };
+            let mut parts = vec![
+                quota.limit_id.clone(),
+                format!("primary {}", quota_window_text(&quota.primary)),
+                format!("secondary {}", quota_window_text(&quota.secondary)),
+                exhausted,
+            ];
+            if let Some(blocked_until) = quota.predicted_blocked_until.as_ref() {
+                parts.push(format!("blocked until {blocked_until}"));
+            }
+            if let Some(next_probe_after) = quota.next_probe_after.as_ref() {
+                parts.push(format!("next probe {next_probe_after}"));
+            }
+            parts.join(", ")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn quota_window_text(window: &super::account::StatusAccountQuotaWindowDisplay) -> String {
+    match (&window.used_percent, &window.resets_at) {
+        (Some(used_percent), Some(resets_at)) => format!("{used_percent}, resets {resets_at}"),
+        (Some(used_percent), None) => used_percent.clone(),
+        (None, Some(resets_at)) => format!("resets {resets_at}"),
+        (None, None) => "unknown".to_string(),
     }
 }
 

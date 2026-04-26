@@ -16,6 +16,12 @@
     }
   },
   "properties": {
+    "accountId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "accountKinds": {
       "items": {
         "type": "string"

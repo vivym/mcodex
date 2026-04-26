@@ -2,6 +2,9 @@ use crate::accounts::diagnostics::AccountsCurrentDiagnostic;
 use crate::accounts::diagnostics::AccountsStatusDiagnostic;
 use crate::accounts::observability_output::render_status_pool_observability_text;
 use crate::accounts::observability_output::status_pool_observability_json_value;
+use crate::accounts::observability_types::PoolAccountView;
+use crate::accounts::observability_types::PoolQuotaFamilyView;
+use crate::accounts::observability_types::StatusPoolObservabilityView;
 use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountDiagnostic;
 use codex_state::AccountPoolDiagnostic;
@@ -102,7 +105,11 @@ pub(crate) fn print_status_text(diagnostic: &AccountsStatusDiagnostic) {
             format_optional_timestamp(pool.next_eligible_at.as_ref())
         );
         for account in &pool.accounts {
-            let eligibility = normalized_account_eligibility(account, preview);
+            let eligibility = normalized_account_eligibility(
+                account,
+                preview,
+                diagnostic.pool_observability.as_ref(),
+            );
             println!(
                 "account {}: enabled={}, health={}, eligibility={}, next eligible at={}{}",
                 account.account_id,
@@ -158,7 +165,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
                     .iter()
                     .map(|account| {
                         let eligibility =
-                            normalized_account_eligibility(account, preview);
+                            normalized_account_eligibility(account, preview, diagnostic.pool_observability.as_ref());
                         serde_json::json!({
                             "accountId": &account.account_id,
                             "poolId": &account.pool_id,
@@ -537,6 +544,7 @@ fn source_suffix(source: Option<AccountSource>) -> String {
 fn normalized_account_eligibility(
     account: &AccountPoolAccountDiagnostic,
     preview: &AccountStartupSelectionPreview,
+    pool_observability: Option<&StatusPoolObservabilityView>,
 ) -> EligibilityView {
     let is_preferred = preview.preferred_account_id.as_deref() == Some(account.account_id.as_str());
     if is_preferred {
@@ -556,6 +564,13 @@ fn normalized_account_eligibility(
 
         match account.health_state {
             Some(AccountHealthState::RateLimited) => {
+                if let Some(eligibility) = quota_account_eligibility(
+                    account,
+                    pool_observability,
+                    /*is_preferred*/ true,
+                ) {
+                    return eligibility;
+                }
                 return EligibilityView {
                     code: "preferredAccountRateLimited",
                     reason: "preferred account is rate limited".to_string(),
@@ -606,6 +621,11 @@ fn normalized_account_eligibility(
 
     match account.health_state {
         Some(AccountHealthState::RateLimited) => {
+            if let Some(eligibility) =
+                quota_account_eligibility(account, pool_observability, /*is_preferred*/ false)
+            {
+                return eligibility;
+            }
             return EligibilityView {
                 code: "rateLimited",
                 reason: "account is rate limited".to_string(),
@@ -644,6 +664,107 @@ fn normalized_account_eligibility(
     EligibilityView {
         code: "eligible",
         reason: "account is eligible for automatic startup selection".to_string(),
+    }
+}
+
+fn quota_account_eligibility(
+    account: &AccountPoolAccountDiagnostic,
+    pool_observability: Option<&StatusPoolObservabilityView>,
+    is_preferred: bool,
+) -> Option<EligibilityView> {
+    let account = observed_account(pool_observability, &account.account_id)?;
+    quota_eligibility_from_families(
+        &account.quotas,
+        account.selection_family.as_str(),
+        is_preferred,
+    )
+}
+
+fn observed_account<'a>(
+    pool_observability: Option<&'a StatusPoolObservabilityView>,
+    account_id: &str,
+) -> Option<&'a PoolAccountView> {
+    pool_observability?
+        .accounts
+        .as_ref()?
+        .iter()
+        .find(|account| account.account_id == account_id)
+}
+
+fn quota_eligibility_from_families(
+    quotas: &[PoolQuotaFamilyView],
+    selection_family: &str,
+    is_preferred: bool,
+) -> Option<EligibilityView> {
+    let selection_family = if selection_family.is_empty() {
+        "codex"
+    } else {
+        selection_family
+    };
+    let quota = quotas
+        .iter()
+        .find(|quota| quota.limit_id == selection_family)
+        .or_else(|| {
+            if selection_family == "codex" {
+                None
+            } else {
+                quotas.iter().find(|quota| quota.limit_id == "codex")
+            }
+        })?;
+
+    if quota.next_probe_after_is_future {
+        return Some(quota_eligibility_view(
+            is_preferred,
+            "probeThrottle",
+            "preferredAccountProbeThrottle",
+            "account is waiting for the next quota probe",
+            "preferred account is waiting for the next quota probe",
+        ));
+    }
+    if matches!(quota.exhausted_windows.as_str(), "secondary" | "both") {
+        return Some(quota_eligibility_view(
+            is_preferred,
+            "secondaryWindowBlocked",
+            "preferredAccountSecondaryWindowBlocked",
+            "account is blocked by the secondary quota window",
+            "preferred account is blocked by the secondary quota window",
+        ));
+    }
+    if quota.exhausted_windows.as_str() == "primary" {
+        return Some(quota_eligibility_view(
+            is_preferred,
+            "primaryWindowBlocked",
+            "preferredAccountPrimaryWindowBlocked",
+            "account is blocked by the primary quota window",
+            "preferred account is blocked by the primary quota window",
+        ));
+    }
+    if quota.exhausted_windows.as_str() == "unknown" {
+        return Some(quota_eligibility_view(
+            is_preferred,
+            "quotaWindowBlocked",
+            "preferredAccountQuotaWindowBlocked",
+            "account is blocked by quota state",
+            "preferred account is blocked by quota state",
+        ));
+    }
+    None
+}
+
+fn quota_eligibility_view(
+    is_preferred: bool,
+    code: &'static str,
+    preferred_code: &'static str,
+    reason: &'static str,
+    preferred_reason: &'static str,
+) -> EligibilityView {
+    EligibilityView {
+        code: if is_preferred { preferred_code } else { code },
+        reason: if is_preferred {
+            preferred_reason.to_string()
+        } else {
+            reason.to_string()
+        },
     }
 }
 

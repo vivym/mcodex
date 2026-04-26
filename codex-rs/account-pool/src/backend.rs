@@ -34,6 +34,8 @@ pub use crate::observability::AccountPoolIssue;
 pub use crate::observability::AccountPoolLease;
 pub use crate::observability::AccountPoolObservabilityReader;
 pub use crate::observability::AccountPoolQuota;
+pub use crate::observability::AccountPoolQuotaFamily;
+pub use crate::observability::AccountPoolQuotaWindow;
 pub use crate::observability::AccountPoolReadRequest;
 pub use crate::observability::AccountPoolReasonCode;
 pub use crate::observability::AccountPoolSelection;
