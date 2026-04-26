@@ -325,6 +325,31 @@ async fn local_observability_reader_preserves_quota_families_and_compat_projecti
     );
 }
 
+#[tokio::test]
+async fn local_observability_reader_forwards_account_id_point_lookup() {
+    let runtime = test_runtime().await;
+    seed_account(&runtime, "acct-1", "team-main", 0, true, true).await;
+    seed_account(&runtime, "acct-2", "team-main", 1, true, true).await;
+
+    let backend = LocalAccountPoolBackend::new(runtime, Duration::seconds(300));
+    let observed = expect_ok(
+        backend
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-2".to_string()),
+                cursor: Some("not-a-cursor".to_string()),
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await,
+    );
+
+    assert_eq!(observed.next_cursor, None);
+    assert_eq!(observed.data.len(), 1);
+    assert_eq!(observed.data[0].account_id, "acct-2");
+}
+
 async fn test_runtime() -> Arc<StateRuntime> {
     let codex_home = expect_ok(tempfile::tempdir()).keep();
     expect_ok(StateRuntime::init(codex_home, "test-provider".to_string()).await)

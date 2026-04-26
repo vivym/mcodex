@@ -802,13 +802,15 @@ fn derive_legacy_quota_record(family: &AccountPoolQuotaFamilyRecord) -> AccountP
             resets_at: match family.exhausted_windows.as_str() {
                 "primary" => family.primary.resets_at,
                 "secondary" => family.secondary.resets_at,
-                "both" => match (family.primary.resets_at, family.secondary.resets_at) {
-                    (Some(primary), Some(secondary)) => Some(primary.min(secondary)),
-                    (Some(primary), None) => Some(primary),
-                    (None, Some(secondary)) => Some(secondary),
-                    (None, None) => None,
-                },
-                "none" | "unknown" => None,
+                "both" | "unknown" => {
+                    match (family.primary.resets_at, family.secondary.resets_at) {
+                        (Some(primary), Some(secondary)) => Some(primary.max(secondary)),
+                        (Some(primary), None) => Some(primary),
+                        (None, Some(secondary)) => Some(secondary),
+                        (None, None) => None,
+                    }
+                }
+                "none" => None,
                 _ => None,
             },
             observed_at: family.observed_at,
@@ -1467,6 +1469,78 @@ mod tests {
         assert_eq!(accounts.next_cursor, None);
         assert_eq!(accounts.data.len(), 1);
         assert_eq!(accounts.data[0].account_id, "acct-2");
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_legacy_quota_without_usage_uses_exhausted_window_reset() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: None,
+                primary_resets_at: Some(timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: Some(timestamp(180)),
+                observed_at: timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Both,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-2".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: None,
+                primary_resets_at: None,
+                secondary_used_percent: None,
+                secondary_resets_at: Some(timestamp(240)),
+                observed_at: timestamp(90),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 2);
+        assert_eq!(
+            accounts.data[0].quota,
+            Some(crate::AccountPoolQuotaRecord {
+                remaining_percent: None,
+                resets_at: Some(timestamp(180)),
+                observed_at: timestamp(60),
+            })
+        );
+        assert_eq!(
+            accounts.data[1].quota,
+            Some(crate::AccountPoolQuotaRecord {
+                remaining_percent: None,
+                resets_at: Some(timestamp(240)),
+                observed_at: timestamp(90),
+            })
+        );
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
