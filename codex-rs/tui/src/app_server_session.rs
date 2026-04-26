@@ -919,10 +919,10 @@ fn status_account_lease_display_from_response(
         .map(|account| status_account_quota_families_from_response(&account.quotas, captured_at))
         .unwrap_or_default();
     let effective_quota_family = account.and_then(|account| {
-        let selection_family = if account.account_kind.is_empty() {
+        let selection_family = if account.selection_family.is_empty() {
             "codex"
         } else {
-            account.account_kind.as_str()
+            account.selection_family.as_str()
         };
         account
             .quotas
@@ -2122,6 +2122,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: None,
             account_kind: "chatgpt".to_string(),
+            selection_family: "chatgpt".to_string(),
             enabled: true,
             health_state: Some("healthy".to_string()),
             operational_state: Some(
@@ -2238,6 +2239,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: None,
             account_kind: "chatgpt".to_string(),
+            selection_family: "chatgpt".to_string(),
             enabled: true,
             health_state: Some("healthy".to_string()),
             operational_state: Some(
@@ -2315,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn status_account_lease_display_uses_account_family_for_quota_note() {
+    fn status_account_lease_display_uses_selection_family_for_quota_note() {
         let captured_at = chrono::Local
             .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
             .single()
@@ -2330,6 +2332,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: None,
             account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
             enabled: true,
             health_state: Some("healthy".to_string()),
             operational_state: Some(
@@ -2348,7 +2351,7 @@ mod tests {
                     Some(next_probe_after),
                 ),
                 quota_family(
-                    "chatgpt",
+                    "local",
                     "primary",
                     /*predicted_blocked_until*/ Some(blocked_until),
                     /*next_probe_after*/ None,
@@ -2398,20 +2401,6 @@ mod tests {
                 remote_reset: None,
                 quota_families: vec![
                     StatusAccountQuotaFamilyDisplay {
-                        limit_id: "chatgpt".to_string(),
-                        primary: StatusAccountQuotaWindowDisplay {
-                            used_percent: Some("42% used".to_string()),
-                            resets_at: None,
-                        },
-                        secondary: StatusAccountQuotaWindowDisplay {
-                            used_percent: Some("100% used".to_string()),
-                            resets_at: Some("04:04".to_string()),
-                        },
-                        exhausted_windows: "primary".to_string(),
-                        predicted_blocked_until: Some("04:04".to_string()),
-                        next_probe_after: None,
-                    },
-                    StatusAccountQuotaFamilyDisplay {
                         limit_id: "codex".to_string(),
                         primary: StatusAccountQuotaWindowDisplay {
                             used_percent: Some("42% used".to_string()),
@@ -2424,6 +2413,20 @@ mod tests {
                         exhausted_windows: "secondary".to_string(),
                         predicted_blocked_until: Some("04:04".to_string()),
                         next_probe_after: Some("03:24".to_string()),
+                    },
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "local".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "primary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: None,
                     },
                 ],
             })

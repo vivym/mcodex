@@ -836,6 +836,9 @@ Implement:
 - additive `quotas: Vec<AccountPoolQuotaFamilyResponse>` on account responses
   while keeping the singular `quota`; `quotas` is always serialized as a
   required non-null array and is empty when no quota rows exist
+- required `selection_family` / wire `selectionFamily` on account responses so
+  CLI/TUI selection explanations use the same effective quota family as the
+  selector instead of guessing from `account_kind`
 - optional `account_id` filtering on `AccountPoolAccountsListParams`, annotated
   with `#[ts(optional = nullable)]` and exposed on the wire as `accountId`, so
   active-account consumers such as the TUI can hydrate exactly the currently

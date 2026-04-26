@@ -161,6 +161,7 @@ SELECT
     membership.position,
     account_registry.backend_account_handle,
     account_registry.account_kind,
+    COALESCE(NULLIF(account_registry.backend_family, ''), 'codex') AS selection_family,
     account_registry.enabled,
     account_registry.healthy,
     account_registry.updated_at AS registry_updated_at,
@@ -299,6 +300,7 @@ LEFT JOIN account_leases AS active_lease
                         .ok()
                         .filter(|value| !value.is_empty()),
                     account_kind: row.try_get("account_kind")?,
+                    selection_family: row.try_get("selection_family")?,
                     enabled,
                     health_state,
                     operational_state,

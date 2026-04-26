@@ -1601,6 +1601,7 @@ List accounts in the pool:
         "accountId": "acct-1",
         "backendAccountRef": "acct-1",
         "accountKind": "chatgpt",
+        "selectionFamily": "chatgpt",
         "enabled": true,
         "healthState": "healthy",
         "operationalState": "leased",
@@ -1666,7 +1667,7 @@ List accounts in the pool:
 }
 ```
 
-`quota` is the legacy nullable compatibility projection and is derived only from the `codex` quota family when present. `quotas` is always present as a non-null array, sorted by `limitId`, and contains one entry for each persisted quota family.
+`selectionFamily` is the quota family used by runtime selection for this account, with `codex` used when the backend family is absent. `quota` is the legacy nullable compatibility projection and is derived only from the `codex` quota family when present. `quotas` is always present as a non-null array, sorted by `limitId`, and contains one entry for each persisted quota family.
 
 List event history. Pagination uses only `cursor` and `limit`; omit or set optional filters to `null` when not needed:
 

@@ -82,6 +82,7 @@ fn account_pool_account_response_serializes_quota_families() {
 
     let value = serde_json::to_value(&response).unwrap();
     assert_eq!(value["quotas"][0]["limitId"], "chatgpt");
+    assert_eq!(value["selectionFamily"], "chatgpt");
     assert!(value["quotas"][0]["primary"].is_object());
     assert!(value["quotas"][0]["secondary"].is_object());
     assert!(value["quotas"][0].get("exhaustedWindows").is_some());
@@ -232,6 +233,7 @@ fn account_row_fixture() -> AccountPoolAccountResponse {
         account_id: "acct-fixture".to_string(),
         backend_account_ref: Some("backend-fixture".to_string()),
         account_kind: "chatgpt".to_string(),
+        selection_family: "chatgpt".to_string(),
         enabled: true,
         health_state: Some("healthy".to_string()),
         operational_state: None,

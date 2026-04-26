@@ -688,6 +688,9 @@ First-slice observability boundary:
 - the `accountId` filter is a point lookup scoped by `poolId`; apply it before
   cursor/limit pagination, return at most one account row, and return
   `nextCursor = null` for that point-lookup response
+- account rows expose the effective `selection_family` as wire
+  `selectionFamily`, normalized to `codex` when the backend family is absent,
+  so UI selection explanations use the same quota family as the selector
 - app-server compatibility is additive in the first slice: the existing
   singular `quota` field remains, and the new `quotas` field is added beside it
 - the singular compatibility `quota` field is projected only from the `codex`

@@ -168,6 +168,7 @@ async fn account_pool_accounts_list_returns_additive_quota_and_quotas_fields() -
     .await?;
 
     assert!(response["data"][0]["quotas"].is_array());
+    assert_eq!(response["data"][0]["selectionFamily"], "chatgpt");
     assert_eq!(response["data"][0]["quotas"][0]["limitId"], "chatgpt");
     assert_eq!(response["data"][0]["quotas"][1]["limitId"], "codex");
     assert!(response["data"][0].get("quota").is_some());

@@ -181,6 +181,7 @@ impl TryFrom<codex_state::AccountPoolAccountRecord> for AccountPoolAccount {
             account_id: value.account_id,
             backend_account_ref: value.backend_account_ref,
             account_kind: value.account_kind,
+            selection_family: value.selection_family,
             enabled: value.enabled,
             health_state: value.health_state,
             operational_state: value
@@ -355,6 +356,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: Some("backend-acct-1".to_string()),
             account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
             enabled: true,
             health_state: Some("unauthorized".to_string()),
             operational_state: Some("error".to_string()),
@@ -403,6 +405,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: Some("backend-acct-1".to_string()),
             account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
             enabled: true,
             health_state: Some("unauthorized".to_string()),
             operational_state: Some(AccountOperationalState::Error),

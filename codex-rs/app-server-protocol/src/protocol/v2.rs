@@ -1922,6 +1922,7 @@ pub struct AccountPoolAccountResponse {
     #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub backend_account_ref: Option<String>,
     pub account_kind: String,
+    pub selection_family: String,
     pub enabled: bool,
     #[schemars(required, schema_with = "nullable_field_schema::<String>")]
     pub health_state: Option<String>,

@@ -367,6 +367,7 @@ fn map_account(account: codex_account_pool::AccountPoolAccount) -> PoolAccountVi
         account_id: account.account_id,
         backend_account_ref: account.backend_account_ref,
         account_kind: account.account_kind,
+        selection_family: account.selection_family,
         enabled: account.enabled,
         health_state: account.health_state,
         operational_state: account

@@ -5443,6 +5443,9 @@
               }
             ]
           },
+          "selectionFamily": {
+            "type": "string"
+          },
           "statusMessage": {
             "type": [
               "string",
@@ -5476,6 +5479,7 @@
           "quota",
           "quotas",
           "selection",
+          "selectionFamily",
           "statusMessage",
           "statusReasonCode",
           "updatedAt"

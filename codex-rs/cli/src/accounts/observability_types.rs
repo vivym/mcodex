@@ -25,6 +25,7 @@ pub(crate) struct PoolAccountView {
     pub account_id: String,
     pub backend_account_ref: Option<String>,
     pub account_kind: String,
+    pub selection_family: String,
     pub enabled: bool,
     pub health_state: Option<String>,
     pub operational_state: Option<String>,

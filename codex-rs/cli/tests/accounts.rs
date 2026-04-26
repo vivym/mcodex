@@ -356,11 +356,16 @@ async fn seed_mixed_family_quota_state_for_status(codex_home: &TempDir) -> Resul
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
+    sqlx::query("UPDATE account_registry SET backend_family = ? WHERE account_id = ?")
+        .bind("local")
+        .bind("acct-1")
+        .execute(&pool)
+        .await?;
     seed_quota_state(
         &pool,
         QuotaStateSeed {
             account_id: "acct-1",
-            limit_id: "chatgpt",
+            limit_id: "local",
             exhausted_windows: "primary",
             predicted_blocked_until: now + 600,
             next_probe_after: None,
@@ -1051,7 +1056,7 @@ async fn accounts_status_treats_stale_probe_timestamp_as_exhausted_window() -> R
 }
 
 #[tokio::test]
-async fn accounts_status_uses_account_family_for_quota_selection_explanations() -> Result<()> {
+async fn accounts_status_uses_selection_family_for_quota_selection_explanations() -> Result<()> {
     let codex_home = prepared_home().await?;
     write_startup_selection(
         &codex_home,

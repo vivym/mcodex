@@ -473,7 +473,11 @@ fn quota_account_eligibility(
     is_preferred: bool,
 ) -> Option<EligibilityView> {
     let account = observed_account(pool_observability, &account.account_id)?;
-    quota_eligibility_from_families(&account.quotas, account.account_kind.as_str(), is_preferred)
+    quota_eligibility_from_families(
+        &account.quotas,
+        account.selection_family.as_str(),
+        is_preferred,
+    )
 }
 
 fn observed_account<'a>(
