@@ -292,7 +292,9 @@ fn remote_startup_notice_data(
     let Some(issue) = startup.startup_resolution_issue.as_ref() else {
         return StartupNoticeData {
             issue_kind: fallback_issue_kind,
-            issue_source: StartupNoticeIssueSource::None,
+            issue_source: remote_startup_notice_issue_source_from_resolution_source(
+                &startup.effective_pool_resolution_source,
+            ),
             candidate_pool_ids: Vec::new(),
         };
     };
@@ -343,6 +345,18 @@ fn remote_startup_notice_issue_source(
         codex_app_server_protocol::AccountStartupResolutionIssueSource::None => {
             StartupNoticeIssueSource::None
         }
+    }
+}
+
+fn remote_startup_notice_issue_source_from_resolution_source(
+    source: &str,
+) -> StartupNoticeIssueSource {
+    match source {
+        "override" => StartupNoticeIssueSource::Override,
+        "configDefault" => StartupNoticeIssueSource::ConfigDefault,
+        "persistedSelection" => StartupNoticeIssueSource::PersistedSelection,
+        "singleVisiblePool" | "none" => StartupNoticeIssueSource::None,
+        _ => StartupNoticeIssueSource::None,
     }
 }
 
@@ -841,6 +855,30 @@ mod tests {
                     issue_kind: StartupNoticeIssueKind::InvalidExplicitDefault,
                     issue_source: StartupNoticeIssueSource::ConfigDefault,
                     candidate_pool_ids: vec!["pool-main".to_string(), "pool-secondary".to_string()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn remote_startup_probe_derives_invalid_default_source_without_issue() {
+        let probe = remote_startup_probe_from_response(AccountLeaseReadResponse {
+            pool_id: Some("legacy-visible-pool".to_string()),
+            startup: AccountStartupSnapshot {
+                effective_pool_resolution_source: "configDefault".to_string(),
+                ..startup_snapshot_for_test(RemoteStartupAvailability::InvalidExplicitDefault, None)
+            },
+            ..empty_account_lease_response_for_test()
+        });
+
+        assert_eq!(
+            probe,
+            StartupProbe::PooledInvalidDefault {
+                remote: true,
+                notice: StartupNoticeData {
+                    issue_kind: StartupNoticeIssueKind::InvalidExplicitDefault,
+                    issue_source: StartupNoticeIssueSource::ConfigDefault,
+                    candidate_pool_ids: Vec::new(),
                 },
             }
         );
