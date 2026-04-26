@@ -22,7 +22,6 @@ pub(crate) struct AccountsStatusDiagnostic {
     pub configured_pool_count: usize,
     pub registered_pool_count: usize,
     pub startup: SharedStartupStatus,
-    pub status_pool_id: Option<String>,
     pub pool: Option<AccountPoolDiagnostic>,
     pub pool_observability: Option<StatusPoolObservabilityView>,
 }
@@ -83,7 +82,6 @@ pub(crate) async fn read_status_diagnostic(
         configured_pool_count: configured_pool_count(config),
         registered_pool_count: registered_pool_count(runtime).await?,
         startup: current.startup,
-        status_pool_id,
         pool,
         pool_observability,
     })

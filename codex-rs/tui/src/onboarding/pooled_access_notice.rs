@@ -20,6 +20,7 @@ use crate::render::Insets;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt as _;
+use crate::startup_access::StartupNoticeIssueKind;
 use crate::startup_access::StartupNoticeIssueSource;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub(crate) enum PooledAccessNoticeKind {
     PooledOnly,
     PooledPaused,
     DefaultPoolRequired {
+        issue_kind: StartupNoticeIssueKind,
         issue_source: StartupNoticeIssueSource,
         candidate_pool_ids: Vec<String>,
     },
@@ -77,10 +79,33 @@ impl PooledAccessNoticeWidget {
     pub(crate) fn default_pool_required_with_source(
         candidate_pool_ids: Vec<String>,
         issue_source: StartupNoticeIssueSource,
+        animations_enabled: bool,
+    ) -> Self {
+        let issue_kind = match issue_source {
+            StartupNoticeIssueSource::None => StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+            StartupNoticeIssueSource::Override
+            | StartupNoticeIssueSource::ConfigDefault
+            | StartupNoticeIssueSource::PersistedSelection => {
+                StartupNoticeIssueKind::InvalidExplicitDefault
+            }
+        };
+        Self::default_pool_required_with_issue(
+            candidate_pool_ids,
+            issue_kind,
+            issue_source,
+            animations_enabled,
+        )
+    }
+
+    pub(crate) fn default_pool_required_with_issue(
+        candidate_pool_ids: Vec<String>,
+        issue_kind: StartupNoticeIssueKind,
+        issue_source: StartupNoticeIssueSource,
         _animations_enabled: bool,
     ) -> Self {
         Self {
             kind: PooledAccessNoticeKind::DefaultPoolRequired {
+                issue_kind,
                 issue_source,
                 candidate_pool_ids,
             },
@@ -115,38 +140,49 @@ impl PooledAccessNoticeWidget {
                     .to_string(),
             ],
             PooledAccessNoticeKind::DefaultPoolRequired {
+                issue_kind,
                 issue_source,
                 candidate_pool_ids,
             } => {
-                let mut paragraphs = vec![match issue_source {
-                    StartupNoticeIssueSource::None => {
+                let mut paragraphs = vec![match issue_kind {
+                    StartupNoticeIssueKind::MultiplePoolsRequireDefault => {
                         "Startup found multiple visible account pools and needs a default before pooled access can continue.".to_string()
                     }
-                    StartupNoticeIssueSource::PersistedSelection => {
-                        "The saved default account pool is no longer available for startup.".to_string()
-                    }
-                    StartupNoticeIssueSource::ConfigDefault => {
-                        "The configured default account pool is not available for startup.".to_string()
-                    }
-                    StartupNoticeIssueSource::Override => {
-                        "The process-local account pool override is not available for startup.".to_string()
+                    StartupNoticeIssueKind::InvalidExplicitDefault => match issue_source {
+                        StartupNoticeIssueSource::None => {
+                            "The default account pool is not available for startup.".to_string()
+                        }
+                        StartupNoticeIssueSource::PersistedSelection => {
+                            "The saved default account pool is no longer available for startup.".to_string()
+                        }
+                        StartupNoticeIssueSource::ConfigDefault => {
+                            "The configured default account pool is not available for startup.".to_string()
+                        }
+                        StartupNoticeIssueSource::Override => {
+                            "The process-local account pool override is not available for startup.".to_string()
+                        }
                     }
                 }];
                 if !candidate_pool_ids.is_empty() {
                     paragraphs.push(format!("Visible pools: {}", candidate_pool_ids.join(", ")));
                 }
-                paragraphs.push(match issue_source {
-                    StartupNoticeIssueSource::None => {
+                paragraphs.push(match issue_kind {
+                    StartupNoticeIssueKind::MultiplePoolsRequireDefault => {
                         "Run `mcodex accounts pool default set <POOL_ID>` to choose one of the visible pools.".to_string()
                     }
-                    StartupNoticeIssueSource::PersistedSelection => {
-                        "Run `mcodex accounts pool default set <POOL_ID>` to choose another pool, or `mcodex accounts pool default clear` to remove the saved default.".to_string()
-                    }
-                    StartupNoticeIssueSource::ConfigDefault => {
-                        "Fix or remove `accounts.default_pool`, then restart startup or hand off to login.".to_string()
-                    }
-                    StartupNoticeIssueSource::Override => {
-                        "Correct the process-local override, then restart startup or hand off to login.".to_string()
+                    StartupNoticeIssueKind::InvalidExplicitDefault => match issue_source {
+                        StartupNoticeIssueSource::None => {
+                            "Run `mcodex accounts pool default set <POOL_ID>` to choose an available pool, or `mcodex accounts pool default clear` to remove the saved default.".to_string()
+                        }
+                        StartupNoticeIssueSource::PersistedSelection => {
+                            "Run `mcodex accounts pool default set <POOL_ID>` to choose another pool, or `mcodex accounts pool default clear` to remove the saved default.".to_string()
+                        }
+                        StartupNoticeIssueSource::ConfigDefault => {
+                            "Fix or remove `accounts.default_pool`, then restart startup or hand off to login.".to_string()
+                        }
+                        StartupNoticeIssueSource::Override => {
+                            "Correct the process-local override, then restart startup or hand off to login.".to_string()
+                        }
                     }
                 });
                 paragraphs
@@ -365,6 +401,21 @@ mod tests {
             "pooled_invalid_config_default_notice",
             render_to_string(&widget)
         );
+    }
+
+    #[test]
+    fn pooled_invalid_default_unknown_source_notice_does_not_claim_multiple_pools() {
+        let widget = PooledAccessNoticeWidget::default_pool_required_with_issue(
+            vec!["team-main".to_string()],
+            StartupNoticeIssueKind::InvalidExplicitDefault,
+            StartupNoticeIssueSource::None,
+            /*animations_enabled*/ false,
+        );
+        let rendered = render_to_string(&widget);
+
+        assert!(rendered.contains("default account pool is not available"));
+        assert!(!rendered.contains("multiple visible account pools"));
+        assert_snapshot!("pooled_invalid_default_unknown_source_notice", rendered);
     }
 
     #[test]

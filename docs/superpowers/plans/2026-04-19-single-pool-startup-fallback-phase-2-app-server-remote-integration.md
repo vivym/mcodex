@@ -1057,3 +1057,31 @@ git commit -m "docs(app-server): document startup snapshot account lease api"
 ```
 
 Only create this commit if docs/schema updates were not already included in earlier task commits.
+
+## Post-Main-Merge Review Fixes
+
+- [x] Preserved TUI startup compatibility with older remote app-servers whose
+  `accountLease/read` response predates the nested `startup` snapshot. The TUI
+  startup probe now synthesizes a minimal snapshot from legacy top-level lease
+  fields only when `startup` is absent.
+- [x] Kept CLI `accounts status --json` top-level `effectivePoolId` tied to the
+  actual startup preview instead of the observability lookup target. Failed
+  override observability remains visible under `poolObservability.poolId`.
+- [x] Passed `StartupNoticeIssueKind` into the pooled default notice widget so
+  future remote invalid-default payloads with partial source facts do not render
+  the multiple-pool blocker copy.
+
+Verification:
+
+```bash
+cd codex-rs
+cargo test -p codex-cli accounts_status_json -- --nocapture
+LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release cargo test -p codex-tui startup_probe_compat -- --nocapture
+LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release cargo test -p codex-tui startup_access -- --nocapture
+LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release cargo test -p codex-tui status -- --nocapture
+LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release cargo test -p codex-tui pooled -- --nocapture
+cargo test -p codex-app-server-protocol
+cargo test -p codex-account-pool
+cargo test -p codex-app-server account_lease -- --nocapture
+cargo test -p codex-app-server account_pool -- --nocapture
+```

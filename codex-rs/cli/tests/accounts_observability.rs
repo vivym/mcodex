@@ -345,7 +345,11 @@ async fn accounts_status_json_keeps_startup_fields_when_observability_read_fails
     assert!(output.success, "stderr: {}", output.stderr);
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
-    assert_eq!(json["effectivePoolId"], "missing-pool");
+    assert!(json["effectivePoolId"].is_null());
+    assert_eq!(
+        json["startup"]["startupResolutionIssue"]["poolId"],
+        "missing-pool"
+    );
     assert_eq!(json["poolObservability"]["poolId"], "missing-pool");
     assert!(json["poolObservability"]["summary"].is_null());
     assert!(json["poolObservability"]["diagnostics"].is_null());

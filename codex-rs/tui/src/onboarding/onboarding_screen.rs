@@ -158,8 +158,9 @@ impl OnboardingScreen {
                 }
                 StartupPromptDecision::PooledDefaultSelectionNotice(data) => {
                     steps.push(Step::PooledDefaultSelectionNotice(
-                        PooledAccessNoticeWidget::default_pool_required_with_source(
+                        PooledAccessNoticeWidget::default_pool_required_with_issue(
                             data.candidate_pool_ids.clone(),
+                            data.issue_kind,
                             data.issue_source,
                             config.animations,
                         ),

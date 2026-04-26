@@ -173,6 +173,76 @@ impl ThreadParamsMode {
     }
 }
 
+fn account_lease_read_response_from_startup_probe_payload(
+    mut payload: serde_json::Value,
+) -> serde_json::Result<AccountLeaseReadResponse> {
+    if payload.get("startup").is_none() {
+        let startup = legacy_startup_snapshot_from_account_lease_payload(&payload);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("startup".to_string(), serde_json::to_value(startup)?);
+        }
+    }
+
+    serde_json::from_value(payload)
+}
+
+fn legacy_startup_snapshot_from_account_lease_payload(
+    payload: &serde_json::Value,
+) -> codex_app_server_protocol::AccountStartupSnapshot {
+    let effective_pool_id = json_string_field(payload, "poolId");
+    let suppressed = payload
+        .get("suppressed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let startup_availability = if suppressed {
+        codex_app_server_protocol::AccountStartupAvailability::Suppressed
+    } else if effective_pool_id.is_some() {
+        codex_app_server_protocol::AccountStartupAvailability::Available
+    } else {
+        codex_app_server_protocol::AccountStartupAvailability::Unavailable
+    };
+    let effective_pool_resolution_source =
+        json_string_field(payload, "effectivePoolResolutionSource").unwrap_or_else(|| {
+            if effective_pool_id.is_some() {
+                "singleVisiblePool".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
+    let selection_eligibility = json_string_field(payload, "switchReason")
+        .or_else(|| json_string_field(payload, "suppressionReason"))
+        .unwrap_or_else(|| match startup_availability {
+            codex_app_server_protocol::AccountStartupAvailability::Available => {
+                "automaticAccountSelected".to_string()
+            }
+            codex_app_server_protocol::AccountStartupAvailability::Suppressed => {
+                "durablySuppressed".to_string()
+            }
+            codex_app_server_protocol::AccountStartupAvailability::MultiplePoolsRequireDefault
+            | codex_app_server_protocol::AccountStartupAvailability::InvalidExplicitDefault
+            | codex_app_server_protocol::AccountStartupAvailability::Unavailable => {
+                "unavailable".to_string()
+            }
+        });
+
+    codex_app_server_protocol::AccountStartupSnapshot {
+        effective_pool_id,
+        effective_pool_resolution_source,
+        configured_default_pool_id: json_string_field(payload, "configuredDefaultPoolId"),
+        persisted_default_pool_id: json_string_field(payload, "persistedDefaultPoolId"),
+        startup_availability,
+        startup_resolution_issue: None,
+        selection_eligibility,
+    }
+}
+
+fn json_string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
@@ -378,7 +448,7 @@ impl AppServerSession {
             .wrap_err("accountLease/read failed during TUI startup probe")?;
 
         match response {
-            Ok(payload) => serde_json::from_value(payload)
+            Ok(payload) => account_lease_read_response_from_startup_probe_payload(payload)
                 .map(Some)
                 .map_err(|source| TypedRequestError::Deserialize {
                     method: METHOD.to_string(),
@@ -1582,6 +1652,118 @@ mod tests {
             startup_resolution_issue: None,
             selection_eligibility: "automaticAccountSelected".to_string(),
         }
+    }
+
+    fn legacy_account_lease_payload_for_test(
+        suppressed: bool,
+        pool_id: Option<&str>,
+        switch_reason: Option<&str>,
+        suppression_reason: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "active": false,
+            "suppressed": suppressed,
+            "accountId": null,
+            "poolId": pool_id,
+            "leaseId": null,
+            "leaseEpoch": null,
+            "leaseAcquiredAt": null,
+            "healthState": null,
+            "switchReason": switch_reason,
+            "suppressionReason": suppression_reason,
+            "transportResetGeneration": null,
+            "lastRemoteContextResetTurnId": null,
+            "minSwitchIntervalSecs": null,
+            "proactiveSwitchPending": null,
+            "proactiveSwitchSuppressed": null,
+            "proactiveSwitchAllowedAt": null,
+            "nextEligibleAt": null,
+            "effectivePoolResolutionSource": if pool_id.is_some() {
+                Some("singleVisiblePool")
+            } else {
+                None
+            },
+            "configuredDefaultPoolId": null,
+            "persistedDefaultPoolId": null,
+        })
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_available_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ false,
+                Some("team-main"),
+                Some("automaticAccountSelected"),
+                /*suppression_reason*/ None,
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                effective_pool_resolution_source: "singleVisiblePool".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_suppressed_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ true,
+                Some("team-main"),
+                /*switch_reason*/ None,
+                Some("durablySuppressed"),
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                effective_pool_resolution_source: "singleVisiblePool".to_string(),
+                startup_availability: AccountStartupAvailability::Suppressed,
+                selection_eligibility: "durablySuppressed".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Suppressed,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_unavailable_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ false, /*pool_id*/ None, /*switch_reason*/ None,
+                /*suppression_reason*/ None,
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                selection_eligibility: "unavailable".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
     }
 
     #[tokio::test]

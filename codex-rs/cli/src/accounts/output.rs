@@ -137,7 +137,7 @@ pub(crate) fn print_status_json(diagnostic: &AccountsStatusDiagnostic) -> anyhow
         "accountPoolOverrideId": diagnostic.account_pool_override_id.as_deref(),
         "configuredPoolCount": diagnostic.configured_pool_count,
         "registeredPoolCount": diagnostic.registered_pool_count,
-        "effectivePoolId": diagnostic.status_pool_id.as_deref(),
+        "effectivePoolId": preview.effective_pool_id.as_deref(),
         "effectivePoolSource": effective_pool_source(diagnostic).map(AccountSource::as_str),
         "effectivePoolResolutionSource": effective_pool_resolution_source_to_wire_string(
             startup.effective_pool_resolution_source
