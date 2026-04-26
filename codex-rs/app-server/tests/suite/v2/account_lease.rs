@@ -135,6 +135,67 @@ async fn account_lease_read_preserves_candidate_pools_for_multi_pool_blocker() -
 }
 
 #[tokio::test]
+async fn account_logout_preserves_candidate_pools_for_multi_pool_startup_blocker() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_pooled_config_toml_without_default(
+        codex_home.path(),
+        &server.uri(),
+        &["team-main", "team-other"],
+    )?;
+    let runtime = seed_account_in_pool(codex_home.path(), "acct-team-main", "team-main", 0).await?;
+    seed_account_in_pool(codex_home.path(), "acct-team-other", "team-other", 1).await?;
+    runtime
+        .write_account_startup_selection(AccountStartupSelectionUpdate {
+            default_pool_id: None,
+            preferred_account_id: Some("acct-team-main".to_string()),
+            suppressed: false,
+        })
+        .await?;
+
+    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let logout_id = mcp.send_logout_account_request().await?;
+    let _: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(logout_id)),
+    )
+    .await??;
+
+    let notification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("accountLease/updated"),
+    )
+    .await??;
+    let updated: AccountLeaseUpdatedNotification =
+        serde_json::from_value(notification.params.expect("params must be present"))?;
+    assert_eq!(
+        updated.startup.startup_availability,
+        AccountStartupAvailability::MultiplePoolsRequireDefault
+    );
+    let issue = updated
+        .startup
+        .startup_resolution_issue
+        .expect("startup resolution issue should be present");
+    assert_eq!(
+        issue.r#type,
+        AccountStartupResolutionIssueType::MultiplePoolsRequireDefault
+    );
+    assert_eq!(issue.source, AccountStartupResolutionIssueSource::None);
+    assert_eq!(issue.candidate_pool_count, Some(2));
+    let candidate_pool_ids = issue
+        .candidate_pools
+        .expect("candidate pools should be present")
+        .into_iter()
+        .map(|pool| pool.pool_id)
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_pool_ids, vec!["team-main", "team-other"]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_lease_read_preserves_candidate_pools_for_invalid_config_default() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;

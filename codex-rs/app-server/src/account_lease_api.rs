@@ -136,7 +136,9 @@ pub(crate) async fn suppress_account_lease_on_logout(
 
     let startup_context =
         read_account_lease_startup_context_with_state_db(config, state_db.clone()).await?;
-    if startup_context.pooled_applicable {
+    if startup_context.pooled_applicable
+        || startup_context.startup.startup_availability != AccountStartupAvailability::Unavailable
+    {
         return Ok(Some(
             account_lease_response_from_startup_status(startup_context.startup).into(),
         ));
