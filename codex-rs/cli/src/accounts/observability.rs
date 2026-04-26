@@ -16,6 +16,8 @@ use codex_account_pool::AccountPoolIssue;
 use codex_account_pool::AccountPoolLease;
 use codex_account_pool::AccountPoolObservabilityReader;
 use codex_account_pool::AccountPoolQuota;
+use codex_account_pool::AccountPoolQuotaFamily;
+use codex_account_pool::AccountPoolQuotaWindow;
 use codex_account_pool::AccountPoolReadRequest;
 use codex_account_pool::AccountPoolReasonCode;
 use codex_account_pool::AccountPoolSelection;
@@ -36,7 +38,9 @@ use crate::accounts::observability_types::EventView;
 use crate::accounts::observability_types::EventsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
+use crate::accounts::observability_types::PoolQuotaFamilyView;
 use crate::accounts::observability_types::PoolQuotaView;
+use crate::accounts::observability_types::PoolQuotaWindowView;
 use crate::accounts::observability_types::PoolSelectionView;
 use crate::accounts::observability_types::PoolShowView;
 use crate::accounts::observability_types::PoolSummaryView;
@@ -353,6 +357,10 @@ fn map_account(account: codex_account_pool::AccountPoolAccount) -> PoolAccountVi
         status_message: account.status_message,
         current_lease: account.current_lease.map(map_lease),
         quota: account.quota.map(map_quota),
+        quotas: sorted_quotas(account.quotas)
+            .into_iter()
+            .map(map_quota_family)
+            .collect(),
         selection: account.selection.map(map_selection),
         updated_at: Some(account.updated_at.to_rfc3339()),
     }
@@ -374,6 +382,34 @@ fn map_quota(quota: AccountPoolQuota) -> PoolQuotaView {
         remaining_percent: quota.remaining_percent,
         resets_at: quota.resets_at.map(|resets_at| resets_at.to_rfc3339()),
         observed_at: quota.observed_at.to_rfc3339(),
+    }
+}
+
+fn sorted_quotas(mut quotas: Vec<AccountPoolQuotaFamily>) -> Vec<AccountPoolQuotaFamily> {
+    quotas.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+    quotas
+}
+
+fn map_quota_family(quota: AccountPoolQuotaFamily) -> PoolQuotaFamilyView {
+    PoolQuotaFamilyView {
+        limit_id: quota.limit_id,
+        primary: map_quota_window(quota.primary),
+        secondary: map_quota_window(quota.secondary),
+        exhausted_windows: quota.exhausted_windows,
+        predicted_blocked_until: quota
+            .predicted_blocked_until
+            .map(|predicted_blocked_until| predicted_blocked_until.to_rfc3339()),
+        next_probe_after: quota
+            .next_probe_after
+            .map(|next_probe_after| next_probe_after.to_rfc3339()),
+        observed_at: quota.observed_at.to_rfc3339(),
+    }
+}
+
+fn map_quota_window(window: AccountPoolQuotaWindow) -> PoolQuotaWindowView {
+    PoolQuotaWindowView {
+        used_percent: window.used_percent,
+        resets_at: window.resets_at.map(|resets_at| resets_at.to_rfc3339()),
     }
 }
 

@@ -4,7 +4,9 @@ use crate::accounts::observability_types::EventView;
 use crate::accounts::observability_types::EventsView;
 use crate::accounts::observability_types::PoolAccountView;
 use crate::accounts::observability_types::PoolLeaseView;
+use crate::accounts::observability_types::PoolQuotaFamilyView;
 use crate::accounts::observability_types::PoolQuotaView;
+use crate::accounts::observability_types::PoolQuotaWindowView;
 use crate::accounts::observability_types::PoolSelectionView;
 use crate::accounts::observability_types::PoolShowView;
 use crate::accounts::observability_types::PoolSummaryView;
@@ -147,6 +149,36 @@ fn render_pool_show_text(view: &PoolShowView) -> String {
                 ),
             ));
         }
+
+        let quota_rows = view
+            .data
+            .iter()
+            .flat_map(|account| {
+                account
+                    .quotas
+                    .iter()
+                    .map(|quota| (account.account_id.as_str(), quota))
+            })
+            .collect::<Vec<_>>();
+        if !quota_rows.is_empty() {
+            lines.push("quotas:".to_string());
+            lines.push(
+                "accountId | family | primary | secondary | exhausted | blockedUntil | nextProbe"
+                    .to_string(),
+            );
+            for (account_id, quota) in quota_rows {
+                lines.push(format!(
+                    "{} | {} | {} | {} | {} | {} | {}",
+                    account_id,
+                    quota.limit_id,
+                    quota_window_text(&quota.primary),
+                    quota_window_text(&quota.secondary),
+                    exhausted_windows_text(&quota.exhausted_windows),
+                    quota.predicted_blocked_until.as_deref().unwrap_or("none"),
+                    quota.next_probe_after.as_deref().unwrap_or("none"),
+                ));
+            }
+        }
     }
 
     if let Some(next_cursor) = view.next_cursor.as_deref() {
@@ -215,6 +247,7 @@ fn pool_account_json_value(account: &PoolAccountView) -> serde_json::Value {
         "statusMessage": account.status_message,
         "currentLease": account.current_lease.as_ref().map(pool_lease_json_value),
         "quota": account.quota.as_ref().map(pool_quota_json_value),
+        "quotas": account.quotas.iter().map(pool_quota_family_json_value).collect::<Vec<_>>(),
         "selection": account.selection.as_ref().map(pool_selection_json_value),
         "updatedAt": account.updated_at,
     })
@@ -237,6 +270,44 @@ fn pool_quota_json_value(quota: &PoolQuotaView) -> serde_json::Value {
         "resetsAt": quota.resets_at,
         "observedAt": quota.observed_at,
     })
+}
+
+fn pool_quota_family_json_value(quota: &PoolQuotaFamilyView) -> serde_json::Value {
+    serde_json::json!({
+        "limitId": quota.limit_id,
+        "primary": pool_quota_window_json_value(&quota.primary),
+        "secondary": pool_quota_window_json_value(&quota.secondary),
+        "exhaustedWindows": quota.exhausted_windows,
+        "predictedBlockedUntil": quota.predicted_blocked_until,
+        "nextProbeAfter": quota.next_probe_after,
+        "observedAt": quota.observed_at,
+    })
+}
+
+fn pool_quota_window_json_value(window: &PoolQuotaWindowView) -> serde_json::Value {
+    serde_json::json!({
+        "usedPercent": window.used_percent,
+        "resetsAt": window.resets_at,
+    })
+}
+
+fn quota_window_text(window: &PoolQuotaWindowView) -> String {
+    let used_percent = window
+        .used_percent
+        .map(|used_percent| format!("{used_percent:.1}% used"))
+        .unwrap_or_else(|| "unknown used".to_string());
+    match window.resets_at.as_deref() {
+        Some(resets_at) => format!("{used_percent}, resets {resets_at}"),
+        None => used_percent,
+    }
+}
+
+fn exhausted_windows_text(exhausted_windows: &str) -> String {
+    if exhausted_windows == "none" {
+        "none".to_string()
+    } else {
+        format!("{exhausted_windows} exhausted")
+    }
 }
 
 fn pool_selection_json_value(selection: &PoolSelectionView) -> serde_json::Value {
@@ -601,6 +672,7 @@ mod tests {
             status_message: None,
             current_lease: None,
             quota: None,
+            quotas: Vec::new(),
             selection: Some(PoolSelectionView {
                 eligible: true,
                 next_eligible_at: None,

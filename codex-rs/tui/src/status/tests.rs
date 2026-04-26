@@ -49,7 +49,9 @@ fn test_active_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:14".to_string()),
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     })
 }
 
@@ -61,7 +63,9 @@ fn test_switched_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        next_probe_after: None,
         remote_reset: Some("gen 2 after turn turn-17".to_string()),
+        quota_families: Vec::new(),
     })
 }
 
@@ -73,7 +77,9 @@ fn test_unavailable_account_lease_display() -> Option<StatusAccountLeaseDisplay>
         note: Some("No eligible account is available".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24".to_string()),
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     })
 }
 
@@ -88,7 +94,9 @@ fn test_non_replayable_account_lease_display() -> Option<StatusAccountLeaseDispl
         ),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     })
 }
 
@@ -100,7 +108,23 @@ fn test_damped_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
         note: Some("Automatic switch held by minimum switch interval".to_string()),
         proactive_switch_allowed_at: Some("03:24".to_string()),
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
+    })
+}
+
+fn test_probe_throttled_account_lease_display() -> Option<StatusAccountLeaseDisplay> {
+    Some(StatusAccountLeaseDisplay {
+        pool_id: Some("team-main".to_string()),
+        account_id: Some("acct-1".to_string()),
+        status: "Cooling down · Healthy".to_string(),
+        note: Some("Quota probe throttle active".to_string()),
+        proactive_switch_allowed_at: None,
+        next_eligible_at: None,
+        next_probe_after: Some("03:24".to_string()),
+        remote_reset: None,
+        quota_families: Vec::new(),
     })
 }
 
@@ -363,6 +387,49 @@ async fn status_snapshot_shows_damped_account_lease_without_next_eligible_time()
     assert!(sanitized.contains("Automatic switch held by minimum switch interval"));
     assert!(sanitized.contains("Can switch at:"));
     assert!(sanitized.contains("03:24"));
+    assert!(!sanitized.contains("Next eligible:"));
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_explains_probe_throttle_without_reusing_next_eligible_copy() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    config.model = Some("gpt-5.1-codex-max".to_string());
+    config.model_provider_id = "openai".to_string();
+    config.cwd = PathBuf::from("/workspace/tests").abs();
+
+    let usage = TokenUsage::default();
+    let captured_at = chrono::Local
+        .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let model_slug = get_model_offline(config.model.as_deref());
+
+    let composite = new_status_output_with_account_lease(
+        &config,
+        test_status_account_display().as_ref(),
+        test_probe_throttled_account_lease_display().as_ref(),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        /*thread_name*/ None,
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        None,
+        captured_at,
+        &model_slug,
+        /*collaboration_mode*/ None,
+        /*reasoning_effort_override*/ None,
+    );
+    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 80));
+    if cfg!(windows) {
+        for line in &mut rendered_lines {
+            *line = line.replace('\\', "/");
+        }
+    }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    assert!(sanitized.contains("Next probe:"));
     assert!(!sanitized.contains("Next eligible:"));
     assert_snapshot!(sanitized);
 }

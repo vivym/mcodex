@@ -33,6 +33,7 @@ pub(crate) struct PoolAccountView {
     pub status_message: Option<String>,
     pub current_lease: Option<PoolLeaseView>,
     pub quota: Option<PoolQuotaView>,
+    pub quotas: Vec<PoolQuotaFamilyView>,
     pub selection: Option<PoolSelectionView>,
     pub updated_at: Option<String>,
 }
@@ -52,6 +53,23 @@ pub(crate) struct PoolQuotaView {
     pub remaining_percent: Option<f64>,
     pub resets_at: Option<String>,
     pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PoolQuotaFamilyView {
+    pub limit_id: String,
+    pub primary: PoolQuotaWindowView,
+    pub secondary: PoolQuotaWindowView,
+    pub exhausted_windows: String,
+    pub predicted_blocked_until: Option<String>,
+    pub next_probe_after: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PoolQuotaWindowView {
+    pub used_percent: Option<f64>,
+    pub resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
