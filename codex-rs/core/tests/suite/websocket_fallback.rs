@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use chrono::Utc;
@@ -36,6 +37,21 @@ use wiremock::ResponseTemplate;
 use wiremock::http::Method;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
+
+const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_production_stack_websocket_fallback_test(
+    test: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    // Websocket fallback turns exercise the same deep async path as production,
+    // whose entrypoint configures a larger Tokio worker stack.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Result<()> {
@@ -89,8 +105,15 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt()
+#[test]
+fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt() -> Result<()>
+{
+    run_production_stack_websocket_fallback_test(
+        websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt_inner(),
+    )
+}
+
+async fn websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt_inner()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -239,8 +262,14 @@ fn fake_access_token(chatgpt_account_id: &str) -> String {
     format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
+#[test]
+fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
+    run_production_stack_websocket_fallback_test(
+        websocket_fallback_switches_to_http_after_retries_exhausted_inner(),
+    )
+}
+
+async fn websocket_fallback_switches_to_http_after_retries_exhausted_inner() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -284,8 +313,14 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result<()> {
+#[test]
+fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result<()> {
+    run_production_stack_websocket_fallback_test(
+        websocket_fallback_hides_first_websocket_retry_stream_error_inner(),
+    )
+}
+
+async fn websocket_fallback_hides_first_websocket_retry_stream_error_inner() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -336,8 +371,8 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
     loop {
         let event = timeout(Duration::from_secs(10), codex.next_event())
             .await
-            .expect("timeout waiting for event")
-            .expect("event stream ended unexpectedly")
+            .context("timeout waiting for event")?
+            .context("event stream ended unexpectedly")?
             .msg;
         match event {
             EventMsg::StreamError(e) => stream_error_messages.push(e.message),
@@ -357,8 +392,12 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+#[test]
+fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+    run_production_stack_websocket_fallback_test(websocket_fallback_is_sticky_across_turns_inner())
+}
+
+async fn websocket_fallback_is_sticky_across_turns_inner() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;

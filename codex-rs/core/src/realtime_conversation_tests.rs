@@ -1176,11 +1176,23 @@ async fn spawn_realtime_websocket_server_with_accept_delay(
         .expect("bind realtime websocket listener");
     let addr = listener.local_addr().expect("listener address");
     let captured_headers = Arc::new(std::sync::Mutex::new(HeaderMap::new()));
-    let (release_tx, release_rx) = oneshot::channel();
+    let (release_tx, mut release_rx) = oneshot::channel();
     let headers_for_callback = Arc::clone(&captured_headers);
     let server_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept websocket");
-        tokio::time::sleep(accept_delay).await;
+        let Ok((stream, _)) = (tokio::select! {
+            _ = &mut release_rx => {
+                return;
+            }
+            accepted = listener.accept() => accepted,
+        }) else {
+            return;
+        };
+        tokio::select! {
+            _ = &mut release_rx => {
+                return;
+            }
+            _ = tokio::time::sleep(accept_delay) => {}
+        }
         let callback = move |request: &Request, response: Response| {
             let mut headers = headers_for_callback
                 .lock()
@@ -1188,13 +1200,23 @@ async fn spawn_realtime_websocket_server_with_accept_delay(
             *headers = request.headers().clone();
             Ok(response)
         };
-        let Ok(mut ws) = accept_hdr_async(stream, callback).await else {
+        let Ok(mut ws) = (tokio::select! {
+            _ = &mut release_rx => {
+                return;
+            }
+            handshake = accept_hdr_async(stream, callback) => handshake,
+        }) else {
             return;
         };
-        let first = ws
-            .next()
-            .await
-            .expect("session update message")
+        let Some(first_result) = (tokio::select! {
+            _ = &mut release_rx => {
+                return;
+            }
+            first_result = ws.next() => first_result,
+        }) else {
+            return;
+        };
+        let first = first_result
             .expect("session update websocket result")
             .into_text()
             .expect("session update text");

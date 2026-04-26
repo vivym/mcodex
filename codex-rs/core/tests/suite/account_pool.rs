@@ -1,5 +1,6 @@
 use anyhow::Result;
 use base64::Engine;
+use chrono::DateTime;
 use chrono::Utc;
 use codex_app_server_protocol::AccountPoolEventType;
 use codex_app_server_protocol::AccountPoolReasonCode;
@@ -1984,14 +1985,13 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     let initial_active_lease =
         wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let active_lease_after_heartbeat =
-        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
-    assert!(
-        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
-        "expected streaming request heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
-    );
+    let _active_lease_after_heartbeat = wait_for_renewed_active_pool_lease(
+        &first,
+        PRIMARY_ACCOUNT_ID,
+        initial_active_lease.renewed_at,
+        Duration::from_secs(10),
+    )
+    .await?;
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -2109,21 +2109,20 @@ async fn long_running_manual_remote_compact_heartbeat_keeps_lease_exclusive() ->
     assert!(first_turn_error.is_none());
 
     let compact_turn_id = first.codex.submit(Op::Compact).await?;
-    tokio::time::timeout(Duration::from_secs(10), compact_request_seen_rx)
+    tokio::time::timeout(Duration::from_secs(30), compact_request_seen_rx)
         .await
         .expect("compact request should start within timeout")
         .expect("compact request should start");
     let initial_active_lease =
         wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let active_lease_after_heartbeat =
-        wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(1)).await?;
-    assert!(
-        active_lease_after_heartbeat.renewed_at > initial_active_lease.renewed_at,
-        "expected manual remote compact heartbeat to renew active lease: {active_lease_after_heartbeat:?}"
-    );
+    let _active_lease_after_heartbeat = wait_for_renewed_active_pool_lease(
+        &first,
+        PRIMARY_ACCOUNT_ID,
+        initial_active_lease.renewed_at,
+        Duration::from_secs(30),
+    )
+    .await?;
 
     let contender_turn_error = submit_turn_and_wait(&second, "contender turn").await?;
     let contender_turn_error = contender_turn_error
@@ -2390,6 +2389,34 @@ async fn wait_for_active_pool_lease(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for active lease for {expected_account_id}"
         );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_renewed_active_pool_lease(
+    test: &TestCodex,
+    expected_account_id: &str,
+    renewed_after: DateTime<Utc>,
+    timeout: Duration,
+) -> Result<codex_state::AccountLeaseRecord> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_seen_lease = None;
+    loop {
+        let active_leases = active_pool_leases(test).await?;
+        if let Some(lease) = active_leases
+            .into_iter()
+            .find(|lease| lease.account_id == expected_account_id)
+        {
+            if lease.renewed_at > renewed_after {
+                return Ok(lease);
+            }
+            last_seen_lease = Some(lease);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for active lease for {expected_account_id} to renew after {renewed_after}; last seen: {last_seen_lease:?}"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

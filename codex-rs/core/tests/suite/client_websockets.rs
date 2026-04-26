@@ -70,8 +70,8 @@ const X_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
-fn run_pooled_websocket_test(test: impl std::future::Future<Output = ()>) {
-    // Pooled websocket turns exercise the same large async path as production,
+fn run_production_stack_websocket_test(test: impl std::future::Future<Output = ()>) {
+    // Full Codex websocket turns exercise the same large async path as production,
     // whose entrypoint configures a larger Tokio worker stack.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -372,7 +372,9 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
 
 #[test]
 fn pooled_mode_does_not_schedule_startup_prewarm_websocket() {
-    run_pooled_websocket_test(pooled_mode_does_not_schedule_startup_prewarm_websocket_inner());
+    run_production_stack_websocket_test(
+        pooled_mode_does_not_schedule_startup_prewarm_websocket_inner(),
+    );
 }
 
 async fn pooled_mode_does_not_schedule_startup_prewarm_websocket_inner() {
@@ -479,7 +481,7 @@ async fn pooled_mode_does_not_schedule_startup_prewarm_websocket_inner() {
 
 #[test]
 fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused() {
-    run_pooled_websocket_test(
+    run_production_stack_websocket_test(
         pooled_websocket_rotation_opens_new_connection_when_context_is_reused_inner(),
     );
 }
@@ -618,7 +620,7 @@ async fn pooled_websocket_rotation_opens_new_connection_when_context_is_reused_i
 
 #[test]
 fn pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket() {
-    run_pooled_websocket_test(
+    run_production_stack_websocket_test(
         pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket_inner(),
     );
 }
@@ -1613,8 +1615,14 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
+#[test]
+fn responses_websocket_connection_limit_error_reconnects_and_completes() {
+    run_production_stack_websocket_test(
+        responses_websocket_connection_limit_error_reconnects_and_completes_inner(),
+    );
+}
+
+async fn responses_websocket_connection_limit_error_reconnects_and_completes_inner() {
     skip_if_no_network!();
 
     let websocket_connection_limit_error = json!({

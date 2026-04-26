@@ -92,6 +92,19 @@ fn thread_manager() -> ThreadManager {
     ThreadManager::with_models_provider_for_tests(CodexAuth::from_api_key("dummy"), provider)
 }
 
+async fn attach_loaded_parent_thread(
+    session: &mut crate::codex::Session,
+    turn: &TurnContext,
+    manager: &ThreadManager,
+) {
+    let parent = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("parent thread should start");
+    session.conversation_id = parent.thread_id;
+    session.services.agent_control = manager.agent_control();
+}
+
 async fn make_session_and_context() -> (crate::codex::Session, TurnContext) {
     let (session, mut turn) = make_base_session_and_context().await;
     Arc::make_mut(&mut turn.config)
@@ -361,7 +374,6 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
 
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
     let mut config = (*turn.config).clone();
     let provider =
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["ollama"].clone();
@@ -377,6 +389,7 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
         .expect("approval policy should be set");
     turn.provider = provider;
     turn.config = Arc::new(config);
+    attach_loaded_parent_thread(&mut session, &turn, &manager).await;
 
     let invocation = invocation(
         Arc::new(session),
@@ -624,7 +637,7 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
 async fn spawn_agent_returns_agent_id_without_task_name() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    attach_loaded_parent_thread(&mut session, &turn, &manager).await;
 
     let output = SpawnAgentHandler
         .handle(invocation(
@@ -1954,7 +1967,6 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
 
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
     let expected_sandbox = pick_allowed_sandbox_policy(
         &turn.config.permissions.sandbox_policy,
         turn.config.permissions.sandbox_policy.get().clone(),
@@ -1975,6 +1987,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         turn.config.permissions.sandbox_policy.get().clone(),
         "test requires a runtime sandbox override that differs from base config"
     );
+    attach_loaded_parent_thread(&mut session, &turn, &manager).await;
 
     let invocation = invocation(
         Arc::new(session),
@@ -2065,11 +2078,11 @@ async fn spawn_agent_allows_depth_up_to_configured_max_depth() {
 
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
 
     let mut config = (*turn.config).clone();
     config.agent_max_depth = DEFAULT_AGENT_MAX_DEPTH + 1;
     turn.config = Arc::new(config);
+    attach_loaded_parent_thread(&mut session, &turn, &manager).await;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.conversation_id,
         depth: DEFAULT_AGENT_MAX_DEPTH,
@@ -2352,7 +2365,7 @@ async fn resume_agent_noops_for_active_agent() {
 async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    attach_loaded_parent_thread(&mut session, &turn, &manager).await;
     let config = turn.config.as_ref().clone();
     let thread = manager
         .resume_thread_with_history(

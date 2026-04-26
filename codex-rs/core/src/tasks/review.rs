@@ -411,71 +411,79 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn review_conversation_inherits_parent_lease_auth() {
-        skip_if_no_network!();
+    #[test]
+    fn review_conversation_inherits_parent_lease_auth() {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("build production-like tokio runtime for review conversation test")
+            .block_on(async {
+                skip_if_no_network!();
 
-        let server = start_mock_server().await;
-        let review_json = serde_json::json!({
-            "findings": [],
-            "overall_correctness": "good",
-            "overall_explanation": "review complete",
-            "overall_confidence_score": 0.9
-        })
-        .to_string();
-        let request_log = mount_sse_once(
-            &server,
-            sse(vec![
-                ev_response_created("resp-review"),
-                ev_assistant_message("msg-review", &review_json),
-                ev_completed("resp-review"),
-            ]),
-        )
-        .await;
+                let server = start_mock_server().await;
+                let review_json = serde_json::json!({
+                    "findings": [],
+                    "overall_correctness": "good",
+                    "overall_explanation": "review complete",
+                    "overall_confidence_score": 0.9
+                })
+                .to_string();
+                let request_log = mount_sse_once(
+                    &server,
+                    sse(vec![
+                        ev_response_created("resp-review"),
+                        ev_assistant_message("msg-review", &review_json),
+                        ev_completed("resp-review"),
+                    ]),
+                )
+                .await;
 
-        let (mut session, mut turn) = make_session_and_context().await;
-        let mut config = (*turn.config).clone();
-        config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-        let config = Arc::new(config);
-        let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
-            config.codex_home.clone().to_path_buf(),
-            Arc::clone(&session.services.auth_manager),
-            config.model_provider.clone(),
-        ));
-        session.services.models_manager = models_manager;
-        session.services.lease_auth.replace_current(Some(Arc::new(
-            TestLeaseScopedAuthSession::new("review-pooled-account"),
-        )));
-        turn.config = Arc::clone(&config);
-        turn.provider = config.model_provider.clone();
-        let session = Arc::new(session);
+                let (mut session, mut turn) = make_session_and_context().await;
+                let mut config = (*turn.config).clone();
+                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                let config = Arc::new(config);
+                let models_manager = Arc::new(crate::test_support::models_manager_with_provider(
+                    config.codex_home.clone().to_path_buf(),
+                    Arc::clone(&session.services.auth_manager),
+                    config.model_provider.clone(),
+                ));
+                session.services.models_manager = models_manager;
+                session.services.lease_auth.replace_current(Some(Arc::new(
+                    TestLeaseScopedAuthSession::new("review-pooled-account"),
+                )));
+                turn.config = Arc::clone(&config);
+                turn.provider = config.model_provider.clone();
+                let session = Arc::new(session);
 
-        let receiver = start_review_conversation(
-            Arc::new(SessionTaskContext::new(Arc::clone(&session))),
-            Arc::new(turn),
-            vec![UserInput::Text {
-                text: "review with inherited lease auth".to_string(),
-                text_elements: Vec::new(),
-            }],
-            CancellationToken::new(),
-        )
-        .await
-        .expect("review conversation should start");
+                let receiver = start_review_conversation(
+                    Arc::new(SessionTaskContext::new(Arc::clone(&session))),
+                    Arc::new(turn),
+                    vec![UserInput::Text {
+                        text: "review with inherited lease auth".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("review conversation should start");
 
-        while let Ok(event) = receiver.recv().await {
-            if matches!(event.msg, EventMsg::TurnComplete(_)) {
-                break;
-            }
-        }
+                while let Ok(event) = receiver.recv().await {
+                    if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                        break;
+                    }
+                }
 
-        let request = request_log.single_request();
-        assert_eq!(
-            request.header("chatgpt-account-id").as_deref(),
-            Some("review-pooled-account")
-        );
-        assert_eq!(
-            request.header("authorization").as_deref(),
-            Some(format!("Bearer {}", fake_access_token("review-pooled-account")).as_str())
-        );
+                let request = request_log.single_request();
+                assert_eq!(
+                    request.header("chatgpt-account-id").as_deref(),
+                    Some("review-pooled-account")
+                );
+                assert_eq!(
+                    request.header("authorization").as_deref(),
+                    Some(format!("Bearer {}", fake_access_token("review-pooled-account")).as_str())
+                );
+            });
     }
 }

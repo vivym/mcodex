@@ -2413,6 +2413,7 @@ async fn websocket_streaming_admission_is_held_until_completion_then_released_on
 
     let server = core_test_support::responses::start_websocket_server(vec![vec![vec![
         core_test_support::responses::ev_response_created("resp-1"),
+        core_test_support::responses::ws_test_delay(Duration::from_secs(1)),
         core_test_support::responses::ev_completed("resp-1"),
     ]]])
     .await;

@@ -87,8 +87,21 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<()> {
+#[test]
+fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<()> {
+    // Websocket turns with tool follow-ups exercise the same deep async path as
+    // production, whose entrypoint configures a larger Tokio worker stack.
+    const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .enable_all()
+        .build()?
+        .block_on(websocket_turn_state_persists_within_turn_and_resets_after_inner())
+}
+
+async fn websocket_turn_state_persists_within_turn_and_resets_after_inner() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let call_id = "ws-shell-turn-state";

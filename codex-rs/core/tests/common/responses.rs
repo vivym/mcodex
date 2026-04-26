@@ -37,6 +37,12 @@ use wiremock::matchers::path_regex;
 
 use crate::test_codex::ApplyPatchModelOutput;
 
+const WEBSOCKET_TEST_DELAY_MS: &str = "__codex_test_delay_ms";
+
+pub fn ws_test_delay(duration: Duration) -> Value {
+    serde_json::json!({ WEBSOCKET_TEST_DELAY_MS: duration.as_millis() as u64 })
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseMock {
     requests: Arc<Mutex<Vec<ResponsesRequest>>>,
@@ -1340,6 +1346,12 @@ pub async fn start_websocket_server_with_headers(
                         .find_map(|event| event.get("delta").and_then(Value::as_str)),
                 );
                 for event in &request_events {
+                    if let Some(delay_ms) =
+                        event.get(WEBSOCKET_TEST_DELAY_MS).and_then(Value::as_u64)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
                     let Ok(payload) = serde_json::to_string(event) else {
                         continue;
                     };

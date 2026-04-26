@@ -2367,8 +2367,11 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
 
     let startup_call_id = "uexec-python-seatbelt";
     let startup_args = serde_json::json!({
-        "cmd": format!("{} -i", python.display()),
-        "yield_time_ms": 1_500,
+        "cmd": format!(
+            "{} -i -c 'import sys; print(\"stdin_isatty=\" + str(sys.stdin.isatty()))'",
+            python.display()
+        ),
+        "yield_time_ms": 5_000,
         "tty": true,
     });
 
@@ -2443,10 +2446,10 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
         .expect("missing python startup output");
 
     let output_text = startup_output.output.replace("\r\n", "\n");
-    // This assert that we are in a TTY.
+    // This asserts that the process is running in a TTY.
     assert!(
-        output_text.contains(">>>"),
-        "python prompt missing from seatbelt output: {output_text:?}"
+        output_text.contains("stdin_isatty=True"),
+        "python TTY marker missing from seatbelt output: {output_text:?}"
     );
 
     assert_eq!(
