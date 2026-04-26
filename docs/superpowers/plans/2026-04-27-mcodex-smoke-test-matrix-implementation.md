@@ -97,8 +97,14 @@ Out of scope for this first slice:
   `~/.mcodex` or `~/.codex`.
 - Smoke scripts must clear inherited `CODEX_HOME` except for the deliberate
   conflict row.
+- Smoke scripts must clear inherited `CODEX_SQLITE_HOME` on every product
+  invocation. `CODEX_SQLITE_HOME` overrides the SQLite state/log location and
+  can otherwise bypass the fixture home.
 - Smoke scripts must require or derive an explicit `MCODEX_BIN`; they must not
   silently test an unrelated `mcodex` on `PATH`.
+- `just` recipes should invoke smoke scripts with `sh`, and smoke scripts
+  should invoke the JSON helper with `python3`, so the plan does not depend on
+  executable bits being preserved for newly added script files.
 - Keep Python helper usage to the standard library; do not add a `jq`
   dependency.
 - Use fake credentials and fake account ids only.
@@ -182,6 +188,7 @@ Add a runbook with these sections:
   it is a real-account launch check.
 - Do not rely on `CODEX_HOME`.
 - Clear `CODEX_HOME` except for the home-conflict row.
+- Clear `CODEX_SQLITE_HOME` for every command in this runbook.
 - Do not intentionally exhaust real account quota.
 
 ## Capture Template
@@ -211,8 +218,13 @@ export SMOKE_ROOT="$(mktemp -d)"
 git rev-parse HEAD
 "$MCODEX_BIN" --version
 "$MCODEX_BIN" --help
-env -u CODEX_HOME MCODEX_HOME="$SMOKE_ROOT/empty" "$MCODEX_BIN" accounts status --json
-env MCODEX_HOME="$SMOKE_ROOT/mcodex" CODEX_HOME="$SMOKE_ROOT/codex" "$MCODEX_BIN" accounts status --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/empty" \
+  "$MCODEX_BIN" accounts status --json
+env -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/mcodex" \
+  CODEX_HOME="$SMOKE_ROOT/codex" \
+  "$MCODEX_BIN" accounts status --json
 ```
 
 The runbook must record the expected markers:
@@ -230,11 +242,63 @@ Document commands using the future fixture helper:
 ```bash
 cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
   seed --home "$SMOKE_ROOT/single" --scenario single-pool
-env -u CODEX_HOME MCODEX_HOME="$SMOKE_ROOT/single" "$MCODEX_BIN" accounts status --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/single" \
+  "$MCODEX_BIN" accounts status --json
 
 cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
   seed --home "$SMOKE_ROOT/multi" --scenario multi-pool
-env -u CODEX_HOME MCODEX_HOME="$SMOKE_ROOT/multi" "$MCODEX_BIN" accounts status --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/multi" \
+  "$MCODEX_BIN" accounts status --json
+
+cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
+  seed --home "$SMOKE_ROOT/default" --scenario multi-pool
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/default" \
+  "$MCODEX_BIN" accounts pool default set team-main
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/default" \
+  "$MCODEX_BIN" accounts status --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/default" \
+  "$MCODEX_BIN" accounts pool default clear
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/default" \
+  "$MCODEX_BIN" accounts status --json
+
+cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
+  seed --home "$SMOKE_ROOT/config-conflict" --scenario config-default-conflict
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/config-conflict" \
+  "$MCODEX_BIN" accounts status --json
+
+cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
+  seed --home "$SMOKE_ROOT/invalid-persisted" --scenario invalid-persisted-default
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/invalid-persisted" \
+  "$MCODEX_BIN" accounts status --json
+
+cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
+  seed --home "$SMOKE_ROOT/invalid-config" --scenario invalid-config-default
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/invalid-config" \
+  "$MCODEX_BIN" accounts status --json
+
+cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- \
+  seed --home "$SMOKE_ROOT/observability" --scenario observability
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/observability" \
+  "$MCODEX_BIN" accounts status --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/observability" \
+  "$MCODEX_BIN" accounts pool show --pool team-main --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/observability" \
+  "$MCODEX_BIN" accounts diagnostics --pool team-main --json
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/observability" \
+  "$MCODEX_BIN" accounts events --pool team-main --json
 ```
 
 The runbook must name the exact JSON markers from the spec:
@@ -244,16 +308,55 @@ The runbook must name the exact JSON markers from the spec:
 - `startup.startupAvailability == "invalidExplicitDefault"`
 - `startup.startupResolutionIssue.kind == "configDefaultPoolUnavailable"`
 - `startup.startupResolutionIssue.kind == "persistedDefaultPoolUnavailable"`
+- `startup.effectivePoolResolutionSource == "persistedSelection"` after
+  `accounts pool default set`
+- `startup.effectivePoolResolutionSource == "configDefault"` when a config
+  default conflicts with a different persisted default
+- `poolObservability.summary.totalAccounts == 2`
+- `summary.activeLeases == 1` for `accounts pool show --pool team-main --json`
 
 - [ ] **Step 4: Add manual TUI and installer notes**
 
-Add short manual rows for:
+Add exact manual rows for:
 
 - empty home startup
 - single pool startup
 - multi-pool default-required startup
 - pooled access paused/default-required surface
 - local installer wrapper identity
+
+Use commands like:
+
+```bash
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/empty-tui" \
+  "$MCODEX_BIN"
+
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/single" \
+  "$MCODEX_BIN"
+
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$SMOKE_ROOT/multi" \
+  "$MCODEX_BIN"
+
+MCODEX_ROOT="$SMOKE_ROOT/install-root" \
+  MCODEX_WRAPPER_DIR="$SMOKE_ROOT/wrappers" \
+  ./scripts/dev/install-local.sh
+PATH="$SMOKE_ROOT/wrappers:$PATH" command -v mcodex
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  PATH="$SMOKE_ROOT/wrappers:$PATH" \
+  MCODEX_HOME="$SMOKE_ROOT/wrapper-home" \
+  mcodex --version
+env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+  PATH="$SMOKE_ROOT/wrappers:$PATH" \
+  MCODEX_HOME="$SMOKE_ROOT/wrapper-home" \
+  mcodex accounts status --json
+```
+
+The installer row must capture `MCODEX_ROOT`, `MCODEX_WRAPPER_DIR`,
+`command -v mcodex`, wrapper path, installed binary path, version output, and
+the `MCODEX_HOME` used for the wrapper command.
 
 Do not make these automated yet. Require a screenshot or terminal capture for
 failures.
@@ -282,11 +385,13 @@ Expected: no whitespace errors.
 - Possible modify: `Cargo.lock`
 - Possible modify: `MODULE.bazel.lock`
 
-- [ ] **Step 1: Write failing fixture tests**
+- [ ] **Step 1: Create the crate skeleton and write failing fixture tests**
 
-Create `codex-rs/smoke-fixtures/src/lib.rs` with tests first. The tests should
-call library functions directly and then verify the resulting startup status
-with `StateRuntime`.
+Create the minimal crate files from Step 2 first, with `seed_fixture(...)`
+implemented as `todo!()` or returning an intentionally incomplete result. Then
+write tests in `codex-rs/smoke-fixtures/src/lib.rs`. The tests should call
+library functions directly and then verify the resulting startup status with
+`StateRuntime`.
 
 Start with these tests:
 
@@ -356,7 +461,9 @@ cd codex-rs
 cargo test -p codex-smoke-fixtures
 ```
 
-Expected: FAIL because the crate and helper do not exist yet.
+Expected red state: the `codex-smoke-fixtures` package is found and the tests
+fail because fixture behavior is not implemented. A package-not-found failure
+does not count as the TDD red state.
 
 - [ ] **Step 2: Register the fixture crate**
 
@@ -803,12 +910,12 @@ Run:
 
 ```bash
 printf '{"startup":{"effectivePoolResolutionSource":"singleVisiblePool","issue":null}}' \
-  | scripts/smoke/assert-json-path.py \
+  | python3 scripts/smoke/assert-json-path.py \
       --path startup.effectivePoolResolutionSource \
       --equals singleVisiblePool
 
 printf '{"startup":{"issue":null}}' \
-  | scripts/smoke/assert-json-path.py --path startup.issue --is-null
+  | python3 scripts/smoke/assert-json-path.py --path startup.issue --is-null
 ```
 
 Expected: both commands exit 0. Add a negative local check while developing,
@@ -859,17 +966,26 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 fixture() {
-  cargo run --quiet --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" \
+  echo "fixture_scenario=$2 fixture_home=$1" >&2
+  env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+    cargo run --quiet --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" \
     -p codex-smoke-fixtures -- seed \
     --home "$1" --scenario "$2" --json
 }
 
 status_json() {
-  env -u CODEX_HOME MCODEX_HOME="$1" "$MCODEX_BIN" accounts status --json
+  env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+    MCODEX_HOME="$1" "$MCODEX_BIN" accounts status --json
 }
 
 assert_path() {
-  printf '%s' "$1" | "$ASSERT_JSON" --path "$2" --equals "$3"
+  echo "assert path=$2 expected=$3"
+  printf '%s' "$1" | python3 "$ASSERT_JSON" --path "$2" --equals "$3"
+}
+
+assert_null() {
+  echo "assert path=$2 expected=null"
+  printf '%s' "$1" | python3 "$ASSERT_JSON" --path "$2" --is-null
 }
 
 echo "smoke=local"
@@ -883,15 +999,16 @@ echo "smoke_root=$SMOKE_ROOT"
 empty_home="$SMOKE_ROOT/empty"
 mkdir -p "$empty_home"
 empty_status=$(status_json "$empty_home")
-printf '%s' "$empty_status" | "$ASSERT_JSON" --path startup.effectivePoolId --is-null
+assert_null "$empty_status" startup.effectivePoolId
 
 codex_home="$SMOKE_ROOT/codex-home-with-pool"
 fixture "$codex_home" single-pool >/dev/null
 mcodex_home="$SMOKE_ROOT/mcodex-empty"
 mkdir -p "$mcodex_home"
-conflict_status=$(env MCODEX_HOME="$mcodex_home" CODEX_HOME="$codex_home" \
+conflict_status=$(env -u CODEX_SQLITE_HOME \
+  MCODEX_HOME="$mcodex_home" CODEX_HOME="$codex_home" \
   "$MCODEX_BIN" accounts status --json)
-printf '%s' "$conflict_status" | "$ASSERT_JSON" --path startup.effectivePoolId --is-null
+assert_null "$conflict_status" startup.effectivePoolId
 
 single_home="$SMOKE_ROOT/single"
 fixture "$single_home" single-pool >/dev/null
@@ -905,11 +1022,11 @@ assert_path "$multi_status" startup.startupAvailability multiplePoolsRequireDefa
 
 default_home="$SMOKE_ROOT/default"
 fixture "$default_home" multi-pool >/dev/null
-env -u CODEX_HOME MCODEX_HOME="$default_home" \
+env -u CODEX_HOME -u CODEX_SQLITE_HOME MCODEX_HOME="$default_home" \
   "$MCODEX_BIN" accounts pool default set team-main >/dev/null
 default_status=$(status_json "$default_home")
 assert_path "$default_status" startup.effectivePoolResolutionSource persistedSelection
-env -u CODEX_HOME MCODEX_HOME="$default_home" \
+env -u CODEX_HOME -u CODEX_SQLITE_HOME MCODEX_HOME="$default_home" \
   "$MCODEX_BIN" accounts pool default clear >/dev/null
 cleared_status=$(status_json "$default_home")
 assert_path "$cleared_status" startup.startupAvailability multiplePoolsRequireDefault
@@ -932,7 +1049,7 @@ In the root `justfile`, add:
 ```make
 [no-cd]
 smoke-mcodex-local *args:
-    ./scripts/smoke/mcodex-local.sh "$@"
+    sh ./scripts/smoke/mcodex-local.sh "$@"
 ```
 
 - [ ] **Step 3: Run the local smoke command**
@@ -990,13 +1107,25 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 fixture() {
-  cargo run --quiet --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" \
+  echo "fixture_scenario=$2 fixture_home=$1" >&2
+  env -u CODEX_HOME -u CODEX_SQLITE_HOME \
+    cargo run --quiet --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" \
     -p codex-smoke-fixtures -- seed \
     --home "$1" --scenario "$2" --json
 }
 
 run_mcodex() {
-  env -u CODEX_HOME MCODEX_HOME="$1" "$MCODEX_BIN" "$@"
+  env -u CODEX_HOME -u CODEX_SQLITE_HOME MCODEX_HOME="$1" "$MCODEX_BIN" "$@"
+}
+
+assert_path() {
+  echo "assert path=$2 expected=$3"
+  printf '%s' "$1" | python3 "$ASSERT_JSON" --path "$2" --equals "$3"
+}
+
+assert_not_null() {
+  echo "assert path=$2 expected=not-null"
+  printf '%s' "$1" | python3 "$ASSERT_JSON" --path "$2" --is-not-null
 }
 
 echo "smoke=cli"
@@ -1009,17 +1138,17 @@ home="$SMOKE_ROOT/observability"
 fixture "$home" observability >/dev/null
 
 status_json=$(run_mcodex "$home" accounts status --json)
-printf '%s' "$status_json" | "$ASSERT_JSON" --path poolObservability.summary.totalAccounts --equals 2
+assert_path "$status_json" poolObservability.summary.totalAccounts 2
 
 pool_json=$(run_mcodex "$home" accounts pool show --pool team-main --json)
-printf '%s' "$pool_json" | "$ASSERT_JSON" --path summary.totalAccounts --equals 2
-printf '%s' "$pool_json" | "$ASSERT_JSON" --path summary.activeLeases --equals 1
+assert_path "$pool_json" summary.totalAccounts 2
+assert_path "$pool_json" summary.activeLeases 1
 
 diagnostics_json=$(run_mcodex "$home" accounts diagnostics --pool team-main --json)
-printf '%s' "$diagnostics_json" | "$ASSERT_JSON" --path status --is-not-null
+assert_not_null "$diagnostics_json" status
 
 events_json=$(run_mcodex "$home" accounts events --pool team-main --json)
-printf '%s' "$events_json" | "$ASSERT_JSON" --path data --is-not-null
+assert_not_null "$events_json" data
 
 run_mcodex "$home" accounts pool show --pool team-main >/dev/null
 run_mcodex "$home" accounts diagnostics --pool team-main >/dev/null
@@ -1039,12 +1168,12 @@ In the root `justfile`, add:
 ```make
 [no-cd]
 smoke-mcodex-cli *args:
-    ./scripts/smoke/mcodex-cli.sh "$@"
+    sh ./scripts/smoke/mcodex-cli.sh "$@"
 
 [no-cd]
 smoke-mcodex-all *args:
-    ./scripts/smoke/mcodex-local.sh "$@"
-    ./scripts/smoke/mcodex-cli.sh "$@"
+    sh ./scripts/smoke/mcodex-local.sh "$@"
+    sh ./scripts/smoke/mcodex-cli.sh "$@"
 ```
 
 - [ ] **Step 3: Run the CLI smoke command**
@@ -1148,8 +1277,12 @@ Run:
 
 ```bash
 cd codex-rs
+just fix -p codex-smoke-fixtures
 just fmt
 ```
+
+Do not rerun tests after `just fix` or `just fmt`; this follows the repo's Rust
+workflow. If `just fix` changes code, inspect the diff before finalizing.
 
 If `Cargo.lock` or Bazel module locks changed, also run from repo root:
 
