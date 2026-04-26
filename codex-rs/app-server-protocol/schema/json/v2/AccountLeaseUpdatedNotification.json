@@ -1,5 +1,159 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AccountStartupAvailability": {
+      "enum": [
+        "available",
+        "suppressed",
+        "multiplePoolsRequireDefault",
+        "invalidExplicitDefault",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "AccountStartupCandidatePool": {
+      "properties": {
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": "string"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "displayName",
+        "poolId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "AccountStartupResolutionIssue": {
+      "properties": {
+        "candidatePoolCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "candidatePools": {
+          "items": {
+            "$ref": "#/definitions/AccountStartupCandidatePool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountStartupResolutionIssueSource"
+        },
+        "type": {
+          "$ref": "#/definitions/AccountStartupResolutionIssueType"
+        }
+      },
+      "required": [
+        "candidatePoolCount",
+        "candidatePools",
+        "message",
+        "poolId",
+        "source",
+        "type"
+      ],
+      "type": "object"
+    },
+    "AccountStartupResolutionIssueSource": {
+      "enum": [
+        "override",
+        "configDefault",
+        "persistedSelection",
+        "none"
+      ],
+      "type": "string"
+    },
+    "AccountStartupResolutionIssueType": {
+      "enum": [
+        "multiplePoolsRequireDefault",
+        "overridePoolUnavailable",
+        "configDefaultPoolUnavailable",
+        "persistedDefaultPoolUnavailable"
+      ],
+      "type": "string"
+    },
+    "AccountStartupSnapshot": {
+      "properties": {
+        "configuredDefaultPoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectivePoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectivePoolResolutionSource": {
+          "type": "string"
+        },
+        "persistedDefaultPoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selectionEligibility": {
+          "type": "string"
+        },
+        "startupAvailability": {
+          "$ref": "#/definitions/AccountStartupAvailability"
+        },
+        "startupResolutionIssue": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountStartupResolutionIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "configuredDefaultPoolId",
+        "effectivePoolId",
+        "effectivePoolResolutionSource",
+        "persistedDefaultPoolId",
+        "selectionEligibility",
+        "startupAvailability",
+        "startupResolutionIssue"
+      ],
+      "type": "object"
+    }
+  },
   "properties": {
     "accountId": {
       "type": [
@@ -47,11 +201,15 @@
         "null"
       ]
     },
+    "startup": {
+      "$ref": "#/definitions/AccountStartupSnapshot"
+    },
     "suppressed": {
       "type": "boolean"
     }
   },
   "required": [
+    "startup",
     "suppressed"
   ],
   "title": "AccountLeaseUpdatedNotification",

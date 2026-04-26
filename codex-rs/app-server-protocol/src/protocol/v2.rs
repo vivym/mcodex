@@ -1788,6 +1788,7 @@ pub struct AccountLeaseReadResponse {
     pub effective_pool_resolution_source: Option<String>,
     pub configured_default_pool_id: Option<String>,
     pub persisted_default_pool_id: Option<String>,
+    pub startup: AccountStartupSnapshot,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1795,12 +1796,112 @@ pub struct AccountLeaseReadResponse {
 #[ts(export_to = "v2/")]
 pub struct AccountLeaseResumeResponse {}
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountStartupAvailability {
+    Available,
+    Suppressed,
+    MultiplePoolsRequireDefault,
+    InvalidExplicitDefault,
+    Unavailable,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountStartupResolutionIssueType {
+    MultiplePoolsRequireDefault,
+    OverridePoolUnavailable,
+    ConfigDefaultPoolUnavailable,
+    PersistedDefaultPoolUnavailable,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub enum AccountStartupResolutionIssueSource {
+    Override,
+    ConfigDefault,
+    PersistedSelection,
+    None,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountStartupCandidatePool {
+    pub pool_id: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub display_name: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub status: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountStartupResolutionIssue {
+    #[serde(rename = "type")]
+    #[ts(rename = "type")]
+    pub r#type: AccountStartupResolutionIssueType,
+    pub source: AccountStartupResolutionIssueSource,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub pool_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<u32>")]
+    pub candidate_pool_count: Option<u32>,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<Vec<AccountStartupCandidatePool>>"
+    )]
+    pub candidate_pools: Option<Vec<AccountStartupCandidatePool>>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountStartupSnapshot {
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub effective_pool_id: Option<String>,
+    pub effective_pool_resolution_source: String,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub configured_default_pool_id: Option<String>,
+    #[schemars(required, schema_with = "nullable_field_schema::<String>")]
+    pub persisted_default_pool_id: Option<String>,
+    pub startup_availability: AccountStartupAvailability,
+    #[schemars(
+        required,
+        schema_with = "nullable_field_schema::<AccountStartupResolutionIssue>"
+    )]
+    pub startup_resolution_issue: Option<AccountStartupResolutionIssue>,
+    pub selection_eligibility: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountPoolReadParams {
     pub pool_id: String,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDefaultSetParams {
+    pub pool_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDefaultSetResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AccountPoolDefaultClearResponse {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -4166,6 +4267,7 @@ pub struct AccountLeaseUpdatedNotification {
     pub proactive_switch_suppressed: Option<bool>,
     #[ts(type = "number | null")]
     pub proactive_switch_allowed_at: Option<i64>,
+    pub startup: AccountStartupSnapshot,
 }
 
 impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
@@ -4179,6 +4281,7 @@ impl From<AccountLeaseReadResponse> for AccountLeaseUpdatedNotification {
             proactive_switch_pending: value.proactive_switch_pending,
             proactive_switch_suppressed: value.proactive_switch_suppressed,
             proactive_switch_allowed_at: value.proactive_switch_allowed_at,
+            startup: value.startup,
         }
     }
 }
@@ -6995,6 +7098,26 @@ mod tests {
                 message: None,
             }
         );
+    }
+
+    #[test]
+    fn account_startup_snapshot_serializes_nullable_fields() -> serde_json::Result<()> {
+        let snapshot = AccountStartupSnapshot {
+            effective_pool_id: Some("team-main".to_string()),
+            effective_pool_resolution_source: "singleVisiblePool".to_string(),
+            configured_default_pool_id: None,
+            persisted_default_pool_id: None,
+            startup_availability: AccountStartupAvailability::Available,
+            startup_resolution_issue: None,
+            selection_eligibility: "automaticAccountSelected".to_string(),
+        };
+
+        let value = serde_json::to_value(snapshot)?;
+        assert_eq!(value["effectivePoolId"], "team-main");
+        assert_eq!(value["configuredDefaultPoolId"], serde_json::Value::Null);
+        assert_eq!(value["startupResolutionIssue"], serde_json::Value::Null);
+
+        Ok(())
     }
 
     #[test]
