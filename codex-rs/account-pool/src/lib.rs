@@ -30,6 +30,8 @@ pub use backend::AccountPoolIssue;
 pub use backend::AccountPoolLease;
 pub use backend::AccountPoolObservabilityReader;
 pub use backend::AccountPoolQuota;
+pub use backend::AccountPoolQuotaFamily;
+pub use backend::AccountPoolQuotaWindow;
 pub use backend::AccountPoolReadRequest;
 pub use backend::AccountPoolReasonCode;
 pub use backend::AccountPoolSelection;

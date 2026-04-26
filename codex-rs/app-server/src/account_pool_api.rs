@@ -63,7 +63,9 @@ pub(crate) async fn list_account_pool_accounts(
     params: AccountPoolAccountsListParams,
 ) -> Result<AccountPoolAccountsListResponse, JSONRPCErrorError> {
     ensure_known_pool(config, &params.pool_id)?;
-    validate_account_cursor(params.cursor.as_deref())?;
+    if params.account_id.is_none() {
+        validate_account_cursor(params.cursor.as_deref())?;
+    }
 
     let Some(reader) = maybe_local_observability_reader(config).await? else {
         return Err(pool_not_found(&params.pool_id));
@@ -72,6 +74,7 @@ pub(crate) async fn list_account_pool_accounts(
     let page = reader
         .list_accounts(pool::AccountPoolAccountsListRequest {
             pool_id: params.pool_id,
+            account_id: params.account_id,
             cursor: params.cursor,
             limit: params.limit,
             states: params.states.map(|states| {

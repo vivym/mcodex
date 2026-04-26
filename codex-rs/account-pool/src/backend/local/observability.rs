@@ -30,6 +30,7 @@ impl AccountPoolObservabilityReader for LocalAccountPoolBackend {
         self.runtime
             .list_account_pool_accounts(codex_state::AccountPoolAccountsListQuery {
                 pool_id: request.pool_id,
+                account_id: request.account_id,
                 cursor: request.cursor,
                 limit: request.limit,
                 states: request.states.map(|states| {

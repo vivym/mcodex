@@ -28,6 +28,7 @@ pub struct AccountPoolSummaryRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountPoolAccountsListQuery {
     pub pool_id: String,
+    pub account_id: Option<String>,
     pub cursor: Option<String>,
     pub limit: Option<u32>,
     pub states: Option<Vec<String>>,
@@ -40,6 +41,7 @@ pub struct AccountPoolAccountRecord {
     pub account_id: String,
     pub backend_account_ref: Option<String>,
     pub account_kind: String,
+    pub selection_family: String,
     pub enabled: bool,
     pub health_state: Option<String>,
     pub operational_state: Option<String>,
@@ -48,6 +50,7 @@ pub struct AccountPoolAccountRecord {
     pub status_message: Option<String>,
     pub current_lease: Option<AccountPoolLeaseRecord>,
     pub quota: Option<AccountPoolQuotaRecord>,
+    pub quotas: Vec<AccountPoolQuotaFamilyRecord>,
     pub selection: Option<AccountPoolSelectionRecord>,
     pub updated_at: DateTime<Utc>,
 }
@@ -76,6 +79,25 @@ pub struct AccountPoolQuotaRecord {
     pub remaining_percent: Option<f64>,
     pub resets_at: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
+}
+
+/// Quota facts for one durable limit family surfaced on an account row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountPoolQuotaFamilyRecord {
+    pub limit_id: String,
+    pub primary: AccountPoolQuotaWindowRecord,
+    pub secondary: AccountPoolQuotaWindowRecord,
+    pub exhausted_windows: String,
+    pub predicted_blocked_until: Option<DateTime<Utc>>,
+    pub next_probe_after: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Window-level quota facts for a quota family.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountPoolQuotaWindowRecord {
+    pub used_percent: Option<f64>,
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 /// Startup-selection facts surfaced on an account row.

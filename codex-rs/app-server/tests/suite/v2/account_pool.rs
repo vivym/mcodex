@@ -48,13 +48,17 @@ use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::ThreadId;
 use codex_state::AccountPoolEventRecord;
+use codex_state::AccountQuotaStateRecord;
+use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::LegacyAccountImport;
+use codex_state::QuotaExhaustedWindows;
 use codex_state::StateRuntime;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
+use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +117,7 @@ async fn account_pool_accounts_list_returns_accounts_for_known_pool() -> Result<
         "accountPool/accounts/list",
         AccountPoolAccountsListParams {
             pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            account_id: None,
             cursor: None,
             limit: None,
             states: Some(vec![AccountOperationalState::Available]),
@@ -137,6 +142,106 @@ async fn account_pool_accounts_list_returns_accounts_for_known_pool() -> Result<
             .map(|selection| selection.eligible),
         Some(true)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_pool_accounts_list_returns_additive_quota_and_quotas_fields() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let runtime = seed_two_accounts(codex_home.path()).await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "codex", 82.0, 120))
+        .await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "chatgpt", 72.0, 180))
+        .await?;
+    let mut mcp = initialized_mcp(codex_home.path()).await?;
+
+    let response: Value = send_account_pool_request(
+        &mut mcp,
+        "accountPool/accounts/list",
+        json!({
+            "poolId": LEGACY_DEFAULT_POOL_ID,
+            "limit": 10,
+        }),
+    )
+    .await?;
+
+    assert!(response["data"][0]["quotas"].is_array());
+    assert_eq!(response["data"][0]["selectionFamily"], "chatgpt");
+    assert_eq!(response["data"][0]["quotas"][0]["limitId"], "chatgpt");
+    assert_eq!(response["data"][0]["quotas"][1]["limitId"], "codex");
+    assert!(response["data"][0].get("quota").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_pool_accounts_list_selection_family_comes_from_backend_family() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let runtime = seed_two_accounts(codex_home.path()).await?;
+    runtime
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: PRIMARY_ACCOUNT_ID.to_string(),
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "codex", 82.0, 120))
+        .await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "local", 72.0, 180))
+        .await?;
+    let mut mcp = initialized_mcp(codex_home.path()).await?;
+
+    let response: Value = send_account_pool_request(
+        &mut mcp,
+        "accountPool/accounts/list",
+        json!({
+            "poolId": LEGACY_DEFAULT_POOL_ID,
+            "accountId": PRIMARY_ACCOUNT_ID,
+        }),
+    )
+    .await?;
+
+    assert_eq!(response["data"].as_array().unwrap().len(), 1);
+    assert_eq!(response["data"][0]["accountKind"], "chatgpt");
+    assert_eq!(response["data"][0]["selectionFamily"], "local");
+    assert_eq!(response["data"][0]["quotas"][0]["limitId"], "codex");
+    assert_eq!(response["data"][0]["quotas"][1]["limitId"], "local");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_pool_accounts_list_account_id_filter_returns_single_row_without_cursor()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    seed_two_accounts(codex_home.path()).await?;
+    let mut mcp = initialized_mcp(codex_home.path()).await?;
+
+    let response: Value = send_account_pool_request(
+        &mut mcp,
+        "accountPool/accounts/list",
+        json!({
+            "poolId": LEGACY_DEFAULT_POOL_ID,
+            "accountId": SECONDARY_ACCOUNT_ID,
+            "cursor": "not-a-cursor",
+            "limit": 1,
+        }),
+    )
+    .await?;
+
+    assert_eq!(response["data"].as_array().unwrap().len(), 1);
+    assert_eq!(response["data"][0]["accountId"], SECONDARY_ACCOUNT_ID);
+    assert!(response["nextCursor"].is_null());
 
     Ok(())
 }
@@ -1289,6 +1394,28 @@ fn test_event(event_id: &str, occurred_at: i64) -> AccountPoolEventRecord {
         reason_code: None,
         message: format!("event {event_id}"),
         details_json: Some(json!({"source": "test"})),
+    }
+}
+
+fn test_quota_state(
+    account_id: &str,
+    limit_id: &str,
+    used_percent: f64,
+    resets_at: i64,
+) -> AccountQuotaStateRecord {
+    AccountQuotaStateRecord {
+        account_id: account_id.to_string(),
+        limit_id: limit_id.to_string(),
+        primary_used_percent: Some(used_percent),
+        primary_resets_at: Some(timestamp(resets_at)),
+        secondary_used_percent: Some(10.0),
+        secondary_resets_at: Some(timestamp(resets_at + 60)),
+        observed_at: timestamp(60),
+        exhausted_windows: QuotaExhaustedWindows::Primary,
+        predicted_blocked_until: Some(timestamp(resets_at)),
+        next_probe_after: Some(timestamp(resets_at - 30)),
+        probe_backoff_level: 1,
+        last_probe_result: None,
     }
 }
 

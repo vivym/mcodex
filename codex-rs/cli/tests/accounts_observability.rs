@@ -111,6 +111,36 @@ async fn accounts_pool_show_text_reports_accounts_none_for_empty_pool() -> Resul
 }
 
 #[tokio::test]
+async fn accounts_pool_show_renders_sorted_quota_families() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_quota_rows(&codex_home, ["codex", "chatgpt"]).await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "pool", "show", "--pool", "team-main"],
+    )
+    .await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("chatgpt"));
+    assert!(output.stdout.contains("codex"));
+    assert!(output.stdout.contains("secondary exhausted"));
+    let quotas = output
+        .stdout
+        .split_once("quotas:")
+        .map(|(_, quotas)| quotas)
+        .expect("quota rows");
+    let chatgpt = quotas.find("chatgpt").expect("chatgpt quota row");
+    let codex = quotas.find("codex").expect("codex quota row");
+    assert!(
+        chatgpt < codex,
+        "quota families should render sorted by family:\n{}",
+        output.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_diagnostics_rejects_conflicting_pool_flags() -> Result<()> {
     let codex_home = TempDir::new()?;
     let output = run_codex(
@@ -544,6 +574,64 @@ INSERT INTO account_quota_state (
     .bind(now)
     .execute(&pool)
     .await?;
+
+    Ok(())
+}
+
+async fn seed_quota_rows<const N: usize>(
+    codex_home: &TempDir,
+    limit_ids: [&'static str; N],
+) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
+    .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let primary_resets_at = now + 300;
+    let secondary_resets_at = now + 600;
+    let next_probe_after = now + 120;
+
+    for limit_id in limit_ids {
+        sqlx::query(
+            r#"
+INSERT INTO account_quota_state (
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind(limit_id)
+        .bind(42.0_f64)
+        .bind(primary_resets_at)
+        .bind(100.0_f64)
+        .bind(secondary_resets_at)
+        .bind(now)
+        .bind(now.saturating_mul(1_000_000_000))
+        .bind("secondary")
+        .bind(secondary_resets_at)
+        .bind(next_probe_after)
+        .bind(1_i64)
+        .bind(Some("still_blocked"))
+        .bind(now)
+        .execute(&pool)
+        .await?;
+    }
 
     Ok(())
 }
