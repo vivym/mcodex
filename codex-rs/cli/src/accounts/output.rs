@@ -473,7 +473,7 @@ fn quota_account_eligibility(
     is_preferred: bool,
 ) -> Option<EligibilityView> {
     let account = observed_account(pool_observability, &account.account_id)?;
-    quota_eligibility_from_families(&account.quotas, is_preferred)
+    quota_eligibility_from_families(&account.quotas, account.account_kind.as_str(), is_preferred)
 }
 
 fn observed_account<'a>(
@@ -489,12 +489,26 @@ fn observed_account<'a>(
 
 fn quota_eligibility_from_families(
     quotas: &[PoolQuotaFamilyView],
+    selection_family: &str,
     is_preferred: bool,
 ) -> Option<EligibilityView> {
-    if quotas.is_empty() {
-        return None;
-    }
-    if quotas.iter().any(|quota| quota.next_probe_after_is_future) {
+    let selection_family = if selection_family.is_empty() {
+        "codex"
+    } else {
+        selection_family
+    };
+    let quota = quotas
+        .iter()
+        .find(|quota| quota.limit_id == selection_family)
+        .or_else(|| {
+            if selection_family == "codex" {
+                None
+            } else {
+                quotas.iter().find(|quota| quota.limit_id == "codex")
+            }
+        })?;
+
+    if quota.next_probe_after_is_future {
         return Some(quota_eligibility_view(
             is_preferred,
             "probeThrottle",
@@ -503,10 +517,7 @@ fn quota_eligibility_from_families(
             "preferred account is waiting for the next quota probe",
         ));
     }
-    if quotas
-        .iter()
-        .any(|quota| matches!(quota.exhausted_windows.as_str(), "secondary" | "both"))
-    {
+    if matches!(quota.exhausted_windows.as_str(), "secondary" | "both") {
         return Some(quota_eligibility_view(
             is_preferred,
             "secondaryWindowBlocked",
@@ -515,10 +526,7 @@ fn quota_eligibility_from_families(
             "preferred account is blocked by the secondary quota window",
         ));
     }
-    if quotas
-        .iter()
-        .any(|quota| quota.exhausted_windows.as_str() == "primary")
-    {
+    if quota.exhausted_windows.as_str() == "primary" {
         return Some(quota_eligibility_view(
             is_preferred,
             "primaryWindowBlocked",
@@ -527,10 +535,7 @@ fn quota_eligibility_from_families(
             "preferred account is blocked by the primary quota window",
         ));
     }
-    if quotas
-        .iter()
-        .any(|quota| quota.exhausted_windows.as_str() == "unknown")
-    {
+    if quota.exhausted_windows.as_str() == "unknown" {
         return Some(quota_eligibility_view(
             is_preferred,
             "quotaWindowBlocked",

@@ -918,15 +918,30 @@ fn status_account_lease_display_from_response(
     let quota_families = account
         .map(|account| status_account_quota_families_from_response(&account.quotas, captured_at))
         .unwrap_or_default();
-    let next_probe_after = account
-        .and_then(|account| {
-            account
-                .quotas
-                .iter()
-                .filter_map(|quota| quota.next_probe_after)
-                .filter(|timestamp| *timestamp > captured_at.timestamp())
-                .min()
-        })
+    let effective_quota_family = account.and_then(|account| {
+        let selection_family = if account.account_kind.is_empty() {
+            "codex"
+        } else {
+            account.account_kind.as_str()
+        };
+        account
+            .quotas
+            .iter()
+            .find(|quota| quota.limit_id == selection_family)
+            .or_else(|| {
+                if selection_family == "codex" {
+                    None
+                } else {
+                    account
+                        .quotas
+                        .iter()
+                        .find(|quota| quota.limit_id == "codex")
+                }
+            })
+    });
+    let next_probe_after = effective_quota_family
+        .and_then(|quota| quota.next_probe_after)
+        .filter(|timestamp| *timestamp > captured_at.timestamp())
         .and_then(|timestamp| format_local_timestamp(timestamp, captured_at));
     let has_proactive_switch_note = response.proactive_switch_pending == Some(true)
         && response.proactive_switch_suppressed == Some(true);
@@ -973,7 +988,8 @@ fn status_account_lease_display_from_response(
     };
     let proactive_switch_note = has_proactive_switch_note
         .then(|| "Automatic switch held by minimum switch interval".to_string());
-    let quota_note = account_quota_note(&quota_families);
+    let quota_note =
+        effective_quota_family.and_then(|quota| account_quota_note(quota, captured_at));
 
     Some(StatusAccountLeaseDisplay {
         pool_id: response.pool_id,
@@ -1017,26 +1033,23 @@ fn status_account_lease_display_from_response_and_hydration_result(
     status_account_lease_display_from_response(response, account.as_ref(), captured_at)
 }
 
-fn account_quota_note(quotas: &[StatusAccountQuotaFamilyDisplay]) -> Option<String> {
-    if quotas.iter().any(|quota| quota.next_probe_after.is_some()) {
+fn account_quota_note(
+    quota: &AccountPoolQuotaFamilyResponse,
+    captured_at: chrono::DateTime<Local>,
+) -> Option<String> {
+    if quota
+        .next_probe_after
+        .is_some_and(|timestamp| timestamp > captured_at.timestamp())
+    {
         return Some("Quota probe throttle active".to_string());
     }
-    if quotas
-        .iter()
-        .any(|quota| matches!(quota.exhausted_windows.as_str(), "secondary" | "both"))
-    {
+    if matches!(quota.exhausted_windows.as_str(), "secondary" | "both") {
         return Some("Blocked by secondary quota window".to_string());
     }
-    if quotas
-        .iter()
-        .any(|quota| quota.exhausted_windows.as_str() == "primary")
-    {
+    if quota.exhausted_windows.as_str() == "primary" {
         return Some("Blocked by primary quota window".to_string());
     }
-    if quotas
-        .iter()
-        .any(|quota| quota.exhausted_windows.as_str() == "unknown")
-    {
+    if quota.exhausted_windows.as_str() == "unknown" {
         return Some("Blocked by quota window".to_string());
     }
     None
@@ -2297,6 +2310,122 @@ mod tests {
                     predicted_blocked_until: Some("04:04".to_string()),
                     next_probe_after: None,
                 }],
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_uses_account_family_for_quota_note() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let next_probe_after = (captured_at + chrono::Duration::minutes(20))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let blocked_until = (captured_at + chrono::Duration::hours(1))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let account = AccountPoolAccountResponse {
+            account_id: "acct-1".to_string(),
+            backend_account_ref: None,
+            account_kind: "chatgpt".to_string(),
+            enabled: true,
+            health_state: Some("healthy".to_string()),
+            operational_state: Some(
+                codex_app_server_protocol::AccountOperationalState::CoolingDown,
+            ),
+            allocatable: Some(false),
+            status_reason_code: None,
+            status_message: None,
+            current_lease: None,
+            quota: None,
+            quotas: vec![
+                quota_family(
+                    "codex",
+                    "secondary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    Some(next_probe_after),
+                ),
+                quota_family(
+                    "chatgpt",
+                    "primary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    /*next_probe_after*/ None,
+                ),
+            ],
+            selection: None,
+            updated_at: captured_at.with_timezone(&chrono::Utc).timestamp(),
+        };
+
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: None,
+                health_state: Some("healthy".to_string()),
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                effective_pool_resolution_source: None,
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+            },
+            Some(&account),
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Waiting · Healthy".to_string(),
+                note: Some("Blocked by primary quota window".to_string()),
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                next_probe_after: None,
+                remote_reset: None,
+                quota_families: vec![
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "chatgpt".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "primary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: None,
+                    },
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "codex".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "secondary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: Some("03:24".to_string()),
+                    },
+                ],
             })
         );
     }
