@@ -529,13 +529,10 @@ fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
 }
 
 fn local_default_pool_set_error(err: anyhow::Error) -> JSONRPCErrorError {
-    if matches!(
-        err.downcast_ref::<LocalDefaultPoolSetError>(),
-        Some(LocalDefaultPoolSetError::PoolNotVisible { .. })
-    ) {
+    if let Some(typed_err) = err.downcast_ref::<LocalDefaultPoolSetError>() {
         return JSONRPCErrorError {
             code: INVALID_PARAMS_ERROR_CODE,
-            message: err.to_string(),
+            message: typed_err.to_string(),
             data: None,
         };
     }
@@ -558,6 +555,22 @@ mod tests {
         ));
 
         assert_eq!(error.code, INTERNAL_ERROR_CODE);
+    }
+
+    #[test]
+    fn local_default_pool_set_error_uses_typed_pool_message_after_context() {
+        let error = local_default_pool_set_error(
+            anyhow::Error::new(LocalDefaultPoolSetError::PoolNotVisible {
+                pool_id: "missing-pool".to_string(),
+            })
+            .context("set local default account pool"),
+        );
+
+        assert_eq!(error.code, INVALID_PARAMS_ERROR_CODE);
+        assert_eq!(
+            error.message,
+            "pool missing-pool is not visible in local startup inventory"
+        );
     }
 
     #[test]
