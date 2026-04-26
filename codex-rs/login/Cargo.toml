@@ -14,7 +14,6 @@ base64 = { workspace = true }
 age = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-app-server-protocol = { workspace = true }
-codex-api = { workspace = true }
 codex-client = { workspace = true }
 codex-config = { workspace = true }
 codex-keyring-store = { workspace = true }
@@ -24,6 +23,7 @@ codex-product-identity = { workspace = true }
 codex-protocol = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-utils-template = { workspace = true }
+ed25519-dalek = { workspace = true }
 once_cell = { workspace = true }
 os_info = { workspace = true }
 rand = { workspace = true }
@@ -46,7 +46,6 @@ urlencoding = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 core_test_support = { workspace = true }
 keyring = { workspace = true }
 pretty_assertions = { workspace = true }

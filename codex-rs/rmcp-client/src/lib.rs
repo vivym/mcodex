@@ -1,10 +1,12 @@
 mod auth_status;
 mod elicitation_client_service;
+mod executor_process_transport;
 mod logging_client_handler;
 mod oauth;
 mod perform_oauth_login;
 mod program_resolver;
 mod rmcp_client;
+mod stdio_server_launcher;
 #[path = "bin/test_stdio_server.rs"]
 mod test_stdio_server;
 mod utils;
@@ -31,4 +33,7 @@ pub use rmcp_client::ListToolsWithConnectorIdResult;
 pub use rmcp_client::RmcpClient;
 pub use rmcp_client::SendElicitation;
 pub use rmcp_client::ToolWithConnectorId;
+pub use stdio_server_launcher::ExecutorStdioServerLauncher;
+pub use stdio_server_launcher::LocalStdioServerLauncher;
+pub use stdio_server_launcher::StdioServerLauncher;
 pub use test_stdio_server::run_test_stdio_server;

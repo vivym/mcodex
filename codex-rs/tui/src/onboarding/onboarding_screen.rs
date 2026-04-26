@@ -4,6 +4,8 @@ use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::ServerNotification;
+use codex_exec_server::LOCAL_FS;
+use codex_git_utils::resolve_root_git_project_for_trust;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
 use crossterm::event::KeyCode;
@@ -86,11 +88,11 @@ pub(crate) struct OnboardingResult {
 }
 
 impl OnboardingScreen {
-    pub(crate) fn new(tui: &mut Tui, args: OnboardingScreenArgs) -> Self {
-        Self::new_with_frame_requester(tui.frame_requester(), args)
+    pub(crate) async fn new(tui: &mut Tui, args: OnboardingScreenArgs) -> Self {
+        Self::new_with_frame_requester(tui.frame_requester(), args).await
     }
 
-    pub(crate) fn new_with_frame_requester(
+    pub(crate) async fn new_with_frame_requester(
         request_frame: FrameRequester,
         args: OnboardingScreenArgs,
     ) -> Self {
@@ -178,8 +180,13 @@ impl OnboardingScreen {
         let show_windows_create_sandbox_hint = false;
         let highlighted = TrustDirectorySelection::Trust;
         if show_trust_screen {
+            let trust_target = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &config.cwd)
+                .await
+                .map(Into::into)
+                .unwrap_or_else(|| cwd.clone());
             steps.push(Step::TrustDirectory(TrustDirectoryWidget {
                 cwd,
+                trust_target,
                 codex_home,
                 show_windows_create_sandbox_hint,
                 should_quit: false,
@@ -598,7 +605,7 @@ pub(crate) async fn run_onboarding_app(
 ) -> Result<OnboardingResult> {
     use tokio_stream::StreamExt;
 
-    let mut onboarding_screen = OnboardingScreen::new(tui, args);
+    let mut onboarding_screen = OnboardingScreen::new(tui, args).await;
     // One-time guard to fully clear the screen after ChatGPT login success message is shown
     let mut did_full_clear_after_success = false;
     let mut reload_config_after_notice = false;
@@ -831,7 +838,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         assert_eq!(step_names(&screen), vec!["welcome", "pooled-only"]);
         assert_snapshot!(
             "pooled_only_notice_screen_initial",
@@ -869,7 +876,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         assert_eq!(step_names(&screen), vec!["welcome", "pooled-only"]);
 
         screen.handle_key_event(crossterm::event::KeyEvent::new(
@@ -900,7 +907,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         *auth_widget_mut(&mut screen).sign_in_state.write().unwrap() =
             SignInState::ChatGptSuccessMessage;
 
@@ -929,7 +936,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         *auth_widget_mut(&mut screen).sign_in_state.write().unwrap() =
             SignInState::ApiKeyConfigured;
 
@@ -955,7 +962,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         screen.handle_key_event(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('n'),
             KeyModifiers::NONE,

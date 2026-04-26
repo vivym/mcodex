@@ -1,4 +1,5 @@
 param(
+    [Alias("Release")]
     [Parameter(Position = 0)]
     [string]$Version = "latest"
 )
@@ -9,6 +10,14 @@ function Write-Step {
     )
 
     Write-Host "==> $Message"
+}
+
+function Write-WarningStep {
+    param(
+        [string]$Message
+    )
+
+    Write-Warning $Message
 }
 
 function Write-Utf8File {
@@ -32,6 +41,14 @@ function Convert-ToSingleQuotedLiteral {
     )
 
     return "'{0}'" -f $Value.Replace("'", "''")
+}
+
+function Convert-ToCmdSetLiteral {
+    param(
+        [string]$Value
+    )
+
+    return ($Value -replace "\^", "^^") -replace "%", "%%"
 }
 
 function Get-Timestamp {
@@ -104,8 +121,9 @@ function Get-InstallConfig {
         CurrentLink = Join-Path $baseRoot "current"
         MetadataFile = Join-Path $baseRoot "install.json"
         WrapperDir = $wrapperDir
-        WrapperPath = Join-Path $wrapperDir "mcodex.ps1"
+        WrapperPath = Join-Path $wrapperDir "mcodex.cmd"
         DownloadBaseUrl = $downloadBaseUrl.TrimEnd("/")
+        LockPath = Join-Path $baseRoot "install.lock"
     }
 }
 
@@ -154,7 +172,7 @@ function Resolve-LatestVersion {
     return $manifest.version
 }
 
-function Resolve-RequestedVersion {
+function Resolve-Version {
     param(
         [string]$RequestedVersion,
         [string]$DownloadBaseUrl
@@ -167,6 +185,15 @@ function Resolve-RequestedVersion {
 
     Assert-ValidVersion -NormalizedVersion $normalizedVersion -RequestedVersion $RequestedVersion
     return $normalizedVersion
+}
+
+function Resolve-RequestedVersion {
+    param(
+        [string]$RequestedVersion,
+        [string]$DownloadBaseUrl
+    )
+
+    return Resolve-Version -RequestedVersion $RequestedVersion -DownloadBaseUrl $DownloadBaseUrl
 }
 
 function Path-Contains {
@@ -411,6 +438,129 @@ function Publish-VersionDirectory {
     Remove-Item -LiteralPath $backupPath -Recurse -Force
 }
 
+function Add-JunctionSupportType {
+    if (([System.Management.Automation.PSTypeName]'McodexInstaller.Junction').Type) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace McodexInstaller
+{
+    public static class Junction
+    {
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        private const uint FSCTL_SET_REPARSE_POINT = 0x000900A4;
+        private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+        private const int HeaderLength = 20;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string lpFileName,
+            uint dwDesiredAccess,
+            uint dwShareMode,
+            IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition,
+            uint dwFlagsAndAttributes,
+            IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DeviceIoControl(
+            SafeFileHandle hDevice,
+            uint dwIoControlCode,
+            byte[] lpInBuffer,
+            int nInBufferSize,
+            IntPtr lpOutBuffer,
+            int nOutBufferSize,
+            out int lpBytesReturned,
+            IntPtr lpOverlapped);
+
+        public static void SetTarget(string linkPath, string targetPath)
+        {
+            string substituteName = "\\??\\" + Path.GetFullPath(targetPath);
+            byte[] substituteNameBytes = Encoding.Unicode.GetBytes(substituteName);
+            if (substituteNameBytes.Length > ushort.MaxValue - HeaderLength) {
+                throw new ArgumentException("Junction target path is too long.", "targetPath");
+            }
+
+            byte[] reparseBuffer = new byte[substituteNameBytes.Length + HeaderLength];
+            WriteUInt32(reparseBuffer, 0, IO_REPARSE_TAG_MOUNT_POINT);
+            WriteUInt16(reparseBuffer, 4, checked((ushort)(substituteNameBytes.Length + 12)));
+            WriteUInt16(reparseBuffer, 8, 0);
+            WriteUInt16(reparseBuffer, 10, checked((ushort)substituteNameBytes.Length));
+            WriteUInt16(reparseBuffer, 12, checked((ushort)(substituteNameBytes.Length + 2)));
+            WriteUInt16(reparseBuffer, 14, 0);
+            Buffer.BlockCopy(substituteNameBytes, 0, reparseBuffer, 16, substituteNameBytes.Length);
+
+            using (SafeFileHandle handle = CreateFileW(
+                linkPath,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero))
+            {
+                if (handle.IsInvalid) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                int bytesReturned;
+                if (!DeviceIoControl(
+                    handle,
+                    FSCTL_SET_REPARSE_POINT,
+                    reparseBuffer,
+                    reparseBuffer.Length,
+                    IntPtr.Zero,
+                    0,
+                    out bytesReturned,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+            }
+        }
+
+        private static void WriteUInt16(byte[] buffer, int offset, ushort value)
+        {
+            buffer[offset] = (byte)value;
+            buffer[offset + 1] = (byte)(value >> 8);
+        }
+
+        private static void WriteUInt32(byte[] buffer, int offset, uint value)
+        {
+            buffer[offset] = (byte)value;
+            buffer[offset + 1] = (byte)(value >> 8);
+            buffer[offset + 2] = (byte)(value >> 16);
+            buffer[offset + 3] = (byte)(value >> 24);
+        }
+    }
+}
+"@
+}
+
+function Set-JunctionTarget {
+    param(
+        [string]$LinkPath,
+        [string]$TargetPath
+    )
+
+    Add-JunctionSupportType
+    [McodexInstaller.Junction]::SetTarget($LinkPath, $TargetPath)
+}
+
 function Test-IsJunction {
     param(
         [string]$Path
@@ -421,53 +571,53 @@ function Test-IsJunction {
     }
 
     $item = Get-Item -LiteralPath $Path -Force
-    return $item.PSIsContainer -and (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    return ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $item.LinkType -eq "Junction"
 }
 
-function Switch-CurrentJunction {
+function Ensure-Junction {
     param(
-        [string]$BaseRoot,
-        [string]$CurrentLink,
-        [string]$TargetDir
+        [string]$LinkPath,
+        [string]$TargetPath,
+        [string]$InstallerOwnedTargetPrefix
     )
 
-    if ((Test-Path -LiteralPath $CurrentLink) -and -not (Test-IsJunction -Path $CurrentLink)) {
-        throw "$CurrentLink exists and is not a junction. Move it aside and rerun the installer."
+    if (-not (Test-Path -LiteralPath $LinkPath)) {
+        New-Item -ItemType Junction -Path $LinkPath -Target $TargetPath | Out-Null
+        return
     }
 
-    $currentLeaf = Split-Path $CurrentLink -Leaf
-    $tempLeaf = ".current.{0}.tmp" -f [System.Guid]::NewGuid().ToString("N")
-    $backupLeaf = ".current.{0}.bak" -f [System.Guid]::NewGuid().ToString("N")
-    $tempPath = Join-Path $BaseRoot $tempLeaf
-    $backupPath = Join-Path $BaseRoot $backupLeaf
-
-    New-Item -ItemType Junction -Path $tempPath -Target $TargetDir | Out-Null
-    try {
-        if (Test-Path -LiteralPath $CurrentLink) {
-            Rename-Item -LiteralPath $CurrentLink -NewName $backupLeaf
-            try {
-                Rename-Item -LiteralPath $tempPath -NewName $currentLeaf
-            } catch {
-                if (Test-Path -LiteralPath $CurrentLink) {
-                    Remove-Item -LiteralPath $CurrentLink -Recurse -Force
-                }
-                if (Test-Path -LiteralPath $backupPath) {
-                    Rename-Item -LiteralPath $backupPath -NewName $currentLeaf
-                }
-                throw
+    $item = Get-Item -LiteralPath $LinkPath -Force
+    if (Test-IsJunction -Path $LinkPath) {
+        $existingTarget = [string]$item.Target
+        if (-not [string]::IsNullOrWhiteSpace($InstallerOwnedTargetPrefix)) {
+            $ownedTargetPrefix = $InstallerOwnedTargetPrefix.TrimEnd("\")
+            if (-not $existingTarget.StartsWith($ownedTargetPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to retarget junction at $LinkPath because it is not managed by this installer."
             }
-
-            Remove-Item -LiteralPath $backupPath -Recurse -Force
+        }
+        if ($existingTarget.Equals($TargetPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             return
         }
 
-        Rename-Item -LiteralPath $tempPath -NewName $currentLeaf
-    } catch {
-        if (Test-Path -LiteralPath $tempPath) {
-            Remove-Item -LiteralPath $tempPath -Recurse -Force
-        }
-        throw
+        Set-JunctionTarget -LinkPath $LinkPath -TargetPath $TargetPath
+        return
     }
+
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to replace non-junction reparse point at $LinkPath."
+    }
+
+    if ($item.PSIsContainer) {
+        if ((Get-ChildItem -LiteralPath $LinkPath -Force | Select-Object -First 1) -ne $null) {
+            throw "Refusing to replace non-empty directory at $LinkPath with a junction."
+        }
+
+        Remove-Item -LiteralPath $LinkPath -Force
+        New-Item -ItemType Junction -Path $LinkPath -Target $TargetPath | Out-Null
+        return
+    }
+
+    throw "Refusing to replace file at $LinkPath with a junction."
 }
 
 function Write-Wrapper {
@@ -476,23 +626,34 @@ function Write-Wrapper {
         [string]$WrapperPath
     )
 
-    $baseRootLiteral = Convert-ToSingleQuotedLiteral -Value $BaseRoot
+    $baseRootLiteral = Convert-ToCmdSetLiteral -Value $BaseRoot
     $wrapper = @'
-$BaseRoot = if ($env:MCODEX_INSTALL_ROOT) { $env:MCODEX_INSTALL_ROOT } else { __BASE_ROOT_LITERAL__ }
-$Target = Join-Path $BaseRoot "current\bin\mcodex.exe"
-if (-not (Test-Path -LiteralPath $Target)) {
-    Write-Error "mcodex installation missing or corrupted; rerun the installer."
-    exit 1
-}
-$env:MCODEX_INSTALL_MANAGED = "1"
-$env:MCODEX_INSTALL_METHOD = "script"
-$env:MCODEX_INSTALL_ROOT = $BaseRoot
-$env:Path = "$(Join-Path $BaseRoot "current\bin");$env:Path"
-& $Target @args
-exit $LASTEXITCODE
+@echo off
+setlocal
+set "BaseRoot=%MCODEX_INSTALL_ROOT%"
+if not defined BaseRoot set "BaseRoot=__BASE_ROOT_LITERAL__"
+set "Target=%BaseRoot%\current\bin\mcodex.exe"
+if not exist "%Target%" (
+    echo mcodex installation missing or corrupted; rerun the installer. 1>&2
+    exit /b 1
+)
+set "MCODEX_INSTALL_MANAGED=1"
+set "MCODEX_INSTALL_METHOD=script"
+set "MCODEX_INSTALL_ROOT=%BaseRoot%"
+set "PATH=%BaseRoot%\current\bin;%PATH%"
+"%Target%" %*
+exit /b %ERRORLEVEL%
 '@.Replace("__BASE_ROOT_LITERAL__", $baseRootLiteral)
 
     Write-Utf8File -Path $WrapperPath -Content $wrapper
+
+    $legacyWrapperPath = [System.IO.Path]::ChangeExtension($WrapperPath, ".ps1")
+    if (Test-Path -LiteralPath $legacyWrapperPath -PathType Leaf) {
+        $legacyWrapper = Get-Content -LiteralPath $legacyWrapperPath -Raw
+        if ($legacyWrapper.Contains("MCODEX_INSTALL_MANAGED") -and $legacyWrapper.Contains("current\bin\mcodex.exe")) {
+            Remove-Item -LiteralPath $legacyWrapperPath -Force
+        }
+    }
 }
 
 function Write-InstallMetadata {
@@ -549,6 +710,155 @@ function Add-WrapperDirToUserPath {
     return $pathUpdate
 }
 
+function Invoke-WithInstallLock {
+    param(
+        [string]$LockPath,
+        [scriptblock]$Script
+    )
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LockPath) | Out-Null
+    $lock = $null
+    while ($null -eq $lock) {
+        try {
+            $lock = [System.IO.File]::Open(
+                $LockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+
+    try {
+        & $Script
+    } finally {
+        $lock.Dispose()
+    }
+}
+
+function Remove-StaleInstallArtifacts {
+    param(
+        [string]$VersionsDir,
+        [string]$BaseRoot
+    )
+
+    if (Test-Path -LiteralPath $VersionsDir -PathType Container) {
+        Get-ChildItem -LiteralPath $VersionsDir -Force -Directory -Filter ".staging.*" -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $VersionsDir -Force -Directory -Filter ".replace.*.old" -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path -LiteralPath $BaseRoot -PathType Container) {
+        Get-ChildItem -LiteralPath $BaseRoot -Force -Directory -Filter ".current.*" -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-VersionFromBinary {
+    param(
+        [string]$BinaryPath
+    )
+
+    if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $versionOutput = & $BinaryPath --version 2>$null
+    } catch {
+        return $null
+    }
+
+    if ($versionOutput -match '([0-9][0-9A-Za-z.+-]*)$') {
+        return $Matches[1]
+    }
+
+    return $null
+}
+
+function Get-CurrentInstalledVersion {
+    param(
+        [string]$CurrentLink
+    )
+
+    return Get-VersionFromBinary -BinaryPath (Join-Path $CurrentLink "bin\mcodex.exe")
+}
+
+function Get-ExistingMcodexCommand {
+    $existing = Get-Command mcodex -ErrorAction SilentlyContinue
+    if ($null -eq $existing) {
+        return $null
+    }
+
+    return $existing.Source
+}
+
+function Get-ConflictingInstall {
+    param(
+        [string]$WrapperPath,
+        [string]$CurrentBinaryPath
+    )
+
+    $existingPath = Get-ExistingMcodexCommand
+    if ([string]::IsNullOrWhiteSpace($existingPath)) {
+        return $null
+    }
+
+    if ($existingPath.Equals($WrapperPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $existingPath.Equals($CurrentBinaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $null
+    }
+
+    Write-Step "Detected existing mcodex command at $existingPath"
+    Write-WarningStep "Multiple mcodex installs can be ambiguous because PATH order decides which one runs."
+
+    return [PSCustomObject]@{
+        Path = $existingPath
+    }
+}
+
+function Test-InstalledBinary {
+    param(
+        [string]$BinaryPath
+    )
+
+    if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+        throw "Installed mcodex binary is missing: $BinaryPath"
+    }
+
+    & $BinaryPath --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed mcodex command failed verification: $BinaryPath --version"
+    }
+}
+
+function Print-LaunchInstructions {
+    param(
+        [string]$PathAction,
+        [string]$WrapperDir
+    )
+
+    switch ($PathAction) {
+        "added" {
+            Write-Step "Current PowerShell session: `$env:Path = `"$WrapperDir;`$env:Path`"; mcodex"
+            Write-Step "Future PowerShell windows: open a new PowerShell window and run: mcodex"
+            Write-Step "PATH was added to the user environment."
+        }
+        "configured" {
+            Write-Step "Current PowerShell session: `$env:Path = `"$WrapperDir;`$env:Path`"; mcodex"
+            Write-Step "Future PowerShell windows: open a new PowerShell window and run: mcodex"
+            Write-Step "PATH is already configured in the user environment."
+        }
+        default {
+            Write-Step "Current PowerShell session: mcodex"
+            Write-Step "Future PowerShell windows: open a new PowerShell window and run: mcodex"
+        }
+    }
+}
+
 function Invoke-McodexInstall {
     param(
         [string]$Version = "latest"
@@ -563,37 +873,56 @@ function Invoke-McodexInstall {
 
         $platform = Get-PlatformDetails
         $config = Get-InstallConfig
+        $resolvedVersion = Resolve-Version -RequestedVersion $Version -DownloadBaseUrl $config.DownloadBaseUrl
+        $currentVersion = Get-CurrentInstalledVersion -CurrentLink $config.CurrentLink
 
-        Write-Step "Installing mcodex CLI"
+        if (-not [string]::IsNullOrWhiteSpace($currentVersion) -and $currentVersion -ne $resolvedVersion) {
+            Write-Step "Updating mcodex CLI from $currentVersion to $resolvedVersion"
+        } elseif (-not [string]::IsNullOrWhiteSpace($currentVersion)) {
+            Write-Step "Updating mcodex CLI"
+        } else {
+            Write-Step "Installing mcodex CLI"
+        }
         Write-Step "Detected platform: $($platform.PlatformLabel)"
+        Write-Step "Resolved version: $resolvedVersion"
 
         New-Item -ItemType Directory -Force -Path $config.BaseRoot, $config.VersionsDir | Out-Null
 
-        $resolvedVersion = Resolve-RequestedVersion -RequestedVersion $Version -DownloadBaseUrl $config.DownloadBaseUrl
+        $conflictingInstall = Get-ConflictingInstall `
+            -WrapperPath $config.WrapperPath `
+            -CurrentBinaryPath (Join-Path $config.CurrentLink "bin\mcodex.exe")
         $tmpRoot = New-TemporaryDirectory -ParentPath $config.BaseRoot -Prefix ".install"
         $stagingDir = $null
 
         try {
-            $checksumsPath = Join-Path $tmpRoot "SHA256SUMS"
-            Download-File -Url "$($config.DownloadBaseUrl)/repositories/mcodex/releases/$resolvedVersion/SHA256SUMS" -OutFile $checksumsPath
+            Invoke-WithInstallLock -LockPath $config.LockPath -Script {
+                Remove-StaleInstallArtifacts -VersionsDir $config.VersionsDir -BaseRoot $config.BaseRoot
 
-            $expectedSha = Get-ExpectedSha256 -ChecksumsPath $checksumsPath -ArchiveName $platform.ArchiveName
-            if ([string]::IsNullOrWhiteSpace($expectedSha)) {
-                throw "No checksum entry found for $($platform.ArchiveName)."
+                $checksumsPath = Join-Path $tmpRoot "SHA256SUMS"
+                Download-File -Url "$($config.DownloadBaseUrl)/repositories/mcodex/releases/$resolvedVersion/SHA256SUMS" -OutFile $checksumsPath
+
+                $expectedSha = Get-ExpectedSha256 -ChecksumsPath $checksumsPath -ArchiveName $platform.ArchiveName
+                if ([string]::IsNullOrWhiteSpace($expectedSha)) {
+                    throw "No checksum entry found for $($platform.ArchiveName)."
+                }
+
+                $versionDir = Join-Path $config.VersionsDir $resolvedVersion
+                if (-not (Test-VersionDirectoryComplete -Directory $versionDir -Version $resolvedVersion -ArchiveName $platform.ArchiveName -Sha256 $expectedSha)) {
+                    if (Test-Path -LiteralPath $versionDir) {
+                        Write-WarningStep "Found incomplete existing release at $versionDir. Reinstalling."
+                    }
+
+                    $stagingDir = Stage-VersionDirectory -Config $config -Version $resolvedVersion -ArchiveName $platform.ArchiveName -ExpectedSha $expectedSha
+                    Publish-VersionDirectory -VersionDir $versionDir -StagingDir $stagingDir
+                    $stagingDir = $null
+                }
+
+                Ensure-Junction -LinkPath $config.CurrentLink -TargetPath $versionDir -InstallerOwnedTargetPrefix $config.VersionsDir
+                Write-Wrapper -BaseRoot $config.BaseRoot -WrapperPath $config.WrapperPath
+                Write-InstallMetadata -MetadataFile $config.MetadataFile -Version $resolvedVersion -InstalledAt (Get-Timestamp) -BaseRoot $config.BaseRoot -VersionsDir $config.VersionsDir -CurrentLink $config.CurrentLink -WrapperPath $config.WrapperPath
+                Test-InstalledBinary -BinaryPath (Join-Path $config.CurrentLink "bin\mcodex.exe")
             }
 
-            $versionDir = Join-Path $config.VersionsDir $resolvedVersion
-            Write-Step "Installing mcodex CLI $resolvedVersion"
-
-            if (-not (Test-VersionDirectoryComplete -Directory $versionDir -Version $resolvedVersion -ArchiveName $platform.ArchiveName -Sha256 $expectedSha)) {
-                $stagingDir = Stage-VersionDirectory -Config $config -Version $resolvedVersion -ArchiveName $platform.ArchiveName -ExpectedSha $expectedSha
-                Publish-VersionDirectory -VersionDir $versionDir -StagingDir $stagingDir
-                $stagingDir = $null
-            }
-
-            Switch-CurrentJunction -BaseRoot $config.BaseRoot -CurrentLink $config.CurrentLink -TargetDir $versionDir
-            Write-Wrapper -BaseRoot $config.BaseRoot -WrapperPath $config.WrapperPath
-            Write-InstallMetadata -MetadataFile $config.MetadataFile -Version $resolvedVersion -InstalledAt (Get-Timestamp) -BaseRoot $config.BaseRoot -VersionsDir $config.VersionsDir -CurrentLink $config.CurrentLink -WrapperPath $config.WrapperPath
             $pathAction = Add-WrapperDirToUserPath -WrapperDir $config.WrapperDir
         } finally {
             if ($stagingDir -and (Test-Path -LiteralPath $stagingDir)) {
@@ -604,15 +933,20 @@ function Invoke-McodexInstall {
             }
         }
 
+        if ($null -ne $conflictingInstall) {
+            Write-WarningStep "Leaving the existing mcodex command installed at $($conflictingInstall.Path)."
+        }
+
         switch ($pathAction.Action) {
             "added" {
-                Write-Step "PATH updated for future PowerShell sessions."
+                Print-LaunchInstructions -PathAction "added" -WrapperDir $config.WrapperDir
             }
             "configured" {
-                Write-Step "PATH is already configured for future PowerShell sessions."
+                Print-LaunchInstructions -PathAction "configured" -WrapperDir $config.WrapperDir
             }
             default {
                 Write-Step "$($config.WrapperDir) is already on PATH."
+                Print-LaunchInstructions -PathAction "already" -WrapperDir $config.WrapperDir
             }
         }
 

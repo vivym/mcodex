@@ -1,5 +1,4 @@
 use super::*;
-use crate::codex::make_session_and_context;
 use crate::function_tool::FunctionCallError;
 use crate::plugins::PluginInstallRequest;
 use crate::plugins::PluginsManager;
@@ -7,6 +6,9 @@ use crate::plugins::test_support::load_plugins_config;
 use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_openai_curated_marketplace;
 use crate::plugins::test_support::write_plugins_feature_config;
+use crate::session::session::Session;
+use crate::session::tests::make_session_and_context;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
@@ -97,8 +99,8 @@ fn fake_access_token(chatgpt_account_id: &str) -> String {
 }
 
 fn function_invocation(
-    session: Arc<crate::codex::Session>,
-    turn: Arc<crate::codex::TurnContext>,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
     arguments: serde_json::Value,
 ) -> ToolInvocation {
     ToolInvocation {

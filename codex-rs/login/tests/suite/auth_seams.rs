@@ -88,6 +88,7 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_r
                 account_id: Some("acct-1".to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;
@@ -110,6 +111,7 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_account_r
                 account_id: Some("acct-2".to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;
@@ -151,6 +153,7 @@ pub(crate) async fn local_lease_scoped_session_refresh_fails_closed_on_lease_epo
                 account_id: Some("acct-1".to_string()),
             }),
             last_refresh: Some(Utc::now()),
+            agent_identity: None,
         },
         AuthCredentialsStoreMode::File,
     )?;

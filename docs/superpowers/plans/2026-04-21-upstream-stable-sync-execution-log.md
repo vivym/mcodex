@@ -36,12 +36,12 @@ Plan: docs/superpowers/plans/2026-04-21-upstream-stable-sync-implementation.md
 
 ## Final Artifact Checklist
 
-- [ ] Cargo.lock reviewed or regenerated
-- [ ] MODULE.bazel.lock refreshed when dependencies changed
+- [x] Cargo.lock reviewed or regenerated
+- [x] MODULE.bazel.lock refreshed when dependencies changed
 - [ ] config schema regenerated when config types changed
 - [ ] app-server schemas regenerated when protocol changed
-- [ ] TUI snapshots reviewed and accepted when UI changed
-- [ ] release/update/install paths checked for mcodex/OSS behavior
+- [x] TUI snapshots reviewed and accepted when UI changed
+- [x] release/update/install paths checked for mcodex/OSS behavior
 - [ ] full workspace test run locally or deferred to required CI with approval
 
 ## rust-v0.121.0 Checkpoint
@@ -206,3 +206,141 @@ Plan: docs/superpowers/plans/2026-04-21-upstream-stable-sync-implementation.md
   - `gpt-5.4 xhigh` review of the Python seatbelt helper, account-pool timing fixes, and shutdown-path updates: no findings
   - `gpt-5.4 xhigh` review of the websocket / rmcp / pooled-auth test updates: no findings
   - `gpt-5.4 xhigh` review of the `cli_stream` test relocation into `codex-cli`: no findings
+
+## rust-v0.121.0 Merge Commit
+
+- Merge commit: `8ca673d4ae3f355d30a5f7a4adc1abf85a0ab720`
+- Commit subject: `Merge tag 'rust-v0.121.0' into sync/rust-v0.121.0-base`
+
+## rust-v0.122.0 Final Merge
+
+- Merge command: `git merge --no-ff --no-commit rust-v0.122.0`
+- Merge started at: 2026-04-22 15:30:37 +0800; base HEAD `8ca673d4ae3f355d30a5f7a4adc1abf85a0ab720`; target rust-v0.122.0 tag `9e1c5b03525a2bedacac533dceb84ecaed0561e6`, peeled commit `230dcadee609fa99d6162fe1107457030e5270a7`
+- Unresolved conflicts:
+  - `codex-rs/Cargo.lock`
+  - `codex-rs/Cargo.toml`
+  - `codex-rs/app-server-protocol/schema/json/ClientRequest.json`
+  - `codex-rs/app-server-protocol/schema/typescript/ClientRequest.ts`
+  - `codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts`
+  - `codex-rs/app-server/README.md`
+  - `codex-rs/app-server/tests/common/mcp_process.rs`
+  - `codex-rs/app-server/tests/suite/v2/command_exec.rs`
+  - `codex-rs/app-server/tests/suite/v2/realtime_conversation.rs`
+  - `codex-rs/app-server/tests/suite/v2/turn_start.rs`
+  - `codex-rs/cli/src/login.rs`
+  - `codex-rs/cli/src/main.rs`
+  - `codex-rs/core/Cargo.toml`
+  - `codex-rs/core/src/client.rs`
+  - `codex-rs/core/src/client_tests.rs`
+  - `codex-rs/core/src/codex.rs`
+  - `codex-rs/core/src/config_loader/layer_io.rs`
+  - `codex-rs/core/src/config_loader/mod.rs`
+  - `codex-rs/core/src/guardian/tests.rs`
+  - `codex-rs/core/src/mcp_openai_file.rs`
+  - `codex-rs/core/src/plugins/manager.rs`
+  - `codex-rs/core/src/session/tests.rs`
+  - `codex-rs/core/src/tasks/compact.rs`
+  - `codex-rs/exec-server/tests/exec_process.rs`
+  - `codex-rs/login/src/auth/mod.rs`
+  - `codex-rs/login/tests/suite/mod.rs`
+  - `codex-rs/rmcp-client/src/lib.rs`
+  - `codex-rs/state/src/lib.rs`
+  - `codex-rs/tui/src/app.rs`
+  - `codex-rs/tui/src/app/app_server_adapter.rs`
+  - `codex-rs/tui/src/app_server_session.rs`
+  - `codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_uses_runtime_preview_values.snap`
+  - `codex-rs/tui/src/debug_config.rs`
+  - `codex-rs/tui/src/history_cell.rs`
+  - `codex-rs/tui/src/onboarding/onboarding_screen.rs`
+  - `codex-rs/tui/src/slash_command.rs`
+  - `codex-rs/tui/src/tooltips.rs`
+  - `codex-rs/tui/src/update_action.rs`
+  - `docs/config.md`
+  - `scripts/install/install.ps1`
+  - `scripts/install/install.sh`
+
+## rust-v0.122.0 Progress Update - 2026-04-22
+
+- Resolved and staged the `core` merge cluster:
+  - migrated remaining test/helper imports from `crate::codex::*` to `crate::session::*`
+  - deleted `codex-rs/core/src/codex.rs` from the merge after confirming `lib.rs` no longer includes that module
+  - staged resolved `core` conflict files including:
+    - `codex-rs/core/Cargo.toml`
+    - `codex-rs/core/src/client.rs`
+    - `codex-rs/core/src/client_tests.rs`
+    - `codex-rs/core/src/config_loader/layer_io.rs`
+    - `codex-rs/core/src/config_loader/mod.rs`
+    - `codex-rs/core/src/guardian/tests.rs`
+    - `codex-rs/core/src/mcp_openai_file.rs`
+    - `codex-rs/core/src/plugins/manager.rs`
+    - `codex-rs/core/src/session/tests.rs`
+    - `codex-rs/core/src/tasks/compact.rs`
+- Resolved and staged the `cli/login` merge cluster:
+  - `codex-rs/cli/src/login.rs`
+  - `codex-rs/cli/src/main.rs`
+  - `codex-rs/login/src/auth/mod.rs`
+  - `codex-rs/login/tests/suite/mod.rs`
+- `cli/login` merge policy:
+  - kept fork `mcodex` branding in help and user-facing login examples
+  - kept fork pooled-startup suppression after logout
+  - adopted upstream `logout_with_revoke(...)` behavior
+  - adopted upstream `plugin` subcommand structure and Windows update-action execution path
+  - kept upstream thread-id-based resume hint while preserving `mcodex` command branding
+- Resolved and staged additional previously-clean conflict files:
+  - `codex-rs/exec-server/tests/exec_process.rs`
+  - `codex-rs/rmcp-client/src/lib.rs`
+  - `codex-rs/state/src/lib.rs`
+- Active subagent ownership during this phase:
+  - `Zeno` (`019db478-6d56-7c13-ae03-d6be52aef3ef`): `app-server/protocol` conflict group
+  - `Locke` (`019db478-6d8a-7c70-972f-a865ce968dc3`): `tui` conflict group
+  - `Wegener` (`019db47b-84f4-71e0-adff-42c5ceb568e0`): `install/docs/manifest` conflict group
+
+## rust-v0.122.0 Verification and Regression Follow-Up
+
+- Installer / docs compatibility fixes:
+  - `scripts/install/install.ps1`: switched the managed Windows launcher from `mcodex.ps1` to `mcodex.cmd`, added `Convert-ToCmdSetLiteral(...)` for safe `%` / `^` escaping, preserved `Resolve-RequestedVersion(...)` as a compatibility alias, and removed only legacy managed `mcodex.ps1` wrappers that pointed at `current\\bin\\mcodex.exe`.
+  - `scripts/install/install.sh`: stopped treating normalized `vlatest` / `rust-vlatest` as a valid latest-channel alias; only empty input or raw `latest` now resolves via `resolve_latest_version`.
+  - `scripts/install/test_install_scripts.py`: updated wrapper expectations to `.cmd`, added legacy wrapper cleanup coverage, and taught the fake Unix archive binary to answer `--version`.
+  - `codex-rs/app-server/README.md`: refreshed manual invocations to `mcodex app-server`.
+- Core / runtime / CLI sync fixes:
+  - `codex-rs/core/src/client.rs`: restored the upstream provider shape by upcasting auth providers to `codex_login::SharedAuthProvider`.
+  - `codex-rs/core/src/session/mod.rs`, `session/session.rs`, `session/turn.rs`, `session_startup_prewarm.rs`: preserved the fork account-pool runtime while adopting upstream session layout; pooled turns now reset inherited websocket sessions before reuse, startup websocket prewarm is skipped in pooled mode, rate-limit snapshots are reported to the account-pool manager before local state emission, usage-limit / unauthorized failures are reported immediately, and exhausted-auth 401 paths return directly instead of falling through generic retry logic.
+  - `codex-rs/core/src/tasks/review.rs`: test coverage now constructs the model provider with the shared auth manager so leased review sessions still use the expected auth path.
+  - `codex-rs/cli/tests/accounts.rs` and `accounts_observability.rs`: seeded `account_quota_state` for the busy preferred account so CLI health output reflects upstream quota-state semantics.
+  - `codex-rs/cli/tests/debug_models.rs`, `marketplace_remove.rs`, `marketplace_upgrade.rs`: switched helpers from `CODEX_HOME` to `MCODEX_HOME` and explicitly removed `CODEX_HOME`.
+  - `codex-rs/cli/tests/runtime_display_identity.rs`: updated the root help expectation to upstream's current `Manage mcodex plugins` wording.
+- App-server / TUI follow-up fixes after merge completion:
+  - `codex-rs/app-server/tests/suite/v2/account_lease.rs`: waited for the rotated turn's `turn/completed` notification before asserting the follow-up `accountLease/updated` event so the test matches the stabilized live-snapshot timing after automatic recovery.
+  - `codex-rs/app-server/src/lib.rs`: replaced the per-loop `shutdown_signal()` construction with a persistent `ShutdownSignalListener` for the processor lifetime. This closes the race where a second `SIGINT` / `SIGTERM` could be missed between graceful-drain loop iterations, leaving the process stuck in graceful drain until the running turn finished.
+  - `codex-rs/tui/src/status/tests.rs`: updated the one stale `new_status_output_with_rate_limits_handle(...)` callsite to pass the new `account_lease_display` argument introduced upstream.
+  - `codex-rs/tui` snapshots: reviewed and accepted the status-card snapshot refresh caused by the merged versioned runtime identity; the accepted diffs were version-label updates from `v0.0.0` to `v0.122.0` plus snapshot metadata churn.
+- Focused review:
+  - `gpt-5.4 xhigh` subagent review of the websocket forced-restart tests identified the `shutdown_signal()` rearm window as the most likely root cause for the earlier intermittent second-signal timeout; the persistent-listener fix above was applied against that root cause.
+- Verification:
+  - `python3 scripts/install/test_install_scripts.py` passed: `Ran 30 tests`, `OK (skipped=7)`
+  - `cargo test -p codex-app-server-protocol` passed
+  - `cargo test -p codex-login` passed
+  - `cargo test -p codex-core --test all suite::account_pool -- --nocapture` passed: `29 passed`
+  - focused pooled/websocket regression coverage passed:
+    - `cargo test -p codex-core pooled_mode_does_not_schedule_startup_prewarm_websocket -- --exact`
+    - `cargo test -p codex-core pooled_websocket_rotation_opens_new_connection_when_context_is_reused -- --exact`
+    - `cargo test -p codex-core pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket -- --exact`
+    - `cargo test -p codex-core websocket_fallback_in_pooled_mode_uses_leased_account_for_first_websocket_attempt -- --exact`
+  - `cargo test -p codex-core` passed fully: unit tests `1710 passed`; integration tests `991 passed`; `responses_headers` `4 passed`
+  - `cargo test -p codex-cli --test accounts` passed
+  - `cargo test -p codex-cli --test accounts_observability` passed
+  - `cargo test -p codex-cli` passed
+  - `cargo test -p codex-app-server --test all suite::v2::connection_handling_websocket_unix:: -- --nocapture` passed: `4 passed`
+  - `cargo test -p codex-app-server` passed fully: unit tests `168 passed`; integration tests `398 passed`; doc tests `0 failed`
+  - `cargo test -p codex-tui` passed fully: unit tests `1765 passed`; integration tests `11 passed + 1 manager regression passed`; doc tests `0 failed`
+  - `just bazel-lock-check` passed
+  - post-verification hygiene passed:
+    - `just fmt`
+    - `just fix -p codex-app-server`
+    - `just fix -p codex-core`
+    - `just fix -p codex-cli`
+    - `just fix -p codex-tui`
+    - `just fix -p codex-login`
+    - `git diff --check`
+- Remaining release gate note:
+  - a full workspace `cargo test` / `just test` run was not executed locally because repo instructions require asking before the workspace-wide test suite. Package-level verification across the touched merge surface was completed instead.

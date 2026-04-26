@@ -281,6 +281,24 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
         ACCOUNT_LEASE_ROTATION_TIMEOUT,
     )
     .await?;
+    timeout(
+        ACCOUNT_LEASE_ROTATION_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "turn/completed for rotated account turn",
+            |notification| {
+                notification.method == "turn/completed"
+                    && notification
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("turn"))
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(second_turn.id.as_str())
+            },
+        ),
+    )
+    .await
+    .context("timed out waiting for rotated turn/completed notification")??;
     let notification = match timeout(
         ACCOUNT_LEASE_ROTATION_TIMEOUT,
         mcp.read_stream_until_matching_notification(
@@ -316,25 +334,6 @@ async fn account_lease_updated_emits_when_automatic_switch_changes_live_snapshot
     assert_eq!(updated.account_id.as_deref(), Some(SECONDARY_ACCOUNT_ID));
     assert_eq!(updated.pool_id.as_deref(), Some("legacy-default"));
     assert_eq!(updated.suppressed, false);
-
-    timeout(
-        ACCOUNT_LEASE_ROTATION_TIMEOUT,
-        mcp.read_stream_until_matching_notification(
-            "turn/completed for rotated account turn",
-            |notification| {
-                notification.method == "turn/completed"
-                    && notification
-                        .params
-                        .as_ref()
-                        .and_then(|params| params.get("turn"))
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(second_turn.id.as_str())
-            },
-        ),
-    )
-    .await
-    .context("timed out waiting for rotated turn/completed notification")??;
 
     Ok(())
 }

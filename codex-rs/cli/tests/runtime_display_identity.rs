@@ -38,7 +38,7 @@ async fn runtime_display_identity_help_uses_mcodex_identity() -> Result<()> {
     assert!(stdout.contains("mcodex CLI"));
     assert!(stdout.contains("Run mcodex non-interactively"));
     assert!(stdout.contains("Manage external MCP servers for mcodex"));
-    assert!(stdout.contains("Manage plugin marketplaces for mcodex"));
+    assert!(stdout.contains("Manage mcodex plugins"));
     assert!(stdout.contains("Start mcodex as an MCP server (stdio)"));
     assert!(stdout.contains("Run commands within a mcodex-provided sandbox"));
     assert!(stdout.contains("Apply the latest diff produced by the mcodex agent"));

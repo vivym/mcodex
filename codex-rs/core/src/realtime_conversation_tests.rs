@@ -3,7 +3,7 @@ use super::RealtimeSessionKind;
 use super::build_realtime_session_config;
 use super::realtime_text_from_handoff_request;
 use super::wrap_realtime_delegation_input;
-use crate::codex::make_session_and_context;
+use crate::session::tests::make_session_and_context;
 use async_channel::bounded;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;

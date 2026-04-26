@@ -1,3 +1,4 @@
+mod agent_assertion;
 mod auth_provider;
 pub mod default_client;
 pub mod error;
@@ -9,7 +10,9 @@ mod lease_scoped_session;
 mod leased_auth;
 mod legacy_auth_view;
 mod manager;
+mod revoke;
 
+pub use agent_assertion::AgentTaskAuthorizationTarget;
 pub use auth_provider::AuthProvider;
 pub use auth_provider::AuthRecovery;
 pub use auth_provider::AuthRecoveryStepResult;

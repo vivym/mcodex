@@ -160,21 +160,42 @@ enum ShutdownAction {
     Finish,
 }
 
-async fn shutdown_signal() -> IoResult<()> {
-    #[cfg(unix)]
-    {
+#[cfg(unix)]
+struct ShutdownSignalListener {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignalListener;
+
+#[cfg(unix)]
+impl ShutdownSignalListener {
+    fn new() -> IoResult<Self> {
         use tokio::signal::unix::SignalKind;
         use tokio::signal::unix::signal;
 
-        let mut term = signal(SignalKind::terminate())?;
-        tokio::select! {
-            ctrl_c_result = tokio::signal::ctrl_c() => ctrl_c_result,
-            _ = term.recv() => Ok(()),
-        }
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
 
-    #[cfg(not(unix))]
-    {
+    async fn recv(&mut self) -> IoResult<()> {
+        tokio::select! {
+            _ = self.interrupt.recv() => Ok(()),
+            _ = self.terminate.recv() => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl ShutdownSignalListener {
+    fn new() -> IoResult<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> IoResult<()> {
         tokio::signal::ctrl_c().await
     }
 }
@@ -301,21 +322,16 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
         /*include_disabled*/ true,
     ) {
-        if !matches!(layer.name, ConfigLayerSource::Project { .. })
-            || layer.disabled_reason.is_none()
-        {
+        let ConfigLayerSource::Project { dot_codex_folder } = &layer.name else {
             continue;
-        }
-        if let ConfigLayerSource::Project { dot_codex_folder } = &layer.name {
-            disabled_folders.push((
-                dot_codex_folder.as_path().display().to_string(),
-                layer
-                    .disabled_reason
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "config.toml is disabled.".to_string()),
-            ));
-        }
+        };
+        let Some(disabled_reason) = &layer.disabled_reason else {
+            continue;
+        };
+        disabled_folders.push((
+            dot_codex_folder.as_path().display().to_string(),
+            disabled_reason.clone(),
+        ));
     }
 
     if disabled_folders.is_empty() {
@@ -323,8 +339,8 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
     }
 
     let mut message = concat!(
-        "Project config.toml files are disabled in the following folders. ",
-        "Settings in those files are ignored, but skills and exec policies still load.\n",
+        "Project-local config, hooks, and exec policies are disabled in the following folders ",
+        "until the project is trusted, but skills still load.\n",
     )
     .to_string();
     for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
@@ -467,12 +483,14 @@ pub async fn run_main_with_transport(
         Err(err) => {
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
-            Config::load_default_with_cli_overrides(cli_kv_overrides.clone()).map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?
+            Config::load_default_with_cli_overrides(cli_kv_overrides.clone())
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("error loading default config after config error: {e}"),
+                    )
+                })?
         }
     };
 
@@ -680,6 +698,9 @@ pub async fn run_main_with_transport(
         info!("outbound router task exited (channel closed)");
     });
 
+    let mut shutdown_signal_listener = graceful_signal_restart_enabled
+        .then(ShutdownSignalListener::new)
+        .transpose()?;
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(outgoing_tx));
         let outbound_control_tx = outbound_control_tx;
@@ -727,7 +748,13 @@ pub async fn run_main_with_transport(
                 }
 
                 tokio::select! {
-                    shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                    shutdown_signal_result = async {
+                        if let Some(shutdown_signal_listener) = shutdown_signal_listener.as_mut() {
+                            shutdown_signal_listener.recv().await
+                        } else {
+                            std::future::pending::<IoResult<()>>().await
+                        }
+                    }, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         if let Err(err) = shutdown_signal_result {
                             warn!("failed to listen for shutdown signal during graceful restart drain: {err}");
                         }

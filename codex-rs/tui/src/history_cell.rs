@@ -62,9 +62,11 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
@@ -1201,6 +1203,8 @@ pub(crate) fn new_session_info(
     let SessionConfiguredEvent {
         model,
         reasoning_effort,
+        approval_policy,
+        sandbox_policy,
         ..
     } = event;
     // Header box rendered as history (so it appears at the very top)
@@ -1210,7 +1214,8 @@ pub(crate) fn new_session_info(
         show_fast_status,
         config.cwd.to_path_buf(),
         CODEX_CLI_VERSION,
-    );
+    )
+    .with_yolo_mode(has_yolo_permissions(approval_policy, &sandbox_policy));
     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
     if is_first_event {
@@ -1278,6 +1283,17 @@ pub(crate) fn new_session_info(
     SessionInfoCell(CompositeHistoryCell { parts })
 }
 
+pub(crate) fn is_yolo_mode(config: &Config) -> bool {
+    has_yolo_permissions(
+        config.permissions.approval_policy.value(),
+        config.permissions.sandbox_policy.get(),
+    )
+}
+
+fn has_yolo_permissions(approval_policy: AskForApproval, sandbox_policy: &SandboxPolicy) -> bool {
+    approval_policy == AskForApproval::Never && *sandbox_policy == SandboxPolicy::DangerFullAccess
+}
+
 pub(crate) fn new_user_prompt(
     message: String,
     text_elements: Vec<TextElement>,
@@ -1300,6 +1316,7 @@ pub(crate) struct SessionHeaderHistoryCell {
     reasoning_effort: Option<ReasoningEffortConfig>,
     show_fast_status: bool,
     directory: PathBuf,
+    yolo_mode: bool,
 }
 
 impl SessionHeaderHistoryCell {
@@ -1335,7 +1352,13 @@ impl SessionHeaderHistoryCell {
             reasoning_effort,
             show_fast_status,
             directory,
+            yolo_mode: false,
         }
+    }
+
+    pub(crate) fn with_yolo_mode(mut self, yolo_mode: bool) -> Self {
+        self.yolo_mode = yolo_mode;
+        self
     }
 
     fn format_directory(&self, max_width: Option<usize>) -> String {
@@ -1396,7 +1419,12 @@ impl HistoryCell for SessionHeaderHistoryCell {
         const CHANGE_MODEL_HINT_COMMAND: &str = "/model";
         const CHANGE_MODEL_HINT_EXPLANATION: &str = " to change";
         const DIR_LABEL: &str = "directory:";
-        let label_width = DIR_LABEL.len();
+        const PERMISSIONS_LABEL: &str = "permissions:";
+        let label_width = if self.yolo_mode {
+            DIR_LABEL.len().max(PERMISSIONS_LABEL.len())
+        } else {
+            DIR_LABEL.len()
+        };
 
         let model_label = format!(
             "{model_label:<label_width$}",
@@ -1430,12 +1458,20 @@ impl HistoryCell for SessionHeaderHistoryCell {
         let dir = self.format_directory(Some(dir_max_width));
         let dir_spans = vec![Span::from(dir_prefix).dim(), Span::from(dir)];
 
-        let lines = vec![
+        let mut lines = vec![
             make_row(title_spans),
             make_row(Vec::new()),
             make_row(model_spans),
             make_row(dir_spans),
         ];
+
+        if self.yolo_mode {
+            let permissions_label = format!("{PERMISSIONS_LABEL:<label_width$}");
+            lines.push(make_row(vec![
+                Span::from(format!("{permissions_label} ")).dim(),
+                "YOLO mode".magenta().bold(),
+            ]));
+        }
 
         with_border(lines)
     }
@@ -4048,6 +4084,23 @@ mod tests {
         let network_rendered = render_lines(&network.display_lines(/*width*/ 120)).join("\n");
         assert!(network_rendered.contains("mcodex network access to"));
         assert!(!network_rendered.contains("Codex network access to"));
+    }
+
+    #[test]
+    fn session_header_indicates_yolo_mode() {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-5".to_string(),
+            /*reasoning_effort*/ None,
+            /*show_fast_status*/ false,
+            test_path_buf("/tmp/project").abs().to_path_buf(),
+            "test",
+        )
+        .with_yolo_mode(/*yolo_mode*/ true);
+
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+        assert!(rendered.contains(">_ mcodex (vtest)"));
+        assert!(rendered.contains("permissions: YOLO mode"));
+        assert!(!rendered.contains("OpenAI Codex"));
     }
 
     #[test]

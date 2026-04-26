@@ -1226,6 +1226,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
     }
@@ -1255,6 +1256,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
     }
@@ -1284,6 +1286,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
     }
@@ -1330,6 +1333,7 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
     }
@@ -1412,6 +1416,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
@@ -1484,6 +1489,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
@@ -1554,6 +1560,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -1751,6 +1758,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
@@ -1786,6 +1794,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -1841,6 +1850,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1891,6 +1901,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -1945,6 +1956,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -2000,6 +2012,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
@@ -2055,6 +2068,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
         let payload_bytes = cache_payload_bytes(&cache_file.signed_payload).expect("payload bytes");
@@ -2143,6 +2157,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             }))
         );
 
@@ -2170,6 +2185,7 @@ enabled = false
                 rules: None,
                 enforce_residency: None,
                 network: None,
+                permissions: None,
             })
         );
     }

@@ -17,12 +17,12 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_utils_template::Template;
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Constrained;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
@@ -306,12 +306,13 @@ mod tests {
     use super::normalize_review_template_line_endings;
     use super::render_review_exit_success;
     use super::start_review_conversation;
-    use crate::codex::make_session_and_context;
+    use crate::session::tests::make_session_and_context;
     use crate::tasks::SessionTaskContext;
     use base64::Engine;
     use codex_login::LeasedTurnAuth;
     use codex_login::auth::LeaseAuthBinding;
     use codex_login::auth::LeaseScopedAuthSession;
+    use codex_model_provider::create_model_provider;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::user_input::UserInput;
     use core_test_support::responses::ev_assistant_message;
@@ -446,7 +447,10 @@ mod tests {
             TestLeaseScopedAuthSession::new("review-pooled-account"),
         )));
         turn.config = Arc::clone(&config);
-        turn.provider = config.model_provider.clone();
+        turn.provider = create_model_provider(
+            config.model_provider.clone(),
+            Some(Arc::clone(&session.services.auth_manager)),
+        );
         let session = Arc::new(session);
 
         let receiver = start_review_conversation(

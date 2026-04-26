@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::SessionTask;
 use super::SessionTaskContext;
-use crate::codex::TurnContext;
+use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
@@ -31,7 +31,8 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> Option<String> {
         let session = session.clone_session();
-        let use_remote_compact = crate::compact::should_use_remote_compact_task(&ctx.provider);
+        let use_remote_compact =
+            crate::compact::should_use_remote_compact_task(ctx.provider.info());
         let pooled_mode_enabled =
             use_remote_compact && session.services.account_pool_manager.is_some();
         let turn_account_selection = if use_remote_compact {
@@ -75,7 +76,7 @@ impl SessionTask for CompactTask {
         let turn_account_id_override = turn_account_selection
             .as_ref()
             .map(|selection| selection.account_id.clone());
-        let _account_pool_lease_heartbeat = crate::codex::start_account_pool_lease_heartbeat(
+        let _account_pool_lease_heartbeat = crate::session::start_account_pool_lease_heartbeat(
             &session,
             turn_account_selection.is_some(),
             &cancellation_token,

@@ -363,6 +363,7 @@ mod tests {
             secondary: None,
             credits: None,
             plan_type: None,
+            rate_limit_reached_type: None,
         };
         manager
             .report_usage_limit_reached(Some(&snapshot), Some(reset_at))

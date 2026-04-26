@@ -135,6 +135,10 @@ class FakeOssRepository:
                 "\n".join(
                     [
                         "#!/bin/sh",
+                        'if [ "${1:-}" = "--version" ]; then',
+                        f"  printf 'mcodex {version}\\n'",
+                        "  exit 0",
+                        "fi",
                         f"printf 'version={version}\\n'",
                         "printf 'managed=%s\\n' \"$MCODEX_INSTALL_MANAGED\"",
                         "printf 'method=%s\\n' \"$MCODEX_INSTALL_METHOD\"",
@@ -274,7 +278,7 @@ class InstallPs1Tests(unittest.TestCase):
 
     def test_write_wrapper_outputs_literal_runtime_variables(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            wrapper_path = Path(tmp) / "mcodex.ps1"
+            wrapper_path = Path(tmp) / "mcodex.cmd"
             result = run_powershell(
                 "\n".join(
                     [
@@ -289,13 +293,36 @@ class InstallPs1Tests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn(
-            '$BaseRoot = if ($env:MCODEX_INSTALL_ROOT) { $env:MCODEX_INSTALL_ROOT } else { \'C:\\tmp\\mcodex\' }',
+            'if not defined BaseRoot set "BaseRoot=C:\\tmp\\mcodex"',
             result.stdout,
         )
-        self.assertIn('if (-not (Test-Path -LiteralPath $Target)) {', result.stdout)
-        self.assertIn('$env:MCODEX_INSTALL_ROOT = $BaseRoot', result.stdout)
-        self.assertIn('& $Target @args', result.stdout)
-        self.assertIn('exit $LASTEXITCODE', result.stdout)
+        self.assertIn('set "Target=%BaseRoot%\\current\\bin\\mcodex.exe"', result.stdout)
+        self.assertIn('set "MCODEX_INSTALL_ROOT=%BaseRoot%"', result.stdout)
+        self.assertIn('"%Target%" %*', result.stdout)
+        self.assertIn("exit /b %ERRORLEVEL%", result.stdout)
+
+    def test_write_wrapper_removes_managed_legacy_ps1_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper_path = Path(tmp) / "mcodex.cmd"
+            legacy_path = Path(tmp) / "mcodex.ps1"
+            legacy_path.write_text(
+                '$env:MCODEX_INSTALL_MANAGED = "1"\n$Target = "current\\bin\\mcodex.exe"\n',
+                encoding="utf-8",
+            )
+            result = run_powershell(
+                "\n".join(
+                    [
+                        "$ErrorActionPreference = 'Stop'",
+                        f". '{INSTALL_PS1}'",
+                        f"$wrapperPath = {_powershell_single_quote(str(wrapper_path))}",
+                        "Write-Wrapper -BaseRoot 'C:\\tmp\\mcodex' -WrapperPath $wrapperPath",
+                        f"Test-Path -LiteralPath {_powershell_single_quote(str(legacy_path))}",
+                    ]
+                )
+            )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout.strip(), "False")
 
     def test_path_update_helper_models_registry_branch_without_mutation(self) -> None:
         wrapper_dir = r"C:\Users\viv\AppData\Local\Programs\Mcodex\bin"
@@ -571,7 +598,7 @@ class InstallPs1Tests(unittest.TestCase):
         version_dir = base_root / "install" / version
         current_link = base_root / "current"
         wrapper_dir = wrapper_dir or fixture.localappdata / "Programs" / "Mcodex" / "bin"
-        wrapper_path = wrapper_dir / "mcodex.ps1"
+        wrapper_path = wrapper_dir / "mcodex.cmd"
         metadata_path = base_root / "install.json"
 
         self.assertTrue((version_dir / "bin" / "mcodex.exe").exists())
@@ -616,9 +643,9 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertRegex(marker["installedAt"], r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}T")
 
         wrapper_text = wrapper_path.read_text(encoding="utf-8")
-        self.assertIn('MCODEX_INSTALL_MANAGED = "1"', wrapper_text)
-        self.assertIn('MCODEX_INSTALL_METHOD = "script"', wrapper_text)
-        self.assertIn('MCODEX_INSTALL_ROOT = $BaseRoot', wrapper_text)
+        self.assertIn('set "MCODEX_INSTALL_MANAGED=1"', wrapper_text)
+        self.assertIn('set "MCODEX_INSTALL_METHOD=script"', wrapper_text)
+        self.assertIn('set "MCODEX_INSTALL_ROOT=%BaseRoot%"', wrapper_text)
         self.assertIn('current\\bin\\mcodex.exe', wrapper_text)
 
         wrapper = fixture.run_wrapper_ps1(wrapper_dir=wrapper_dir)

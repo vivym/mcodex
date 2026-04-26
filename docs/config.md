@@ -28,12 +28,18 @@ resources, review those read/write race conditions before enabling this setting.
 
 ## MCP tool approvals
 
-mcodex stores per-tool approval overrides for custom MCP servers under
-`mcp_servers` in `~/.mcodex/config.toml`:
+mcodex stores approval defaults and per-tool approval overrides for custom MCP
+servers under `mcp_servers` in `~/.mcodex/config.toml`. Set
+`default_tools_approval_mode` on the server to apply a default to every tool,
+and use per-tool `approval_mode` entries for exceptions:
 
 ```toml
+[mcp_servers.docs]
+command = "docs-server"
+default_tools_approval_mode = "approve"
+
 [mcp_servers.docs.tools.search]
-approval_mode = "approve"
+approval_mode = "prompt"
 ```
 
 ## Apps (Connectors)

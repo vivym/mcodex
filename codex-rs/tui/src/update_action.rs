@@ -16,9 +16,9 @@ pub(crate) enum UpdatePlatform {
 impl UpdatePlatform {
     fn current() -> Self {
         if cfg!(windows) {
-            UpdatePlatform::Windows
+            Self::Windows
         } else {
-            UpdatePlatform::Unix
+            Self::Unix
         }
     }
 }
@@ -37,12 +37,8 @@ impl UpdateAction {
 
     pub(crate) fn display_command_for_platform(self, platform: UpdatePlatform) -> &'static str {
         match (self, platform) {
-            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Unix) => {
-                MCODEX.unix_install_command
-            }
-            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Windows) => {
-                MCODEX.windows_install_command
-            }
+            (Self::ScriptManagedLatest, UpdatePlatform::Unix) => MCODEX.unix_install_command,
+            (Self::ScriptManagedLatest, UpdatePlatform::Windows) => MCODEX.windows_install_command,
         }
     }
 
@@ -51,10 +47,10 @@ impl UpdateAction {
         platform: UpdatePlatform,
     ) -> (&'static str, &'static [&'static str]) {
         match (self, platform) {
-            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Unix) => {
+            (Self::ScriptManagedLatest, UpdatePlatform::Unix) => {
                 ("sh", &["-c", MCODEX.unix_install_command])
             }
-            (UpdateAction::ScriptManagedLatest, UpdatePlatform::Windows) => (
+            (Self::ScriptManagedLatest, UpdatePlatform::Windows) => (
                 "powershell",
                 &[
                     "-NoProfile",
@@ -84,6 +80,7 @@ fn detect_update_action(managed: bool, method: Option<&str>) -> Option<UpdateAct
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn detects_script_managed_update_action_only() {
@@ -110,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn script_update_commands_use_oss_installers() {
+    fn script_update_commands_use_runtime_installers() {
         assert_eq!(
             UpdateAction::ScriptManagedLatest.display_command_for_platform(UpdatePlatform::Unix),
             MCODEX.unix_install_command

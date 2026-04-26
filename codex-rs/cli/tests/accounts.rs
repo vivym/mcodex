@@ -271,6 +271,43 @@ INSERT INTO account_runtime_state (
 
     sqlx::query(
         r#"
+INSERT INTO account_quota_state (
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("acct-2")
+    .bind("codex")
+    .bind(99.0_f64)
+    .bind(expires_at)
+    .bind(Option::<f64>::None)
+    .bind(Option::<i64>::None)
+    .bind(now)
+    .bind(now * 1_000_000_000_i64)
+    .bind("primary")
+    .bind(expires_at)
+    .bind(expires_at)
+    .bind(0_i64)
+    .bind(Option::<String>::None)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
 UPDATE account_registry
 SET healthy = 0,
     updated_at = ?
@@ -832,7 +869,7 @@ async fn accounts_status_json_preserves_preferred_rate_limited_reason() -> Resul
     assert!(output.success, "stderr: {}", output.stderr);
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
-    assert_eq!(json["healthState"], "healthy");
+    assert_eq!(json["healthState"], "coolingDown");
 
     let accounts = json["accounts"].as_array().expect("accounts array");
     assert_eq!(accounts[0]["accountId"], "acct-2");

@@ -2,7 +2,8 @@
 
 set -eu
 
-VERSION_INPUT="${1:-latest}"
+RELEASE="latest"
+
 BASE_ROOT="${MCODEX_INSTALL_ROOT:-$HOME/.mcodex}"
 VERSIONS_DIR="$BASE_ROOT/install"
 CURRENT_LINK="$BASE_ROOT/current"
@@ -10,6 +11,9 @@ METADATA_FILE="$BASE_ROOT/install.json"
 WRAPPER_DIR="${MCODEX_WRAPPER_DIR:-$HOME/.local/bin}"
 WRAPPER_PATH="$WRAPPER_DIR/mcodex"
 DOWNLOAD_BASE_URL="${MCODEX_DOWNLOAD_BASE_URL:-https://downloads.mcodex.sota.wiki}"
+LOCK_FILE="$BASE_ROOT/install.lock"
+LOCK_DIR="$BASE_ROOT/install.lock.d"
+LOCK_STALE_AFTER_SECS=600
 
 path_action="already"
 path_profile=""
@@ -18,9 +22,15 @@ STAGING_DIR=""
 REPLACE_BACKUP_DIR=""
 REPLACE_TARGET_DIR=""
 REPLACE_ACTIVE=0
+lock_kind=""
+conflict_path=""
 
 step() {
   printf '==> %s\n' "$1"
+}
+
+warn() {
+  printf 'WARNING: %s\n' "$1" >&2
 }
 
 fail() {
@@ -28,7 +38,57 @@ fail() {
   exit 1
 }
 
+normalize_version() {
+  version="$1"
+
+  case "$version" in
+    "" | latest)
+      printf 'latest\n'
+      ;;
+    rust-v*)
+      printf '%s\n' "${version#rust-v}"
+      ;;
+    v*)
+      printf '%s\n' "${version#v}"
+      ;;
+    *)
+      printf '%s\n' "$version"
+      ;;
+  esac
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --release)
+        if [ "$#" -lt 2 ]; then
+          fail "--release requires a value."
+        fi
+        RELEASE="$2"
+        shift
+        ;;
+      --help | -h)
+        cat <<EOF
+Usage: install.sh [VERSION] [--release VERSION]
+EOF
+        exit 0
+        ;;
+      --*)
+        fail "Unknown argument: $1"
+        ;;
+      *)
+        if [ "$RELEASE" != "latest" ]; then
+          fail "Version was already specified; use either a positional VERSION or --release VERSION."
+        fi
+        RELEASE="$1"
+        ;;
+    esac
+    shift
+  done
+}
+
 cleanup() {
+  release_install_lock
   if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
     rm -rf "$STAGING_DIR"
   fi
@@ -65,10 +125,6 @@ on_signal() {
   exit "$status"
 }
 
-trap on_exit EXIT
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
-
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     fail "$1 is required to install mcodex."
@@ -99,30 +155,11 @@ json_string_field() {
   sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
 }
 
-normalize_version() {
-  version="$1"
-
-  case "$version" in
-    "" | latest)
-      printf 'latest\n'
-      ;;
-    rust-v*)
-      printf '%s\n' "${version#rust-v}"
-      ;;
-    v*)
-      printf '%s\n' "${version#v}"
-      ;;
-    *)
-      printf '%s\n' "$version"
-      ;;
-  esac
-}
-
 validate_version() {
   version="$1"
 
   if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+(-((alpha|beta)[.][0-9]+))?$'; then
-    fail "Invalid version: $VERSION_INPUT"
+    fail "Invalid version: $version"
   fi
 }
 
@@ -193,6 +230,21 @@ detect_platform() {
   fi
 
   ARCHIVE_NAME="mcodex-$os-$arch.tar.gz"
+
+  case "$os/$arch" in
+    darwin/arm64)
+      PLATFORM_LABEL="macOS (Apple Silicon)"
+      ;;
+    darwin/x64)
+      PLATFORM_LABEL="macOS (Intel)"
+      ;;
+    linux/arm64)
+      PLATFORM_LABEL="Linux (ARM64)"
+      ;;
+    linux/x64)
+      PLATFORM_LABEL="Linux (x64)"
+      ;;
+  esac
 }
 
 resolve_latest_version() {
@@ -206,6 +258,17 @@ resolve_latest_version() {
 
   validate_version "$resolved_version"
   printf '%s\n' "$resolved_version"
+}
+
+resolve_version() {
+  if [ -z "$RELEASE" ] || [ "$RELEASE" = "latest" ]; then
+    resolve_latest_version
+    return
+  fi
+
+  normalized_version="$(normalize_version "$RELEASE")"
+  validate_version "$normalized_version"
+  printf '%s\n' "$normalized_version"
 }
 
 download_checksums() {
@@ -231,7 +294,7 @@ expected_sha_for_archive() {
   ' "$checksums_path"
 }
 
-compute_sha256() {
+file_sha256() {
   file="$1"
 
   if command -v sha256sum >/dev/null 2>&1; then
@@ -244,7 +307,12 @@ compute_sha256() {
     return
   fi
 
-  fail "sha256sum or shasum is required to install mcodex."
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | sed 's/^.*= //'
+    return
+  fi
+
+  fail "sha256sum, shasum, or openssl is required to install mcodex."
 }
 
 timestamp() {
@@ -315,7 +383,7 @@ stage_version_dir() {
   archive_path="$STAGING_DIR/$archive_name"
 
   download_file "$archive_url" "$archive_path"
-  actual_sha="$(compute_sha256 "$archive_path")"
+  actual_sha="$(file_sha256 "$archive_path")"
 
   if [ "$actual_sha" != "$expected_sha" ]; then
     fail "Archive checksum mismatch for $archive_name."
@@ -436,6 +504,79 @@ EOF
   mv -f "$metadata_tmp" "$METADATA_FILE"
 }
 
+pick_profile() {
+  case "$os:${SHELL:-}" in
+    darwin:*/zsh)
+      printf '%s\n' "$HOME/.zprofile"
+      ;;
+    darwin:*/bash)
+      printf '%s\n' "$HOME/.bash_profile"
+      ;;
+    linux:*/zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    linux:*/bash)
+      printf '%s\n' "$HOME/.bashrc"
+      ;;
+    *)
+      printf '%s\n' "$HOME/.profile"
+      ;;
+  esac
+}
+
+append_path_block() {
+  profile="$1"
+  begin_marker="$2"
+  end_marker="$3"
+  path_line="$4"
+
+  {
+    printf '\n%s\n' "$begin_marker"
+    printf '%s\n' "$path_line"
+    printf '%s\n' "$end_marker"
+  } >>"$profile"
+}
+
+rewrite_path_block() {
+  profile="$1"
+  begin_marker="$2"
+  end_marker="$3"
+  path_line="$4"
+  tmp_profile="$TMP_ROOT/profile.$$.tmp"
+
+  awk -v begin="$begin_marker" -v end="$end_marker" -v line="$path_line" '
+    BEGIN {
+      in_block = 0
+      replaced = 0
+    }
+    $0 == begin {
+      if (!replaced) {
+        print begin
+        print line
+        print end
+        replaced = 1
+      }
+      in_block = 1
+      next
+    }
+    in_block {
+      if ($0 == end) {
+        in_block = 0
+      }
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (in_block != 0) {
+        exit 1
+      }
+    }
+  ' "$profile" >"$tmp_profile"
+  mv "$tmp_profile" "$profile"
+}
+
 add_to_path() {
   path_action="already"
   path_profile=""
@@ -446,32 +587,197 @@ add_to_path() {
       ;;
   esac
 
-  profile="$HOME/.profile"
-  case "${SHELL:-}" in
-    */zsh)
-      profile="$HOME/.zshrc"
-      ;;
-    */bash)
-      profile="$HOME/.bashrc"
-      ;;
-  esac
-
+  profile="$(pick_profile)"
   path_profile="$profile"
+  begin_marker="# >>> mcodex installer >>>"
+  end_marker="# <<< mcodex installer <<<"
   # shellcheck disable=SC2016
   wrapper_dir_escaped="$(printf '%s' "$WRAPPER_DIR" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\$/\\$/g; s/`/\\`/g')"
   path_line="export PATH=\"$wrapper_dir_escaped:\$PATH\""
 
-  if [ -f "$profile" ] && grep -F "$path_line" "$profile" >/dev/null 2>&1; then
-    path_action="configured"
+  if [ -f "$profile" ] && grep -F "$begin_marker" "$profile" >/dev/null 2>&1; then
+    if grep -F "$path_line" "$profile" >/dev/null 2>&1; then
+      path_action="configured"
+      return
+    fi
+
+    if grep -F "$end_marker" "$profile" >/dev/null 2>&1; then
+      rewrite_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
+      path_action="updated"
+      return
+    fi
+  fi
+
+  append_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
+  path_action="added"
+}
+
+mkdir_lock_is_stale() {
+  [ -d "$LOCK_DIR" ] || return 1
+
+  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  started_at="$(cat "$LOCK_DIR/started_at" 2>/dev/null || true)"
+  now="$(date +%s 2>/dev/null || printf '0')"
+
+  case "$started_at" in
+    '' | *[!0-9]*)
+      started_at=0
+      ;;
+  esac
+
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  if [ "$started_at" -eq 0 ] || [ "$now" -eq 0 ]; then
+    return 0
+  fi
+
+  [ $((now - started_at)) -ge "$LOCK_STALE_AFTER_SECS" ]
+}
+
+acquire_install_lock() {
+  mkdir -p "$BASE_ROOT"
+
+  if [ "$HOST_OS" = "darwin" ] && command -v lockf >/dev/null 2>&1; then
+    : >>"$LOCK_FILE"
+    exec 9<>"$LOCK_FILE"
+    lockf 9
+    lock_kind="lockf"
     return
   fi
 
-  {
-    printf '\n# Added by mcodex installer\n'
-    printf '%s\n' "$path_line"
-  } >>"$profile"
-  path_action="added"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock 9
+    lock_kind="flock"
+    return
+  fi
+
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if mkdir_lock_is_stale; then
+      warn "Removing stale installer lock at $LOCK_DIR"
+      rm -rf "$LOCK_DIR"
+      continue
+    fi
+    sleep 1
+  done
+
+  printf '%s\n' "$$" >"$LOCK_DIR/pid"
+  date +%s >"$LOCK_DIR/started_at" 2>/dev/null || true
+  lock_kind="mkdir"
 }
+
+release_install_lock() {
+  if [ "$lock_kind" = "mkdir" ]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+  elif [ "$lock_kind" = "flock" ] || [ "$lock_kind" = "lockf" ]; then
+    exec 9>&- 2>/dev/null || true
+  fi
+  lock_kind=""
+}
+
+remove_glob_matches() {
+  directory="$1"
+  pattern="$2"
+  set -- "$directory"/$pattern
+  if [ ! -e "$1" ]; then
+    return 0
+  fi
+  rm -rf "$@"
+}
+
+cleanup_stale_install_artifacts() {
+  mkdir -p "$VERSIONS_DIR" "$BASE_ROOT"
+
+  remove_glob_matches "$VERSIONS_DIR" '.staging.*'
+  remove_glob_matches "$VERSIONS_DIR" '.replace.*.old'
+  remove_glob_matches "$BASE_ROOT" '.current.*'
+
+  if [ -d "$WRAPPER_DIR" ]; then
+    set -- "$WRAPPER_DIR"/.mcodex-wrapper.*
+    if [ -e "$1" ]; then
+      rm -f "$@"
+    fi
+  fi
+}
+
+version_from_binary() {
+  binary_path="$1"
+
+  if [ ! -x "$binary_path" ]; then
+    return 1
+  fi
+
+  "$binary_path" --version 2>/dev/null | sed -n 's/.* \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1
+}
+
+current_installed_version() {
+  version="$(version_from_binary "$CURRENT_LINK/bin/mcodex" || true)"
+  if [ -n "$version" ]; then
+    printf '%s\n' "$version"
+  fi
+}
+
+resolve_existing_mcodex() {
+  command -v mcodex 2>/dev/null || true
+}
+
+detect_conflicting_install() {
+  existing_path="$(resolve_existing_mcodex)"
+
+  case "$existing_path" in
+    '' | "$WRAPPER_PATH" | "$CURRENT_LINK/bin/mcodex")
+      return
+      ;;
+  esac
+
+  conflict_path="$existing_path"
+  step "Detected existing mcodex command at $existing_path"
+  warn "Multiple mcodex installs can be ambiguous because PATH order decides which one runs."
+}
+
+handle_conflicting_install() {
+  if [ -n "$conflict_path" ]; then
+    warn "Leaving the existing mcodex command installed at $conflict_path."
+  fi
+}
+
+print_launch_instructions() {
+  case "$path_action" in
+    added)
+      step "Current terminal: export PATH=\"$WRAPPER_DIR:\$PATH\" && mcodex"
+      step "Future terminals: open a new terminal and run: mcodex"
+      step "PATH was added to $path_profile"
+      ;;
+    updated)
+      step "Current terminal: export PATH=\"$WRAPPER_DIR:\$PATH\" && mcodex"
+      step "Future terminals: open a new terminal and run: mcodex"
+      step "PATH was updated in $path_profile"
+      ;;
+    configured)
+      step "Current terminal: export PATH=\"$WRAPPER_DIR:\$PATH\" && mcodex"
+      step "Future terminals: open a new terminal and run: mcodex"
+      step "PATH is already configured in $path_profile"
+      ;;
+    *)
+      step "Current terminal: mcodex"
+      step "Future terminals: open a new terminal and run: mcodex"
+      ;;
+  esac
+}
+
+verify_visible_command() {
+  if ! "$WRAPPER_PATH" --version >/dev/null 2>&1; then
+    fail "Installed mcodex command failed verification: $WRAPPER_PATH --version"
+  fi
+}
+
+parse_args "$@"
+
+trap on_exit EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 require_command awk
 require_command grep
@@ -485,14 +791,22 @@ TMP_ROOT="$(mktemp -d "$BASE_ROOT/.install.XXXXXX")"
 HOST_OS="$(host_platform)"
 
 detect_platform
+RESOLVED_VERSION="$(resolve_version)"
+current_version="$(current_installed_version)"
 
-resolved_input="$(normalize_version "$VERSION_INPUT")"
-if [ "$VERSION_INPUT" = "latest" ]; then
-  RESOLVED_VERSION="$(resolve_latest_version)"
+if [ -n "$current_version" ] && [ "$current_version" != "$RESOLVED_VERSION" ]; then
+  step "Updating mcodex CLI from $current_version to $RESOLVED_VERSION"
+elif [ -n "$current_version" ]; then
+  step "Updating mcodex CLI"
 else
-  validate_version "$resolved_input"
-  RESOLVED_VERSION="$resolved_input"
+  step "Installing mcodex CLI"
 fi
+step "Detected platform: $PLATFORM_LABEL"
+step "Resolved version: $RESOLVED_VERSION"
+
+detect_conflicting_install
+acquire_install_lock
+cleanup_stale_install_artifacts
 
 CHECKSUMS_FILE="$(download_checksums "$RESOLVED_VERSION")"
 EXPECTED_SHA="$(expected_sha_for_archive "$CHECKSUMS_FILE" "$ARCHIVE_NAME")"
@@ -503,9 +817,10 @@ fi
 
 VERSION_DIR="$VERSIONS_DIR/$RESOLVED_VERSION"
 
-step "Installing mcodex CLI $RESOLVED_VERSION"
-
 if ! version_dir_complete "$VERSION_DIR" "$RESOLVED_VERSION" "$ARCHIVE_NAME" "$EXPECTED_SHA"; then
+  if [ -e "$VERSION_DIR" ] || [ -L "$VERSION_DIR" ]; then
+    warn "Found incomplete existing release at $VERSION_DIR; reinstalling."
+  fi
   stage_version_dir "$RESOLVED_VERSION" "$ARCHIVE_NAME" "$EXPECTED_SHA"
   publish_version_dir "$VERSION_DIR"
 fi
@@ -514,16 +829,17 @@ switch_current_link "$VERSION_DIR"
 write_wrapper
 write_metadata "$RESOLVED_VERSION" "$(timestamp)"
 add_to_path
+verify_visible_command
+release_install_lock
+handle_conflicting_install
 
 case "$path_action" in
-  added)
-    step "PATH updated for future shells in $path_profile"
-    ;;
-  configured)
-    step "PATH is already configured for future shells in $path_profile"
+  added | updated | configured)
+    print_launch_instructions
     ;;
   *)
     step "$WRAPPER_DIR is already on PATH"
+    print_launch_instructions
     ;;
 esac
 
