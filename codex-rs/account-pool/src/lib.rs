@@ -62,6 +62,7 @@ pub use quota_selection::build_selection_plan;
 pub use selection::evaluate_context_reuse;
 pub use startup_default::LocalDefaultPoolClearRequest;
 pub use startup_default::LocalDefaultPoolMutationOutcome;
+pub use startup_default::LocalDefaultPoolSetError;
 pub use startup_default::LocalDefaultPoolSetRequest;
 pub use startup_default::clear_local_default_pool;
 pub use startup_default::set_local_default_pool;

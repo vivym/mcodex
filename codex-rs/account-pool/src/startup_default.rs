@@ -1,6 +1,6 @@
-use anyhow::bail;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalDefaultPoolSetRequest {
@@ -22,6 +22,26 @@ pub struct LocalDefaultPoolMutationOutcome {
     pub preferred_account_cleared: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalDefaultPoolSetError {
+    PoolNotVisible { pool_id: String },
+}
+
+impl fmt::Display for LocalDefaultPoolSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoolNotVisible { pool_id } => {
+                write!(
+                    f,
+                    "pool {pool_id} is not visible in local startup inventory"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocalDefaultPoolSetError {}
+
 pub async fn set_local_default_pool(
     runtime: &StateRuntime,
     request: LocalDefaultPoolSetRequest,
@@ -34,10 +54,10 @@ pub async fn set_local_default_pool(
         .map(|pool| pool.pool_id)
         .any(|pool_id| pool_id == requested_pool_id)
     {
-        bail!(
-            "pool {} is not visible in local startup inventory",
-            request.pool_id
-        );
+        return Err(LocalDefaultPoolSetError::PoolNotVisible {
+            pool_id: request.pool_id,
+        }
+        .into());
     }
 
     let selection = runtime.read_account_startup_selection().await?;

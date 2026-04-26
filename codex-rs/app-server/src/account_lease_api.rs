@@ -1,6 +1,7 @@
 use chrono::Duration;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::LocalDefaultPoolClearRequest;
+use codex_account_pool::LocalDefaultPoolSetError;
 use codex_account_pool::LocalDefaultPoolSetRequest;
 use codex_account_pool::SharedStartupStatus;
 use codex_account_pool::clear_local_default_pool;
@@ -528,11 +529,13 @@ fn internal_error(err: anyhow::Error) -> JSONRPCErrorError {
 }
 
 fn local_default_pool_set_error(err: anyhow::Error) -> JSONRPCErrorError {
-    let message = err.to_string();
-    if message.contains("is not visible in local startup inventory") {
+    if matches!(
+        err.downcast_ref::<LocalDefaultPoolSetError>(),
+        Some(LocalDefaultPoolSetError::PoolNotVisible { .. })
+    ) {
         return JSONRPCErrorError {
             code: INVALID_PARAMS_ERROR_CODE,
-            message,
+            message: err.to_string(),
             data: None,
         };
     }
@@ -547,6 +550,15 @@ mod tests {
     use codex_state::EffectivePoolResolutionSource;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
+
+    #[test]
+    fn local_default_pool_set_error_does_not_map_untyped_message_to_invalid_params() {
+        let error = local_default_pool_set_error(anyhow::anyhow!(
+            "database failed while checking whether pool missing-pool is not visible in local startup inventory"
+        ));
+
+        assert_eq!(error.code, INTERNAL_ERROR_CODE);
+    }
 
     #[test]
     fn runtime_response_keeps_live_fields_when_startup_suppression_is_cleared() {
