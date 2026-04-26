@@ -49,6 +49,7 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::ThreadId;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountQuotaStateRecord;
+use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::LegacyAccountImport;
@@ -172,6 +173,49 @@ async fn account_pool_accounts_list_returns_additive_quota_and_quotas_fields() -
     assert_eq!(response["data"][0]["quotas"][0]["limitId"], "chatgpt");
     assert_eq!(response["data"][0]["quotas"][1]["limitId"], "codex");
     assert!(response["data"][0].get("quota").is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_pool_accounts_list_selection_family_comes_from_backend_family() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let runtime = seed_two_accounts(codex_home.path()).await?;
+    runtime
+        .upsert_account_registry_entry(AccountRegistryEntryUpdate {
+            account_id: PRIMARY_ACCOUNT_ID.to_string(),
+            pool_id: LEGACY_DEFAULT_POOL_ID.to_string(),
+            position: 0,
+            account_kind: "chatgpt".to_string(),
+            backend_family: "local".to_string(),
+            workspace_id: None,
+            enabled: true,
+            healthy: true,
+        })
+        .await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "codex", 82.0, 120))
+        .await?;
+    runtime
+        .upsert_account_quota_state(test_quota_state(PRIMARY_ACCOUNT_ID, "local", 72.0, 180))
+        .await?;
+    let mut mcp = initialized_mcp(codex_home.path()).await?;
+
+    let response: Value = send_account_pool_request(
+        &mut mcp,
+        "accountPool/accounts/list",
+        json!({
+            "poolId": LEGACY_DEFAULT_POOL_ID,
+            "accountId": PRIMARY_ACCOUNT_ID,
+        }),
+    )
+    .await?;
+
+    assert_eq!(response["data"].as_array().unwrap().len(), 1);
+    assert_eq!(response["data"][0]["accountKind"], "chatgpt");
+    assert_eq!(response["data"][0]["selectionFamily"], "local");
+    assert_eq!(response["data"][0]["quotas"][0]["limitId"], "codex");
+    assert_eq!(response["data"][0]["quotas"][1]["limitId"], "local");
 
     Ok(())
 }
