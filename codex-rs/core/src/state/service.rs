@@ -913,7 +913,6 @@ impl AccountPoolManager {
                 | AccountStartupEligibility::PreferredAccountInOtherPool { .. }
                 | AccountStartupEligibility::PreferredAccountDisabled
                 | AccountStartupEligibility::PreferredAccountUnhealthy
-                | AccountStartupEligibility::PreferredAccountBusy
                 | AccountStartupEligibility::NoEligibleAccount
         ) {
             return Ok(None);
