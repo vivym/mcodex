@@ -123,7 +123,7 @@ Out of scope for this first slice:
 - Read: `codex-rs/cli/tests/accounts.rs`
 - Read: `codex-rs/cli/tests/accounts_observability.rs`
 
-- [ ] **Step 1: Confirm branch and working tree**
+- [x] **Step 1: Confirm branch and working tree**
 
 Run:
 
@@ -135,7 +135,7 @@ git branch --show-current
 Expected: current branch is the intended implementation branch and unrelated
 files are either absent or intentionally left unstaged.
 
-- [ ] **Step 2: Confirm current smoke gaps**
+- [x] **Step 2: Confirm current smoke gaps**
 
 Run:
 
@@ -148,7 +148,7 @@ Expected: no existing `just smoke-mcodex-*` recipes. Existing CLI tests have
 local state seeding patterns that the fixture helper can copy or replace with
 public `codex-state` APIs.
 
-- [ ] **Step 3: Build the binary under test if needed**
+- [x] **Step 3: Build the binary under test if needed**
 
 Run:
 
@@ -168,7 +168,7 @@ Expected: `codex-rs/target/debug/mcodex` exists and can be used as
 
 - Add: `docs/superpowers/runbooks/2026-04-27-mcodex-smoke-p0.md`
 
-- [ ] **Step 1: Create the runbook skeleton**
+- [x] **Step 1: Create the runbook skeleton**
 
 Add a runbook with these sections:
 
@@ -208,7 +208,7 @@ Add a runbook with these sections:
 | Notes | |
 ```
 
-- [ ] **Step 2: Add P0-A rows**
+- [x] **Step 2: Add P0-A rows**
 
 Document exact commands for:
 
@@ -235,7 +235,7 @@ The runbook must record the expected markers:
 - empty-home TUI launch reaches normal unauthenticated/no-account startup, not
   pooled access
 
-- [ ] **Step 3: Add P0-B rows with fixture placeholders**
+- [x] **Step 3: Add P0-B rows with fixture placeholders**
 
 Document commands using the future fixture helper:
 
@@ -315,7 +315,7 @@ The runbook must name the exact JSON markers from the spec:
 - `poolObservability.summary.totalAccounts == 2`
 - `summary.activeLeases == 1` for `accounts pool show --pool team-main --json`
 
-- [ ] **Step 4: Add manual TUI and installer notes**
+- [x] **Step 4: Add manual TUI and installer notes**
 
 Add exact manual rows for:
 
@@ -361,7 +361,7 @@ the `MCODEX_HOME` used for the wrapper command.
 Do not make these automated yet. Require a screenshot or terminal capture for
 failures.
 
-- [ ] **Step 5: Verify docs formatting**
+- [x] **Step 5: Verify docs formatting**
 
 Run:
 
@@ -385,7 +385,7 @@ Expected: no whitespace errors.
 - Possible modify: `Cargo.lock`
 - Possible modify: `MODULE.bazel.lock`
 
-- [ ] **Step 1: Create the crate skeleton and write failing fixture tests**
+- [x] **Step 1: Create the crate skeleton and write failing fixture tests**
 
 Create the minimal crate files from Step 2 first, with `seed_fixture(...)`
 implemented as `todo!()` or returning an intentionally incomplete result. Then
@@ -465,7 +465,7 @@ Expected red state: the `codex-smoke-fixtures` package is found and the tests
 fail because fixture behavior is not implemented. A package-not-found failure
 does not count as the TDD red state.
 
-- [ ] **Step 2: Register the fixture crate**
+- [x] **Step 2: Register the fixture crate**
 
 Add the crate to `codex-rs/Cargo.toml`:
 
@@ -521,7 +521,7 @@ codex_rust_crate(
 )
 ```
 
-- [ ] **Step 3: Implement scenario enum and summary output**
+- [x] **Step 3: Implement scenario enum and summary output**
 
 In `src/lib.rs`, add:
 
@@ -651,7 +651,7 @@ pub async fn seed_fixture(home: &Path, scenario: SmokeScenario) -> Result<SmokeF
 The helper should use `StateRuntime` APIs instead of raw SQL for account
 registration, startup selection, quota state, lease, and events.
 
-- [ ] **Step 4: Implement account/config/quota helpers**
+- [x] **Step 4: Implement account/config/quota helpers**
 
 Use `RegisteredAccountUpsert` so the helper remains compatible with future
 local/remote-shaped account fields:
@@ -758,7 +758,7 @@ async fn seed_quota(runtime: &StateRuntime, account_id: &str) -> Result<()> {
 If any field names have drifted, use the current exported `codex-state` types
 rather than adding raw SQL to the fixture crate.
 
-- [ ] **Step 5: Implement the fixture CLI**
+- [x] **Step 5: Implement the fixture CLI**
 
 In `src/main.rs`:
 
@@ -815,7 +815,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 6: Run fixture tests and formatting**
+- [x] **Step 6: Run fixture tests and formatting**
 
 Run:
 
@@ -827,7 +827,7 @@ just fmt
 
 Expected: fixture crate tests pass. Do not run full workspace tests yet.
 
-- [ ] **Step 7: Update Bazel lock state if needed**
+- [x] **Step 7: Update Bazel lock state if needed**
 
 If `Cargo.lock` changed or the new crate affects Bazel module resolution, run
 from repo root:
@@ -848,7 +848,7 @@ fail, record the exact failure and do not claim Bazel lock verification passed.
 
 - Add: `scripts/smoke/assert-json-path.py`
 
-- [ ] **Step 1: Create a dependency-free JSON path assertion script**
+- [x] **Step 1: Create a dependency-free JSON path assertion script**
 
 Create a small Python script that reads JSON from stdin and validates simple dot
 paths used by the smoke scripts:
@@ -904,7 +904,7 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 2: Verify helper with sample JSON**
+- [x] **Step 2: Verify helper with sample JSON**
 
 Run:
 
@@ -930,7 +930,7 @@ but do not encode a failing command into `just`.
 - Add: `scripts/smoke/mcodex-local.sh`
 - Modify: `justfile`
 
-- [ ] **Step 1: Write the local smoke script**
+- [x] **Step 1: Write the local smoke script**
 
 Create `scripts/smoke/mcodex-local.sh`:
 
@@ -1042,7 +1042,7 @@ echo "smoke-mcodex-local: pass"
 If current JSON field names differ, update the script to match current CLI JSON
 without changing the spec intent.
 
-- [ ] **Step 2: Add the just recipe**
+- [x] **Step 2: Add the just recipe**
 
 In the root `justfile`, add:
 
@@ -1052,7 +1052,7 @@ smoke-mcodex-local *args:
     sh ./scripts/smoke/mcodex-local.sh "$@"
 ```
 
-- [ ] **Step 3: Run the local smoke command**
+- [x] **Step 3: Run the local smoke command**
 
 Run:
 
@@ -1072,7 +1072,7 @@ Expected: prints binary/version/git SHA and exits with
 - Add: `scripts/smoke/mcodex-cli.sh`
 - Modify: `justfile`
 
-- [ ] **Step 1: Write the CLI smoke script**
+- [x] **Step 1: Write the CLI smoke script**
 
 Create `scripts/smoke/mcodex-cli.sh`:
 
@@ -1161,7 +1161,7 @@ If current `accounts status --json` nests observability summary under a
 different path, update only the assertion path after confirming the existing CLI
 contract.
 
-- [ ] **Step 2: Add just recipes**
+- [x] **Step 2: Add just recipes**
 
 In the root `justfile`, add:
 
@@ -1176,7 +1176,7 @@ smoke-mcodex-all *args:
     sh ./scripts/smoke/mcodex-cli.sh "$@"
 ```
 
-- [ ] **Step 3: Run the CLI smoke command**
+- [x] **Step 3: Run the CLI smoke command**
 
 Run:
 
@@ -1197,7 +1197,7 @@ Expected: both commands pass without touching a real mcodex home.
 - Modify: `docs/superpowers/specs/2026-04-27-mcodex-smoke-test-matrix-design.md` only if implementation uncovers a spec bug
 - Modify: this plan document checkboxes as tasks complete
 
-- [ ] **Step 1: Link the automated commands from the runbook**
+- [x] **Step 1: Link the automated commands from the runbook**
 
 Add:
 
@@ -1217,7 +1217,7 @@ installer-wrapper, app-server, runtime, quota, subagent, and remote rows remain
 separate until their harnesses are added.
 ````
 
-- [ ] **Step 2: Add a future-work section**
+- [x] **Step 2: Add a future-work section**
 
 List the next smoke phases without implementing them:
 
@@ -1230,7 +1230,7 @@ List the next smoke phases without implementing them:
 
 Each future row should point back to the spec matrix IDs.
 
-- [ ] **Step 3: Verify docs only diffs**
+- [x] **Step 3: Verify docs only diffs**
 
 Run:
 
@@ -1248,7 +1248,7 @@ Expected: no whitespace errors.
 
 - All changed files in this plan
 
-- [ ] **Step 1: Run targeted tests**
+- [x] **Step 1: Run targeted tests**
 
 Run:
 
@@ -1259,7 +1259,7 @@ cargo test -p codex-smoke-fixtures
 
 Expected: PASS.
 
-- [ ] **Step 2: Run focused smoke commands**
+- [x] **Step 2: Run focused smoke commands**
 
 Run from repo root:
 
@@ -1271,7 +1271,7 @@ MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-all
 
 Expected: all PASS.
 
-- [ ] **Step 3: Run formatting and lock checks**
+- [x] **Step 3: Run formatting and lock checks**
 
 Run:
 
@@ -1292,7 +1292,7 @@ just bazel-lock-check
 
 Expected: no formatting or lock drift remains.
 
-- [ ] **Step 4: Check final diff**
+- [x] **Step 4: Check final diff**
 
 Run:
 

@@ -477,6 +477,35 @@ capture `$SMOKE_ROOT/install-root/.install.json` when present. Its metadata is
 expected to include `product`, `installMethod`, `currentVersion`,
 `installedAt`, `baseRoot`, `versionsDir`, `currentLink`, and `wrapperPath`.
 
+## Automated P0 Subset
+
+Run:
+
+```bash
+MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-local
+MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-cli
+MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-all
+```
+
+These commands cover the automated local and CLI subset only. Manual TUI,
+installer-wrapper, app-server, runtime, quota, subagent, and remote rows remain
+separate until their harnesses are added.
+
+## Future Smoke Phases
+
+- `just smoke-mcodex-app-server`: M-15 and M-16 app-server startup snapshot,
+  default mutation, and notification rows.
+- `just smoke-mcodex-runtime`: M-18, M-20, and related runtime lease authority
+  rows for pooled turns and busy-account selection.
+- `just smoke-mcodex-quota`: M-21 and M-22 exhausted, near-exhausted, damping,
+  and reprobe/backoff rows.
+- `just smoke-mcodex-installer`: M-04 and M-23 installer-wrapper identity,
+  PATH, and exit-code forwarding rows.
+- Fake remote backend contract smoke: M-24 remote-shaped inventory, startup
+  snapshot, pause/drain/quota facts, and explicit remote-only fact absence.
+- Minimal headless TUI startup smoke: M-05, M-07, M-09, M-13, and M-14 startup
+  surfaces once the TUI harness can capture stable screens.
+
 ## Manual TUI Rows
 
 Run these rows only after defining the expected visible marker before launch.
