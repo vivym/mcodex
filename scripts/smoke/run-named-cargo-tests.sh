@@ -53,7 +53,7 @@ trap 'handle_signal 143' TERM
 trap 'handle_signal 129' HUP
 trap 'handle_signal 131' QUIT
 
-run_with_timeout() {
+run_cargo_with_timeout() {
   timeout_secs=$1
   shift
   timeout_status_file="$TMP_DIR/timeout.$$.status"
@@ -147,6 +147,14 @@ finish($status >> 8);
 ' "$timeout_status_file" "$timeout_secs" "$@" &
   ACTIVE_TIMEOUT_PID=$!
   while [ ! -f "$timeout_status_file" ]; do
+    if ! kill -0 "$ACTIVE_TIMEOUT_PID" 2>/dev/null; then
+      set +e
+      wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
+      set -e
+      ACTIVE_TIMEOUT_PID=
+      echo "cargo helper exited before writing status; failing closed" >&2
+      return 255
+    fi
     sleep 1
   done
   status=$(sed -n '1p' "$timeout_status_file")
@@ -238,11 +246,17 @@ $targets_seen
 $target_key
 "*) ;;
     *)
-      echo "warming target package=$package target=$target_kind $target_name"
+      echo "warming target package=$package target=$target_kind $target_name timeout=${timeout_secs}s"
       if [ "$target_kind" = "--lib" ]; then
-        cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" --no-run
+        run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" --no-run || {
+          echo "failed to warm target package=$package target=$target_kind $target_name" >&2
+          exit 1
+        }
       else
-        cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" --no-run
+        run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" --no-run || {
+          echo "failed to warm target package=$package target=$target_kind $target_name" >&2
+          exit 1
+        }
       fi
       targets_seen="${targets_seen}
 $target_key"
@@ -252,15 +266,15 @@ $target_key"
   tmp_list="$TMP_DIR/list.$line_number"
   tmp_run="$TMP_DIR/run.$line_number"
 
-  echo "listing gate=$gate package=$package target=$target_kind $target_name test=$exact_path"
+  echo "listing gate=$gate package=$package target=$target_kind $target_name timeout=${timeout_secs}s test=$exact_path"
   if [ "$target_kind" = "--lib" ]; then
-    cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
+    run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
       echo "failed to list named regression: $exact_path" >&2
       cat "$tmp_list" >&2
       exit 1
     }
   else
-    cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
+    run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
       echo "failed to list named regression: $exact_path" >&2
       cat "$tmp_list" >&2
       exit 1
@@ -278,12 +292,12 @@ $target_key"
   start_epoch=$(date +%s)
 
   if [ "$target_kind" = "--lib" ]; then
-    run_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
+    run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
       cat "$tmp_run" >&2
       exit 1
     }
   else
-    run_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
+    run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
       cat "$tmp_run" >&2
       exit 1
     }

@@ -57,10 +57,15 @@ mode=${FAKE_CARGO_MODE:?}
 args=" $* "
 exact="suite::account_pool::exact_test"
 printf '%s\n' "$args" >> "${FAKE_CARGO_ARGS_LOG:-/dev/null}"
-if printf '%s' "$args" | grep -Fq " --no-run"; then
-  printf 'fake cargo warm build\n'
-  exit 0
-fi
+case "$mode" in
+  interrupt-warm-child|interrupt-list-child) ;;
+  *)
+    if printf '%s' "$args" | grep -Fq " --no-run"; then
+      printf 'fake cargo warm build\n'
+      exit 0
+    fi
+    ;;
+esac
 case "$mode" in
   ok)
     if printf '%s' "$args" | grep -Fq " --list"; then
@@ -175,6 +180,44 @@ case "$mode" in
       exit 2
     fi
     ;;
+  interrupt-warm-child)
+    if printf '%s' "$args" | grep -Fq " --no-run"; then
+      (
+        trap 'exit 0' INT TERM HUP QUIT
+        while :; do
+          sleep 1
+        done
+      ) &
+      child_pid=$!
+      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
+      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
+      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
+      wait "$child_pid"
+    else
+      echo "unexpected interrupt-warm-child invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  interrupt-list-child)
+    if printf '%s' "$args" | grep -Fq " --no-run"; then
+      printf 'fake cargo warm build\n'
+    elif printf '%s' "$args" | grep -Fq " --list"; then
+      (
+        trap 'exit 0' INT TERM HUP QUIT
+        while :; do
+          sleep 1
+        done
+      ) &
+      child_pid=$!
+      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
+      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
+      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
+      wait "$child_pid"
+    else
+      echo "unexpected interrupt-list-child invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   *)
     echo "unknown fake cargo mode: $mode" >&2
     exit 2
@@ -227,6 +270,76 @@ wait_for_file() {
   exit 1
 }
 
+assert_interrupt_cleans_child() {
+  name=$1
+  mode=$2
+  fake_bin=$3
+  descriptor_file=$4
+  signal_name=$5
+  expected_status=$6
+  child_pid_file="$TMP_DIR/$name-child.pid"
+  runner_pid_file="$TMP_DIR/$name-runner.pid"
+  status_file="$TMP_DIR/$name-runner.status"
+  out_file="$TMP_DIR/$name.out"
+  err_file="$TMP_DIR/$name.err"
+
+  env FAKE_CARGO_MODE="$mode" \
+    FAKE_CARGO_CHILD_PID="$child_pid_file" \
+    FAKE_CARGO_WATCHDOG_PID="$TMP_DIR/$name-watchdog.pid" \
+    PATH="$fake_bin:$PATH" \
+    perl -e '
+use strict;
+use warnings;
+
+$SIG{INT} = "DEFAULT";
+my ($runner_pid_file, $status_file, $runner, $descriptor) = @ARGV;
+my $pid = fork();
+die "fork failed: $!\n" if !defined $pid;
+
+if ($pid == 0) {
+    $SIG{INT} = "DEFAULT";
+    exec "sh", $runner, $descriptor or die "exec failed: $!\n";
+}
+
+open my $pid_fh, ">", $runner_pid_file or die "open runner pid file failed: $!\n";
+print {$pid_fh} "$pid\n";
+close $pid_fh or die "close runner pid file failed: $!\n";
+
+waitpid($pid, 0);
+my $exit_status = ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+open my $status_fh, ">", $status_file or die "open status file failed: $!\n";
+print {$status_fh} "$exit_status\n";
+close $status_fh or die "close status file failed: $!\n";
+' "$runner_pid_file" "$status_file" "$RUNNER" "$descriptor_file" >"$out_file" 2>"$err_file" &
+  helper_pid=$!
+  wait_for_file "$runner_pid_file" "$name-runner-pid"
+  wait_for_file "$child_pid_file" "$name-child-pid"
+  start_epoch=$(date +%s)
+  kill "-$signal_name" "$(sed -n '1p' "$runner_pid_file")"
+  if ! wait "$helper_pid"; then
+    echo "$name interrupt helper failed" >&2
+    cat "$out_file" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+  wait_for_file "$status_file" "$name-status"
+  interrupt_status=$(sed -n '1p' "$status_file")
+  interrupt_elapsed=$(( $(date +%s) - start_epoch ))
+  if [ "$interrupt_status" -ne "$expected_status" ]; then
+    echo "expected interrupted $name runner to exit $expected_status, got $interrupt_status" >&2
+    cat "$out_file" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+  if [ "$interrupt_elapsed" -ge 10 ]; then
+    echo "expected interrupted $name runner to exit promptly, took ${interrupt_elapsed}s" >&2
+    cat "$out_file" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+  assert_process_exits "$(sed -n '1p' "$child_pid_file")" "$name-child"
+}
+
 descriptor="$TMP_DIR/tests.txt"
 write_descriptor "$descriptor"
 
@@ -239,6 +352,8 @@ no_proof_bin=$(write_fake_cargo no-proof)
 prefixed_proof_bin=$(write_fake_cargo prefixed-proof)
 timeout_child_bin=$(write_fake_cargo timeout-child)
 interrupt_child_bin=$(write_fake_cargo interrupt-child)
+interrupt_warm_child_bin=$(write_fake_cargo interrupt-warm-child)
+interrupt_list_child_bin=$(write_fake_cargo interrupt-list-child)
 
 assert_passes ok env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$TMP_DIR/ok-cargo-args.log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
 if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
@@ -312,65 +427,10 @@ if ! grep -Fq "timed out after 1s" "$TMP_DIR/timeout_child.err"; then
 fi
 
 interrupt_descriptor="$TMP_DIR/interrupt-child.txt"
-interrupt_child_pid_file="$TMP_DIR/interrupt-child.pid"
-interrupt_runner_pid_file="$TMP_DIR/interrupt-runner.pid"
-interrupt_status_file="$TMP_DIR/interrupt-runner.status"
 write_descriptor_line "$interrupt_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
-env FAKE_CARGO_MODE=interrupt-child \
-  FAKE_CARGO_CHILD_PID="$interrupt_child_pid_file" \
-  FAKE_CARGO_WATCHDOG_PID="$TMP_DIR/interrupt-watchdog.pid" \
-  PATH="$interrupt_child_bin:$PATH" \
-  perl -e '
-use strict;
-use warnings;
-
-$SIG{INT} = "DEFAULT";
-my ($runner_pid_file, $status_file, $runner, $descriptor) = @ARGV;
-my $pid = fork();
-die "fork failed: $!\n" if !defined $pid;
-
-if ($pid == 0) {
-    $SIG{INT} = "DEFAULT";
-    exec "sh", $runner, $descriptor or die "exec failed: $!\n";
-}
-
-open my $pid_fh, ">", $runner_pid_file or die "open runner pid file failed: $!\n";
-print {$pid_fh} "$pid\n";
-close $pid_fh or die "close runner pid file failed: $!\n";
-
-waitpid($pid, 0);
-my $exit_status = ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
-open my $status_fh, ">", $status_file or die "open status file failed: $!\n";
-print {$status_fh} "$exit_status\n";
-close $status_fh or die "close status file failed: $!\n";
-' "$interrupt_runner_pid_file" "$interrupt_status_file" "$RUNNER" "$interrupt_descriptor" >"$TMP_DIR/interrupt_child.out" 2>"$TMP_DIR/interrupt_child.err" &
-interrupt_helper_pid=$!
-wait_for_file "$interrupt_runner_pid_file" interrupt-runner-pid
-wait_for_file "$interrupt_child_pid_file" interrupt-child-pid
-interrupt_start_epoch=$(date +%s)
-kill -INT "$(sed -n '1p' "$interrupt_runner_pid_file")"
-if ! wait "$interrupt_helper_pid"; then
-  echo "interrupt helper failed" >&2
-  cat "$TMP_DIR/interrupt_child.out" >&2
-  cat "$TMP_DIR/interrupt_child.err" >&2
-  exit 1
-fi
-wait_for_file "$interrupt_status_file" interrupt-status
-interrupt_status=$(sed -n '1p' "$interrupt_status_file")
-interrupt_elapsed=$(( $(date +%s) - interrupt_start_epoch ))
-if [ "$interrupt_status" -ne 130 ]; then
-  echo "expected interrupted runner to exit 130, got $interrupt_status" >&2
-  cat "$TMP_DIR/interrupt_child.out" >&2
-  cat "$TMP_DIR/interrupt_child.err" >&2
-  exit 1
-fi
-if [ "$interrupt_elapsed" -ge 10 ]; then
-  echo "expected interrupted runner to exit promptly, took ${interrupt_elapsed}s" >&2
-  cat "$TMP_DIR/interrupt_child.out" >&2
-  cat "$TMP_DIR/interrupt_child.err" >&2
-  exit 1
-fi
-assert_process_exits "$(sed -n '1p' "$interrupt_child_pid_file")" interrupt-child
+assert_interrupt_cleans_child interrupt interrupt-child "$interrupt_child_bin" "$interrupt_descriptor" INT 130
+assert_interrupt_cleans_child warm-interrupt interrupt-warm-child "$interrupt_warm_child_bin" "$interrupt_descriptor" TERM 143
+assert_interrupt_cleans_child list-interrupt interrupt-list-child "$interrupt_list_child_bin" "$interrupt_descriptor" TERM 143
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"
