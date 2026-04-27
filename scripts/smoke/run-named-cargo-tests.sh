@@ -64,29 +64,27 @@ use warnings;
 
 my $status_file = shift @ARGV;
 my $timeout_secs = shift @ARGV;
+my $pid;
 
 sub finish {
     my ($exit_status) = @_;
-    open my $fh, ">", $status_file or die "open status file failed: $!\n";
+    my $tmp_status_file = "$status_file.$$";
+    open my $fh, ">", $tmp_status_file or die "open status file failed: $!\n";
     print {$fh} "$exit_status\n";
     close $fh or die "close status file failed: $!\n";
+    rename $tmp_status_file, $status_file or die "rename status file failed: $!\n";
     exit $exit_status;
-}
-
-my $pid = fork();
-if (!defined $pid) {
-    print STDERR "fork failed: $!\n";
-    finish(255);
-}
-
-if ($pid == 0) {
-    setpgrp(0, 0) or die "setpgrp failed: $!\n";
-    exec @ARGV or die "exec failed: $!\n";
 }
 
 sub terminate_child_group {
     my ($exit_status) = @_;
     alarm 0;
+    if (!defined $pid) {
+        finish($exit_status);
+    }
+    if ($pid == 0) {
+        exit $exit_status;
+    }
     kill "TERM", -$pid;
     kill "TERM", $pid;
     select undef, undef, undef, 0.5;
@@ -107,6 +105,20 @@ for my $sig (keys %signal_status) {
     $SIG{$name} = sub {
         terminate_child_group($signal_status{$name});
     };
+}
+
+$pid = fork();
+if (!defined $pid) {
+    print STDERR "fork failed: $!\n";
+    finish(255);
+}
+
+if ($pid == 0) {
+    for my $sig (keys %signal_status) {
+        $SIG{$sig} = "DEFAULT";
+    }
+    setpgrp(0, 0) or die "setpgrp failed: $!\n";
+    exec @ARGV or die "exec failed: $!\n";
 }
 
 my $status;
@@ -146,7 +158,7 @@ if ($status & 127) {
 finish($status >> 8);
 ' "$timeout_status_file" "$timeout_secs" "$@" &
   ACTIVE_TIMEOUT_PID=$!
-  while [ ! -f "$timeout_status_file" ]; do
+  while [ ! -s "$timeout_status_file" ]; do
     if ! kill -0 "$ACTIVE_TIMEOUT_PID" 2>/dev/null; then
       set +e
       wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
@@ -195,6 +207,16 @@ while IFS= read -r line || [ -n "$line" ]; do
   rest=${rest#*|}
   timeout_secs=${rest%%|*}
   notes=${rest#*|}
+
+  if [ -z "$package" ]; then
+    echo "invalid package at $DESCRIPTOR_FILE:$line_number: package must be non-empty" >&2
+    exit 2
+  fi
+
+  if [ -z "$exact_path" ]; then
+    echo "invalid exact path at $DESCRIPTOR_FILE:$line_number: exact path must be non-empty" >&2
+    exit 2
+  fi
 
   case "$gate" in
     runtime|quota) ;;

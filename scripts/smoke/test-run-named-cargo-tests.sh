@@ -373,6 +373,31 @@ if [ -s "$empty_test_target_log" ]; then
   exit 1
 fi
 
+empty_package_descriptor="$TMP_DIR/empty-package.txt"
+empty_package_log="$TMP_DIR/empty-package-cargo-args.log"
+write_descriptor_line "$empty_package_descriptor" "runtime||--test|all|suite::account_pool::exact_test|30|fake descriptor"
+assert_fails empty_package env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$empty_package_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_package_descriptor"
+if [ -s "$empty_package_log" ]; then
+  echo "expected invalid empty package to fail before cargo invocation" >&2
+  cat "$empty_package_log" >&2
+  exit 1
+fi
+
+empty_exact_path_descriptor="$TMP_DIR/empty-exact-path.txt"
+empty_exact_path_log="$TMP_DIR/empty-exact-path-cargo-args.log"
+write_descriptor_line "$empty_exact_path_descriptor" "runtime|codex-core|--test|all||30|fake descriptor"
+assert_fails empty_exact_path env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$empty_exact_path_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_exact_path_descriptor"
+if [ -s "$empty_exact_path_log" ]; then
+  echo "expected invalid empty exact path to fail before cargo invocation" >&2
+  cat "$empty_exact_path_log" >&2
+  exit 1
+fi
+
+if ! grep -Fq '[ ! -s "$timeout_status_file" ]' "$RUNNER"; then
+  echo "expected runner to wait for non-empty timeout status file" >&2
+  exit 1
+fi
+
 empty_notes_descriptor="$TMP_DIR/empty-notes.txt"
 write_descriptor_line "$empty_notes_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|"
 assert_passes empty_notes env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_notes_descriptor"
