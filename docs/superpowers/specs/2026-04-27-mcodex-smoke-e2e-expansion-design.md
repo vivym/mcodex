@@ -97,6 +97,12 @@ preferred first implementation should do both: fail early on the environment
 variable and still run critical tests with `--nocapture` so accidental skips are
 visible.
 
+This means `smoke-mcodex-runtime-gate`, `smoke-mcodex-quota-gate`, and
+`smoke-mcodex-gate` must run from a network-enabled local shell or CI
+environment. If a developer runs them from a Codex sandbox where
+`CODEX_SANDBOX_NETWORK_DISABLED` is set, the expected result is an explicit
+failure that says to rerun outside the Codex sandbox or in network-enabled CI.
+
 ### Keep Fixtures Isolated
 
 All automated smoke must use temporary or explicitly provided `MCODEX_HOME`
@@ -237,9 +243,10 @@ The first expansion must add one focused regression before
 1. Seed two accounts in one pool.
 2. Start runtime A and acquire account A.
 3. Start runtime B against the same isolated home.
-4. Assert runtime B uses account B or fails closed when no eligible account is
-   available.
+4. Assert runtime B uses account B while account B is eligible.
 5. Assert runtime B does not use account A while A's lease is live.
+6. Add a separate single-account or all-accounts-unavailable branch where
+   runtime B fails closed instead of using account A.
 
 This can be a crate-level E2E test with mock responses. It should not require
 real processes unless the existing harness already makes that cheap and stable.
@@ -309,6 +316,12 @@ Suggested shape:
 - runs with `--manifest-path "$REPO_ROOT/codex-rs/Cargo.toml"`
 - runs with an explicit target, never a package-wide substring-only filter
 - runs critical tests with `-- --exact --nocapture`
+- performs preflight listing with the same package, target, and exact filter:
+  `cargo test --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --list`
+- accepts preflight success only when exactly one list line equals
+  `$exact_path: test`
+- runs the test with the same package, target, and exact filter:
+  `cargo test --manifest-path "$REPO_ROOT/codex-rs/Cargo.toml" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --nocapture`
 - records command, package, target, exact test path, and elapsed time
 - inherits cargo and network environment unchanged, including:
   - `HTTPS_PROXY`
@@ -430,6 +443,13 @@ If disk pressure is high, the gate should prefer existing build artifacts and
 should not trigger release builds unless the installer or wrapper smoke row is
 requested.
 
+The runtime and quota gates are mandatory for `smoke-mcodex-gate`; they are not
+optional just because they are more expensive than local/CLI smoke. However,
+their first cold build may still pull large dependencies. In particular,
+`codex-core --test all` can compile the `codex-code-mode` dependency graph,
+which includes `v8`. Exact test filters reduce how many tests run, but they do
+not shrink the target's compile graph.
+
 The implementation plan should include a cost-measurement step for each new
 gate. Record cold and warm timings for at least:
 
@@ -438,11 +458,15 @@ gate. Record cold and warm timings for at least:
 - `codex-app-server --test all`
 - `codex-tui --lib`
 
-If a gate proves too slow or pulls large dependencies on a clean machine, keep
-it out of `smoke-mcodex-gate` and place it under `smoke-mcodex-e2e` until the
-cost is understood. The plan should also document local artifact requirements
-for large dependencies, especially `RUSTY_V8_ARCHIVE` and `LK_CUSTOM_WEBRTC`,
-and should leave proxy variables untouched.
+The implementation plan must record target directory size before and after the
+new runtime/quota gate on a cold build and define a local free-disk warning
+threshold. If the cold-build cost is too high for routine local use,
+`smoke-mcodex-gate` still includes runtime/quota, but the runbook should offer a
+documented lighter command for local smoke and reserve `smoke-mcodex-gate` for
+merge or CI use. App-server and TUI gates may stay under `smoke-mcodex-e2e`
+until their cost is understood. The plan should also document local artifact
+requirements for large dependencies, especially `RUSTY_V8_ARCHIVE` and
+`LK_CUSTOM_WEBRTC`, and should leave proxy variables untouched.
 
 ## Acceptance Criteria
 
@@ -481,9 +505,9 @@ and should leave proxy variables untouched.
    descriptors.
 6. Add `smoke-mcodex-quota-gate` using exact package/target/test descriptors.
 7. Measure cold and warm runtime cost for runtime and quota gates.
-8. Add `smoke-mcodex-gate` as local + CLI + runtime + quota only if the cost is
-   acceptable; otherwise document the narrower default and keep heavy rows under
-   `smoke-mcodex-e2e`.
+8. Add `smoke-mcodex-gate` as local + CLI + runtime + quota. If the runtime or
+   quota cold-build cost is high, document a lighter local-only command
+   separately; do not redefine the merge gate to omit runtime/quota.
 9. Update the P0 runbook with the new automated gate rows and command-name
    compatibility table.
 10. Add app-server and TUI gates as the next slice once runtime/quota gate cost
