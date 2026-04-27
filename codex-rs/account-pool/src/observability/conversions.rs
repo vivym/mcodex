@@ -10,6 +10,8 @@ use super::AccountPoolEventsPage;
 use super::AccountPoolIssue;
 use super::AccountPoolLease;
 use super::AccountPoolQuota;
+use super::AccountPoolQuotaFamily;
+use super::AccountPoolQuotaWindow;
 use super::AccountPoolReasonCode;
 use super::AccountPoolSelection;
 use super::AccountPoolSnapshot;
@@ -125,6 +127,29 @@ impl From<codex_state::AccountPoolQuotaRecord> for AccountPoolQuota {
     }
 }
 
+impl From<codex_state::AccountPoolQuotaWindowRecord> for AccountPoolQuotaWindow {
+    fn from(value: codex_state::AccountPoolQuotaWindowRecord) -> Self {
+        Self {
+            used_percent: value.used_percent,
+            resets_at: value.resets_at,
+        }
+    }
+}
+
+impl From<codex_state::AccountPoolQuotaFamilyRecord> for AccountPoolQuotaFamily {
+    fn from(value: codex_state::AccountPoolQuotaFamilyRecord) -> Self {
+        Self {
+            limit_id: value.limit_id,
+            primary: value.primary.into(),
+            secondary: value.secondary.into(),
+            exhausted_windows: value.exhausted_windows,
+            predicted_blocked_until: value.predicted_blocked_until,
+            next_probe_after: value.next_probe_after,
+            observed_at: value.observed_at,
+        }
+    }
+}
+
 impl From<codex_state::AccountPoolSelectionRecord> for AccountPoolSelection {
     fn from(value: codex_state::AccountPoolSelectionRecord) -> Self {
         Self {
@@ -156,6 +181,7 @@ impl TryFrom<codex_state::AccountPoolAccountRecord> for AccountPoolAccount {
             account_id: value.account_id,
             backend_account_ref: value.backend_account_ref,
             account_kind: value.account_kind,
+            selection_family: value.selection_family,
             enabled: value.enabled,
             health_state: value.health_state,
             operational_state: value
@@ -171,6 +197,7 @@ impl TryFrom<codex_state::AccountPoolAccountRecord> for AccountPoolAccount {
             status_message: value.status_message,
             current_lease: value.current_lease.map(Into::into),
             quota: value.quota.map(Into::into),
+            quotas: value.quotas.into_iter().map(Into::into).collect(),
             selection: value.selection.map(Into::into),
             updated_at: value.updated_at,
         })
@@ -329,6 +356,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: Some("backend-acct-1".to_string()),
             account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
             enabled: true,
             health_state: Some("unauthorized".to_string()),
             operational_state: Some("error".to_string()),
@@ -348,6 +376,21 @@ mod tests {
                 resets_at: Some(timestamp(14)),
                 observed_at: timestamp(15),
             }),
+            quotas: vec![codex_state::AccountPoolQuotaFamilyRecord {
+                limit_id: "codex".to_string(),
+                primary: codex_state::AccountPoolQuotaWindowRecord {
+                    used_percent: Some(87.5),
+                    resets_at: Some(timestamp(14)),
+                },
+                secondary: codex_state::AccountPoolQuotaWindowRecord {
+                    used_percent: None,
+                    resets_at: None,
+                },
+                exhausted_windows: "primary".to_string(),
+                predicted_blocked_until: Some(timestamp(14)),
+                next_probe_after: Some(timestamp(13)),
+                observed_at: timestamp(15),
+            }],
             selection: Some(codex_state::AccountPoolSelectionRecord {
                 eligible: false,
                 next_eligible_at: Some(timestamp(16)),
@@ -362,6 +405,7 @@ mod tests {
             account_id: "acct-1".to_string(),
             backend_account_ref: Some("backend-acct-1".to_string()),
             account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
             enabled: true,
             health_state: Some("unauthorized".to_string()),
             operational_state: Some(AccountOperationalState::Error),
@@ -381,6 +425,21 @@ mod tests {
                 resets_at: Some(timestamp(14)),
                 observed_at: timestamp(15),
             }),
+            quotas: vec![super::AccountPoolQuotaFamily {
+                limit_id: "codex".to_string(),
+                primary: super::AccountPoolQuotaWindow {
+                    used_percent: Some(87.5),
+                    resets_at: Some(timestamp(14)),
+                },
+                secondary: super::AccountPoolQuotaWindow {
+                    used_percent: None,
+                    resets_at: None,
+                },
+                exhausted_windows: "primary".to_string(),
+                predicted_blocked_until: Some(timestamp(14)),
+                next_probe_after: Some(timestamp(13)),
+                observed_at: timestamp(15),
+            }],
             selection: Some(AccountPoolSelection {
                 eligible: false,
                 next_eligible_at: Some(timestamp(16)),

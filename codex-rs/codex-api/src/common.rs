@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
 pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
@@ -278,8 +279,36 @@ pub fn create_text_param_for_request(
     })
 }
 
+enum ResponseStreamDropAction {
+    AbortTask(tokio::task::JoinHandle<()>),
+    CancelRequest(oneshot::Sender<()>),
+}
+
 pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+    drop_action: Option<ResponseStreamDropAction>,
+}
+
+impl ResponseStream {
+    pub(crate) fn with_abort(
+        rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            rx_event,
+            drop_action: Some(ResponseStreamDropAction::AbortTask(task)),
+        }
+    }
+
+    pub(crate) fn with_cancel(
+        rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+        cancel: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            rx_event,
+            drop_action: Some(ResponseStreamDropAction::CancelRequest(cancel)),
+        }
+    }
 }
 
 impl Stream for ResponseStream {
@@ -287,5 +316,19 @@ impl Stream for ResponseStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx_event.poll_recv(cx)
+    }
+}
+
+impl Drop for ResponseStream {
+    fn drop(&mut self) {
+        let Some(action) = self.drop_action.take() else {
+            return;
+        };
+        match action {
+            ResponseStreamDropAction::AbortTask(handle) => handle.abort(),
+            ResponseStreamDropAction::CancelRequest(cancel) => {
+                let _ = cancel.send(());
+            }
+        }
     }
 }

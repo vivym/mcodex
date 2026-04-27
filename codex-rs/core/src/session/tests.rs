@@ -1734,10 +1734,12 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         current_date: turn_context.current_date.clone(),
         timezone: turn_context.timezone.clone(),
         approval_policy: turn_context.approval_policy.value(),
+        approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy.get().clone(),
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
+        service_tier: None,
         personality: turn_context.personality,
         collaboration_mode: Some(turn_context.collaboration_mode.clone()),
         realtime_active: Some(turn_context.realtime_active),
@@ -3081,6 +3083,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
         None,
+        None,
         Some(Arc::new(
             codex_exec_server::Environment::create(/*exec_server_url*/ None)
                 .await
@@ -3208,6 +3211,7 @@ async fn session_new_fails_before_emitting_events_when_initial_agent_identity_re
         mcp_manager,
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
+        None,
         None,
         Some(Arc::new(
             codex_exec_server::Environment::create(/*exec_server_url*/ None)
@@ -3362,6 +3366,7 @@ async fn session_new_emits_session_configured_before_async_agent_identity_failur
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
         None,
+        None,
         Some(Arc::new(
             codex_exec_server::Environment::create(/*exec_server_url*/ None)
                 .await
@@ -3444,6 +3449,66 @@ async fn session_new_emits_session_configured_before_async_agent_identity_failur
     })
     .await
     .expect("shutdown event should arrive after async registration failure");
+}
+
+#[tokio::test]
+async fn codex_spawn_preserves_runtime_lease_host_handle() {
+    let codex_home = tempfile::tempdir().expect("create temp dir");
+    let config = build_test_config(codex_home.path()).await;
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let models_manager = Arc::new(ModelsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_manager.clone(),
+        /*model_catalog*/ None,
+        CollaborationModesConfig::default(),
+    ));
+    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ true,
+    ));
+    let skills_watcher = Arc::new(SkillsWatcher::noop());
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
+    );
+    let CodexSpawnOk { codex, .. } = Codex::spawn(CodexSpawnArgs {
+        config,
+        auth_manager,
+        models_manager,
+        environment_manager: Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+        skills_manager,
+        plugins_manager,
+        mcp_manager,
+        skills_watcher,
+        conversation_history: InitialHistory::New,
+        session_source: SessionSource::Exec,
+        agent_control: AgentControl::default(),
+        dynamic_tools: Vec::new(),
+        persist_extended_history: false,
+        metrics_service_name: None,
+        inherited_shell_snapshot: None,
+        inherited_exec_policy: Some(Arc::new(ExecPolicyManager::default())),
+        compat_inherited_lease_auth_session: None,
+        runtime_lease_host: Some(runtime_lease_host.clone()),
+        user_shell_override: None,
+        parent_trace: None,
+        analytics_events_client: None,
+    })
+    .await
+    .expect("spawn codex");
+
+    let stored_host = codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("runtime lease host");
+    assert!(stored_host.ptr_eq_for_test(&runtime_lease_host));
+
+    codex.shutdown_and_wait().await.expect("shutdown codex");
 }
 
 // todo: use online model info
@@ -3580,6 +3645,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         thread_store: codex_thread_store::LocalThreadStore::new(
             codex_rollout::RolloutConfig::from_view(config.as_ref()),
@@ -3757,7 +3823,8 @@ async fn make_session_with_config_and_rx(
         mcp_manager,
         Arc::new(SkillsWatcher::noop()),
         AgentControl::default(),
-        /*inherited_lease_auth_session*/ None,
+        /*compat_inherited_lease_auth_session*/ None,
+        /*runtime_lease_host*/ None,
         Some(Arc::new(
             codex_exec_server::Environment::create(/*exec_server_url*/ None)
                 .await
@@ -4698,6 +4765,7 @@ where
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         account_pool_manager: None,
+        runtime_lease_host: None,
         lease_auth: Arc::new(crate::lease_auth::SessionLeaseAuth::default()),
         thread_store: codex_thread_store::LocalThreadStore::new(
             codex_rollout::RolloutConfig::from_view(config.as_ref()),
@@ -6919,6 +6987,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             tracker,
             call,
             ToolCallSource::Direct,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .err()
@@ -7161,6 +7230,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             tracker: Arc::clone(&turn_diff_tracker),
             call_id,
             tool_name: codex_tools::ToolName::plain(tool_name),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "command": params.command.clone(),
@@ -7239,6 +7309,7 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
             tracker: Arc::clone(&tracker),
             call_id: "exec-call".to_string(),
             tool_name: codex_tools::ToolName::plain("exec_command"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload: ToolPayload::Function {
                 arguments: serde_json::json!({
                     "cmd": "echo hi",

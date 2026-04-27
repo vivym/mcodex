@@ -63,6 +63,66 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
 }
 
 #[tokio::test]
+async fn load_rollout_items_falls_back_to_filename_thread_id_without_session_meta()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let day_dir = home.path().join("sessions/2025/01/03");
+    fs::create_dir_all(&day_dir)?;
+    let uuid = Uuid::new_v4();
+    let path = day_dir.join(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"));
+    let mut file = File::create(&path)?;
+    let user_event = serde_json::json!({
+        "timestamp": "2025-01-03T12:00:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "Hello from user",
+            "kind": "plain",
+        },
+    });
+    writeln!(file, "{user_event}")?;
+
+    let (_items, thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+
+    assert_eq!(parse_errors, 0);
+    assert_eq!(thread_id, ThreadId::from_string(&uuid.to_string()).ok(),);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_prefers_filename_thread_id_over_mismatched_session_meta()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let day_dir = home.path().join("sessions/2025/01/03");
+    fs::create_dir_all(&day_dir)?;
+    let child_uuid = Uuid::new_v4();
+    let source_uuid = Uuid::new_v4();
+    let child_thread_id = ThreadId::from_string(&child_uuid.to_string()).ok();
+    let path = day_dir.join(format!("rollout-2025-01-03T12-00-00-{child_uuid}.jsonl"));
+    let mut file = File::create(&path)?;
+    let session_meta = serde_json::json!({
+        "timestamp": "2025-01-03T12:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": source_uuid,
+            "timestamp": "2025-01-03T12:00:00Z",
+            "cwd": ".",
+            "originator": "test_originator",
+            "cli_version": "test_version",
+            "source": "cli",
+            "model_provider": "test-provider",
+        },
+    });
+    writeln!(file, "{session_meta}")?;
+
+    let (_items, thread_id, parse_errors) = RolloutRecorder::load_rollout_items(&path).await?;
+
+    assert_eq!(parse_errors, 0);
+    assert_eq!(thread_id, child_thread_id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -546,10 +606,12 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             network: None,
             file_system_sandbox_policy: None,
             model: "test-model".to_string(),
+            service_tier: None,
             personality: None,
             collaboration_mode: None,
             realtime_active: None,

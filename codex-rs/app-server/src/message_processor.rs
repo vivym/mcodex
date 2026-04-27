@@ -1028,6 +1028,28 @@ impl MessageProcessor {
                     )
                     .await;
             }
+            ClientRequest::AccountPoolDefaultSet { request_id, params } => {
+                self.codex_message_processor
+                    .account_pool_default_set(
+                        ConnectionRequestId {
+                            connection_id,
+                            request_id,
+                        },
+                        params,
+                    )
+                    .await;
+            }
+            ClientRequest::AccountPoolDefaultClear {
+                request_id,
+                params: _,
+            } => {
+                self.codex_message_processor
+                    .account_pool_default_clear(ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    })
+                    .await;
+            }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
                 // inline the full `CodexMessageProcessor::process_request` future, which
@@ -1036,8 +1058,9 @@ impl MessageProcessor {
                     .process_request(
                         connection_id,
                         other,
-                        app_server_client_name,
-                        client_version,
+                        session.app_server_client_name.clone(),
+                        session.client_version.clone(),
+                        transport,
                         request_context,
                     )
                     .boxed()

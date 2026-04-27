@@ -46,6 +46,19 @@ install:
 local-install:
     ./scripts/dev/install-local.sh
 
+[no-cd]
+smoke-mcodex-local *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-local.sh" "$@"
+
+[no-cd]
+smoke-mcodex-cli *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-cli.sh" "$@"
+
+[no-cd]
+smoke-mcodex-all *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-local.sh" "$@"
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-cli.sh" "$@"
+
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
 #

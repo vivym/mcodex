@@ -145,7 +145,50 @@ pub enum EffectivePoolResolutionSource {
     Override,
     ConfigDefault,
     PersistedSelection,
+    SingleVisiblePool,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStartupAvailability {
+    Available,
+    Suppressed,
+    MultiplePoolsRequireDefault,
+    InvalidExplicitDefault,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStartupResolutionIssueKind {
+    MultiplePoolsRequireDefault,
+    OverridePoolUnavailable,
+    ConfigDefaultPoolUnavailable,
+    PersistedDefaultPoolUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStartupResolutionIssueSource {
+    Override,
+    ConfigDefault,
+    PersistedSelection,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStartupCandidatePool {
+    pub pool_id: String,
+    pub display_name: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStartupResolutionIssue {
+    pub kind: AccountStartupResolutionIssueKind,
+    pub source: AccountStartupResolutionIssueSource,
+    pub pool_id: Option<String>,
+    pub candidate_pool_count: Option<usize>,
+    pub candidate_pools: Option<Vec<AccountStartupCandidatePool>>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +197,9 @@ pub struct AccountStartupStatus {
     pub configured_default_pool_id: Option<String>,
     pub persisted_default_pool_id: Option<String>,
     pub effective_pool_resolution_source: EffectivePoolResolutionSource,
+    pub startup_availability: AccountStartupAvailability,
+    pub startup_resolution_issue: Option<AccountStartupResolutionIssue>,
+    pub candidate_pools: Vec<AccountStartupCandidatePool>,
 }
 
 /// Eligibility result for fresh-runtime startup selection.

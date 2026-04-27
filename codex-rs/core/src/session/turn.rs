@@ -209,6 +209,7 @@ pub(crate) async fn run_turn(
         &sess,
         &turn_context,
         turn_account_id_override.clone(),
+        cancellation_token.child_token(),
     )
     .await
     {
@@ -580,6 +581,7 @@ pub(crate) async fn run_turn(
                         turn_account_id_override.clone(),
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        cancellation_token.child_token(),
                     )
                     .await
                     .is_err()
@@ -796,6 +798,7 @@ async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
     let mut pre_sampling_compacted = maybe_run_previous_model_inline_compact(
@@ -803,6 +806,7 @@ async fn run_pre_sampling_compact(
         turn_context,
         total_usage_tokens_before_compaction,
         account_id_override.clone(),
+        cancellation_token.child_token(),
     )
     .await?;
     let total_usage_tokens = sess.get_total_token_usage().await;
@@ -819,6 +823,7 @@ async fn run_pre_sampling_compact(
             account_id_override,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            cancellation_token.child_token(),
         )
         .await?;
         pre_sampling_compacted = true;
@@ -837,6 +842,7 @@ async fn maybe_run_previous_model_inline_compact(
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
     account_id_override: Option<String>,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(false);
@@ -868,6 +874,7 @@ async fn maybe_run_previous_model_inline_compact(
             account_id_override,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(true);
@@ -882,6 +889,7 @@ async fn run_auto_compact(
     account_id_override: Option<String>,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: CancellationToken,
 ) -> CodexResult<()> {
     if should_use_remote_compact_task(turn_context.provider.info()) {
         run_inline_remote_auto_compact_task(
@@ -891,6 +899,7 @@ async fn run_auto_compact(
             account_id_override,
             reason,
             phase,
+            cancellation_token,
         )
         .await?;
     } else {
@@ -900,6 +909,7 @@ async fn run_auto_compact(
             initial_context_injection,
             reason,
             phase,
+            cancellation_token,
         )
         .await?;
     }
@@ -1302,7 +1312,7 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let discoverable_tools = if apps_enabled && turn_context.tools_config.tool_suggest {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(
@@ -1981,6 +1991,7 @@ async fn try_run_sampling_request(
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
             turn_context.config.service_tier,
+            Some(&turn_context.sub_id),
             turn_metadata_header,
         )
         .instrument(trace_span!("stream_request"))

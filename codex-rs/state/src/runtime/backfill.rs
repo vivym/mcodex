@@ -130,7 +130,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
-    async fn init_removes_legacy_state_db_files() {
+    async fn init_only_removes_imported_legacy_state_db_family_after_successful_import() {
         let codex_home = unique_temp_dir();
         tokio::fs::create_dir_all(&codex_home)
             .await
@@ -139,17 +139,18 @@ mod tests {
         let current_name = state_db_filename();
         let previous_version = STATE_DB_VERSION.saturating_sub(1);
         let unversioned_name = format!("{STATE_DB_FILENAME}.sqlite");
+        let legacy_db_path =
+            codex_home.join(format!("{STATE_DB_FILENAME}_{previous_version}.sqlite"));
+        let legacy_pool =
+            super::open_state_sqlite(legacy_db_path.as_path(), &super::runtime_state_migrator())
+                .await
+                .expect("open legacy state db");
+        legacy_pool.close().await;
         for suffix in ["", "-wal", "-shm", "-journal"] {
-            let path = codex_home.join(format!("{unversioned_name}{suffix}"));
-            tokio::fs::write(path, b"legacy")
+            let unversioned_path = codex_home.join(format!("{unversioned_name}{suffix}"));
+            tokio::fs::write(unversioned_path, b"legacy")
                 .await
                 .expect("write legacy");
-            let old_version_path = codex_home.join(format!(
-                "{STATE_DB_FILENAME}_{previous_version}.sqlite{suffix}"
-            ));
-            tokio::fs::write(old_version_path, b"old_version")
-                .await
-                .expect("write old version");
         }
         let unrelated_path = codex_home.join("state.sqlite_backup");
         tokio::fs::write(&unrelated_path, b"keep")
@@ -170,7 +171,7 @@ mod tests {
                 tokio::fs::try_exists(&legacy_path)
                     .await
                     .expect("check legacy path"),
-                false
+                true
             );
             let old_version_path = codex_home.join(format!(
                 "{STATE_DB_FILENAME}_{previous_version}.sqlite{suffix}"

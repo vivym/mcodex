@@ -14,6 +14,8 @@ mod rate_limits;
 
 pub(crate) use account::StatusAccountDisplay;
 pub(crate) use account::StatusAccountLeaseDisplay;
+pub(crate) use account::StatusAccountQuotaFamilyDisplay;
+pub(crate) use account::StatusAccountQuotaWindowDisplay;
 pub(crate) use card::StatusHistoryHandle;
 #[cfg(test)]
 pub(crate) use card::new_status_output;

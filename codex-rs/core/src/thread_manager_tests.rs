@@ -3,6 +3,8 @@ use crate::config::test_config;
 use crate::rollout::RolloutRecorder;
 use crate::session::tests::make_session_and_context;
 use crate::tasks::interrupted_turn_history_marker;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::models::ContentItem;
@@ -10,6 +12,8 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use core_test_support::PathBufExt;
@@ -112,6 +116,43 @@ fn truncates_before_requested_user_message() {
         serde_json::to_value(truncated2.get_rollout_items()).unwrap(),
         serde_json::to_value(initial2).unwrap()
     );
+}
+
+#[test]
+fn ensure_fork_history_reorders_canonical_session_meta_to_front() {
+    let canonical_thread_id = ThreadId::new();
+    let mismatched_thread_id = ThreadId::new();
+    let history = InitialHistory::Forked(vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: mismatched_thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: canonical_thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::ResponseItem(user_msg("hello")),
+    ]);
+
+    let normalized =
+        ensure_fork_history_preserves_source_thread_id(history, Some(canonical_thread_id));
+
+    let InitialHistory::Forked(items) = normalized else {
+        panic!("expected forked history");
+    };
+    assert!(matches!(
+        items.first(),
+        Some(RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta { id, .. },
+            ..
+        })) if *id == canonical_thread_id
+    ));
 }
 
 #[test]
@@ -240,6 +281,7 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
@@ -274,6 +316,383 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
 }
 
 #[tokio::test]
+async fn thread_spawn_child_inherits_parent_runtime_lease_host() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let root_runtime_lease_host = root
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host")
+        .clone();
+    let expected_tree_id = crate::runtime_lease::CollaborationTreeId::for_test("tree-threadspawn");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            manager.agent_control(),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn thread child");
+    let child_runtime_lease_host = child
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&root_runtime_lease_host));
+    assert_eq!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .account_pool_manager
+            .is_none()
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_spawn_child_fails_when_runtime_parent_is_not_loaded() -> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(true),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let missing_parent_thread_id = ThreadId::new();
+
+    let result = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            manager.agent_control(),
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: missing_parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await;
+
+    let err = match result {
+        Ok(child) => {
+            child.thread.shutdown_and_wait().await?;
+            root.thread.shutdown_and_wait().await?;
+            anyhow::bail!(
+                "spawned ThreadSpawn child without loaded runtime parent {missing_parent_thread_id}"
+            );
+        }
+        Err(err) => err,
+    };
+    root.thread.shutdown_and_wait().await?;
+    assert!(
+        err.to_string()
+            .contains("cannot inherit runtime lease authority"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_threadspawn_child_with_explicit_runtime_parent_inherits_runtime_lease_host_and_tree()
+-> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(true),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let expected_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-memory-background");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
+    let root_runtime_lease_host = root
+        .thread
+        .codex
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("root runtime lease host")
+        .clone();
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source_and_runtime_parent(
+            config,
+            root.thread.codex.session.services.agent_control.clone(),
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+            RuntimeLeaseInheritanceSource::LookupThread(root.thread_id),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn memory child");
+
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .runtime_lease_host
+            .as_ref()
+            .expect("child runtime lease host")
+            .ptr_eq_for_test(&root_runtime_lease_host)
+    );
+    assert_eq!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_threadspawn_child_without_runtime_parent_does_not_infer_root_runtime_lease_host_or_tree()
+-> anyhow::Result<()> {
+    let temp_dir = tempdir()?;
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
+    std::fs::create_dir_all(&config.codex_home)?;
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(true),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: Some("pool-main".to_string()),
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::new(
+            /*exec_server_url*/ None,
+        )),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start root thread");
+    let root_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-memory-background");
+    root.thread
+        .codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(root_tree_id.clone());
+
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            root.thread.codex.session.services.agent_control.clone(),
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
+            /*persist_extended_history*/ false,
+            /*metrics_service_name*/ None,
+            /*inherited_shell_snapshot*/ None,
+            /*inherited_exec_policy*/ None,
+        )
+        .await
+        .expect("spawn memory child without runtime parent");
+
+    assert!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .runtime_lease_host
+            .is_none()
+    );
+    assert_ne!(
+        child
+            .thread
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        root_tree_id
+    );
+
+    child.thread.shutdown_and_wait().await?;
+    root.thread.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn new_uses_configured_openai_provider_for_model_refresh() {
     let server = MockServer::start().await;
     let models_mock = mount_models_once(&server, ModelsResponse { models: vec![] }).await;
@@ -282,6 +701,7 @@ async fn new_uses_configured_openai_provider_for_model_refresh() {
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
     config.model_catalog = None;
     config
@@ -425,6 +845,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -528,6 +949,7 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =
@@ -621,6 +1043,7 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
+    config.sqlite_home = config.codex_home.to_path_buf();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
     let auth_manager =

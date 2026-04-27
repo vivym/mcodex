@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::guardian::GuardianApprovalRequest;
@@ -62,11 +63,15 @@ use crate::session::completed_session_loop_termination;
 /// The returned `events_rx` yields non-approval events emitted by the sub-agent.
 /// Approval requests are handled via `parent_session` and are not surfaced.
 /// The returned `ops_tx` allows the caller to submit additional `Op`s to the sub-agent.
+///
+/// `compat_inherited_lease_auth_session` exists only for non-pooled
+/// compatibility paths. Pooled children must rely on the inherited runtime
+/// lease host instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
@@ -76,8 +81,34 @@ pub(crate) async fn run_codex_thread_interactive(
 ) -> Result<Codex, CodexErr> {
     let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let runtime_lease_host = parent_session.services.runtime_lease_host.clone();
+    let mut runtime_lease_startup_reservation =
+        if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
+            Some(
+                host.try_reserve_startup_for_child(format!(
+                    "delegate-subagent-startup-{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to reserve runtime lease startup for delegate child: {err:#}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+    let compat_inherited_lease_auth_session = if runtime_lease_host
+        .as_ref()
+        .is_some_and(|host| host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled)
+    {
+        None
+    } else {
+        compat_inherited_lease_auth_session
+    };
 
-    let CodexSpawnOk { codex, .. } = Box::pin(Codex::spawn(CodexSpawnArgs {
+    let spawn_result = Box::pin(Codex::spawn(CodexSpawnArgs {
         config,
         auth_manager,
         models_manager,
@@ -95,13 +126,53 @@ pub(crate) async fn run_codex_thread_interactive(
         persist_extended_history: false,
         metrics_service_name: None,
         inherited_shell_snapshot: None,
-        inherited_lease_auth_session,
+        compat_inherited_lease_auth_session,
+        runtime_lease_host,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
         parent_trace: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
     }))
-    .await?;
+    .await;
+    let CodexSpawnOk { codex, .. } = match spawn_result {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            if let Some(reservation) = runtime_lease_startup_reservation.take()
+                && let Err(rollback_err) = reservation.rollback().await
+            {
+                warn!(
+                    "failed to roll back runtime lease startup reservation after delegate spawn failure: {rollback_err:#}"
+                );
+            }
+            return Err(err);
+        }
+    };
+    let initial_collaboration_tree_id = match &subagent_source {
+        SubAgentSource::Other(source) if source == crate::guardian::GUARDIAN_REVIEWER_NAME => {
+            crate::runtime_lease::CollaborationTreeId::root_for_session(
+                &codex.session.conversation_id.to_string(),
+            )
+        }
+        _ => parent_session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+    };
+    codex
+        .session
+        .services
+        .model_client
+        .set_collaboration_tree_id(initial_collaboration_tree_id);
+    if let Some(reservation) = runtime_lease_startup_reservation.take()
+        && let Err(err) = reservation
+            .promote_to_session(&codex.session.conversation_id.to_string())
+            .await
+    {
+        let _ = codex.shutdown_and_wait().await;
+        return Err(CodexErr::Fatal(format!(
+            "failed to promote runtime lease startup reservation: {err:#}"
+        )));
+    }
     if parent_session.enabled(codex_features::Feature::GeneralAnalytics) {
         let thread_config = codex.thread_config_snapshot().await;
         let client_metadata = parent_session.app_server_client_metadata().await;
@@ -163,7 +234,7 @@ pub(crate) async fn run_codex_thread_interactive(
 pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
-    inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
     models_manager: Arc<ModelsManager>,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
@@ -176,10 +247,14 @@ pub(crate) async fn run_codex_thread_one_shot(
     // Use a child token so we can stop the delegate after completion without
     // requiring the caller to cancel the parent token.
     let child_cancel = cancel_token.child_token();
+    let parent_collaboration_tree_id = parent_session
+        .services
+        .model_client
+        .current_collaboration_tree_id();
     let io = Box::pin(run_codex_thread_interactive(
         config,
         auth_manager,
-        inherited_lease_auth_session,
+        compat_inherited_lease_auth_session,
         models_manager,
         parent_session,
         parent_ctx,
@@ -188,6 +263,15 @@ pub(crate) async fn run_codex_thread_one_shot(
         initial_history,
     ))
     .await?;
+    let collaboration_binding = io.session.services.bind_collaboration_tree(
+        parent_collaboration_tree_id,
+        format!(
+            "{}:delegate-one-shot:{}",
+            io.session.conversation_id,
+            uuid::Uuid::now_v7()
+        ),
+        child_cancel.clone(),
+    );
 
     // Send the initial input to kick off the one-shot turn.
     io.submit(Op::UserInput {
@@ -205,6 +289,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let session_loop_termination = io.session_loop_termination.clone();
     let io_for_bridge = io;
     tokio::spawn(async move {
+        let _collaboration_binding = collaboration_binding;
         while let Ok(event) = io_for_bridge.next_event().await {
             let should_shutdown = matches!(
                 event.msg,

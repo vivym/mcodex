@@ -1,3 +1,4 @@
+mod default_pool;
 mod diagnostics;
 mod mutate;
 mod observability;
@@ -16,6 +17,9 @@ use codex_state::AccountStartupSelectionUpdate;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
 use codex_utils_cli::CliConfigOverrides;
+use default_pool::clear_default_pool;
+use default_pool::reject_process_local_override;
+use default_pool::set_default_pool;
 use diagnostics::read_current_diagnostic;
 use diagnostics::read_status_diagnostic;
 use mutate::assign_account_pool;
@@ -135,6 +139,7 @@ pub struct PoolCommand {
 pub enum PoolSubcommand {
     List,
     Assign(PoolAssignCommand),
+    Default(PoolDefaultCommand),
     Show(PoolShowCommand),
 }
 
@@ -143,6 +148,24 @@ pub struct PoolAssignCommand {
     #[arg(value_name = "ACCOUNT_ID")]
     pub account_id: String,
 
+    #[arg(value_name = "POOL_ID")]
+    pub pool_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolDefaultCommand {
+    #[command(subcommand)]
+    pub subcommand: PoolDefaultSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum PoolDefaultSubcommand {
+    Set(PoolDefaultSetCommand),
+    Clear,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolDefaultSetCommand {
     #[arg(value_name = "POOL_ID")]
     pub pool_id: String,
 }
@@ -277,6 +300,12 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
         && matches!(command.subcommand, Some(AddAccountSubcommand::ApiKey))
     {
         return api_key_add_is_unsupported().map(|_| ());
+    }
+    if let AccountsSubcommand::Pool(PoolCommand {
+        subcommand: PoolSubcommand::Default(_),
+    }) = &subcommand
+    {
+        reject_process_local_override(account_pool.as_deref())?;
     }
 
     let cli_overrides = config_overrides
@@ -445,6 +474,20 @@ async fn run_accounts_impl(command: AccountsCommand) -> anyhow::Result<()> {
                     PoolSubcommand::Assign(command) => {
                         assign_account_pool(&runtime, &command.account_id, &command.pool_id).await
                     }
+                    PoolSubcommand::Default(command) => match command.subcommand {
+                        PoolDefaultSubcommand::Set(command) => {
+                            set_default_pool(
+                                &runtime,
+                                &config,
+                                account_pool.as_deref(),
+                                &command.pool_id,
+                            )
+                            .await
+                        }
+                        PoolDefaultSubcommand::Clear => {
+                            clear_default_pool(&runtime, &config, account_pool.as_deref()).await
+                        }
+                    },
                     PoolSubcommand::Show(_) => {
                         unreachable!("handled before runtime initialization")
                     }
@@ -550,4 +593,21 @@ fn validate_explicit_observability_target(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountsCommand;
+    use clap::Parser;
+
+    #[test]
+    fn accounts_pool_default_commands_parse() {
+        let set = AccountsCommand::try_parse_from(["codex", "pool", "default", "set", "team-main"])
+            .expect("default set parses");
+        assert!(format!("{set:?}").contains("Default"));
+
+        let clear = AccountsCommand::try_parse_from(["codex", "pool", "default", "clear"])
+            .expect("default clear parses");
+        assert!(format!("{clear:?}").contains("Clear"));
+    }
 }

@@ -69,6 +69,15 @@ use url::Url;
 const MCP_CALL_COUNT_METRIC: &str = "codex.mcp.call";
 const MCP_CALL_DURATION_METRIC: &str = "codex.mcp.call.duration_ms";
 
+struct McpToolCallRequest<'a> {
+    server: &'a str,
+    tool_name: &'a str,
+    arguments_value: Option<serde_json::Value>,
+    metadata: Option<&'a McpToolApprovalMetadata>,
+    request_meta: Option<serde_json::Value>,
+    cancellation_token: tokio_util::sync::CancellationToken,
+}
+
 /// Handles the specified tool call dispatches the appropriate
 /// `McpToolCallBegin` and `McpToolCallEnd` events to the `Session`.
 pub(crate) async fn handle_mcp_tool_call(
@@ -78,6 +87,7 @@ pub(crate) async fn handle_mcp_tool_call(
     server: String,
     tool_name: String,
     arguments: String,
+    cancellation_token: tokio_util::sync::CancellationToken,
 ) -> CallToolResult {
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
@@ -190,11 +200,14 @@ pub(crate) async fn handle_mcp_tool_call(
                     execute_mcp_tool_call(
                         sess.as_ref(),
                         turn_context.as_ref(),
-                        &server,
-                        &tool_name,
-                        arguments_value.clone(),
-                        metadata.as_ref(),
-                        request_meta.clone(),
+                        McpToolCallRequest {
+                            server: &server,
+                            tool_name: &tool_name,
+                            arguments_value: arguments_value.clone(),
+                            metadata: metadata.as_ref(),
+                            request_meta: request_meta.clone(),
+                            cancellation_token: cancellation_token.child_token(),
+                        },
                     )
                     .await
                 }
@@ -306,11 +319,14 @@ pub(crate) async fn handle_mcp_tool_call(
         execute_mcp_tool_call(
             sess.as_ref(),
             turn_context.as_ref(),
-            &server,
-            &tool_name,
-            arguments_value.clone(),
-            metadata.as_ref(),
-            request_meta,
+            McpToolCallRequest {
+                server: &server,
+                tool_name: &tool_name,
+                arguments_value: arguments_value.clone(),
+                metadata: metadata.as_ref(),
+                request_meta,
+                cancellation_token: cancellation_token.child_token(),
+            },
         )
         .await
     }
@@ -464,17 +480,22 @@ fn record_server_fields(span: &Span, url: Option<&str>) {
 async fn execute_mcp_tool_call(
     sess: &Session,
     turn_context: &TurnContext,
-    server: &str,
-    tool_name: &str,
-    arguments_value: Option<serde_json::Value>,
-    metadata: Option<&McpToolApprovalMetadata>,
-    request_meta: Option<serde_json::Value>,
+    request: McpToolCallRequest<'_>,
 ) -> Result<CallToolResult, String> {
+    let McpToolCallRequest {
+        server,
+        tool_name,
+        arguments_value,
+        metadata,
+        request_meta,
+        cancellation_token,
+    } = request;
     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
         sess,
         turn_context,
         arguments_value,
         metadata.and_then(|metadata| metadata.openai_file_input_params.as_deref()),
+        cancellation_token,
     )
     .await?;
     let request_meta =

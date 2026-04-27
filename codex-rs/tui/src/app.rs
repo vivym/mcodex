@@ -8476,8 +8476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_live_thread_for_selection_rejects_empty_non_ephemeral_fallback_threads()
-    -> Result<()> {
+    async fn attach_live_thread_for_selection_allows_empty_live_thread_resume() -> Result<()> {
         let mut app = make_test_app().await;
         let mut app_server =
             crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
@@ -8494,16 +8493,12 @@ mod tests {
             /*is_closed*/ false,
         );
 
-        let err = app
+        let live_attached = app
             .attach_live_thread_for_selection(&mut app_server, thread_id)
-            .await
-            .expect_err("empty fallback should not attach as a blank replay-only thread");
+            .await?;
 
-        assert_eq!(
-            err.to_string(),
-            format!("Agent thread {thread_id} is not yet available for replay or live attach.")
-        );
-        assert!(!app.thread_event_channels.contains_key(&thread_id));
+        assert!(live_attached);
+        assert!(app.thread_event_channels.contains_key(&thread_id));
         Ok(())
     }
 
@@ -9633,10 +9628,12 @@ guardian_approval = true
             current_date: None,
             timezone: None,
             approval_policy: primary_session.approval_policy,
+            approvals_reviewer: Some(primary_session.approvals_reviewer),
             sandbox_policy: primary_session.sandbox_policy.clone(),
             network: None,
             file_system_sandbox_policy: None,
             model: "gpt-agent".to_string(),
+            service_tier: primary_session.service_tier,
             personality: None,
             collaboration_mode: None,
             realtime_active: Some(false),

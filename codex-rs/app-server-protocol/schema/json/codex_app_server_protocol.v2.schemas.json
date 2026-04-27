@@ -152,6 +152,9 @@
             "null"
           ]
         },
+        "startup": {
+          "$ref": "#/definitions/AccountStartupSnapshot"
+        },
         "suppressed": {
           "type": "boolean"
         },
@@ -178,6 +181,7 @@
       },
       "required": [
         "active",
+        "startup",
         "suppressed"
       ],
       "title": "AccountLeaseReadResponse",
@@ -237,11 +241,15 @@
             "null"
           ]
         },
+        "startup": {
+          "$ref": "#/definitions/AccountStartupSnapshot"
+        },
         "suppressed": {
           "type": "boolean"
         }
       },
       "required": [
+        "startup",
         "suppressed"
       ],
       "title": "AccountLeaseUpdatedNotification",
@@ -344,6 +352,12 @@
             }
           ]
         },
+        "quotas": {
+          "items": {
+            "$ref": "#/definitions/AccountPoolQuotaFamilyResponse"
+          },
+          "type": "array"
+        },
         "selection": {
           "anyOf": [
             {
@@ -353,6 +367,9 @@
               "type": "null"
             }
           ]
+        },
+        "selectionFamily": {
+          "type": "string"
         },
         "statusMessage": {
           "type": [
@@ -385,7 +402,9 @@
         "healthState",
         "operationalState",
         "quota",
+        "quotas",
         "selection",
+        "selectionFamily",
         "statusMessage",
         "statusReasonCode",
         "updatedAt"
@@ -395,6 +414,12 @@
     "AccountPoolAccountsListParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "accountKinds": {
           "items": {
             "type": "string"
@@ -466,6 +491,29 @@
         "remote"
       ],
       "type": "string"
+    },
+    "AccountPoolDefaultClearResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "AccountPoolDefaultClearResponse",
+      "type": "object"
+    },
+    "AccountPoolDefaultSetParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "poolId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "poolId"
+      ],
+      "title": "AccountPoolDefaultSetParams",
+      "type": "object"
+    },
+    "AccountPoolDefaultSetResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "AccountPoolDefaultSetResponse",
+      "type": "object"
     },
     "AccountPoolDiagnosticsIssueResponse": {
       "properties": {
@@ -783,6 +831,50 @@
       ],
       "type": "object"
     },
+    "AccountPoolQuotaFamilyResponse": {
+      "properties": {
+        "exhaustedWindows": {
+          "type": "string"
+        },
+        "limitId": {
+          "type": "string"
+        },
+        "nextProbeAfter": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observedAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "predictedBlockedUntil": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "primary": {
+          "$ref": "#/definitions/AccountPoolQuotaWindowResponse"
+        },
+        "secondary": {
+          "$ref": "#/definitions/AccountPoolQuotaWindowResponse"
+        }
+      },
+      "required": [
+        "exhaustedWindows",
+        "limitId",
+        "nextProbeAfter",
+        "observedAt",
+        "predictedBlockedUntil",
+        "primary",
+        "secondary"
+      ],
+      "type": "object"
+    },
     "AccountPoolQuotaResponse": {
       "properties": {
         "observedAt": {
@@ -808,6 +900,29 @@
         "observedAt",
         "remainingPercent",
         "resetsAt"
+      ],
+      "type": "object"
+    },
+    "AccountPoolQuotaWindowResponse": {
+      "properties": {
+        "resetsAt": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "usedPercent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "resetsAt",
+        "usedPercent"
       ],
       "type": "object"
     },
@@ -999,6 +1114,158 @@
         "rateLimits"
       ],
       "title": "AccountRateLimitsUpdatedNotification",
+      "type": "object"
+    },
+    "AccountStartupAvailability": {
+      "enum": [
+        "available",
+        "suppressed",
+        "multiplePoolsRequireDefault",
+        "invalidExplicitDefault",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "AccountStartupCandidatePool": {
+      "properties": {
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": "string"
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "displayName",
+        "poolId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "AccountStartupResolutionIssue": {
+      "properties": {
+        "candidatePoolCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "candidatePools": {
+          "items": {
+            "$ref": "#/definitions/AccountStartupCandidatePool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/AccountStartupResolutionIssueSource"
+        },
+        "type": {
+          "$ref": "#/definitions/AccountStartupResolutionIssueType"
+        }
+      },
+      "required": [
+        "candidatePoolCount",
+        "candidatePools",
+        "message",
+        "poolId",
+        "source",
+        "type"
+      ],
+      "type": "object"
+    },
+    "AccountStartupResolutionIssueSource": {
+      "enum": [
+        "override",
+        "configDefault",
+        "persistedSelection",
+        "none"
+      ],
+      "type": "string"
+    },
+    "AccountStartupResolutionIssueType": {
+      "enum": [
+        "multiplePoolsRequireDefault",
+        "overridePoolUnavailable",
+        "configDefaultPoolUnavailable",
+        "persistedDefaultPoolUnavailable"
+      ],
+      "type": "string"
+    },
+    "AccountStartupSnapshot": {
+      "properties": {
+        "configuredDefaultPoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectivePoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectivePoolResolutionSource": {
+          "type": "string"
+        },
+        "persistedDefaultPoolId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selectionEligibility": {
+          "type": "string"
+        },
+        "startupAvailability": {
+          "$ref": "#/definitions/AccountStartupAvailability"
+        },
+        "startupResolutionIssue": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AccountStartupResolutionIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "configuredDefaultPoolId",
+        "effectivePoolId",
+        "effectivePoolResolutionSource",
+        "persistedDefaultPoolId",
+        "selectionEligibility",
+        "startupAvailability",
+        "startupResolutionIssue"
+      ],
       "type": "object"
     },
     "AccountUpdatedNotification": {
@@ -3019,6 +3286,53 @@
             "params"
           ],
           "title": "AccountPool/readRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/default/set"
+              ],
+              "title": "AccountPool/default/setRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AccountPoolDefaultSetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "AccountPool/default/setRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "accountPool/default/clear"
+              ],
+              "title": "AccountPool/default/clearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "id",
+            "method"
+          ],
+          "title": "AccountPool/default/clearRequest",
           "type": "object"
         },
         {

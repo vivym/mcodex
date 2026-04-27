@@ -109,6 +109,15 @@ impl ThreadWatchManager {
             .await;
     }
 
+    pub(crate) async fn remove_thread_silently(&self, thread_id: &str) {
+        let thread_id = thread_id.to_string();
+        self.mutate_and_publish(move |state| {
+            let _ = state.remove_thread(&thread_id);
+            None
+        })
+        .await;
+    }
+
     pub(crate) async fn loaded_status_for_thread(&self, thread_id: &str) -> ThreadStatus {
         self.state.lock().await.loaded_status_for_thread(thread_id)
     }

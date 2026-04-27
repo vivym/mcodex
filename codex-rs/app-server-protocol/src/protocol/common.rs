@@ -534,6 +534,14 @@ client_request_definitions! {
         params: v2::AccountPoolReadParams,
         response: v2::AccountPoolReadResponse,
     },
+    AccountPoolDefaultSet => "accountPool/default/set" {
+        params: v2::AccountPoolDefaultSetParams,
+        response: v2::AccountPoolDefaultSetResponse,
+    },
+    AccountPoolDefaultClear => "accountPool/default/clear" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::AccountPoolDefaultClearResponse,
+    },
     AccountPoolAccountsList => "accountPool/accounts/list" {
         params: v2::AccountPoolAccountsListParams,
         response: v2::AccountPoolAccountsListResponse,
@@ -1899,6 +1907,45 @@ mod tests {
     }
 
     #[test]
+    fn serialize_account_pool_default_set() -> Result<()> {
+        let request = ClientRequest::AccountPoolDefaultSet {
+            request_id: RequestId::Integer(9),
+            params: v2::AccountPoolDefaultSetParams {
+                pool_id: "team-main".to_string(),
+            },
+        };
+
+        assert_eq!(
+            json!({
+                "method": "accountPool/default/set",
+                "id": 9,
+                "params": {
+                    "poolId": "team-main"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_pool_default_clear() -> Result<()> {
+        let request = ClientRequest::AccountPoolDefaultClear {
+            request_id: RequestId::Integer(9),
+            params: None,
+        };
+
+        assert_eq!(
+            json!({
+                "method": "accountPool/default/clear",
+                "id": 9
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn serialize_thread_realtime_start_prompt_default_and_null() -> Result<()> {
         let default_prompt_request = ClientRequest::ThreadRealtimeStart {
             request_id: RequestId::Integer(9),
@@ -2023,6 +2070,15 @@ mod tests {
                 proactive_switch_pending: None,
                 proactive_switch_suppressed: None,
                 proactive_switch_allowed_at: None,
+                startup: v2::AccountStartupSnapshot {
+                    effective_pool_id: Some("pool-main".to_string()),
+                    effective_pool_resolution_source: "singleVisiblePool".to_string(),
+                    configured_default_pool_id: None,
+                    persisted_default_pool_id: None,
+                    startup_availability: v2::AccountStartupAvailability::Available,
+                    startup_resolution_issue: None,
+                    selection_eligibility: "automaticAccountSelected".to_string(),
+                },
             });
         assert_eq!(
             json!({
@@ -2035,7 +2091,16 @@ mod tests {
                     "minSwitchIntervalSecs": null,
                     "proactiveSwitchPending": null,
                     "proactiveSwitchSuppressed": null,
-                    "proactiveSwitchAllowedAt": null
+                    "proactiveSwitchAllowedAt": null,
+                    "startup": {
+                        "effectivePoolId": "pool-main",
+                        "effectivePoolResolutionSource": "singleVisiblePool",
+                        "configuredDefaultPoolId": null,
+                        "persistedDefaultPoolId": null,
+                        "startupAvailability": "available",
+                        "startupResolutionIssue": null,
+                        "selectionEligibility": "automaticAccountSelected"
+                    }
                 }
             }),
             serde_json::to_value(&notification)?,

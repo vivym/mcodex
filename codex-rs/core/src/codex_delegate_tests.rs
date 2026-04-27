@@ -1,7 +1,15 @@
 use super::*;
+use crate::config::Config;
+use crate::config::ConfigBuilder;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_QUESTION_ID_PREFIX;
 use async_channel::bounded;
+use codex_config::types::AccountPoolDefinitionToml;
+use codex_config::types::AccountsConfigToml;
+use codex_login::CodexAuth;
+use codex_login::auth::LeaseAuthBinding;
+use codex_login::auth::LeaseScopedAuthSession;
+use codex_login::auth::LeasedTurnAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ResponseItem;
@@ -15,6 +23,7 @@ use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::request_permissions::RequestPermissionProfile;
@@ -23,14 +32,50 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
+use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::time::timeout;
+
+struct TestLeaseScopedAuthSession {
+    binding: LeaseAuthBinding,
+}
+
+impl TestLeaseScopedAuthSession {
+    fn new(account_id: &str) -> Self {
+        Self {
+            binding: LeaseAuthBinding {
+                account_id: account_id.to_string(),
+                backend_account_handle: format!("handle-{account_id}"),
+                lease_epoch: 1,
+            },
+        }
+    }
+}
+
+impl LeaseScopedAuthSession for TestLeaseScopedAuthSession {
+    fn leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        self.refresh_leased_turn_auth()
+    }
+
+    fn refresh_leased_turn_auth(&self) -> anyhow::Result<LeasedTurnAuth> {
+        Ok(LeasedTurnAuth::new(CodexAuth::from_api_key("test api key")))
+    }
+
+    fn binding(&self) -> &LeaseAuthBinding {
+        &self.binding
+    }
+
+    fn ensure_current(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn forward_events_cancelled_while_send_blocked_shuts_down_delegate() {
@@ -154,6 +199,201 @@ async fn forward_ops_preserves_submission_trace_context() {
 }
 
 #[tokio::test]
+async fn run_codex_thread_interactive_inherits_parent_runtime_lease_host() -> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) =
+        crate::session::tests::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-a".to_string()),
+    );
+    install_authority_for_delegate_test(
+        &runtime_lease_host,
+        pooled_config.as_ref(),
+        "holder-delegate-runtime-a",
+    )
+    .await?;
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let expected_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-review-parent");
+    parent_session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(expected_tree_id.clone());
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_interactive(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        /*compat_inherited_lease_auth_session*/ None,
+        Arc::clone(&parent_session.services.models_manager),
+        Arc::clone(&parent_session),
+        parent_ctx,
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await?;
+
+    let child_runtime_lease_host = child
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
+    assert_eq!(
+        child
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+        expected_tree_id
+    );
+    assert!(child.session.services.account_pool_manager.is_none());
+
+    child.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_host_exists()
+-> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) =
+        crate::session::tests::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-b".to_string()),
+    );
+    install_authority_for_delegate_test(
+        &runtime_lease_host,
+        pooled_config.as_ref(),
+        "holder-delegate-runtime-b",
+    )
+    .await?;
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_interactive(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        Some(Arc::new(TestLeaseScopedAuthSession::new(
+            "delegate-child-account",
+        ))),
+        Arc::clone(&parent_session.services.models_manager),
+        Arc::clone(&parent_session),
+        parent_ctx,
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await?;
+
+    assert!(
+        child
+            .session
+            .services
+            .lease_auth
+            .current_session()
+            .is_none(),
+        "delegate child should rely on runtime host, not inherited static lease auth"
+    );
+    let child_runtime_lease_host = child
+        .session
+        .services
+        .runtime_lease_host
+        .as_ref()
+        .expect("child runtime lease host");
+    assert!(child_runtime_lease_host.ptr_eq_for_test(&runtime_lease_host));
+
+    child.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_codex_thread_one_shot_registers_invocation_collaboration_membership()
+-> anyhow::Result<()> {
+    let (mut parent_session, mut parent_ctx) =
+        crate::session::tests::make_session_and_context().await;
+    let pooled_config = Arc::new(build_test_config_with_pool(&parent_ctx.config.codex_home).await);
+    let runtime_lease_host = crate::runtime_lease::RuntimeLeaseHost::pooled_with_authority_for_test(
+        crate::runtime_lease::RuntimeLeaseHostId::new("runtime-c".to_string()),
+        crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("acct-c", 11),
+    );
+    parent_session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+    parent_ctx.config = Arc::clone(&pooled_config);
+
+    let parent_session = Arc::new(parent_session);
+    let parent_tree_id =
+        crate::runtime_lease::CollaborationTreeId::for_test("tree-review-parent-one-shot");
+    parent_session
+        .services
+        .model_client
+        .set_collaboration_tree_for_test(parent_tree_id.clone());
+    let parent_ctx = Arc::new(parent_ctx);
+    let child = run_codex_thread_one_shot(
+        pooled_config.as_ref().clone(),
+        Arc::clone(&parent_session.services.auth_manager),
+        /*compat_inherited_lease_auth_session*/ None,
+        Arc::clone(&parent_session.services.models_manager),
+        vec![UserInput::Text {
+            text: "keep the review idle".into(),
+            text_elements: Vec::new(),
+        }],
+        Arc::clone(&parent_session),
+        Arc::clone(&parent_ctx),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*final_output_json_schema*/ None,
+        /*initial_history*/ None,
+    )
+    .await?;
+    let child_session_loop_termination = child.session_loop_termination.clone();
+
+    assert!(
+        runtime_lease_host
+            .collaboration_member_ids_for_test(&parent_tree_id)
+            .iter()
+            .any(|member_id| member_id.contains(":delegate-one-shot:")),
+        "one-shot delegate should register an invocation-scoped collaboration membership before any provider request"
+    );
+
+    let authority = runtime_lease_host
+        .pooled_authority()
+        .expect("delegate test host should publish authority");
+    let reporting_request = crate::runtime_lease::LeaseRequestContext::for_test(
+        crate::runtime_lease::RequestBoundaryKind::ResponsesHttp,
+        "reporter-session",
+        parent_tree_id.clone(),
+    );
+    let reporting_admission = authority
+        .acquire_request_lease_for_test(reporting_request)
+        .await?;
+    authority
+        .report_terminal_unauthorized(&reporting_admission.snapshot)
+        .await?;
+    drop(reporting_admission.guard);
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime_lease_host.collaboration_member_count_for_test(&parent_tree_id) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for one-shot membership cleanup");
+    timeout(Duration::from_secs(2), child_session_loop_termination)
+        .await
+        .expect("timed out waiting for one-shot delegate shutdown");
+    Ok(())
+}
+
+#[tokio::test]
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
@@ -239,6 +479,53 @@ async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
             response: expected_response,
         }
     );
+}
+
+async fn build_test_config_with_pool(codex_home: &Path) -> Config {
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.to_path_buf())
+        .build()
+        .await
+        .expect("load default test config");
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool-main".to_string(),
+        AccountPoolDefinitionToml {
+            allow_context_reuse: Some(false),
+            account_kinds: None,
+        },
+    );
+    config.accounts = Some(AccountsConfigToml {
+        backend: None,
+        default_pool: None,
+        proactive_switch_threshold_percent: None,
+        lease_ttl_secs: None,
+        heartbeat_interval_secs: None,
+        min_switch_interval_secs: None,
+        allocation_mode: None,
+        pools: Some(pools),
+    });
+    config
+}
+
+async fn install_authority_for_delegate_test(
+    runtime_lease_host: &crate::runtime_lease::RuntimeLeaseHost,
+    config: &Config,
+    holder_instance_id: &str,
+) -> anyhow::Result<()> {
+    let state_db =
+        codex_state::StateRuntime::init(config.codex_home.to_path_buf(), "mock_provider".into())
+            .await?;
+    let authority = crate::state::SessionServices::build_root_runtime_lease_authority(
+        Some(state_db),
+        config.accounts.clone(),
+        config.codex_home.to_path_buf(),
+        holder_instance_id.to_string(),
+    )
+    .await?
+    .expect("delegate test pooled authority should build");
+    runtime_lease_host.install_authority(authority)?;
+    Ok(())
 }
 
 #[tokio::test]

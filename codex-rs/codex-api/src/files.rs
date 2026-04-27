@@ -30,6 +30,21 @@ pub struct UploadedOpenAiFile {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOpenAiFileUpload {
+    pub file_id: String,
+    pub file_name: String,
+    pub file_size_bytes: u64,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiFileRequestKind {
+    Create,
+    Upload,
+    Finalize,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiFileError {
     #[error("path `{path}` does not exist")]
@@ -56,8 +71,9 @@ pub enum OpenAiFileError {
         #[source]
         source: reqwest::Error,
     },
-    #[error("OpenAI file request to {url} failed with status {status}: {body}")]
+    #[error("OpenAI file {request_kind:?} request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
+        request_kind: OpenAiFileRequestKind,
         url: String,
         status: StatusCode,
         body: String,
@@ -90,15 +106,16 @@ struct DownloadLinkResponse {
     error_message: Option<String>,
 }
 
+struct LocalFileUploadSource {
+    file_name: String,
+    file_size_bytes: u64,
+}
+
 pub fn openai_file_uri(file_id: &str) -> String {
     format!("{OPENAI_FILE_URI_PREFIX}{file_id}")
 }
 
-pub async fn upload_local_file(
-    base_url: &str,
-    auth: &dyn AuthProvider,
-    path: &Path,
-) -> Result<UploadedOpenAiFile, OpenAiFileError> {
+async fn local_file_upload_source(path: &Path) -> Result<LocalFileUploadSource, OpenAiFileError> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|source| match source.kind() {
@@ -128,11 +145,23 @@ pub async fn upload_local_file(
         .and_then(|value| value.to_str())
         .unwrap_or("file")
         .to_string();
+    Ok(LocalFileUploadSource {
+        file_name,
+        file_size_bytes: metadata.len(),
+    })
+}
+
+pub async fn start_local_file_upload(
+    base_url: &str,
+    auth: &impl AuthProvider,
+    path: &Path,
+) -> Result<PendingOpenAiFileUpload, OpenAiFileError> {
+    let source = local_file_upload_source(path).await?;
     let create_url = format!("{}/files", base_url.trim_end_matches('/'));
     let create_response = authorized_request(auth, reqwest::Method::POST, &create_url)
         .json(&serde_json::json!({
-            "file_name": file_name,
-            "file_size": metadata.len(),
+            "file_name": source.file_name,
+            "file_size": source.file_size_bytes,
             "use_case": OPENAI_FILE_USE_CASE,
         }))
         .send()
@@ -145,6 +174,7 @@ pub async fn upload_local_file(
     let create_body = create_response.text().await.unwrap_or_default();
     if !create_status.is_success() {
         return Err(OpenAiFileError::UnexpectedStatus {
+            request_kind: OpenAiFileRequestKind::Create,
             url: create_url,
             status: create_status,
             body: create_body,
@@ -166,7 +196,7 @@ pub async fn upload_local_file(
         .put(&create_payload.upload_url)
         .timeout(OPENAI_FILE_REQUEST_TIMEOUT)
         .header("x-ms-blob-type", "BlockBlob")
-        .header(CONTENT_LENGTH, metadata.len())
+        .header(CONTENT_LENGTH, source.file_size_bytes)
         .body(reqwest::Body::wrap_stream(ReaderStream::new(upload_file)))
         .send()
         .await
@@ -178,16 +208,30 @@ pub async fn upload_local_file(
     let upload_body = upload_response.text().await.unwrap_or_default();
     if !upload_status.is_success() {
         return Err(OpenAiFileError::UnexpectedStatus {
+            request_kind: OpenAiFileRequestKind::Upload,
             url: create_payload.upload_url.clone(),
             status: upload_status,
             body: upload_body,
         });
     }
 
+    Ok(PendingOpenAiFileUpload {
+        file_id: create_payload.file_id,
+        file_name: source.file_name,
+        file_size_bytes: source.file_size_bytes,
+        path: path.to_path_buf(),
+    })
+}
+
+pub async fn finalize_local_file_upload(
+    base_url: &str,
+    auth: &impl AuthProvider,
+    pending_upload: &PendingOpenAiFileUpload,
+) -> Result<UploadedOpenAiFile, OpenAiFileError> {
     let finalize_url = format!(
         "{}/files/{}/uploaded",
         base_url.trim_end_matches('/'),
-        create_payload.file_id,
+        pending_upload.file_id,
     );
     let finalize_started_at = Instant::now();
     loop {
@@ -203,6 +247,7 @@ pub async fn upload_local_file(
         let finalize_body = finalize_response.text().await.unwrap_or_default();
         if !finalize_status.is_success() {
             return Err(OpenAiFileError::UnexpectedStatus {
+                request_kind: OpenAiFileRequestKind::Finalize,
                 url: finalize_url.clone(),
                 status: finalize_status,
                 body: finalize_body,
@@ -217,31 +262,33 @@ pub async fn upload_local_file(
         match finalize_payload.status.as_str() {
             "success" => {
                 return Ok(UploadedOpenAiFile {
-                    file_id: create_payload.file_id.clone(),
-                    uri: openai_file_uri(&create_payload.file_id),
+                    file_id: pending_upload.file_id.clone(),
+                    uri: openai_file_uri(&pending_upload.file_id),
                     download_url: finalize_payload.download_url.ok_or_else(|| {
                         OpenAiFileError::UploadFailed {
-                            file_id: create_payload.file_id.clone(),
+                            file_id: pending_upload.file_id.clone(),
                             message: "missing download_url".to_string(),
                         }
                     })?,
-                    file_name: finalize_payload.file_name.unwrap_or(file_name),
-                    file_size_bytes: metadata.len(),
+                    file_name: finalize_payload
+                        .file_name
+                        .unwrap_or_else(|| pending_upload.file_name.clone()),
+                    file_size_bytes: pending_upload.file_size_bytes,
                     mime_type: finalize_payload.mime_type,
-                    path: path.to_path_buf(),
+                    path: pending_upload.path.clone(),
                 });
             }
             "retry" => {
                 if finalize_started_at.elapsed() >= OPENAI_FILE_FINALIZE_TIMEOUT {
                     return Err(OpenAiFileError::UploadNotReady {
-                        file_id: create_payload.file_id,
+                        file_id: pending_upload.file_id.clone(),
                     });
                 }
                 tokio::time::sleep(OPENAI_FILE_FINALIZE_RETRY_DELAY).await;
             }
             _ => {
                 return Err(OpenAiFileError::UploadFailed {
-                    file_id: create_payload.file_id,
+                    file_id: pending_upload.file_id.clone(),
                     message: finalize_payload
                         .error_message
                         .unwrap_or_else(|| "upload finalization returned an error".to_string()),
@@ -249,6 +296,15 @@ pub async fn upload_local_file(
             }
         }
     }
+}
+
+pub async fn upload_local_file(
+    base_url: &str,
+    auth: &impl AuthProvider,
+    path: &Path,
+) -> Result<UploadedOpenAiFile, OpenAiFileError> {
+    let pending_upload = start_local_file_upload(base_url, auth, path).await?;
+    finalize_local_file_upload(base_url, auth, &pending_upload).await
 }
 
 fn authorized_request(

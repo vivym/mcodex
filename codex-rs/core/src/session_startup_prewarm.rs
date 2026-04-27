@@ -231,6 +231,7 @@ async fn schedule_startup_prewarm_inner(
         .turn_metadata_state
         .current_header_value();
     let mut client_session = session.services.model_client.new_session();
+    client_session.set_request_cancellation_token(startup_cancellation_token.child_token());
     client_session
         .prewarm_websocket(
             &startup_prompt,
@@ -239,6 +240,7 @@ async fn schedule_startup_prewarm_inner(
             startup_turn_context.reasoning_effort,
             startup_turn_context.reasoning_summary,
             startup_turn_context.config.service_tier,
+            Some(&startup_turn_context.sub_id),
             startup_turn_metadata_header.as_deref(),
         )
         .await?;

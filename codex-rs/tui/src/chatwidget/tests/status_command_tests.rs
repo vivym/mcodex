@@ -73,7 +73,9 @@ async fn status_command_renders_pooled_lease_details() {
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24 on 11 Apr".to_string()),
+        next_probe_after: None,
         remote_reset: Some("gen 2 after turn turn-17".to_string()),
+        quota_families: Vec::new(),
     });
 
     chat.dispatch_command(SlashCommand::Status);
@@ -108,7 +110,9 @@ async fn account_lease_updated_adds_automatic_switch_notice_when_account_changes
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     }));
     assert!(drain_insert_history(&mut rx).is_empty());
 
@@ -119,7 +123,9 @@ async fn account_lease_updated_adds_automatic_switch_notice_when_account_changes
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: Some("gen 1 after turn turn-2".to_string()),
+        quota_families: Vec::new(),
     }));
 
     let cells = drain_insert_history(&mut rx);
@@ -145,7 +151,9 @@ async fn account_lease_updated_adds_non_replayable_turn_notice() {
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     }));
     assert!(drain_insert_history(&mut rx).is_empty());
 
@@ -159,7 +167,9 @@ async fn account_lease_updated_adds_non_replayable_turn_notice() {
         ),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24".to_string()),
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     }));
 
     let cells = drain_insert_history(&mut rx);
@@ -185,7 +195,9 @@ async fn account_lease_updated_adds_no_eligible_account_error_notice() {
         note: Some("Automatic selection in use".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     }));
     assert!(drain_insert_history(&mut rx).is_empty());
 
@@ -196,7 +208,9 @@ async fn account_lease_updated_adds_no_eligible_account_error_notice() {
         note: Some("No eligible account is available".to_string()),
         proactive_switch_allowed_at: None,
         next_eligible_at: Some("03:24".to_string()),
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     }));
 
     let cells = drain_insert_history(&mut rx);
@@ -222,7 +236,9 @@ async fn status_command_renders_damped_account_lease_without_next_eligible_hint(
         note: Some("Automatic switch held by minimum switch interval".to_string()),
         proactive_switch_allowed_at: Some("03:24".to_string()),
         next_eligible_at: None,
+        next_probe_after: None,
         remote_reset: None,
+        quota_families: Vec::new(),
     });
 
     chat.dispatch_command(SlashCommand::Status);

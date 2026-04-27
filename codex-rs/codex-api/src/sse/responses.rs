@@ -45,13 +45,13 @@ pub fn stream_from_fixture(
     let reader = std::io::Cursor::new(content);
     let stream = ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
-    tokio::spawn(process_sse(
+    let task = tokio::spawn(process_sse(
         Box::pin(stream),
         tx_event,
         idle_timeout,
         /*telemetry*/ None,
     ));
-    Ok(ResponseStream { rx_event })
+    Ok(ResponseStream::with_abort(rx_event, task))
 }
 
 pub fn spawn_response_stream(
@@ -84,7 +84,7 @@ pub fn spawn_response_stream(
         let _ = turn_state.set(header_value.to_string());
     }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Some(model) = server_model {
             let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
         }
@@ -102,7 +102,7 @@ pub fn spawn_response_stream(
         process_sse(stream_response.bytes, tx_event, idle_timeout, telemetry).await;
     });
 
-    ResponseStream { rx_event }
+    ResponseStream::with_abort(rx_event, task)
 }
 
 #[derive(Debug, Deserialize)]

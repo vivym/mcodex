@@ -1,4 +1,8 @@
 use super::LocalAccountPoolBackend;
+use crate::StartupPoolCandidate;
+use crate::StartupPoolInventory;
+use crate::StartupPreferredAccountOutcome;
+use crate::StartupSelectionFacts;
 use crate::backend::AccountPoolExecutionBackend;
 use crate::quota::ProbeOutcome;
 use crate::types::LeaseGrant;
@@ -14,8 +18,8 @@ use codex_state::AccountQuotaProbeBackoff;
 use codex_state::AccountQuotaProbeObservation;
 use codex_state::AccountQuotaProbeStillBlocked;
 use codex_state::AccountQuotaStateRecord;
+use codex_state::AccountStartupEligibility;
 use codex_state::AccountStartupSelectionState;
-use codex_state::AccountStartupStatus;
 use codex_state::LeaseKey;
 use codex_state::LeaseRenewal;
 use std::sync::Arc;
@@ -246,13 +250,65 @@ impl AccountPoolExecutionBackend for LocalAccountPoolBackend {
         self.runtime.read_account_startup_selection().await
     }
 
-    async fn read_account_startup_status(
+    async fn read_startup_pool_inventory(&self) -> anyhow::Result<StartupPoolInventory> {
+        let candidates = self
+            .runtime
+            .read_account_startup_inventory()
+            .await?
+            .into_iter()
+            .map(|candidate| StartupPoolCandidate {
+                pool_id: candidate.pool_id,
+                display_name: candidate.display_name,
+                status: candidate.status,
+            })
+            .collect();
+        Ok(StartupPoolInventory { candidates })
+    }
+
+    async fn read_startup_selection_facts(
         &self,
-        configured_default_pool_id: Option<&str>,
-    ) -> anyhow::Result<AccountStartupStatus> {
-        self.runtime
-            .read_account_startup_status(configured_default_pool_id)
-            .await
+        pool_id: &str,
+    ) -> anyhow::Result<StartupSelectionFacts> {
+        let predicted_account_id = self
+            .runtime
+            .read_first_eligible_startup_account_id(pool_id)
+            .await?;
+        let preview = self
+            .runtime
+            .preview_account_startup_selection_without_suppression(Some(pool_id))
+            .await?;
+        let preferred_account_outcome = match preview.eligibility {
+            AccountStartupEligibility::PreferredAccountSelected => {
+                Some(StartupPreferredAccountOutcome::Selected)
+            }
+            AccountStartupEligibility::PreferredAccountMissing => {
+                Some(StartupPreferredAccountOutcome::Missing)
+            }
+            AccountStartupEligibility::PreferredAccountInOtherPool { ref actual_pool_id } => {
+                Some(StartupPreferredAccountOutcome::InOtherPool {
+                    actual_pool_id: actual_pool_id.clone(),
+                })
+            }
+            AccountStartupEligibility::PreferredAccountDisabled => {
+                Some(StartupPreferredAccountOutcome::Disabled)
+            }
+            AccountStartupEligibility::PreferredAccountUnhealthy => {
+                Some(StartupPreferredAccountOutcome::Unhealthy)
+            }
+            AccountStartupEligibility::PreferredAccountBusy => {
+                Some(StartupPreferredAccountOutcome::Busy)
+            }
+            AccountStartupEligibility::Suppressed
+            | AccountStartupEligibility::MissingPool
+            | AccountStartupEligibility::AutomaticAccountSelected
+            | AccountStartupEligibility::NoEligibleAccount => None,
+        };
+
+        Ok(StartupSelectionFacts {
+            preferred_account_outcome,
+            any_eligible_account: predicted_account_id.is_some(),
+            predicted_account_id,
+        })
     }
 }
 

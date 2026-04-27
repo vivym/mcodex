@@ -67,6 +67,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod account_lease_api;
 mod account_pool_api;
+mod account_startup_snapshot;
 mod app_server_tracing;
 mod bespoke_event_handling;
 mod codex_message_processor;
@@ -83,6 +84,7 @@ pub mod in_process;
 mod message_processor;
 mod models;
 mod outgoing_message;
+mod pooled_runtime_scope;
 mod server_request_error;
 mod thread_state;
 mod thread_status;

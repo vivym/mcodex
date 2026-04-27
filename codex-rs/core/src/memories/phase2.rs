@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Default)]
 struct Claim {
@@ -140,8 +141,34 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
     let prompt = agent::get_prompt(config, &selection, &removed_extension_resources);
     let source = SessionSource::SubAgent(SubAgentSource::MemoryConsolidation);
     let agent_control = session.services.agent_control.detached_registry();
+    session
+        .services
+        .agent_control
+        .register_session_root(session.conversation_id, &session.session_source().await);
+    let _collaboration_binding = session
+        .services
+        .bind_synthetic_background_collaboration_tree(
+            format!(
+                "{}:memory-phase2:{}",
+                session.conversation_id,
+                Uuid::now_v7()
+            ),
+            tokio_util::sync::CancellationToken::new(),
+        );
+    let runtime_lease_inheritance = crate::thread_manager::RuntimeLeaseInheritance {
+        host: session.services.runtime_lease_host.clone(),
+        collaboration_tree_id: session
+            .services
+            .model_client
+            .current_collaboration_tree_id(),
+    };
     let thread_id = match agent_control
-        .spawn_agent(agent_config, prompt.into(), Some(source))
+        .spawn_agent_with_runtime_lease_inheritance(
+            runtime_lease_inheritance,
+            agent_config,
+            prompt.into(),
+            Some(source),
+        )
         .await
     {
         Ok(thread_id) => thread_id,

@@ -180,7 +180,7 @@ impl Session {
         mcp_servers: HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
     ) {
-        let auth = self.services.auth_manager.auth().await;
+        let auth = self.current_auth().await;
         let config = self.get_config().await;
         let mcp_config = config
             .to_mcp_config(self.services.plugins_manager.as_ref())

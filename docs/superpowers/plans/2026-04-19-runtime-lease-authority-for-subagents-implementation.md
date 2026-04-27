@@ -16,6 +16,8 @@ This plan assumes `account-pool-quota-aware-selection` continues through Task 3 
 
 Do not execute the quota-aware plan's original Task 4 while this plan is in progress. That original Task 4 modifies `codex-rs/core/src/state/service.rs`, `codex-rs/core/tests/suite/account_pool.rs`, and `codex-rs/account-pool/src/backend.rs`, which are exactly the runtime control-plane integration points this plan changes. In this plan, Task 7 replaces that original Task 4 by wiring the quota-aware selector into the new `RuntimeLeaseHost` boundary.
 
+Post Task 6 anti-regression rule: pooled production code must not reintroduce a session-local bridge path around `RuntimeLeaseHost`. Root pooled sessions build exactly one owned `RuntimeLeaseAuthority` and publish it with `RuntimeLeaseHost::install_authority(...)`; children and delegates use request-boundary admission from the inherited host. Do not add APIs named or shaped like `legacy_manager_bridge`, `attach_legacy_manager_bridge`, `has_legacy_manager_bridge`, `account_pool_manager_for_turn`, or `install_manager_owner`.
+
 Safe parallel work while this plan is active:
 
 - quota-aware selection Tasks 1-3 in `codex-rs/state` and `codex-rs/account-pool`
@@ -342,7 +344,7 @@ git commit -m "feat(core): add runtime lease host seam"
 
 - [ ] **Step 1: Write failing tests for the inherited-child no-dual-manager invariant**
 
-Add tests that verify an inherited child session with a runtime host does not build a second session-local `AccountPoolManager` while the root session can still keep the temporary legacy bridge owner until Task 6:
+Add tests that verify an inherited child session with a runtime host does not build a second session-local `AccountPoolManager` while the root session can still keep the temporary owned authority until Task 6:
 
 ```rust
 #[tokio::test]
@@ -380,7 +382,7 @@ Expected: FAIL because sessions still decide account-pool ownership only from `i
 
 In `Codex::spawn`, derive a host before account-pool manager construction. The host may be `Pooled` or `NonPooled`; host presence alone must not mean provider requests require pooled admission. Only `host.pooled_authority()` / `host.is_pooled()` drives pooled request admission.
 
-During Tasks 2-5, root pooled sessions keep the existing `account_pool_manager` as a temporary legacy owner bridge so startup selection, compact gating, live snapshots, and shutdown behavior keep working until Task 6 migrates ownership into `RuntimeLeaseAuthority`. Inherited child sessions sharing that host must not create their own manager.
+During Tasks 2-5, root pooled sessions keep the existing `account_pool_manager` as a temporary owned authority so startup selection, compact gating, live snapshots, and shutdown behavior keep working until Task 6 migrates ownership into `RuntimeLeaseAuthority`. Inherited child sessions sharing that host must not create their own manager.
 
 ```rust
 let runtime_lease_host = runtime_lease_host.or_else(|| {
@@ -407,18 +409,18 @@ let account_pool_manager = if runtime_lease_host
 };
 ```
 
-Do not keep this exact `new_from_config` shape if a clearer constructor emerges, but preserve the invariant: inherited child sessions must not create a second pooled manager. Root pooled sessions may temporarily keep exactly one bridge manager until Task 6 replaces it with the host-owned authority.
+Do not keep this exact `new_from_config` shape if a clearer constructor emerges, but preserve the invariant: inherited child sessions must not create a second pooled manager. Root pooled sessions may temporarily keep exactly one owned authority until Task 6 replaces it with the host-owned authority.
 
-For non-pooled hosts, `account_pool_manager` can remain available as the existing legacy/non-pooled path until Task 6 finishes separating pooled and non-pooled host behavior. Do not remove working root-session behavior before the host-backed control plane exists.
+For non-pooled hosts, `account_pool_manager` can remain available as the existing non-pooled compatibility path until Task 6 finishes separating pooled and non-pooled host behavior. Do not remove working root-session behavior before the host-backed control plane exists.
 
-At the same time, register the root manager with the host so later tasks have a real production authority target:
+At the same time, register the root authority with the host so later tasks have a real production authority target:
 
 ```rust
-if let (Some(host), Some(account_pool_manager)) = (
+if let (Some(host), Some(authority)) = (
     runtime_lease_host.as_ref(),
-    account_pool_manager.as_ref(),
+    authority_owned_runtime_lease.as_ref(),
 ) {
-    host.attach_legacy_manager_bridge(Arc::clone(account_pool_manager));
+    host.install_authority(authority.clone())?;
 }
 ```
 
@@ -476,16 +478,16 @@ git commit -m "feat(core): enforce runtime pooled lease ownership"
 
 **Guard cleanup design:** `LeaseAdmissionGuard` must release admissions synchronously in `Drop`. Do not put the admitted-request set behind `tokio::sync::Mutex` if the guard's drop path needs to mutate it. Use a small synchronous interior state for admission accounting, for example `std::sync::Mutex<AdmissionTrackerState>` plus `tokio::sync::Notify`, and keep all database/lease-acquisition work outside the guard drop path. The drop path may remove an `admission_id` and call `Notify::notify_waiters()` synchronously; it must not spawn async cleanup.
 
-**Temporary production bridge design:** Tasks 3-5 must be buildable before Task 6 moves full lease ownership into `RuntimeLeaseAuthority`. To do that, `RuntimeLeaseAuthority` needs an explicit temporary production mode that wraps the root session's existing `AccountPoolManager` and exposes the same `acquire_request_lease` / `report_*` interface. Use an internal mode like:
+**Temporary production manager-owner design:** Tasks 3-5 must be buildable before Task 6 moves full lease ownership into `RuntimeLeaseAuthority`. To do that, `RuntimeLeaseAuthority` needs an explicit temporary production mode that wraps the root session's existing `AccountPoolManager` and exposes the same `acquire_request_lease` / `report_*` interface. Use an internal mode like:
 
 ```rust
 enum RuntimeLeaseAuthorityMode {
-    LegacyManagerBridge(Arc<tokio::sync::Mutex<AccountPoolManager>>),
+    ManagerOwner(Arc<tokio::sync::Mutex<AccountPoolManager>>),
     HostOwned(HostOwnedLeaseState),
 }
 ```
 
-Tasks 3-5 implement the interface against `LegacyManagerBridge` for real pooled sessions while unit tests can still use the in-memory authority constructors. Task 6 replaces the bridge-backed implementation with `HostOwned` and removes the root-session bridge manager.
+Tasks 3-5 implement the interface against `ManagerOwner` for real pooled sessions while unit tests can still use the in-memory authority constructors. Task 6 keeps this as the runtime authority owner surface and removes all session-level bridge accessors.
 
 **Files:**
 - Create: `codex-rs/core/src/runtime_lease/admission.rs`
@@ -819,7 +821,7 @@ struct AuthorityState {
 }
 
 enum RuntimeLeaseAuthorityMode {
-    LegacyManagerBridge(Arc<tokio::sync::Mutex<AccountPoolManager>>),
+    ManagerOwner(Arc<tokio::sync::Mutex<AccountPoolManager>>),
     HostOwned(HostOwnedLeaseState),
 }
 
@@ -1464,7 +1466,7 @@ async fn normal_pooled_codex_session_routes_provider_request_through_runtime_hos
     harness.submit_one_user_turn("hello").await?;
 
     assert_eq!(harness.recorded_request_admissions(), 1);
-    assert!(harness.runtime_host_has_legacy_manager_bridge());
+    assert!(harness.runtime_host_has_owned_authority());
     Ok(())
 }
 ```
@@ -1707,7 +1709,7 @@ In `codex.rs`, remove the pre-turn `prepare_turn()` call from `run_turn()` once 
 
 Remove `start_account_pool_lease_heartbeat()` or turn it into a compatibility shim that is no longer used in pooled runtime-host mode. Heartbeat belongs to the authority and continues while a draining generation has admitted work.
 
-At the end of Task 6, remove the temporary root-session bridge manager introduced in Task 2 for pooled runtimes. From this point onward, pooled root sessions and child sessions both use the host-owned authority; only non-pooled/legacy sessions may still carry `SessionServices.account_pool_manager`.
+At the end of Task 6, remove all temporary root-session bridge accessors introduced in Task 2 for pooled runtimes. From this point onward, pooled root sessions and child sessions both use the host-owned authority; only non-pooled compatibility sessions may still carry `SessionServices.account_pool_manager`.
 
 - [ ] **Step 5: Migrate live lease snapshot reads and notifications**
 
@@ -2133,7 +2135,7 @@ git commit -m "feat(core): scope pooled lease faults to collaboration trees"
 - Modify: `codex-rs/app-server/tests/suite/v2/account_pool.rs`
 - Modify: `codex-rs/app-server/README.md`
 
-- [ ] **Step 1: Write failing app-server boundary tests**
+- [x] **Step 1: Write failing app-server boundary tests**
 
 Add tests:
 
@@ -2189,7 +2191,7 @@ async fn websocket_app_server_rejects_pooled_runtime_host_creation() -> anyhow::
 }
 ```
 
-- [ ] **Step 2: Run app-server tests and verify failure**
+- [x] **Step 2: Run app-server tests and verify failure**
 
 Run:
 
@@ -2200,7 +2202,7 @@ cargo test -p codex-app-server account_pool -- --nocapture
 
 Expected: FAIL because the app-server guard does not yet cover all start/resume/fork/load/unload host boundaries.
 
-- [ ] **Step 3: Implement top-level pooled host scope**
+- [x] **Step 3: Implement top-level pooled host scope**
 
 In `message_processor.rs`, preserve and pass `AppServerTransport` into `CodexMessageProcessor` for every `thread/start`, `thread/resume`, and `thread/fork` path that can create a runtime host. In `codex_message_processor.rs`, keep the runtime lease host scoped to the loaded top-level thread or pooled-selection context, not the process-global `ThreadManagerState`.
 
@@ -2216,11 +2218,11 @@ Apply the gate to:
 
 Subagent `ThreadSpawn` inside the loaded top-level context is allowed and shares the same runtime host.
 
-- [ ] **Step 4: Update app-server README**
+- [x] **Step 4: Update app-server README**
 
 Document that pooled mode in stdio app-server supports only one loaded/running top-level thread context at a time; child subagents under that context share its runtime lease host.
 
-- [ ] **Step 5: Run app-server tests**
+- [x] **Step 5: Run app-server tests**
 
 Run:
 
@@ -2231,7 +2233,7 @@ cargo test -p codex-app-server account_pool -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -2256,7 +2258,7 @@ git commit -m "feat(app-server): scope pooled lease host to top-level thread"
 - Test: `codex-rs/core/src/codex_delegate_tests.rs`
 - Test: `codex-rs/core/tests/suite/account_pool.rs`
 
-- [ ] **Step 1: Write failing no-static-inheritance regression tests**
+- [x] **Step 1: Write failing no-static-inheritance regression tests**
 
 Add tests:
 
@@ -2286,7 +2288,7 @@ async fn child_session_follows_rotation_after_creation() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify failure if compatibility path still wins**
+- [x] **Step 2: Run tests and verify failure if compatibility path still wins**
 
 Run:
 
@@ -2298,7 +2300,7 @@ cargo test -p codex-core child_session_follows_rotation_after_creation -- --noca
 
 Expected: FAIL until all primary child paths use runtime host admission instead of static inherited lease auth.
 
-- [ ] **Step 3: Narrow `inherited_lease_auth_session`**
+- [x] **Step 3: Narrow `inherited_lease_auth_session`**
 
 Remove `inherited_lease_auth_session` from normal `ThreadSpawn`, review, and guardian call paths. If it is still required for a non-pooled compatibility case, rename the field to make that narrowness explicit:
 
@@ -2308,7 +2310,7 @@ compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
 
 Do not leave ambiguous primary-path callsites passing inherited lease auth.
 
-- [ ] **Step 4: Remove `ModelClientSession` creation-time lease snapshots**
+- [x] **Step 4: Remove `ModelClientSession` creation-time lease snapshots**
 
 Remove this pattern from `new_session()`:
 
@@ -2322,7 +2324,7 @@ lease_auth_session: self
 
 `ModelClientSession` must not cache pooled auth as a turn-scoped capability. It can keep non-pooled shared auth behavior and request-scoped `LeaseSnapshot` data only for in-flight provider work.
 
-- [ ] **Step 5: Run pooled child behavior tests**
+- [x] **Step 5: Run pooled child behavior tests**
 
 Run:
 
@@ -2335,7 +2337,7 @@ cargo test -p codex-core client_tests -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 
@@ -2375,11 +2377,26 @@ Run:
 ```bash
 cd codex-rs
 cargo test -p codex-app-server account_pool -- --nocapture
+cargo test -p codex-app-server account_lease -- --nocapture
+cargo test -p codex-app-server thread_archive -- --nocapture
 ```
 
 Expected: PASS.
 
-- [ ] **Step 3: Run formatting**
+- [ ] **Step 3: Run CLI focused suite**
+
+Run:
+
+```bash
+cd codex-rs
+cargo test -p codex-cli mcodex -- --nocapture
+cargo test -p codex-cli --test accounts -- --nocapture
+cargo test -p codex-cli --test accounts_observability -- --nocapture
+```
+
+Expected: PASS.
+
+- [x] **Step 4: Run formatting**
 
 Run:
 
@@ -2390,7 +2407,124 @@ just fmt
 
 Expected: no remaining rustfmt changes, or only expected formatting changes from this plan.
 
-- [ ] **Step 4: Run scoped lints**
+Latest verification ledger, 2026-04-25:
+
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed -- --nocapture` failed with `ThreadNotFound(root)` before the live-descendant fallback fix.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_removed -- --nocapture` passed after the fix.
+- RED: `cargo test -p codex-core pooled_host_snapshot_ignores_remote_reset_from_previous_generation -- --nocapture` failed because generation 11 reset metadata was exposed on generation 12.
+- GREEN: `cargo test -p codex-core pooled_host_snapshot_ignores_remote_reset_from_previous_generation -- --nocapture` passed after the generation match fix.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 3 targeted tests.
+- PASS: `cargo test -p codex-app-server account_pool -- --nocapture` passed 19 targeted tests.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- Not run in this pass: the full Task 11 core matrix, app-server `account_lease` and `thread_archive`, CLI focused suites, and full workspace `cargo test`.
+
+Latest review-fix verification ledger, 2026-04-25:
+
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed -- --nocapture` failed because the root-missing fallback only returned the root anchor and persisted child, not the live grandchild.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed -- --nocapture` passed after merging persisted subtree seeds with live `SessionSource` descendants.
+- RED: `cargo test -p codex-core pooled_host_snapshot_matches_remote_reset_by_manager_generation_not_lease_epoch -- --nocapture` failed because manager-backed runtime generation 2 was compared against durable lease epoch 1.
+- GREEN: `cargo test -p codex-core pooled_host_snapshot_matches_remote_reset_by_manager_generation_not_lease_epoch -- --nocapture` passed after adding `runtime_generation` to the live snapshot and matching remote resets against it.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 2 targeted tests after the final live traversal cleanup.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core agent::registry -- --nocapture` passed 18 targeted tests after updating root metadata expectations.
+- PASS: `cargo test -p codex-app-server account_lease_api -- --nocapture` passed 2 targeted tests for runtime snapshot construction.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+
+Latest reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: reviewer identified gaps in mixed-status persisted subtree traversal, remote reset state across host reuse, manager snapshot generation/identity consistency, and state DB fallback selection.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 3 targeted tests, including `list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants`.
+- PASS: `cargo test -p codex-state thread_spawn_edges_track_directional_status -- --nocapture` passed, including status-agnostic mixed-status descendant coverage.
+- PASS: `cargo test -p codex-core runtime_lease_host_reuse_clears_remote_reset_state -- --nocapture` passed.
+- PASS: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` passed.
+- PASS: `cargo test -p codex-core runtime_lease_host_reuse -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: reran `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` after the fixes; 3 targeted tests passed.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-state`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+
+Latest gpt-5.5 reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: two `gpt-5.5` `xhigh` reviewers identified stale active-lease snapshots after external disable, mixed-status recursive traversal cycle risk, status-filtered app-server fallback traversal, and misleading plan-ledger wording.
+- RED: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` failed before the active-holder revalidation fix because `snapshot.active` stayed `true` after external disable released the durable lease.
+- RED: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` failed after the first attempted fix because validating inside `AccountPoolManagerSnapshotSeed::snapshot()` broke point-in-time seed semantics.
+- GREEN: `cargo test -p codex-core snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity -- --nocapture` passed after moving active-holder validation to `AccountPoolManager::snapshot_seed().await`.
+- GREEN: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` passed after the seed-creation revalidation fix.
+- PASS: `cargo test -p codex-state thread_spawn_edges_track_directional_status -- --nocapture` passed, including the new mixed-status cycle guard coverage.
+- PASS: `cargo test -p codex-core pooled_host_snapshot -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 3 targeted tests.
+- PASS: `cargo test -p codex-app-server account_lease_read_reports_live_active_lease_fields_after_turn_start -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server thread_archive_clears_stale_subscriptions_before_resume -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-state`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not run in this reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
+Latest gpt-5.5 follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: `gpt-5.5` `xhigh` reviewer identified two Medium issues: snapshot revalidation swallowed DB read errors as inactive, and ThreadManager aborted before live subtree traversal when persisted subtree reads failed.
+- RED: `cargo test -p codex-core snapshot_seed_preserves_cached_lease_when_holder_read_fails -- --nocapture` failed to compile before the tri-state validation helper existed.
+- GREEN: `cargo test -p codex-core snapshot_seed_preserves_cached_lease_when_holder_read_fails -- --nocapture` passed after preserving cached active lease on holder-read errors.
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails -- --nocapture` failed with `Fatal(\"failed to load thread-spawn descendants...\")` before persisted lookup errors were downgraded.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_uses_live_descendants_when_persisted_lookup_fails -- --nocapture` passed after logging persisted lookup failures and still running live traversal.
+- PASS: `cargo test -p codex-core snapshot_seed -- --nocapture` passed 2 targeted tests.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 4 targeted tests.
+- PASS: `cargo test -p codex-core account_lease_snapshot_clears_revoked_live_lease_after_external_disable -- --nocapture` passed 1 targeted integration test.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test.
+- PASS: `just bazel-lock-update`.
+- PASS: `just bazel-lock-check`.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix -p codex-core`, per repository instruction.
+- Not run in this follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
+Latest gpt-5.5 second follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: `gpt-5.5` `xhigh` reviewers identified that degrading persisted lookup failures inside `list_agent_subtree_thread_ids` made the complete subtree API silently partial and could still misclassify a known persisted root as not found.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 5 targeted tests after splitting complete and live-only subtree APIs.
+- GREEN detail: complete `list_agent_subtree_thread_ids` now reports persisted lookup errors instead of returning partial results.
+- GREEN detail: new `list_live_agent_subtree_thread_ids` keeps app-server pooled-runtime ownership checks live-safe. A later reviewer loop found feedback/upload still needed a live-subtree fallback when complete lookup fails; see the next ledger.
+- PASS: `cargo test -p codex-app-server pooled_mode_rejects_second_top_level_stdio_runtime_creation -- --nocapture` passed 1 targeted integration test after app-server switched to the live-only subtree API.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not run in this second follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
+Latest gpt-5.5 third follow-up reviewer-loop verification ledger, 2026-04-25:
+
+- REVIEW/REPRO before fix: two `gpt-5.5` `xhigh` reviewers identified that `feedback/upload` fallback still dropped live subagent thread ids when complete persisted subtree lookup failed, and that complete subtree lookup could be poisoned by an unrelated broken live State DB candidate.
+- RED: `cargo test -p codex-core list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db -- --nocapture` failed with `Fatal("failed to load thread-spawn descendants... no such table: thread_spawn_edges")` before candidate DB errors were treated as tentative.
+- GREEN: `cargo test -p codex-core list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db -- --nocapture` passed after complete lookup continued scanning candidates and only returned tentative persisted errors when no DB proved ownership of the root/subtree.
+- INITIAL GREEN: `cargo test -p codex-app-server feedback_thread_ids_fallback_includes_live_subagents_without_persisted_subtree -- --nocapture` passed after `feedback/upload` fallback was changed to seed from the live subtree and then merge persisted descendants when available; this test was later strengthened and renamed in the next review item.
+- PASS: `cargo test -p codex-core list_agent_subtree_thread_ids -- --nocapture` passed 6 targeted tests.
+- REVIEW/REPRO after initial fix: two `gpt-5.5` `xhigh` reviewers found the app-server test only called the fallback helper directly and did not cover the production wrapper's complete-lookup-error branch, persisted merge, dedupe, or preserved order.
+- RED: `cargo test -p codex-app-server feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error -- --nocapture` failed to compile before the wrapper seam existed.
+- GREEN: `cargo test -p codex-app-server feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error -- --nocapture` passed after adding a wrapper seam for the complete lookup result and asserting root/live/persisted-only order with live/persisted dedupe.
+- REVIEW: two additional `gpt-5.5` `xhigh` reviewers reported no blocking/high/medium findings after the wrapper seam and strengthened app-server test.
+- PASS: `just fmt`.
+- PASS: `just fix -p codex-core`; it still reports the existing `core/src/client.rs:1194` `expect_used` warning.
+- PASS: `just fix -p codex-app-server`.
+- PASS: `git diff --check`.
+- Design note: app-server did not add a `sqlx` dev-dependency. Direct `DROP TABLE thread_spawn_edges` fault injection remains in `codex-core`; app-server covers fallback behavior at its own boundary.
+- Not rerun after final `just fmt` / `just fix`, per repository instruction.
+- Not yet run in this third follow-up reviewer loop: the full Task 11 core matrix, full app-server `account_lease` and `thread_archive` filters, CLI focused suites, full workspace `cargo test`, and an end-to-end `feedback/upload` Sentry upload test.
+
+- [ ] **Step 5: Run scoped lints**
 
 Run:
 
@@ -2399,11 +2533,12 @@ cd codex-rs
 just fix -p codex-core
 just fix -p codex-app-server
 just fix -p codex-account-pool
+just fix -p codex-cli
 ```
 
 Expected: no unresolved clippy diagnostics.
 
-- [ ] **Step 5: Ask before full workspace tests**
+- [ ] **Step 6: Ask before full workspace tests**
 
 Because this plan changes `codex-core`, ask the user before running the complete suite:
 
@@ -2414,7 +2549,7 @@ cargo test
 
 Expected if approved: PASS.
 
-- [ ] **Step 6: Commit verification fixes**
+- [ ] **Step 7: Commit verification fixes**
 
 If `just fix` or docs updates changed files:
 

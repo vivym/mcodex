@@ -20,6 +20,12 @@
     },
     "AccountPoolAccountsListParams": {
       "properties": {
+        "accountId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "accountKinds": {
           "items": {
             "type": "string"
@@ -54,6 +60,17 @@
             "array",
             "null"
           ]
+        }
+      },
+      "required": [
+        "poolId"
+      ],
+      "type": "object"
+    },
+    "AccountPoolDefaultSetParams": {
+      "properties": {
+        "poolId": {
+          "type": "string"
         }
       },
       "required": [
@@ -5229,6 +5246,53 @@
         "params"
       ],
       "title": "AccountPool/readRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/default/set"
+          ],
+          "title": "AccountPool/default/setRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AccountPoolDefaultSetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "AccountPool/default/setRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "accountPool/default/clear"
+          ],
+          "title": "AccountPool/default/clearRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "id",
+        "method"
+      ],
+      "title": "AccountPool/default/clearRequest",
       "type": "object"
     },
     {

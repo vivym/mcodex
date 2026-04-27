@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
@@ -103,6 +105,7 @@ pub struct McpProcess {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     pending_messages: VecDeque<JSONRPCMessage>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
@@ -201,10 +204,16 @@ impl McpProcess {
 
         // Forward child's stderr to our stderr so failures are visible even
         // when stdout/stderr are captured by the test harness.
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = process.stderr.take() {
             let mut stderr_reader = BufReader::new(stderr).lines();
+            let captured_stderr_lines = stderr_lines.clone();
             tokio::spawn(async move {
                 while let Ok(Some(line)) = stderr_reader.next_line().await {
+                    captured_stderr_lines
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(line.clone());
                     eprintln!("[mcp stderr] {line}");
                 }
             });
@@ -215,7 +224,39 @@ impl McpProcess {
             stdin: Some(stdin),
             stdout,
             pending_messages: VecDeque::new(),
+            stderr_lines,
         })
+    }
+
+    pub fn stderr_lines(&self) -> Vec<String> {
+        self.stderr_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub async fn stderr_lines_after_quiet_period(&self) -> Vec<String> {
+        let quiet_period = std::time::Duration::from_millis(25);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut stable_intervals = 0;
+        let mut lines = self.stderr_lines();
+
+        loop {
+            tokio::time::sleep(quiet_period).await;
+            let next_lines = self.stderr_lines();
+            if next_lines.len() == lines.len() {
+                stable_intervals += 1;
+                if stable_intervals >= 2 || tokio::time::Instant::now() >= deadline {
+                    return next_lines;
+                }
+            } else {
+                stable_intervals = 0;
+                lines = next_lines;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return lines;
+            }
+        }
     }
 
     /// Performs the initialization handshake with the MCP server.
@@ -338,6 +379,24 @@ impl McpProcess {
             .await
     }
 
+    /// Send an `accountPool/default/set` JSON-RPC request.
+    pub async fn send_account_pool_default_set_request(
+        &mut self,
+        pool_id: &str,
+    ) -> anyhow::Result<i64> {
+        self.send_request(
+            "accountPool/default/set",
+            Some(serde_json::json!({ "poolId": pool_id })),
+        )
+        .await
+    }
+
+    /// Send an `accountPool/default/clear` JSON-RPC request.
+    pub async fn send_account_pool_default_clear_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountPool/default/clear", /*params*/ None)
+            .await
+    }
+
     /// Send `accountLease/read` and wait for the response.
     pub async fn read_account_lease(&mut self) -> anyhow::Result<JSONRPCResponse> {
         let request_id = self.send_account_lease_read_request().await?;
@@ -359,6 +418,23 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("account/sendAddCreditsNudgeEmail", params)
+            .await
+    }
+
+    /// Send `accountPool/default/set` and wait for the response.
+    pub async fn account_pool_default_set(
+        &mut self,
+        pool_id: &str,
+    ) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_pool_default_set_request(pool_id).await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    /// Send `accountPool/default/clear` and wait for the response.
+    pub async fn account_pool_default_clear(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_pool_default_clear_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
             .await
     }
 

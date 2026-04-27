@@ -476,6 +476,7 @@ mod phase2 {
                 codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home.path())
                     .expect("codex home is absolute");
             config.cwd = config.codex_home.clone();
+            config.sqlite_home = config.codex_home.to_path_buf();
             config.permissions.file_system_sandbox_policy = FileSystemSandboxPolicy::unrestricted();
             config.permissions.network_sandbox_policy = NetworkSandboxPolicy::Enabled;
             let config = Arc::new(config);
@@ -498,6 +499,75 @@ mod phase2 {
             let (mut session, _turn_context) = make_session_and_context().await;
             session.services.state_db = Some(Arc::clone(&state_db));
             session.services.agent_control = manager.agent_control();
+
+            Self {
+                _codex_home: codex_home,
+                config,
+                session: Arc::new(session),
+                manager,
+                state_db,
+            }
+        }
+
+        async fn new_with_runtime_lease_authority(
+            authority: crate::runtime_lease::RuntimeLeaseAuthority,
+        ) -> Self {
+            let codex_home = tempfile::tempdir().expect("create temp codex home");
+            let mut config = test_config().await;
+            config.codex_home =
+                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home.path())
+                    .expect("codex home is absolute");
+            config.cwd = config.codex_home.clone();
+            config.sqlite_home = config.codex_home.to_path_buf();
+            let config = Arc::new(config);
+
+            let state_db = codex_state::StateRuntime::init(
+                config.codex_home.to_path_buf(),
+                config.model_provider_id.clone(),
+            )
+            .await
+            .expect("initialize state db");
+
+            let manager = ThreadManager::with_models_provider_and_home_for_tests(
+                CodexAuth::from_api_key("dummy"),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
+                    /*exec_server_url*/ None,
+                )),
+            );
+            let (mut session, _turn_context) = make_session_and_context().await;
+            let session_id = session.conversation_id.to_string();
+            let runtime_lease_host =
+                crate::runtime_lease::RuntimeLeaseHost::pooled_with_authority_for_test(
+                    crate::runtime_lease::RuntimeLeaseHostId::new(
+                        "memory-phase2-runtime-test".to_string(),
+                    ),
+                    authority,
+                );
+            session.services.state_db = Some(Arc::clone(&state_db));
+            session.services.agent_control = manager.agent_control();
+            session.services.runtime_lease_host = Some(runtime_lease_host.clone());
+            session.services.model_client = crate::client::ModelClient::new_with_runtime_lease(
+                /*auth_manager*/ None,
+                /*lease_auth*/ None,
+                Some(runtime_lease_host),
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runtime_lease::SessionLeaseView::new(),
+                ))),
+                session_id.clone(),
+                Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
+                    crate::runtime_lease::CollaborationTreeId::root_for_session(&session_id),
+                )),
+                session.conversation_id,
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                config.model_provider.clone(),
+                SessionSource::Exec,
+                /*model_verbosity*/ None,
+                /*enable_request_compression*/ false,
+                /*include_timing_metrics*/ false,
+                /*beta_features_header*/ None,
+            );
 
             Self {
                 _codex_home: codex_home,
@@ -944,6 +1014,7 @@ mod phase2 {
             codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(codex_home.path())
                 .expect("codex home is absolute");
         config.cwd = config.codex_home.clone();
+        config.sqlite_home = config.codex_home.to_path_buf();
         let config = Arc::new(config);
 
         let state_db = codex_state::StateRuntime::init(
@@ -1044,5 +1115,96 @@ mod phase2 {
                 .expect("check old extension resource"),
             "spawn failures should not prune extension resources before retry"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_unique_synthetic_background_tree_per_invocation() {
+        let first_harness = DispatchHarness::new_with_runtime_lease_authority(
+            crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("acct-memory-a", 31),
+        )
+        .await;
+        first_harness
+            .seed_stage1_output(Utc::now().timestamp())
+            .await;
+
+        phase2::run(&first_harness.session, Arc::clone(&first_harness.config)).await;
+
+        let first_thread_id = first_harness
+            .manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("first consolidation thread");
+        let first_tree_id = first_harness
+            .manager
+            .get_thread(first_thread_id)
+            .await
+            .expect("first consolidation thread should be loaded")
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id()
+            .to_string();
+        assert!(
+            first_tree_id.starts_with("background:"),
+            "expected synthetic background tree, got {first_tree_id}"
+        );
+        pretty_assertions::assert_eq!(
+            first_harness
+                .session
+                .services
+                .model_client
+                .current_collaboration_tree_id()
+                .to_string(),
+            format!("session:{}", first_harness.session.conversation_id)
+        );
+        first_harness.shutdown_threads().await;
+
+        let second_harness = DispatchHarness::new_with_runtime_lease_authority(
+            crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("acct-memory-b", 32),
+        )
+        .await;
+        second_harness
+            .seed_stage1_output(Utc::now().timestamp())
+            .await;
+
+        phase2::run(&second_harness.session, Arc::clone(&second_harness.config)).await;
+
+        let second_thread_id = second_harness
+            .manager
+            .list_thread_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("second consolidation thread");
+        let second_tree_id = second_harness
+            .manager
+            .get_thread(second_thread_id)
+            .await
+            .expect("second consolidation thread should be loaded")
+            .codex
+            .session
+            .services
+            .model_client
+            .current_collaboration_tree_id()
+            .to_string();
+        assert!(
+            second_tree_id.starts_with("background:"),
+            "expected synthetic background tree, got {second_tree_id}"
+        );
+        pretty_assertions::assert_eq!(
+            second_harness
+                .session
+                .services
+                .model_client
+                .current_collaboration_tree_id()
+                .to_string(),
+            format!("session:{}", second_harness.session.conversation_id)
+        );
+        assert_ne!(first_tree_id, second_tree_id);
+
+        second_harness.shutdown_threads().await;
     }
 }

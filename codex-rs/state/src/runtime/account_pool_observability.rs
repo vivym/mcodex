@@ -9,11 +9,14 @@ use crate::model::AccountPoolEventsListQuery;
 use crate::model::AccountPoolEventsPage;
 use crate::model::AccountPoolIssueRecord;
 use crate::model::AccountPoolLeaseRecord;
+use crate::model::AccountPoolQuotaFamilyRecord;
 use crate::model::AccountPoolQuotaRecord;
+use crate::model::AccountPoolQuotaWindowRecord;
 use crate::model::AccountPoolSelectionRecord;
 use crate::model::AccountPoolSnapshotRecord;
 use crate::model::AccountPoolSummaryRecord;
 use crate::model::account_datetime_to_epoch_seconds;
+use crate::model::account_epoch_nanos_to_datetime;
 use crate::model::account_epoch_seconds_to_datetime;
 use chrono::Utc;
 use serde_json::Value;
@@ -21,6 +24,7 @@ use sqlx::Executor;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::Sqlite;
+use std::collections::HashMap;
 
 const DEFAULT_ACCOUNT_PAGE_LIMIT: u32 = 50;
 const MAX_ACCOUNT_PAGE_LIMIT: u32 = 200;
@@ -113,11 +117,15 @@ WHERE membership.pool_id = ?
             MAX_ACCOUNT_PAGE_LIMIT,
         );
         let states = request.states.filter(|states| !states.is_empty());
-        let cursor = request
-            .cursor
-            .as_deref()
-            .map(decode_account_cursor)
-            .transpose()?;
+        let cursor = if request.account_id.is_none() {
+            request
+                .cursor
+                .as_deref()
+                .map(decode_account_cursor)
+                .transpose()?
+        } else {
+            None
+        };
 
         let quota_joins = super::account_pool_quota::selection_quota_state_joins_sql(
             "selection_quota_state",
@@ -153,6 +161,7 @@ SELECT
     membership.position,
     account_registry.backend_account_handle,
     account_registry.account_kind,
+    COALESCE(NULLIF(account_registry.backend_family, ''), 'codex') AS selection_family,
     account_registry.enabled,
     account_registry.healthy,
     account_registry.updated_at AS registry_updated_at,
@@ -185,6 +194,11 @@ LEFT JOIN account_leases AS active_lease
         builder.push(" WHERE membership.pool_id = ");
         builder.push_bind(&request.pool_id);
 
+        if let Some(account_id) = request.account_id.as_ref() {
+            builder.push(" AND membership.account_id = ");
+            builder.push_bind(account_id);
+        }
+
         if let Some(account_kinds) = request.account_kinds.as_ref()
             && !account_kinds.is_empty()
         {
@@ -196,7 +210,9 @@ LEFT JOIN account_leases AS active_lease
             builder.push(")");
         }
 
-        if let Some((position, account_id)) = cursor.as_ref() {
+        if request.account_id.is_none()
+            && let Some((position, account_id)) = cursor.as_ref()
+        {
             builder.push(" AND (membership.position > ");
             builder.push_bind(*position);
             builder.push(" OR (membership.position = ");
@@ -207,7 +223,7 @@ LEFT JOIN account_leases AS active_lease
         }
 
         builder.push(" ORDER BY membership.position ASC, membership.account_id ASC");
-        if states.is_none() {
+        if states.is_none() && request.account_id.is_none() {
             builder.push(" LIMIT ");
             builder.push_bind(i64::from(limit) + 1);
         }
@@ -284,6 +300,7 @@ LEFT JOIN account_leases AS active_lease
                         .ok()
                         .filter(|value| !value.is_empty()),
                     account_kind: row.try_get("account_kind")?,
+                    selection_family: row.try_get("selection_family")?,
                     enabled,
                     health_state,
                     operational_state,
@@ -292,6 +309,7 @@ LEFT JOIN account_leases AS active_lease
                     status_message: None,
                     current_lease,
                     quota: None::<AccountPoolQuotaRecord>,
+                    quotas: Vec::new(),
                     selection: Some(AccountPoolSelectionRecord {
                         eligible: !selection.suppressed
                             && enabled
@@ -312,7 +330,7 @@ LEFT JOIN account_leases AS active_lease
             ));
         }
 
-        let next_cursor = if entries.len() > limit as usize {
+        let next_cursor = if request.account_id.is_none() && entries.len() > limit as usize {
             entries
                 .get(limit as usize - 1)
                 .map(|(position, account_id, _)| {
@@ -321,11 +339,27 @@ LEFT JOIN account_leases AS active_lease
         } else {
             None
         };
-        let data = entries
+        let mut data: Vec<_> = entries
             .into_iter()
             .take(limit as usize)
             .map(|(_, _, record)| record)
             .collect();
+        let visible_account_ids: Vec<_> = data
+            .iter()
+            .map(|record| record.account_id.clone())
+            .collect();
+        let mut quota_families_by_account =
+            load_account_pool_quota_families(self.pool.as_ref(), &visible_account_ids).await?;
+        for record in &mut data {
+            record.quotas = quota_families_by_account
+                .remove(&record.account_id)
+                .unwrap_or_default();
+            record.quota = record
+                .quotas
+                .iter()
+                .find(|quota| quota.limit_id == "codex")
+                .map(derive_legacy_quota_record);
+        }
 
         Ok(AccountPoolAccountsPage { data, next_cursor })
     }
@@ -660,6 +694,138 @@ INSERT INTO account_pool_events (
     Ok(())
 }
 
+async fn load_account_pool_quota_families<'e, E>(
+    executor: E,
+    account_ids: &[String],
+) -> anyhow::Result<HashMap<String, Vec<AccountPoolQuotaFamilyRecord>>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    if account_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        r#"
+SELECT
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    COALESCE(observed_at_nanos, observed_at * 1000000000) AS observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after
+FROM account_quota_state
+WHERE account_id IN (
+        "#,
+    );
+    let mut separated = builder.separated(", ");
+    for account_id in account_ids {
+        separated.push_bind(account_id);
+    }
+    builder.push(") ORDER BY account_id ASC, limit_id ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+    let mut by_account: HashMap<String, Vec<AccountPoolQuotaFamilyRecord>> = HashMap::new();
+    for row in rows {
+        let account_id: String = row.try_get("account_id")?;
+        let family = AccountPoolQuotaFamilyRecord {
+            limit_id: row.try_get("limit_id")?,
+            primary: AccountPoolQuotaWindowRecord {
+                used_percent: row.try_get("primary_used_percent")?,
+                resets_at: row
+                    .try_get::<Option<i64>, _>("primary_resets_at")?
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?,
+            },
+            secondary: AccountPoolQuotaWindowRecord {
+                used_percent: row.try_get("secondary_used_percent")?,
+                resets_at: row
+                    .try_get::<Option<i64>, _>("secondary_resets_at")?
+                    .map(account_epoch_seconds_to_datetime)
+                    .transpose()?,
+            },
+            exhausted_windows: row.try_get("exhausted_windows")?,
+            predicted_blocked_until: row
+                .try_get::<Option<i64>, _>("predicted_blocked_until")?
+                .map(account_epoch_seconds_to_datetime)
+                .transpose()?,
+            next_probe_after: row
+                .try_get::<Option<i64>, _>("next_probe_after")?
+                .map(account_epoch_seconds_to_datetime)
+                .transpose()?,
+            observed_at: account_epoch_nanos_to_datetime(row.try_get("observed_at_nanos")?)?,
+        };
+        by_account.entry(account_id).or_default().push(family);
+    }
+
+    Ok(by_account)
+}
+
+fn derive_legacy_quota_record(family: &AccountPoolQuotaFamilyRecord) -> AccountPoolQuotaRecord {
+    let chosen_used_window = [
+        (
+            family.primary.used_percent,
+            family.primary.resets_at,
+            QuotaWindowKind::Primary,
+        ),
+        (
+            family.secondary.used_percent,
+            family.secondary.resets_at,
+            QuotaWindowKind::Secondary,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(used_percent, resets_at, kind)| {
+        used_percent.map(|used_percent| {
+            let remaining_percent = (100.0 - used_percent).clamp(0.0, 100.0);
+            (remaining_percent, resets_at, kind)
+        })
+    })
+    .min_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    match chosen_used_window {
+        Some((remaining_percent, resets_at, _)) => AccountPoolQuotaRecord {
+            remaining_percent: Some(remaining_percent),
+            resets_at,
+            observed_at: family.observed_at,
+        },
+        None => AccountPoolQuotaRecord {
+            remaining_percent: None,
+            resets_at: match family.exhausted_windows.as_str() {
+                "primary" => family.primary.resets_at,
+                "secondary" => family.secondary.resets_at,
+                "both" | "unknown" => {
+                    match (family.primary.resets_at, family.secondary.resets_at) {
+                        (Some(primary), Some(secondary)) => Some(primary.max(secondary)),
+                        (Some(primary), None) => Some(primary),
+                        (None, Some(secondary)) => Some(secondary),
+                        (None, None) => None,
+                    }
+                }
+                "none" => None,
+                _ => None,
+            },
+            observed_at: family.observed_at,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QuotaWindowKind {
+    Primary,
+    Secondary,
+}
+
 fn normalize_page_limit(limit: Option<u32>, default_limit: u32, max_limit: u32) -> u32 {
     limit.unwrap_or(default_limit).max(1).min(max_limit)
 }
@@ -989,6 +1155,7 @@ mod tests {
         let accounts = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec!["leased".to_string()]),
@@ -1031,6 +1198,7 @@ mod tests {
         let accounts = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec!["coolingDown".to_string()]),
@@ -1091,6 +1259,7 @@ mod tests {
         let accounts = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec!["coolingDown".to_string()]),
@@ -1150,6 +1319,7 @@ mod tests {
         let accounts = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec!["coolingDown".to_string()]),
@@ -1253,6 +1423,7 @@ mod tests {
         let first = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(1),
                 states: None,
@@ -1263,6 +1434,7 @@ mod tests {
         let second = runtime
             .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: first.next_cursor.clone(),
                 limit: Some(1),
                 states: None,
@@ -1276,6 +1448,101 @@ mod tests {
         assert_eq!(second.data.len(), 1);
         assert_eq!(second.data[0].account_id, "acct-2");
         assert_ne!(first.next_cursor, second.next_cursor);
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_account_id_lookup_ignores_malformed_cursor() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-2".to_string()),
+                cursor: Some("not-a-cursor".to_string()),
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 1);
+        assert_eq!(accounts.data[0].account_id, "acct-2");
+    }
+
+    #[tokio::test]
+    async fn list_account_pool_accounts_legacy_quota_without_usage_uses_exhausted_window_reset() {
+        let runtime = test_runtime().await;
+        seed_account(&runtime, "acct-1", "team-main", 0).await;
+        seed_account(&runtime, "acct-2", "team-main", 1).await;
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-1".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: None,
+                primary_resets_at: Some(timestamp(120)),
+                secondary_used_percent: None,
+                secondary_resets_at: Some(timestamp(180)),
+                observed_at: timestamp(60),
+                exhausted_windows: crate::QuotaExhaustedWindows::Both,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+        runtime
+            .upsert_account_quota_state(crate::AccountQuotaStateRecord {
+                account_id: "acct-2".to_string(),
+                limit_id: "codex".to_string(),
+                primary_used_percent: None,
+                primary_resets_at: None,
+                secondary_used_percent: None,
+                secondary_resets_at: Some(timestamp(240)),
+                observed_at: timestamp(90),
+                exhausted_windows: crate::QuotaExhaustedWindows::Unknown,
+                predicted_blocked_until: None,
+                next_probe_after: None,
+                probe_backoff_level: 0,
+                last_probe_result: None,
+            })
+            .await
+            .unwrap();
+
+        let accounts = runtime
+            .list_account_pool_accounts(crate::AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(accounts.next_cursor, None);
+        assert_eq!(accounts.data.len(), 2);
+        assert_eq!(
+            accounts.data[0].quota,
+            Some(crate::AccountPoolQuotaRecord {
+                remaining_percent: None,
+                resets_at: Some(timestamp(180)),
+                observed_at: timestamp(60),
+            })
+        );
+        assert_eq!(
+            accounts.data[1].quota,
+            Some(crate::AccountPoolQuotaRecord {
+                remaining_percent: None,
+                resets_at: Some(timestamp(240)),
+                observed_at: timestamp(90),
+            })
+        );
     }
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {

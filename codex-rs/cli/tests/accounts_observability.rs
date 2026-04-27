@@ -111,6 +111,36 @@ async fn accounts_pool_show_text_reports_accounts_none_for_empty_pool() -> Resul
 }
 
 #[tokio::test]
+async fn accounts_pool_show_renders_sorted_quota_families() -> Result<()> {
+    let codex_home = prepared_home().await?;
+    seed_quota_rows(&codex_home, ["codex", "chatgpt"]).await?;
+
+    let output = run_codex(
+        &codex_home,
+        &["accounts", "pool", "show", "--pool", "team-main"],
+    )
+    .await?;
+
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stdout.contains("chatgpt"));
+    assert!(output.stdout.contains("codex"));
+    assert!(output.stdout.contains("secondary exhausted"));
+    let quotas = output
+        .stdout
+        .split_once("quotas:")
+        .map(|(_, quotas)| quotas)
+        .expect("quota rows");
+    let chatgpt = quotas.find("chatgpt").expect("chatgpt quota row");
+    let codex = quotas.find("codex").expect("codex quota row");
+    assert!(
+        chatgpt < codex,
+        "quota families should render sorted by family:\n{}",
+        output.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn accounts_diagnostics_rejects_conflicting_pool_flags() -> Result<()> {
     let codex_home = TempDir::new()?;
     let output = run_codex(
@@ -315,7 +345,11 @@ async fn accounts_status_json_keeps_startup_fields_when_observability_read_fails
     assert!(output.success, "stderr: {}", output.stderr);
 
     let json: serde_json::Value = serde_json::from_str(&output.stdout)?;
-    assert_eq!(json["effectivePoolId"], "missing-pool");
+    assert!(json["effectivePoolId"].is_null());
+    assert_eq!(
+        json["startup"]["startupResolutionIssue"]["poolId"],
+        "missing-pool"
+    );
     assert_eq!(json["poolObservability"]["poolId"], "missing-pool");
     assert!(json["poolObservability"]["summary"].is_null());
     assert!(json["poolObservability"]["diagnostics"].is_null());
@@ -356,7 +390,7 @@ async fn accounts_status_json_keeps_summary_when_diagnostics_read_fails() -> Res
 #[tokio::test]
 async fn accounts_status_text_reports_degraded_issue_summary() -> Result<()> {
     let codex_home = prepared_home().await?;
-    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+    seed_busy_and_rate_limited_pool_state(&codex_home).await?;
 
     let output = run_codex(&codex_home, &["accounts", "status"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
@@ -393,7 +427,7 @@ async fn prepared_home() -> Result<TempDir> {
 #[tokio::test]
 async fn accounts_diagnostics_json_reports_degraded_issue_details() -> Result<()> {
     let codex_home = prepared_home().await?;
-    seed_busy_and_unhealthy_pool_state(&codex_home).await?;
+    seed_busy_and_rate_limited_pool_state(&codex_home).await?;
 
     let output = run_codex(&codex_home, &["accounts", "diagnostics", "--json"]).await?;
     assert!(output.success, "stderr: {}", output.stderr);
@@ -404,9 +438,12 @@ async fn accounts_diagnostics_json_reports_degraded_issue_details() -> Result<()
     assert!(json["generatedAt"].as_str().is_some());
     let issues = json["issues"].as_array().expect("issues");
     assert_eq!(issues.len(), 1);
-    assert!(issues[0]["severity"].as_str().is_some());
-    assert!(issues[0]["reasonCode"].as_str().is_some());
-    assert!(issues[0]["message"].as_str().is_some());
+    assert_eq!(issues[0]["severity"], "warning");
+    assert_eq!(issues[0]["reasonCode"], "cooldownActive");
+    assert_eq!(issues[0]["message"], "account acct-2 is in cooldown");
+    assert_eq!(issues[0]["accountId"], "acct-2");
+    assert_eq!(issues[0]["holderInstanceId"], serde_json::Value::Null);
+    assert!(issues[0]["nextRelevantAt"].as_str().is_some());
     Ok(())
 }
 
@@ -465,7 +502,7 @@ async fn seed_state(codex_home: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> {
+async fn seed_busy_and_rate_limited_pool_state(codex_home: &TempDir) -> Result<()> {
     let pool = SqlitePool::connect(&format!(
         "sqlite://{}",
         state_db_path(codex_home.path()).display()
@@ -474,7 +511,9 @@ async fn seed_busy_and_unhealthy_pool_state(codex_home: &TempDir) -> Result<()> 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    let expires_at = now + 300;
+    let lease_expires_at = now + 300;
+    let quota_blocked_until = now + 300;
+    let quota_probe_after = now + 240;
 
     sqlx::query(
         r#"
@@ -498,29 +537,8 @@ INSERT INTO account_leases (
     .bind(0_i64)
     .bind(now)
     .bind(now)
-    .bind(expires_at)
+    .bind(lease_expires_at)
     .bind(Option::<i64>::None)
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-INSERT INTO account_runtime_state (
-    account_id,
-    pool_id,
-    health_state,
-    last_health_event_sequence,
-    last_health_event_at,
-    updated_at
-) VALUES (?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind("acct-2")
-    .bind("team-main")
-    .bind("rate_limited")
-    .bind(1_i64)
-    .bind(now)
-    .bind(now)
     .execute(&pool)
     .await?;
 
@@ -546,33 +564,78 @@ INSERT INTO account_quota_state (
     )
     .bind("acct-2")
     .bind("codex")
-    .bind(99.0_f64)
-    .bind(expires_at)
+    .bind(100.0_f64)
+    .bind(quota_blocked_until)
     .bind(Option::<f64>::None)
     .bind(Option::<i64>::None)
     .bind(now)
-    .bind(now * 1_000_000_000_i64)
+    .bind(now.saturating_mul(1_000_000_000))
     .bind("primary")
-    .bind(expires_at)
-    .bind(expires_at)
+    .bind(quota_blocked_until)
+    .bind(quota_probe_after)
     .bind(0_i64)
     .bind(Option::<String>::None)
     .bind(now)
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        r#"
-UPDATE account_registry
-SET healthy = 0,
-    updated_at = ?
-WHERE account_id = ?
-        "#,
-    )
-    .bind(now)
-    .bind("acct-2")
-    .execute(&pool)
+    Ok(())
+}
+
+async fn seed_quota_rows<const N: usize>(
+    codex_home: &TempDir,
+    limit_ids: [&'static str; N],
+) -> Result<()> {
+    let pool = SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state_db_path(codex_home.path()).display()
+    ))
     .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let primary_resets_at = now + 300;
+    let secondary_resets_at = now + 600;
+    let next_probe_after = now + 120;
+
+    for limit_id in limit_ids {
+        sqlx::query(
+            r#"
+INSERT INTO account_quota_state (
+    account_id,
+    limit_id,
+    primary_used_percent,
+    primary_resets_at,
+    secondary_used_percent,
+    secondary_resets_at,
+    observed_at,
+    observed_at_nanos,
+    exhausted_windows,
+    predicted_blocked_until,
+    next_probe_after,
+    probe_backoff_level,
+    last_probe_result,
+    updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("acct-1")
+        .bind(limit_id)
+        .bind(42.0_f64)
+        .bind(primary_resets_at)
+        .bind(100.0_f64)
+        .bind(secondary_resets_at)
+        .bind(now)
+        .bind(now.saturating_mul(1_000_000_000))
+        .bind("secondary")
+        .bind(secondary_resets_at)
+        .bind(next_probe_after)
+        .bind(1_i64)
+        .bind(Some("still_blocked"))
+        .bind(now)
+        .execute(&pool)
+        .await?;
+    }
 
     Ok(())
 }

@@ -37,6 +37,7 @@ const CHATGPT_LOGIN_DISABLED_MESSAGE: &str =
 const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
     "API key login is disabled. Use ChatGPT login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const API_KEY_STDIN_HINT_MESSAGE: &str = "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | mcodex login --with-api-key`.";
 
 /// Installs a small file-backed tracing layer for direct `mcodex login` flows.
 ///
@@ -106,10 +107,14 @@ fn init_login_file_logging(config: &Config) -> Option<WorkerGuard> {
     Some(guard)
 }
 
-fn print_login_server_start(actual_port: u16, auth_url: &str) {
-    eprintln!(
+fn login_server_start_message(actual_port: u16, auth_url: &str) -> String {
+    format!(
         "Starting local login server on http://localhost:{actual_port}.\nIf your browser did not open, navigate to this URL to authenticate:\n\n{auth_url}\n\nOn a remote or headless machine? Use `mcodex login --device-auth` instead."
-    );
+    )
+}
+
+fn print_login_server_start(actual_port: u16, auth_url: &str) {
+    eprintln!("{}", login_server_start_message(actual_port, auth_url));
 }
 
 pub async fn login_with_chatgpt(
@@ -193,9 +198,7 @@ pub fn read_api_key_from_stdin() -> String {
     let mut stdin = std::io::stdin();
 
     if stdin.is_terminal() {
-        eprintln!(
-            "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv OPENAI_API_KEY | mcodex login --with-api-key`."
-        );
+        eprintln!("{API_KEY_STDIN_HINT_MESSAGE}");
         std::process::exit(1);
     }
 
@@ -408,7 +411,23 @@ fn safe_format_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::API_KEY_STDIN_HINT_MESSAGE;
+    use super::login_server_start_message;
     use super::safe_format_key;
+
+    #[test]
+    fn login_server_start_hint_uses_mcodex_binary_name() {
+        let message = login_server_start_message(/*actual_port*/ 1234, "https://example.test");
+
+        assert!(message.contains("`mcodex login --device-auth`"));
+        assert!(!message.contains("`codex login --device-auth`"));
+    }
+
+    #[test]
+    fn api_key_stdin_hint_uses_mcodex_binary_name() {
+        assert!(API_KEY_STDIN_HINT_MESSAGE.contains("| mcodex login --with-api-key"));
+        assert!(!API_KEY_STDIN_HINT_MESSAGE.contains("| codex login --with-api-key"));
+    }
 
     #[test]
     fn formats_long_key() {

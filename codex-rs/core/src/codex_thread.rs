@@ -87,6 +87,11 @@ impl CodexThread {
     }
 
     #[doc(hidden)]
+    pub async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
+        self.codex.session.try_ensure_rollout_materialized().await
+    }
+
+    #[doc(hidden)]
     pub async fn flush_rollout(&self) -> std::io::Result<()> {
         self.codex.session.flush_rollout().await
     }
@@ -249,12 +254,17 @@ impl CodexThread {
     }
 
     #[doc(hidden)]
-    pub async fn current_lease_bridge_account_id(&self) -> Option<String> {
-        self.codex.current_lease_bridge_account_id().await
+    pub async fn current_auth_account_id(&self) -> Option<String> {
+        self.codex.current_auth_account_id().await
     }
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.codex.thread_config_snapshot().await
+    }
+
+    #[doc(hidden)]
+    pub async fn effective_config(&self) -> std::sync::Arc<crate::config::Config> {
+        self.codex.session.get_config().await
     }
 
     pub async fn read_mcp_resource(

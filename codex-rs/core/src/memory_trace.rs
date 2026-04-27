@@ -51,7 +51,13 @@ pub async fn build_memories_from_trace_files(
 
     let raw_memories = prepared.iter().map(|trace| trace.payload.clone()).collect();
     let output = client
-        .summarize_memories(raw_memories, model_info, effort, session_telemetry)
+        .summarize_memories(
+            raw_memories,
+            model_info,
+            effort,
+            session_telemetry,
+            tokio_util::sync::CancellationToken::new(),
+        )
         .await?;
     if output.len() != prepared.len() {
         return Err(CodexErr::InvalidRequest(format!(

@@ -19,6 +19,7 @@ pub struct SelectionRequest {
     pub pool_id: Option<String>,
     pub intent: SelectionIntent,
     pub selection_family: Option<String>,
+    pub preferred_account_id: Option<String>,
     pub current_account_id: Option<String>,
     pub just_replaced_account_id: Option<String>,
     pub reserved_probe_target_account_id: Option<String>,
@@ -38,6 +39,7 @@ impl SelectionRequest {
             pool_id: None,
             intent,
             selection_family: None,
+            preferred_account_id: None,
             current_account_id: None,
             just_replaced_account_id: None,
             reserved_probe_target_account_id: None,
@@ -61,6 +63,11 @@ impl SelectionRequest {
 
     pub fn with_current_account(mut self, account_id: &str) -> Self {
         self.current_account_id = Some(account_id.to_string());
+        self
+    }
+
+    pub fn with_preferred_account(mut self, account_id: &str) -> Self {
+        self.preferred_account_id = Some(account_id.to_string());
         self
     }
 

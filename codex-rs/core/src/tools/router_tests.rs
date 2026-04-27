@@ -55,6 +55,7 @@ async fn js_repl_tools_only_blocks_direct_tool_calls() -> anyhow::Result<()> {
             tracker,
             call,
             ToolCallSource::Direct,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .err()
@@ -109,6 +110,7 @@ async fn js_repl_tools_only_allows_js_repl_source_calls() -> anyhow::Result<()> 
             tracker,
             call,
             ToolCallSource::JsRepl,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .err()
@@ -158,6 +160,7 @@ async fn js_repl_tools_only_blocks_namespaced_js_repl_tool() -> anyhow::Result<(
             tracker,
             call,
             ToolCallSource::Direct,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .err()

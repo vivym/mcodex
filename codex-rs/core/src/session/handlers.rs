@@ -470,7 +470,7 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 
 pub async fn list_mcp_tools(sess: &Session, config: &Arc<Config>, sub_id: String) {
     let mcp_connection_manager = sess.services.mcp_connection_manager.read().await;
-    let auth = sess.services.auth_manager.auth().await;
+    let auth = sess.current_auth().await;
     let mcp_servers = sess
         .services
         .mcp_manager
@@ -915,12 +915,12 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         .unified_exec_manager
         .terminate_all_processes()
         .await;
-    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-        let mut account_pool_manager = account_pool_manager.lock().await;
-        if let Err(err) = account_pool_manager.release_for_shutdown().await {
-            warn!("failed to release account-pool lease during shutdown: {err:#}");
-        }
-        sess.services.lease_auth.clear();
+    if let Err(err) = sess
+        .services
+        .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+        .await
+    {
+        warn!("failed to release runtime lease session during shutdown: {err:#}");
     }
     sess.guardian_review_session.shutdown().await;
     info!("Shutting down Codex instance");
@@ -1215,12 +1215,12 @@ pub(super) async fn submission_loop(
     // Also drain cached guardian state if the submission loop exits because
     // the channel closed without receiving an explicit shutdown op.
     sess.guardian_review_session.shutdown().await;
-    if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-        let mut account_pool_manager = account_pool_manager.lock().await;
-        if let Err(err) = account_pool_manager.release_for_shutdown().await {
-            warn!("failed to release account-pool lease after dispatch loop exit: {err:#}");
-        }
-        sess.services.lease_auth.clear();
+    if let Err(err) = sess
+        .services
+        .release_runtime_lease_session_for_shutdown(&sess.conversation_id.to_string())
+        .await
+    {
+        warn!("failed to release runtime lease session after dispatch loop exit: {err:#}");
     }
     debug!("Agent loop exited");
 }

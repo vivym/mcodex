@@ -1,0 +1,15 @@
+---
+source: tui/src/onboarding/pooled_access_notice.rs
+expression: rendered
+---
+  Choose a default account pool
+
+  The default account pool is not available for startup.
+
+  Visible pools: team-main
+
+  Run `mcodex accounts pool default set <POOL_ID>` to choose an
+  available pool, or `mcodex accounts pool default clear` to remove the
+  saved default.
+
+  Press enter or l to log in

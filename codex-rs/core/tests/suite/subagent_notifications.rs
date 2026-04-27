@@ -610,8 +610,21 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
+#[test]
+fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
+    // Role override spawning exercises the same deep async path as production,
+    // whose entrypoint configures a larger Tokio worker stack.
+    const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES)
+        .enable_all()
+        .build()?
+        .block_on(spawn_agent_role_overrides_requested_model_and_reasoning_settings_inner())
+}
+
+async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings_inner() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -626,13 +639,14 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
         |builder| {
             builder.with_config(|config| {
                 let role_path = config.codex_home.join("custom-role.toml");
-                std::fs::write(
+                if let Err(err) = std::fs::write(
                     &role_path,
                     format!(
                         "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
                     ),
-                )
-                .expect("write role config");
+                ) {
+                    panic!("write role config: {err}");
+                }
                 config.agent_roles.insert(
                     "custom".to_string(),
                     AgentRoleConfig {

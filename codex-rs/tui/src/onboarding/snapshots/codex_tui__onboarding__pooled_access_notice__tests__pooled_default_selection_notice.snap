@@ -1,0 +1,15 @@
+---
+source: tui/src/onboarding/pooled_access_notice.rs
+expression: render_to_string(&widget)
+---
+  Choose a default account pool
+
+  Startup found multiple visible account pools and needs a default
+  before pooled access can continue.
+
+  Visible pools: team-main, team-other
+
+  Run `mcodex accounts pool default set <POOL_ID>` to choose one of the
+  visible pools.
+
+  Press enter or l to log in

@@ -229,6 +229,10 @@ mod spawn_agents_on_csv {
         turn: Arc<TurnContext>,
         arguments: String,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
+        session
+            .services
+            .agent_control
+            .register_session_root(session.conversation_id, &turn.session_source);
         let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
         if args.instruction.trim().is_empty() {
             return Err(FunctionCallError::RespondToModel(
@@ -629,7 +633,8 @@ async fn run_agent_job_loop(
                 let thread_id = match session
                     .services
                     .agent_control
-                    .spawn_agent(
+                    .spawn_agent_from_parent_thread(
+                        session.conversation_id,
                         options.spawn_config.clone(),
                         items.into(),
                         Some(SessionSource::SubAgent(SubAgentSource::Other(format!(

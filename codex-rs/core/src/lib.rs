@@ -141,6 +141,7 @@ pub use agents_md::AgentsMdManager;
 pub use agents_md::DEFAULT_AGENTS_MD_FILENAME;
 pub use agents_md::LOCAL_AGENTS_MD_FILENAME;
 mod rollout;
+mod runtime_lease;
 pub(crate) mod safety;
 mod session_rollout_init_error;
 pub mod shell;

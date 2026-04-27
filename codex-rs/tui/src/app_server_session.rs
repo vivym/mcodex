@@ -5,6 +5,8 @@ use crate::legacy_core::config::Config;
 use crate::legacy_core::message_history_metadata;
 use crate::status::StatusAccountDisplay;
 use crate::status::StatusAccountLeaseDisplay;
+use crate::status::StatusAccountQuotaFamilyDisplay;
+use crate::status::StatusAccountQuotaWindowDisplay;
 use crate::status::format_reset_timestamp;
 use crate::status::plan_type_display_name;
 use chrono::Local;
@@ -16,6 +18,11 @@ use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLeaseReadResponse;
 use codex_app_server_protocol::AccountLeaseResumeResponse;
+use codex_app_server_protocol::AccountPoolAccountResponse;
+use codex_app_server_protocol::AccountPoolAccountsListParams;
+use codex_app_server_protocol::AccountPoolAccountsListResponse;
+use codex_app_server_protocol::AccountPoolQuotaFamilyResponse;
+use codex_app_server_protocol::AccountPoolQuotaWindowResponse;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -180,6 +187,76 @@ impl ThreadParamsMode {
     }
 }
 
+fn account_lease_read_response_from_startup_probe_payload(
+    mut payload: serde_json::Value,
+) -> serde_json::Result<AccountLeaseReadResponse> {
+    if payload.get("startup").is_none() {
+        let startup = legacy_startup_snapshot_from_account_lease_payload(&payload);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("startup".to_string(), serde_json::to_value(startup)?);
+        }
+    }
+
+    serde_json::from_value(payload)
+}
+
+fn legacy_startup_snapshot_from_account_lease_payload(
+    payload: &serde_json::Value,
+) -> codex_app_server_protocol::AccountStartupSnapshot {
+    let effective_pool_id = json_string_field(payload, "poolId");
+    let suppressed = payload
+        .get("suppressed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let startup_availability = if suppressed {
+        codex_app_server_protocol::AccountStartupAvailability::Suppressed
+    } else if effective_pool_id.is_some() {
+        codex_app_server_protocol::AccountStartupAvailability::Available
+    } else {
+        codex_app_server_protocol::AccountStartupAvailability::Unavailable
+    };
+    let effective_pool_resolution_source =
+        json_string_field(payload, "effectivePoolResolutionSource").unwrap_or_else(|| {
+            if effective_pool_id.is_some() {
+                "singleVisiblePool".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
+    let selection_eligibility = json_string_field(payload, "switchReason")
+        .or_else(|| json_string_field(payload, "suppressionReason"))
+        .unwrap_or_else(|| match startup_availability {
+            codex_app_server_protocol::AccountStartupAvailability::Available => {
+                "automaticAccountSelected".to_string()
+            }
+            codex_app_server_protocol::AccountStartupAvailability::Suppressed => {
+                "durablySuppressed".to_string()
+            }
+            codex_app_server_protocol::AccountStartupAvailability::MultiplePoolsRequireDefault
+            | codex_app_server_protocol::AccountStartupAvailability::InvalidExplicitDefault
+            | codex_app_server_protocol::AccountStartupAvailability::Unavailable => {
+                "unavailable".to_string()
+            }
+        });
+
+    codex_app_server_protocol::AccountStartupSnapshot {
+        effective_pool_id,
+        effective_pool_resolution_source,
+        configured_default_pool_id: json_string_field(payload, "configuredDefaultPoolId"),
+        persisted_default_pool_id: json_string_field(payload, "persistedDefaultPoolId"),
+        startup_availability,
+        startup_resolution_issue: None,
+        selection_eligibility,
+    }
+}
+
+fn json_string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
@@ -325,10 +402,46 @@ impl AppServerSession {
             })
             .await
             .wrap_err("accountLease/read failed during TUI bootstrap")?;
-        Ok(status_account_lease_display_from_response(
-            response,
-            Local::now(),
-        ))
+        let account = self
+            .read_current_account_pool_account(
+                response.pool_id.as_deref(),
+                response.account_id.as_deref(),
+            )
+            .await;
+        Ok(
+            status_account_lease_display_from_response_and_hydration_result(
+                response,
+                account,
+                Local::now(),
+            ),
+        )
+    }
+
+    async fn read_current_account_pool_account(
+        &self,
+        pool_id: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Result<Option<AccountPoolAccountResponse>> {
+        let (Some(pool_id), Some(account_id)) = (pool_id, account_id) else {
+            return Ok(None);
+        };
+        let request_id = self.next_request_id();
+        let response: AccountPoolAccountsListResponse = self
+            .client
+            .request_typed(ClientRequest::AccountPoolAccountsList {
+                request_id,
+                params: AccountPoolAccountsListParams {
+                    pool_id: pool_id.to_string(),
+                    account_id: Some(account_id.to_string()),
+                    cursor: None,
+                    limit: None,
+                    states: None,
+                    account_kinds: None,
+                },
+            })
+            .await
+            .wrap_err("accountPool/accounts/list failed during TUI bootstrap")?;
+        Ok(response.data.into_iter().next())
     }
 
     #[allow(dead_code)]
@@ -349,7 +462,7 @@ impl AppServerSession {
             .wrap_err("accountLease/read failed during TUI startup probe")?;
 
         match response {
-            Ok(payload) => serde_json::from_value(payload)
+            Ok(payload) => account_lease_read_response_from_startup_probe_payload(payload)
                 .map(Some)
                 .map_err(|source| TypedRequestError::Deserialize {
                     method: METHOD.to_string(),
@@ -981,8 +1094,37 @@ impl AppServerSession {
 
 fn status_account_lease_display_from_response(
     response: AccountLeaseReadResponse,
+    account: Option<&AccountPoolAccountResponse>,
     captured_at: chrono::DateTime<Local>,
 ) -> Option<StatusAccountLeaseDisplay> {
+    let quota_families = account
+        .map(|account| status_account_quota_families_from_response(&account.quotas, captured_at))
+        .unwrap_or_default();
+    let effective_quota_family = account.and_then(|account| {
+        let selection_family = if account.selection_family.is_empty() {
+            "codex"
+        } else {
+            account.selection_family.as_str()
+        };
+        account
+            .quotas
+            .iter()
+            .find(|quota| quota.limit_id == selection_family)
+            .or_else(|| {
+                if selection_family == "codex" {
+                    None
+                } else {
+                    account
+                        .quotas
+                        .iter()
+                        .find(|quota| quota.limit_id == "codex")
+                }
+            })
+    });
+    let next_probe_after = effective_quota_family
+        .and_then(|quota| quota.next_probe_after)
+        .filter(|timestamp| *timestamp > captured_at.timestamp())
+        .and_then(|timestamp| format_local_timestamp(timestamp, captured_at));
     let has_proactive_switch_note = response.proactive_switch_pending == Some(true)
         && response.proactive_switch_suppressed == Some(true);
     let has_visible_state = response.active
@@ -996,19 +1138,19 @@ fn status_account_lease_display_from_response(
         || response.last_remote_context_reset_turn_id.is_some()
         || has_proactive_switch_note
         || response.proactive_switch_allowed_at.is_some()
-        || response.next_eligible_at.is_some();
+        || response.next_eligible_at.is_some()
+        || next_probe_after.is_some()
+        || !quota_families.is_empty();
     if !has_visible_state {
         return None;
     }
 
     let proactive_switch_allowed_at = response
         .proactive_switch_allowed_at
-        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
-        .map(|dt| format_reset_timestamp(dt, captured_at));
+        .and_then(|timestamp| format_local_timestamp(timestamp, captured_at));
     let next_eligible_at = response
         .next_eligible_at
-        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
-        .map(|dt| format_reset_timestamp(dt, captured_at));
+        .and_then(|timestamp| format_local_timestamp(timestamp, captured_at));
     let health = response
         .health_state
         .as_deref()
@@ -1017,7 +1159,7 @@ fn status_account_lease_display_from_response(
         "Active"
     } else if response.suppressed {
         "Suppressed"
-    } else if next_eligible_at.is_some() {
+    } else if next_eligible_at.is_some() || next_probe_after.is_some() {
         "Cooling down"
     } else {
         "Waiting"
@@ -1028,6 +1170,8 @@ fn status_account_lease_display_from_response(
     };
     let proactive_switch_note = has_proactive_switch_note
         .then(|| "Automatic switch held by minimum switch interval".to_string());
+    let quota_note =
+        effective_quota_family.and_then(|quota| account_quota_note(quota, captured_at));
 
     Some(StatusAccountLeaseDisplay {
         pool_id: response.pool_id,
@@ -1043,14 +1187,108 @@ fn status_account_lease_display_from_response(
                     .switch_reason
                     .as_deref()
                     .map(account_lease_reason_text)
-            }),
+            })
+            .or(quota_note),
         proactive_switch_allowed_at,
         next_eligible_at,
+        next_probe_after,
         remote_reset: account_lease_remote_reset_text(
             response.transport_reset_generation,
             response.last_remote_context_reset_turn_id.as_deref(),
         ),
+        quota_families,
     })
+}
+
+fn status_account_lease_display_from_response_and_hydration_result(
+    response: AccountLeaseReadResponse,
+    account: Result<Option<AccountPoolAccountResponse>>,
+    captured_at: chrono::DateTime<Local>,
+) -> Option<StatusAccountLeaseDisplay> {
+    let account = match account {
+        Ok(account) => account,
+        Err(err) => {
+            tracing::debug!(error = %err, "account pool account hydration unavailable");
+            None
+        }
+    };
+    status_account_lease_display_from_response(response, account.as_ref(), captured_at)
+}
+
+fn account_quota_note(
+    quota: &AccountPoolQuotaFamilyResponse,
+    captured_at: chrono::DateTime<Local>,
+) -> Option<String> {
+    if quota
+        .next_probe_after
+        .is_some_and(|timestamp| timestamp > captured_at.timestamp())
+    {
+        return Some("Quota probe throttle active".to_string());
+    }
+    if matches!(quota.exhausted_windows.as_str(), "secondary" | "both") {
+        return Some("Blocked by secondary quota window".to_string());
+    }
+    if quota.exhausted_windows.as_str() == "primary" {
+        return Some("Blocked by primary quota window".to_string());
+    }
+    if quota.exhausted_windows.as_str() == "unknown" {
+        return Some("Blocked by quota window".to_string());
+    }
+    None
+}
+
+fn status_account_quota_families_from_response(
+    quotas: &[AccountPoolQuotaFamilyResponse],
+    captured_at: chrono::DateTime<Local>,
+) -> Vec<StatusAccountQuotaFamilyDisplay> {
+    let mut quotas = quotas.to_vec();
+    quotas.sort_by(|left, right| left.limit_id.cmp(&right.limit_id));
+    quotas
+        .into_iter()
+        .map(|quota| StatusAccountQuotaFamilyDisplay {
+            limit_id: quota.limit_id,
+            primary: status_account_quota_window_from_response(quota.primary, captured_at),
+            secondary: status_account_quota_window_from_response(quota.secondary, captured_at),
+            exhausted_windows: quota.exhausted_windows,
+            predicted_blocked_until: quota
+                .predicted_blocked_until
+                .and_then(|timestamp| format_local_timestamp(timestamp, captured_at)),
+            next_probe_after: quota
+                .next_probe_after
+                .and_then(|timestamp| format_future_local_timestamp(timestamp, captured_at)),
+        })
+        .collect()
+}
+
+fn status_account_quota_window_from_response(
+    window: AccountPoolQuotaWindowResponse,
+    captured_at: chrono::DateTime<Local>,
+) -> StatusAccountQuotaWindowDisplay {
+    StatusAccountQuotaWindowDisplay {
+        used_percent: window
+            .used_percent
+            .map(|used_percent| format!("{used_percent:.0}% used")),
+        resets_at: window
+            .resets_at
+            .and_then(|timestamp| format_local_timestamp(timestamp, captured_at)),
+    }
+}
+
+fn format_local_timestamp(timestamp: i64, captured_at: chrono::DateTime<Local>) -> Option<String> {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|dt| format_reset_timestamp(dt, captured_at))
+}
+
+fn format_future_local_timestamp(
+    timestamp: i64,
+    captured_at: chrono::DateTime<Local>,
+) -> Option<String> {
+    if timestamp <= captured_at.timestamp() {
+        return None;
+    }
+    format_local_timestamp(timestamp, captured_at)
 }
 
 fn account_lease_health_text(health_state: &str) -> Option<&'static str> {
@@ -1496,6 +1734,8 @@ mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
     use chrono::TimeZone;
+    use codex_app_server_protocol::AccountStartupAvailability;
+    use codex_app_server_protocol::AccountStartupSnapshot;
     use codex_app_server_protocol::ThreadStatus;
     use codex_app_server_protocol::Turn;
     use codex_app_server_protocol::TurnStatus;
@@ -1510,6 +1750,137 @@ mod tests {
             .build()
             .await
             .expect("config should build")
+    }
+
+    fn startup_snapshot_for_test(
+        startup_availability: AccountStartupAvailability,
+        effective_pool_id: Option<&str>,
+        configured_default_pool_id: Option<&str>,
+        persisted_default_pool_id: Option<&str>,
+    ) -> AccountStartupSnapshot {
+        AccountStartupSnapshot {
+            effective_pool_id: effective_pool_id.map(str::to_owned),
+            effective_pool_resolution_source: effective_pool_id
+                .map(|_| "persistedSelection".to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            configured_default_pool_id: configured_default_pool_id.map(str::to_owned),
+            persisted_default_pool_id: persisted_default_pool_id.map(str::to_owned),
+            startup_availability,
+            startup_resolution_issue: None,
+            selection_eligibility: "automaticAccountSelected".to_string(),
+        }
+    }
+
+    fn legacy_account_lease_payload_for_test(
+        suppressed: bool,
+        pool_id: Option<&str>,
+        switch_reason: Option<&str>,
+        suppression_reason: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "active": false,
+            "suppressed": suppressed,
+            "accountId": null,
+            "poolId": pool_id,
+            "leaseId": null,
+            "leaseEpoch": null,
+            "leaseAcquiredAt": null,
+            "healthState": null,
+            "switchReason": switch_reason,
+            "suppressionReason": suppression_reason,
+            "transportResetGeneration": null,
+            "lastRemoteContextResetTurnId": null,
+            "minSwitchIntervalSecs": null,
+            "proactiveSwitchPending": null,
+            "proactiveSwitchSuppressed": null,
+            "proactiveSwitchAllowedAt": null,
+            "nextEligibleAt": null,
+            "effectivePoolResolutionSource": if pool_id.is_some() {
+                Some("singleVisiblePool")
+            } else {
+                None
+            },
+            "configuredDefaultPoolId": null,
+            "persistedDefaultPoolId": null,
+        })
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_available_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ false,
+                Some("team-main"),
+                Some("automaticAccountSelected"),
+                /*suppression_reason*/ None,
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                effective_pool_resolution_source: "singleVisiblePool".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_suppressed_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ true,
+                Some("team-main"),
+                /*switch_reason*/ None,
+                Some("durablySuppressed"),
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                effective_pool_resolution_source: "singleVisiblePool".to_string(),
+                startup_availability: AccountStartupAvailability::Suppressed,
+                selection_eligibility: "durablySuppressed".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Suppressed,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn startup_probe_compat_synthesizes_unavailable_snapshot_from_legacy_payload() {
+        let response = account_lease_read_response_from_startup_probe_payload(
+            legacy_account_lease_payload_for_test(
+                /*suppressed*/ false, /*pool_id*/ None, /*switch_reason*/ None,
+                /*suppression_reason*/ None,
+            ),
+        )
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(
+            response.startup,
+            AccountStartupSnapshot {
+                selection_eligibility: "unavailable".to_string(),
+                ..startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                )
+            }
+        );
     }
 
     #[tokio::test]
@@ -1796,6 +2167,63 @@ mod tests {
     }
 
     #[test]
+    fn status_account_lease_display_keeps_base_response_when_hydration_fails() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let response = AccountLeaseReadResponse {
+            active: false,
+            suppressed: false,
+            account_id: Some("acct-1".to_string()),
+            pool_id: Some("team-main".to_string()),
+            lease_id: None,
+            lease_epoch: None,
+            lease_acquired_at: None,
+            health_state: Some("healthy".to_string()),
+            switch_reason: None,
+            suppression_reason: None,
+            transport_reset_generation: None,
+            last_remote_context_reset_turn_id: None,
+            min_switch_interval_secs: None,
+            proactive_switch_pending: None,
+            proactive_switch_suppressed: None,
+            proactive_switch_allowed_at: None,
+            next_eligible_at: None,
+            effective_pool_resolution_source: None,
+            configured_default_pool_id: None,
+            persisted_default_pool_id: None,
+            startup: startup_snapshot_for_test(
+                AccountStartupAvailability::Available,
+                Some("team-main"),
+                /*configured_default_pool_id*/ None,
+                /*persisted_default_pool_id*/ None,
+            ),
+        };
+
+        let display = status_account_lease_display_from_response_and_hydration_result(
+            response,
+            Err(color_eyre::eyre::eyre!("account hydration unavailable")),
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Waiting · Healthy".to_string(),
+                note: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                next_probe_after: None,
+                remote_reset: None,
+                quota_families: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
     fn status_account_lease_display_from_response_hides_empty_state() {
         let captured_at = chrono::Local
             .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
@@ -1823,7 +2251,14 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    None,
+                    None,
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -1862,7 +2297,14 @@ mod tests {
                 effective_pool_resolution_source: Some("persistedSelection".to_string()),
                 configured_default_pool_id: None,
                 persisted_default_pool_id: Some("legacy-default".to_string()),
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("legacy-default"),
+                    None,
+                    Some("legacy-default"),
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -1875,7 +2317,9 @@ mod tests {
                 note: Some("Automatic selection in use".to_string()),
                 proactive_switch_allowed_at: None,
                 next_eligible_at: Some("03:04 on 11 Apr".to_string()),
+                next_probe_after: None,
                 remote_reset: Some("gen 2 after turn turn-17".to_string()),
+                quota_families: Vec::new(),
             })
         );
     }
@@ -1912,7 +2356,14 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    None,
+                    None,
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -1925,7 +2376,9 @@ mod tests {
                 note: Some("Automatic switch held by minimum switch interval".to_string()),
                 proactive_switch_allowed_at: Some("03:24".to_string()),
                 next_eligible_at: None,
+                next_probe_after: None,
                 remote_reset: None,
+                quota_families: Vec::new(),
             })
         );
     }
@@ -1958,7 +2411,14 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Unavailable,
+                    None,
+                    None,
+                    None,
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -1997,7 +2457,14 @@ mod tests {
                 effective_pool_resolution_source: None,
                 configured_default_pool_id: None,
                 persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    None,
+                    None,
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -2010,7 +2477,354 @@ mod tests {
                 note: Some("Automatic switch held by minimum switch interval".to_string()),
                 proactive_switch_allowed_at: Some("03:24".to_string()),
                 next_eligible_at: None,
+                next_probe_after: None,
                 remote_reset: None,
+                quota_families: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_derives_probe_metadata_from_quota_families() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let next_probe_after = (captured_at + chrono::Duration::minutes(20))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let blocked_until = (captured_at + chrono::Duration::hours(1))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let account = AccountPoolAccountResponse {
+            account_id: "acct-1".to_string(),
+            backend_account_ref: None,
+            account_kind: "chatgpt".to_string(),
+            selection_family: "chatgpt".to_string(),
+            enabled: true,
+            health_state: Some("healthy".to_string()),
+            operational_state: Some(
+                codex_app_server_protocol::AccountOperationalState::CoolingDown,
+            ),
+            allocatable: Some(false),
+            status_reason_code: None,
+            status_message: None,
+            current_lease: None,
+            quota: None,
+            quotas: vec![
+                quota_family(
+                    "codex",
+                    "primary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    /*next_probe_after*/ None,
+                ),
+                quota_family(
+                    "chatgpt",
+                    "secondary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    Some(next_probe_after),
+                ),
+            ],
+            selection: None,
+            updated_at: captured_at.with_timezone(&chrono::Utc).timestamp(),
+        };
+
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: None,
+                health_state: Some("healthy".to_string()),
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                effective_pool_resolution_source: None,
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                ),
+            },
+            Some(&account),
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Cooling down · Healthy".to_string(),
+                note: Some("Quota probe throttle active".to_string()),
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                next_probe_after: Some("03:24".to_string()),
+                remote_reset: None,
+                quota_families: vec![
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "chatgpt".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "secondary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: Some("03:24".to_string()),
+                    },
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "codex".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "primary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: None,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_ignores_past_probe_timestamp_for_quota_note() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let stale_probe_after = (captured_at - chrono::Duration::minutes(5))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let blocked_until = (captured_at + chrono::Duration::hours(1))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let account = AccountPoolAccountResponse {
+            account_id: "acct-1".to_string(),
+            backend_account_ref: None,
+            account_kind: "chatgpt".to_string(),
+            selection_family: "chatgpt".to_string(),
+            enabled: true,
+            health_state: Some("healthy".to_string()),
+            operational_state: Some(
+                codex_app_server_protocol::AccountOperationalState::CoolingDown,
+            ),
+            allocatable: Some(false),
+            status_reason_code: None,
+            status_message: None,
+            current_lease: None,
+            quota: None,
+            quotas: vec![quota_family(
+                "chatgpt",
+                "secondary",
+                /*predicted_blocked_until*/ Some(blocked_until),
+                Some(stale_probe_after),
+            )],
+            selection: None,
+            updated_at: captured_at.with_timezone(&chrono::Utc).timestamp(),
+        };
+
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: None,
+                health_state: Some("healthy".to_string()),
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                effective_pool_resolution_source: None,
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                ),
+            },
+            Some(&account),
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Waiting · Healthy".to_string(),
+                note: Some("Blocked by secondary quota window".to_string()),
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                next_probe_after: None,
+                remote_reset: None,
+                quota_families: vec![StatusAccountQuotaFamilyDisplay {
+                    limit_id: "chatgpt".to_string(),
+                    primary: StatusAccountQuotaWindowDisplay {
+                        used_percent: Some("42% used".to_string()),
+                        resets_at: None,
+                    },
+                    secondary: StatusAccountQuotaWindowDisplay {
+                        used_percent: Some("100% used".to_string()),
+                        resets_at: Some("04:04".to_string()),
+                    },
+                    exhausted_windows: "secondary".to_string(),
+                    predicted_blocked_until: Some("04:04".to_string()),
+                    next_probe_after: None,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn status_account_lease_display_uses_selection_family_for_quota_note() {
+        let captured_at = chrono::Local
+            .with_ymd_and_hms(2024, 4, 10, 3, 4, 5)
+            .single()
+            .expect("timestamp");
+        let next_probe_after = (captured_at + chrono::Duration::minutes(20))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let blocked_until = (captured_at + chrono::Duration::hours(1))
+            .with_timezone(&chrono::Utc)
+            .timestamp();
+        let account = AccountPoolAccountResponse {
+            account_id: "acct-1".to_string(),
+            backend_account_ref: None,
+            account_kind: "chatgpt".to_string(),
+            selection_family: "local".to_string(),
+            enabled: true,
+            health_state: Some("healthy".to_string()),
+            operational_state: Some(
+                codex_app_server_protocol::AccountOperationalState::CoolingDown,
+            ),
+            allocatable: Some(false),
+            status_reason_code: None,
+            status_message: None,
+            current_lease: None,
+            quota: None,
+            quotas: vec![
+                quota_family(
+                    "codex",
+                    "secondary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    Some(next_probe_after),
+                ),
+                quota_family(
+                    "local",
+                    "primary",
+                    /*predicted_blocked_until*/ Some(blocked_until),
+                    /*next_probe_after*/ None,
+                ),
+            ],
+            selection: None,
+            updated_at: captured_at.with_timezone(&chrono::Utc).timestamp(),
+        };
+
+        let display = status_account_lease_display_from_response(
+            AccountLeaseReadResponse {
+                active: false,
+                suppressed: false,
+                account_id: Some("acct-1".to_string()),
+                pool_id: Some("team-main".to_string()),
+                lease_id: None,
+                lease_epoch: None,
+                lease_acquired_at: None,
+                health_state: Some("healthy".to_string()),
+                switch_reason: None,
+                suppression_reason: None,
+                transport_reset_generation: None,
+                last_remote_context_reset_turn_id: None,
+                min_switch_interval_secs: None,
+                proactive_switch_pending: None,
+                proactive_switch_suppressed: None,
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                effective_pool_resolution_source: None,
+                configured_default_pool_id: None,
+                persisted_default_pool_id: None,
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("team-main"),
+                    /*configured_default_pool_id*/ None,
+                    /*persisted_default_pool_id*/ None,
+                ),
+            },
+            Some(&account),
+            captured_at,
+        );
+
+        assert_eq!(
+            display,
+            Some(StatusAccountLeaseDisplay {
+                pool_id: Some("team-main".to_string()),
+                account_id: Some("acct-1".to_string()),
+                status: "Waiting · Healthy".to_string(),
+                note: Some("Blocked by primary quota window".to_string()),
+                proactive_switch_allowed_at: None,
+                next_eligible_at: None,
+                next_probe_after: None,
+                remote_reset: None,
+                quota_families: vec![
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "codex".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "secondary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: Some("03:24".to_string()),
+                    },
+                    StatusAccountQuotaFamilyDisplay {
+                        limit_id: "local".to_string(),
+                        primary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("42% used".to_string()),
+                            resets_at: None,
+                        },
+                        secondary: StatusAccountQuotaWindowDisplay {
+                            used_percent: Some("100% used".to_string()),
+                            resets_at: Some("04:04".to_string()),
+                        },
+                        exhausted_windows: "primary".to_string(),
+                        predicted_blocked_until: Some("04:04".to_string()),
+                        next_probe_after: None,
+                    },
+                ],
             })
         );
     }
@@ -2047,7 +2861,14 @@ mod tests {
                 effective_pool_resolution_source: Some("persistedSelection".to_string()),
                 configured_default_pool_id: None,
                 persisted_default_pool_id: Some("legacy-default".to_string()),
+                startup: startup_snapshot_for_test(
+                    AccountStartupAvailability::Available,
+                    Some("legacy-default"),
+                    None,
+                    Some("legacy-default"),
+                ),
             },
+            None,
             captured_at,
         );
 
@@ -2063,8 +2884,33 @@ mod tests {
                 ),
                 proactive_switch_allowed_at: None,
                 next_eligible_at: Some("03:24".to_string()),
+                next_probe_after: None,
                 remote_reset: None,
+                quota_families: Vec::new(),
             })
         );
+    }
+
+    fn quota_family(
+        limit_id: &str,
+        exhausted_windows: &str,
+        predicted_blocked_until: Option<i64>,
+        next_probe_after: Option<i64>,
+    ) -> AccountPoolQuotaFamilyResponse {
+        AccountPoolQuotaFamilyResponse {
+            limit_id: limit_id.to_string(),
+            primary: AccountPoolQuotaWindowResponse {
+                used_percent: Some(42.0),
+                resets_at: None,
+            },
+            secondary: AccountPoolQuotaWindowResponse {
+                used_percent: Some(100.0),
+                resets_at: predicted_blocked_until,
+            },
+            exhausted_windows: exhausted_windows.to_string(),
+            predicted_blocked_until,
+            next_probe_after,
+            observed_at: 1,
+        }
     }
 }

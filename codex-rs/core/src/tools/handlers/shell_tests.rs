@@ -228,6 +228,7 @@ async fn shell_pre_tool_use_payload_uses_joined_command() {
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-41".to_string(),
             tool_name: codex_tools::ToolName::plain("shell"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload,
         }),
         Some(crate::tools::registry::PreToolUsePayload {
@@ -253,6 +254,7 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
             call_id: "call-42".to_string(),
             tool_name: codex_tools::ToolName::plain("shell_command"),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
             payload,
         }),
         Some(crate::tools::registry::PreToolUsePayload {

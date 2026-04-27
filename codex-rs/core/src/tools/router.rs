@@ -24,6 +24,7 @@ use codex_tools::ToolsConfig;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub use crate::tools::context::ToolCallSource;
@@ -270,6 +271,7 @@ impl ToolRouter {
         tracker: SharedTurnDiffTracker,
         call: ToolCall,
         source: ToolCallSource,
+        cancellation_token: CancellationToken,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let ToolCall {
             tool_name,
@@ -296,6 +298,7 @@ impl ToolRouter {
             call_id,
             tool_name,
             payload,
+            cancellation_token,
         };
 
         self.registry.dispatch_any(invocation).await

@@ -344,6 +344,10 @@ enum ExecpolicySubcommand {
 }
 
 #[derive(Debug, Parser)]
+#[clap(
+    bin_name = "mcodex login",
+    override_usage = "mcodex login [OPTIONS] [COMMAND]"
+)]
 struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
@@ -1700,8 +1704,10 @@ mod tests {
             .write_long_help(&mut output)
             .expect("render login help");
         let help = String::from_utf8(output).expect("help should be utf8");
+        let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(help.contains("mcodex login --with-api-key"));
+        assert!(help.contains("Usage: mcodex login [OPTIONS] [COMMAND]"));
+        assert!(normalized_help.contains("printenv OPENAI_API_KEY | mcodex login --with-api-key"));
     }
 
     #[test]

@@ -444,7 +444,8 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
-    pub(crate) inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+    pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
@@ -500,7 +501,8 @@ impl Codex {
             inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
+            runtime_lease_host,
             parent_trace: _,
             analytics_events_client,
         } = args;
@@ -697,7 +699,8 @@ impl Codex {
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
-            inherited_lease_auth_session,
+            compat_inherited_lease_auth_session,
+            runtime_lease_host,
             environment,
             analytics_events_client,
         )
@@ -837,12 +840,15 @@ impl Codex {
     }
 
     pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
-        let account_pool_manager = self.session.services.account_pool_manager.as_ref()?;
-        let snapshot_seed = {
-            let account_pool_manager = account_pool_manager.lock().await;
-            account_pool_manager.snapshot_seed()
-        };
-        Some(snapshot_seed.snapshot().await)
+        if let Some(account_pool_manager) = self.session.services.account_pool_manager.as_ref() {
+            let snapshot_seed = {
+                let account_pool_manager = account_pool_manager.lock().await;
+                account_pool_manager.snapshot_seed().await
+            };
+            return Some(snapshot_seed.snapshot().await);
+        }
+        let runtime_lease_host = self.session.services.runtime_lease_host.as_ref()?;
+        runtime_lease_host.account_lease_snapshot().await
     }
 
     pub(crate) async fn current_auth(&self) -> Option<CodexAuth> {
@@ -853,6 +859,10 @@ impl Codex {
         self.current_auth()
             .await
             .and_then(|auth| auth.get_account_id())
+    }
+
+    pub(crate) async fn current_auth_account_id(&self) -> Option<String> {
+        self.current_lease_bridge_account_id().await
     }
 
     pub(crate) fn enabled(&self, feature: Feature) -> bool {

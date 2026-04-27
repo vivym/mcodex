@@ -101,6 +101,7 @@ impl SessionTask for CompactTask {
                 session.clone(),
                 ctx,
                 turn_account_id_override,
+                cancellation_token.child_token(),
             )
             .await
         } else {
@@ -109,7 +110,13 @@ impl SessionTask for CompactTask {
                 /*inc*/ 1,
                 &[("type", "local")],
             );
-            crate::compact::run_compact_task(session.clone(), ctx, input).await
+            crate::compact::run_compact_task(
+                session.clone(),
+                ctx,
+                input,
+                cancellation_token.child_token(),
+            )
+            .await
         };
         None
     }

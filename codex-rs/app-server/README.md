@@ -1446,14 +1446,16 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated`.
-- `accountLease/read` — read pooled lease status for the current process. When exactly one pooled thread is loaded, the response prefers that thread's live lease snapshot and otherwise falls back to startup-selection preview state. Live snapshots also expose proactive switch damping state via `leaseAcquiredAt`, `minSwitchIntervalSecs`, `proactiveSwitchPending`, `proactiveSwitchSuppressed`, and `proactiveSwitchAllowedAt`. In v1 this is supported only for stdio-style single-client runtimes; websocket is rejected and stdio must have at most one loaded thread.
-- `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`.
+- `accountLease/read` — read pooled lease status and the nested `AccountStartupSnapshot` startup-selection snapshot for the current process. This is a startup-intent read API and may run over WebSocket without acquiring a pooled runtime lease. When stdio app-server has one loaded top-level pooled context, top-level lease fields prefer that context's live lease snapshot and the nested `startup` field continues to describe startup-selection intent.
+- `accountLease/resume` — clear durable pooled startup suppression and any durable preferred-account override; emits `accountLease/updated`. This is a startup-intent write API and may run over WebSocket without acquiring a pooled runtime lease.
 - `accountPool/read` — read the current summary and configured policy for a known account pool.
-- `accountPool/accounts/list` — list accounts in a known pool, with optional cursor, limit, operational-state, and account-kind filters.
+- `accountPool/default/set` — set the durable startup default pool with `{ "poolId": "..." }`; emits `accountLease/updated` when the durable startup-selection state changes.
+- `accountPool/default/clear` — clear the durable startup default pool; emits `accountLease/updated` when the durable startup-selection state changes.
+- `accountPool/accounts/list` — list accounts in a known pool, with optional account-id, cursor, limit, operational-state, and account-kind filters. When `accountId` is provided, the request is a pool-scoped point lookup and returns at most one row with `nextCursor: null`.
 - `accountPool/events/list` — list recent append-only pool events, with optional account, event-type, cursor, and limit filters.
 - `accountPool/diagnostics/read` — read derived diagnostics for a known account pool.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `chatgpt`, or `null`) and includes the current ChatGPT `planType` when available.
-- `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes or when a loaded pooled thread's live lease notification state changes.
+- `accountLease/updated` (notify) — emitted when durable pooled startup-selection state changes or when a loaded pooled thread's live lease notification state changes. Payloads include the nested `startup` snapshot.
 - `account/rateLimits/read` — fetch ChatGPT rate limits; updates arrive via `account/rateLimits/updated` (notify).
 - `account/rateLimits/updated` (notify) — emitted whenever a user's ChatGPT rate limits change.
 - `account/sendAddCreditsNudgeEmail` — ask ChatGPT to email the workspace owner about depleted credits or a reached usage limit.
@@ -1543,7 +1545,28 @@ Field notes:
 { "method": "account/logout", "id": 6 }
 { "id": 6, "result": {} }
 { "method": "account/updated", "params": { "authMode": null, "planType": null } }
-{ "method": "accountLease/updated", "params": { "accountId": null, "poolId": "legacy-default", "suppressed": true, "leaseAcquiredAt": null, "minSwitchIntervalSecs": null, "proactiveSwitchPending": null, "proactiveSwitchSuppressed": null, "proactiveSwitchAllowedAt": null } }
+{
+  "method": "accountLease/updated",
+  "params": {
+    "accountId": null,
+    "poolId": "legacy-default",
+    "suppressed": true,
+    "leaseAcquiredAt": null,
+    "minSwitchIntervalSecs": null,
+    "proactiveSwitchPending": null,
+    "proactiveSwitchSuppressed": null,
+    "proactiveSwitchAllowedAt": null,
+    "startup": {
+      "effectivePoolId": "legacy-default",
+      "effectivePoolResolutionSource": "configDefault",
+      "configuredDefaultPoolId": "legacy-default",
+      "persistedDefaultPoolId": null,
+      "startupAvailability": "suppressed",
+      "startupResolutionIssue": null,
+      "selectionEligibility": "durablySuppressed"
+    }
+  }
+}
 ```
 
 When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears only that in-memory auth context and does not durably suppress pooled startup selection.
@@ -1571,30 +1594,78 @@ When runtime-local `chatgptAuthTokens` auth is active, `account/logout` clears o
     "proactiveSwitchPending": false,
     "proactiveSwitchSuppressed": false,
     "proactiveSwitchAllowedAt": null,
-    "nextEligibleAt": null
+    "nextEligibleAt": null,
+    "effectivePoolResolutionSource": "configDefault",
+    "configuredDefaultPoolId": "legacy-default",
+    "persistedDefaultPoolId": null,
+    "startup": {
+      "effectivePoolId": "legacy-default",
+      "effectivePoolResolutionSource": "configDefault",
+      "configuredDefaultPoolId": "legacy-default",
+      "persistedDefaultPoolId": null,
+      "startupAvailability": "available",
+      "startupResolutionIssue": null,
+      "selectionEligibility": "automaticAccountSelected"
+    }
   }
 }
 { "method": "accountLease/resume", "id": 8 }
 { "id": 8, "result": {} }
-{ "method": "accountLease/updated", "params": { "accountId": "acct-1", "poolId": "legacy-default", "suppressed": false, "leaseAcquiredAt": null, "minSwitchIntervalSecs": null, "proactiveSwitchPending": null, "proactiveSwitchSuppressed": null, "proactiveSwitchAllowedAt": null } }
+{
+  "method": "accountLease/updated",
+  "params": {
+    "accountId": "acct-1",
+    "poolId": "legacy-default",
+    "suppressed": false,
+    "leaseAcquiredAt": null,
+    "minSwitchIntervalSecs": null,
+    "proactiveSwitchPending": null,
+    "proactiveSwitchSuppressed": null,
+    "proactiveSwitchAllowedAt": null,
+    "startup": {
+      "effectivePoolId": "legacy-default",
+      "effectivePoolResolutionSource": "configDefault",
+      "configuredDefaultPoolId": "legacy-default",
+      "persistedDefaultPoolId": null,
+      "startupAvailability": "available",
+      "startupResolutionIssue": null,
+      "selectionEligibility": "automaticAccountSelected"
+    }
+  }
+}
 ```
 
 Field notes:
 
+- `startup` is the authoritative `AccountStartupSnapshot` on both `accountLease/read` responses and `accountLease/updated` notifications. It contains `effectivePoolId`, `effectivePoolResolutionSource`, `configuredDefaultPoolId`, `persistedDefaultPoolId`, `startupAvailability`, `startupResolutionIssue`, and `selectionEligibility`.
+- `startupAvailability` is one of `available`, `suppressed`, `multiplePoolsRequireDefault`, `invalidExplicitDefault`, or `unavailable`. `startupResolutionIssue` is `null` when startup selection is usable; otherwise it describes the blocker and may include candidate pools.
+- The top-level `accountId`, `poolId`, lease, health, reset, and proactive-switch fields remain live lease fields. They are separate from nested `startup`, which describes startup intent and durable/default-pool resolution. The top-level `effectivePoolResolutionSource`, `configuredDefaultPoolId`, and `persistedDefaultPoolId` fields are compatibility projections of the nested `startup` values.
 - `switchReason` explains why the current preview or live lease selected its account. `suppressionReason` explains why pooled startup or live lease reuse is currently blocked. Either field may be `null`.
 - The pooled lease reason fields reuse the same camelCase codes, depending on whether the response is a startup preview or a live thread snapshot: `automaticAccountSelected`, `preferredAccountSelected`, `missingPool`, `preferredAccountMissing`, `preferredAccountInOtherPool`, `preferredAccountDisabled`, `preferredAccountUnhealthy`, `preferredAccountBusy`, `noEligibleAccount`, `durablySuppressed`, and `nonReplayableTurn`.
 - `durablySuppressed` is returned on `suppressionReason` when pooled startup was manually suppressed and remains in effect until `accountLease/resume`.
 - `nonReplayableTurn` is returned on live snapshots when the current turn could not be replayed onto the next pooled account; future turns continue on the next eligible account instead of replaying the current turn.
 - `leaseAcquiredAt` is set only for live thread snapshots. `minSwitchIntervalSecs`, `proactiveSwitchPending`, `proactiveSwitchSuppressed`, and `proactiveSwitchAllowedAt` are also live-thread-only fields and remain `null` for startup previews and manually resumed durable state.
+- `accountLease/read`, `accountLease/resume`, `accountPool/default/set`, and `accountPool/default/clear` are startup-intent APIs. They may run over WebSocket and do not reserve pooled runtime leases. Runtime execution APIs such as `thread/start`, `turn/start`, review, and compaction continue to reject pooled WebSocket execution through the existing unsupported-transport error path.
+
+Default startup pool mutations:
+
+```json
+{ "method": "accountPool/default/set", "id": 9, "params": { "poolId": "team-main" } }
+{ "id": 9, "result": {} }
+{ "method": "accountPool/default/clear", "id": 10 }
+{ "id": 10, "result": {} }
+```
+
+`accountLease/resume` sends `accountLease/updated` after a successful resume with the post-resume snapshot. `accountPool/default/set` and `accountPool/default/clear` emit `accountLease/updated` only when the durable startup-selection state changes. Successful no-op default-pool mutations still return an empty result and do not emit an update notification.
 
 ### 8) Account pool observability
 
 Read a known pool summary and policy:
 
 ```json
-{ "method": "accountPool/read", "id": 9, "params": { "poolId": "legacy-default" } }
+{ "method": "accountPool/read", "id": 11, "params": { "poolId": "legacy-default" } }
 {
-  "id": 9,
+  "id": 11,
   "result": {
     "poolId": "legacy-default",
     "backend": "local",
@@ -1623,21 +1694,23 @@ Read a known pool summary and policy:
 List accounts in the pool:
 
 ```json
-{ "method": "accountPool/accounts/list", "id": 10, "params": {
+{ "method": "accountPool/accounts/list", "id": 12, "params": {
     "poolId": "legacy-default",
+    "accountId": null,
     "cursor": null,
     "limit": 50,
     "states": ["available", "leased"],
     "accountKinds": ["chatgpt"]
 } }
 {
-  "id": 10,
+  "id": 12,
   "result": {
     "data": [
       {
         "accountId": "acct-1",
         "backendAccountRef": "acct-1",
         "accountKind": "chatgpt",
+        "selectionFamily": "chatgpt",
         "enabled": true,
         "healthState": "healthy",
         "operationalState": "leased",
@@ -1652,7 +1725,43 @@ List accounts in the pool:
           "renewedAt": 1710000030,
           "expiresAt": 1710000300
         },
-        "quota": null,
+        "quota": {
+          "remainingPercent": 18.0,
+          "resetsAt": 1710001200,
+          "observedAt": 1710000000
+        },
+        "quotas": [
+          {
+            "limitId": "chatgpt",
+            "primary": {
+              "usedPercent": 72.0,
+              "resetsAt": 1710001800
+            },
+            "secondary": {
+              "usedPercent": null,
+              "resetsAt": null
+            },
+            "exhaustedWindows": "none",
+            "predictedBlockedUntil": null,
+            "nextProbeAfter": null,
+            "observedAt": 1710000000
+          },
+          {
+            "limitId": "codex",
+            "primary": {
+              "usedPercent": 82.0,
+              "resetsAt": 1710001200
+            },
+            "secondary": {
+              "usedPercent": 10.0,
+              "resetsAt": 1710003600
+            },
+            "exhaustedWindows": "primary",
+            "predictedBlockedUntil": 1710001200,
+            "nextProbeAfter": 1710000600,
+            "observedAt": 1710000000
+          }
+        ],
         "selection": {
           "eligible": false,
           "nextEligibleAt": 1710000300,
@@ -1667,10 +1776,12 @@ List accounts in the pool:
 }
 ```
 
+`selectionFamily` is the quota family used by runtime selection for this account, with `codex` used when the backend family is absent. `quota` is the legacy nullable compatibility projection and is derived only from the `codex` quota family when present. `quotas` is always present as a non-null array, sorted by `limitId`, and contains one entry for each persisted quota family.
+
 List event history. Pagination uses only `cursor` and `limit`; omit or set optional filters to `null` when not needed:
 
 ```json
-{ "method": "accountPool/events/list", "id": 11, "params": {
+{ "method": "accountPool/events/list", "id": 13, "params": {
     "poolId": "legacy-default",
     "accountId": null,
     "types": ["leaseAcquired", "proactiveSwitchSuppressed"],
@@ -1678,7 +1789,7 @@ List event history. Pagination uses only `cursor` and `limit`; omit or set optio
     "limit": 25
 } }
 {
-  "id": 11,
+  "id": 13,
   "result": {
     "data": [
       {
@@ -1702,9 +1813,9 @@ List event history. Pagination uses only `cursor` and `limit`; omit or set optio
 Read derived diagnostics:
 
 ```json
-{ "method": "accountPool/diagnostics/read", "id": 12, "params": { "poolId": "legacy-default" } }
+{ "method": "accountPool/diagnostics/read", "id": 14, "params": { "poolId": "legacy-default" } }
 {
-  "id": 12,
+  "id": 14,
   "result": {
     "poolId": "legacy-default",
     "generatedAt": 1710000060,
@@ -1725,7 +1836,7 @@ Read derived diagnostics:
 
 Field notes:
 
-- `accountPool/*` methods are read-only and scoped to one caller-provided `poolId`; pool discovery is separate.
+- `accountPool/read`, `accountPool/accounts/list`, `accountPool/events/list`, and `accountPool/diagnostics/read` are read-only and scoped to one caller-provided `poolId`; pool discovery is separate.
 - Unknown or unconfigured `poolId` values return JSON-RPC error code `-32004` with an account-pool-not-found message.
 - Malformed account or event cursors return JSON-RPC invalid params error code `-32602`.
 - Response fields whose value may be unknown are present with `null` rather than omitted.
@@ -1735,8 +1846,8 @@ Field notes:
 ### 9) Rate limits (ChatGPT)
 
 ```json
-{ "method": "account/rateLimits/read", "id": 13 }
-{ "id": 13, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null } } }
+{ "method": "account/rateLimits/read", "id": 15 }
+{ "id": 15, "result": { "rateLimits": { "primary": { "usedPercent": 25, "windowDurationMins": 15, "resetsAt": 1730947200 }, "secondary": null, "rateLimitReachedType": null } } }
 { "method": "account/rateLimits/updated", "params": { "rateLimits": { … } } }
 ```
 

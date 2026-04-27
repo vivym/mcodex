@@ -23,6 +23,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::ThreadStore;
@@ -1814,6 +1815,351 @@ async fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants
         no_path_child_subtree_thread_ids,
         expected_no_path_child_subtree_thread_ids
     );
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_uses_live_descendants_after_root_and_parent_removed() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let grandchild_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello grandchild"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("grandchild spawn should succeed");
+    let grandchild_thread = harness
+        .manager
+        .get_thread(grandchild_thread_id)
+        .await
+        .expect("grandchild should be loaded");
+    let state_db_ctx = grandchild_thread
+        .state_db()
+        .expect("grandchild should expose state DB");
+    state_db_ctx
+        .upsert_thread_spawn_edge(
+            root_thread_id,
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("root child edge should be written");
+    state_db_ctx
+        .upsert_thread_spawn_edge(
+            ThreadId::new(),
+            grandchild_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await
+        .expect("stale persisted grandchild edge should be written");
+
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed");
+    harness
+        .manager
+        .remove_thread(&child_thread_id)
+        .await
+        .expect("child should be removed");
+    let subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("root subtree should still load from live deeper descendants");
+    assert!(
+        subtree_thread_ids.contains(&root_thread_id),
+        "root id should remain the subtree anchor: {subtree_thread_ids:?}"
+    );
+    assert!(
+        subtree_thread_ids.contains(&child_thread_id),
+        "persisted child should be preserved for mixed live/archived subtree feedback: {subtree_thread_ids:?}"
+    );
+    assert!(
+        subtree_thread_ids.contains(&grandchild_thread_id),
+        "live grandchild should be recovered even after root and parent are removed: {subtree_thread_ids:?}"
+    );
+    assert_eq!(subtree_thread_ids.len(), 3);
+    harness
+        .control
+        .shutdown_live_agent(grandchild_thread_id)
+        .await
+        .expect("grandchild shutdown");
+    root_thread
+        .shutdown_and_wait()
+        .await
+        .expect("root shutdown");
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_returns_error_when_persisted_lookup_fails() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let state_db_path = codex_state::state_db_path(root_state_db.codex_home());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject persisted subtree lookup failure");
+    pool.close().await;
+
+    let err = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect_err("complete subtree should fail when persisted lookup fails");
+    assert_matches!(
+        err,
+        codex_protocol::error::CodexErr::Fatal(message)
+            if message.contains("failed to load thread-spawn descendants")
+    );
+
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_live_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("live subtree should still load when persisted lookup fails");
+    subtree_thread_ids.sort_by_key(ToString::to_string);
+    let mut expected_thread_ids = vec![root_thread_id, child_thread_id];
+    expected_thread_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(subtree_thread_ids, expected_thread_ids);
+    let _ = harness.manager.remove_thread(&child_thread_id).await;
+    let _ = harness.manager.remove_thread(&root_thread_id).await;
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_reports_persisted_error_for_known_unloaded_root() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let (other_thread_id, _other_thread) = harness.start_thread().await;
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed from live manager");
+    assert!(harness.manager.get_thread(root_thread_id).await.is_err());
+
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let state_db_path = codex_state::state_db_path(root_state_db.codex_home());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject persisted subtree lookup failure");
+    pool.close().await;
+
+    let err = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect_err("known persisted root should report persisted lookup error");
+    assert_matches!(
+        err,
+        codex_protocol::error::CodexErr::Fatal(message)
+            if message.contains("failed to load thread-spawn descendants")
+    );
+
+    let _ = harness.manager.remove_thread(&other_thread_id).await;
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_ignores_unrelated_broken_candidate_db() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let (same_db_thread_id, same_db_thread) = harness.start_thread().await;
+    let (_other_home, other_config) = test_config().await;
+    let other_thread = harness
+        .manager
+        .start_thread(other_config)
+        .await
+        .expect("other-home thread should start");
+    let root_state_db = root_thread.state_db().expect("root should expose state DB");
+    let other_state_db = other_thread
+        .thread
+        .state_db()
+        .expect("other-home thread should expose state DB");
+    assert_ne!(root_state_db.codex_home(), other_state_db.codex_home());
+    assert!(
+        other_state_db
+            .get_thread(root_thread_id)
+            .await
+            .expect("unrelated state DB metadata read should succeed")
+            .is_none(),
+        "unrelated state DB should not know the root thread"
+    );
+    persist_thread_for_tree_resume(&root_thread, "root persisted").await;
+    assert!(
+        root_state_db
+            .get_thread(root_thread_id)
+            .await
+            .expect("owning state DB metadata read should succeed")
+            .is_some(),
+        "owning state DB should know the root thread"
+    );
+    harness
+        .manager
+        .remove_thread(&root_thread_id)
+        .await
+        .expect("root should be removed from live manager");
+
+    let other_state_db_path = codex_state::state_db_path(other_state_db.codex_home());
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(other_state_db_path)
+            .create_if_missing(false),
+    )
+    .await
+    .expect("test should open unrelated state DB directly");
+    sqlx::query("DROP TABLE thread_spawn_edges")
+        .execute(&pool)
+        .await
+        .expect("test should inject unrelated persisted lookup failure");
+    pool.close().await;
+    root_state_db
+        .list_thread_spawn_descendants(root_thread_id)
+        .await
+        .expect("owning state DB descendant lookup should remain healthy");
+    assert!(
+        other_state_db
+            .list_thread_spawn_descendants(root_thread_id)
+            .await
+            .is_err(),
+        "unrelated state DB descendant lookup should be broken"
+    );
+
+    let subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("unrelated broken candidate DB should not poison the owning DB");
+    assert_eq!(subtree_thread_ids, vec![root_thread_id]);
+
+    let _ = harness.manager.remove_thread(&same_db_thread_id).await;
+    let _ = harness.manager.remove_thread(&other_thread.thread_id).await;
+    let _ = same_db_thread.shutdown_and_wait().await;
+    let _ = other_thread.thread.shutdown_and_wait().await;
+    let _ = root_thread.shutdown_and_wait().await;
+}
+
+#[tokio::test]
+async fn list_agent_subtree_thread_ids_includes_mixed_status_persisted_descendants() {
+    let harness = AgentControlHarness::new().await;
+    let (root_thread_id, root_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let grandchild_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello grandchild"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: child_thread_id,
+                depth: 2,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("grandchild spawn should succeed");
+    let state_db_ctx = root_thread.state_db().expect("root should expose state DB");
+    state_db_ctx
+        .set_thread_spawn_edge_status(child_thread_id, DirectionalThreadSpawnEdgeStatus::Closed)
+        .await
+        .expect("child edge should be closed");
+
+    harness
+        .manager
+        .remove_thread(&child_thread_id)
+        .await
+        .expect("child should be removed");
+    harness
+        .manager
+        .remove_thread(&grandchild_thread_id)
+        .await
+        .expect("grandchild should be removed");
+
+    let mut subtree_thread_ids = harness
+        .manager
+        .list_agent_subtree_thread_ids(root_thread_id)
+        .await
+        .expect("root subtree should load from persisted mixed-status edges");
+    subtree_thread_ids.sort_by_key(ToString::to_string);
+    let mut expected_thread_ids = vec![root_thread_id, child_thread_id, grandchild_thread_id];
+    expected_thread_ids.sort_by_key(ToString::to_string);
+
+    assert_eq!(subtree_thread_ids, expected_thread_ids);
+    root_thread
+        .shutdown_and_wait()
+        .await
+        .expect("root shutdown");
 }
 
 #[tokio::test]

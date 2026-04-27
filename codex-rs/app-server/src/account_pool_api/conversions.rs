@@ -7,7 +7,9 @@ use codex_app_server_protocol::AccountPoolDiagnosticsStatus;
 use codex_app_server_protocol::AccountPoolEventResponse;
 use codex_app_server_protocol::AccountPoolEventType;
 use codex_app_server_protocol::AccountPoolLeaseResponse;
+use codex_app_server_protocol::AccountPoolQuotaFamilyResponse;
 use codex_app_server_protocol::AccountPoolQuotaResponse;
+use codex_app_server_protocol::AccountPoolQuotaWindowResponse;
 use codex_app_server_protocol::AccountPoolReasonCode;
 use codex_app_server_protocol::AccountPoolSelectionResponse;
 use codex_app_server_protocol::AccountPoolSummaryResponse;
@@ -35,6 +37,7 @@ pub(super) fn account_pool_account_response(
         account_id: account.account_id,
         backend_account_ref: account.backend_account_ref,
         account_kind: account.account_kind,
+        selection_family: account.selection_family,
         enabled: account.enabled,
         health_state: account.health_state,
         operational_state: account
@@ -47,6 +50,11 @@ pub(super) fn account_pool_account_response(
         status_message: account.status_message,
         current_lease: account.current_lease.map(account_pool_lease_response),
         quota: account.quota.map(account_pool_quota_response),
+        quotas: account
+            .quotas
+            .into_iter()
+            .map(account_pool_quota_family_response)
+            .collect(),
         selection: account.selection.map(account_pool_selection_response),
         updated_at: account.updated_at.timestamp(),
     }
@@ -156,6 +164,33 @@ fn account_pool_quota_response(quota: pool::AccountPoolQuota) -> AccountPoolQuot
         remaining_percent: quota.remaining_percent,
         resets_at: quota.resets_at.map(|resets_at| resets_at.timestamp()),
         observed_at: quota.observed_at.timestamp(),
+    }
+}
+
+fn account_pool_quota_family_response(
+    quota: pool::AccountPoolQuotaFamily,
+) -> AccountPoolQuotaFamilyResponse {
+    AccountPoolQuotaFamilyResponse {
+        limit_id: quota.limit_id,
+        primary: account_pool_quota_window_response(quota.primary),
+        secondary: account_pool_quota_window_response(quota.secondary),
+        exhausted_windows: quota.exhausted_windows,
+        predicted_blocked_until: quota
+            .predicted_blocked_until
+            .map(|predicted_blocked_until| predicted_blocked_until.timestamp()),
+        next_probe_after: quota
+            .next_probe_after
+            .map(|next_probe_after| next_probe_after.timestamp()),
+        observed_at: quota.observed_at.timestamp(),
+    }
+}
+
+fn account_pool_quota_window_response(
+    window: pool::AccountPoolQuotaWindow,
+) -> AccountPoolQuotaWindowResponse {
+    AccountPoolQuotaWindowResponse {
+        used_percent: window.used_percent,
+        resets_at: window.resets_at.map(|resets_at| resets_at.timestamp()),
     }
 }
 

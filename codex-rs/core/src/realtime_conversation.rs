@@ -1,6 +1,13 @@
+use crate::client::AdmittedClientSetup;
 use crate::client::ModelClient;
+use crate::client::await_api_result_or_cancel;
+use crate::client::merge_auth_recovery;
+use crate::client::realtime_websocket_auth_headers;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
+use crate::runtime_lease::LeaseAdmissionGuard;
+use crate::runtime_lease::LeaseRequestReporter;
+use crate::runtime_lease::RequestBoundaryKind;
 use crate::session::session::Session;
 use anyhow::Context;
 use async_channel::Receiver;
@@ -19,14 +26,17 @@ use codex_api::RealtimeSessionMode;
 use codex_api::RealtimeWebsocketClient;
 use codex_api::RealtimeWebsocketEvents;
 use codex_api::RealtimeWebsocketWriter;
+use codex_api::TransportError;
 use codex_api::map_api_error;
 use codex_app_server_protocol::AuthMode;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_login::AuthRecovery;
 use codex_login::CodexAuth;
 use codex_login::default_client::default_headers;
 use codex_login::read_openai_api_key_from_env;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -47,6 +57,7 @@ use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
 use http::HeaderMap;
 use http::HeaderValue;
+use http::StatusCode;
 use http::header::AUTHORIZATION;
 use serde_json::json;
 use std::sync::Arc;
@@ -54,6 +65,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -86,8 +98,9 @@ enum RealtimeFanoutTaskStop {
     Detach,
 }
 
+#[derive(Clone)]
 pub(crate) struct RealtimeConversationManager {
-    state: Mutex<Option<ConversationState>>,
+    state: Arc<Mutex<Option<ConversationState>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,14 +229,20 @@ struct ConversationState {
     handoff: RealtimeHandoffState,
     input_task: JoinHandle<()>,
     fanout_task: Option<JoinHandle<()>>,
+    lease_cancellation_task: Option<JoinHandle<()>>,
     realtime_active: Arc<AtomicBool>,
+    _lease_reporter: Option<LeaseRequestReporter>,
+    _lease_guard: Option<LeaseAdmissionGuard>,
 }
 
 struct RealtimeStart {
     api_provider: ApiProvider,
     extra_headers: Option<HeaderMap>,
+    session_id_is_implicit: bool,
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
+    session_telemetry: SessionTelemetry,
+    cancellation_token: CancellationToken,
     sdp: Option<String>,
 }
 
@@ -231,13 +250,41 @@ struct RealtimeStartOutput {
     realtime_active: Arc<AtomicBool>,
     events_rx: Receiver<RealtimeEvent>,
     sdp: Option<String>,
+    lease_cancellation_token: Option<CancellationToken>,
+}
+
+async fn report_realtime_admission_error(
+    reporter: Option<&LeaseRequestReporter>,
+    err: ApiError,
+) -> CodexErr {
+    let terminal_unauthorized = matches!(
+        &err,
+        ApiError::Transport(TransportError::Http { status, .. })
+            if *status == http::StatusCode::UNAUTHORIZED
+    );
+    if let Some(reporter) = reporter
+        && terminal_unauthorized
+    {
+        reporter.report_terminal_unauthorized().await;
+    }
+
+    let mapped = map_api_error(err);
+    if let Some(reporter) = reporter
+        && let CodexErr::UsageLimitReached(usage_limit) = &mapped
+    {
+        if let Some(rate_limits) = usage_limit.rate_limits.as_deref() {
+            reporter.report_rate_limits(rate_limits).await;
+        }
+        reporter.report_usage_limit_reached().await;
+    }
+    mapped
 }
 
 #[allow(dead_code)]
 impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(None),
+            state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -274,8 +321,11 @@ impl RealtimeConversationManager {
         let RealtimeStart {
             api_provider,
             extra_headers,
+            session_id_is_implicit,
             session_config,
             model_client,
+            session_telemetry,
+            cancellation_token,
             sdp,
         } = start;
         let event_parser = session_config.event_parser;
@@ -285,35 +335,204 @@ impl RealtimeConversationManager {
         };
 
         let client = RealtimeWebsocketClient::new(api_provider);
-        let (connection, sdp) = if let Some(sdp) = sdp {
-            let call = model_client
-                .create_realtime_call_with_headers(
+        let extra_headers = extra_headers.unwrap_or_default();
+        let (connection, sdp, lease_reporter, lease_guard, lease_cancellation_token) =
+            if let Some(sdp) = sdp {
+                let mut session_config = session_config;
+                let mut extra_headers = extra_headers;
+                let call = model_client
+                    .create_realtime_call_with_headers(crate::client::RealtimeCallStartRequest {
+                        sdp,
+                        session_config: session_config.clone(),
+                        collaboration_tree_id: model_client.current_collaboration_tree_id(),
+                        session_telemetry: &session_telemetry,
+                        cancellation_token: cancellation_token.child_token(),
+                        extra_headers: extra_headers.clone(),
+                        session_id_is_implicit,
+                    })
+                    .await?;
+                let crate::client::RealtimeWebrtcCallStart {
                     sdp,
-                    session_config.clone(),
-                    extra_headers.unwrap_or_default(),
-                )
-                .await?;
-            let connection = client
-                .connect_webrtc_sideband(
-                    session_config,
-                    &call.call_id,
-                    call.sideband_headers,
-                    default_headers(),
-                )
-                .await
-                .map_err(map_api_error)?;
-            (connection, Some(call.sdp))
-        } else {
-            let connection = client
-                .connect(
-                    session_config,
-                    extra_headers.unwrap_or_default(),
-                    default_headers(),
-                )
-                .await
-                .map_err(map_api_error)?;
-            (connection, None)
-        };
+                    call_id,
+                    reporter: _call_reporter,
+                    guard: _call_guard,
+                    lease_cancellation_token: call_lease_cancellation_token,
+                } = call;
+                let mut auth_recovery: Option<Box<dyn AuthRecovery>> = None;
+                loop {
+                    let request_cancellation_token = call_lease_cancellation_token.child_token();
+                    let connect_setup = model_client
+                        .prepare_realtime_sideband_connect(
+                            &model_client.current_collaboration_tree_id(),
+                            request_cancellation_token.clone(),
+                        )
+                        .await?;
+                    let crate::client::RealtimeSidebandConnectSetup {
+                        mut sideband_headers,
+                        reporter,
+                        guard,
+                        lease_cancellation_token,
+                        auth_recovery: next_auth_recovery,
+                    } = connect_setup;
+                    let mut request_auth_recovery =
+                        merge_auth_recovery(next_auth_recovery, &mut auth_recovery);
+                    if session_id_is_implicit {
+                        model_client.refresh_implicit_realtime_session_id(
+                            &mut session_config,
+                            &mut extra_headers,
+                        )?;
+                        if let Some(session_id) = session_config.session_id.as_deref()
+                            && let Ok(header_value) = http::HeaderValue::from_str(session_id)
+                        {
+                            sideband_headers.insert("x-session-id", header_value);
+                        }
+                    }
+                    match await_api_result_or_cancel(
+                        Some(&lease_cancellation_token),
+                        "realtime sideband connect",
+                        client.connect_webrtc_sideband(
+                            session_config.clone(),
+                            &call_id,
+                            sideband_headers,
+                            default_headers(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(connection) => {
+                            break (
+                                connection,
+                                Some(sdp),
+                                reporter,
+                                guard,
+                                Some(lease_cancellation_token),
+                            );
+                        }
+                        Err(ApiError::Transport(
+                            unauthorized_transport @ TransportError::Http { status, .. },
+                        )) if status == StatusCode::UNAUTHORIZED => {
+                            match crate::client::handle_unauthorized(
+                                unauthorized_transport,
+                                &mut request_auth_recovery,
+                                &session_telemetry,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    auth_recovery = request_auth_recovery;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    if let Some(reporter) = reporter.as_ref() {
+                                        reporter.report_terminal_unauthorized().await;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            return Err(
+                                report_realtime_admission_error(reporter.as_ref(), err).await
+                            );
+                        }
+                    }
+                }
+            } else {
+                let mut session_config = session_config;
+                let mut auth_recovery: Option<Box<dyn AuthRecovery>> = None;
+                loop {
+                    let request_cancellation_token = cancellation_token.child_token();
+                    let mut websocket_headers = extra_headers.clone();
+                    let (reporter, guard, mut request_auth_recovery) =
+                        if model_client.pooled_runtime_authority_active() {
+                            let admitted_setup = model_client
+                                .admitted_client_setup(
+                                    RequestBoundaryKind::Realtime,
+                                    crate::client::LeaseRequestPurpose::Standard,
+                                    crate::client::AdmittedClientSetupRequest {
+                                        collaboration_tree_id: &model_client
+                                            .current_collaboration_tree_id(),
+                                        collaboration_member_id: model_client
+                                            .current_collaboration_member_id(),
+                                        turn_id: None,
+                                        request_id: "realtime-websocket",
+                                        cancellation_token: request_cancellation_token.clone(),
+                                        agent_task: None,
+                                    },
+                                )
+                                .await?;
+                            let AdmittedClientSetup {
+                                setup: client_setup,
+                                reporter,
+                                auth_recovery: next_auth_recovery,
+                                guard,
+                            } = admitted_setup;
+                            websocket_headers
+                                .extend(realtime_websocket_auth_headers(&client_setup.api_auth));
+                            (
+                                reporter,
+                                guard,
+                                merge_auth_recovery(next_auth_recovery, &mut auth_recovery),
+                            )
+                        } else {
+                            (None, None, None)
+                        };
+                    if session_id_is_implicit {
+                        model_client.refresh_implicit_realtime_session_id(
+                            &mut session_config,
+                            &mut websocket_headers,
+                        )?;
+                    }
+                    match await_api_result_or_cancel(
+                        Some(&request_cancellation_token),
+                        "realtime websocket connect",
+                        client.connect(
+                            session_config.clone(),
+                            websocket_headers,
+                            default_headers(),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(connection) => {
+                            break (
+                                connection,
+                                None,
+                                reporter,
+                                guard,
+                                Some(request_cancellation_token),
+                            );
+                        }
+                        Err(ApiError::Transport(
+                            unauthorized_transport @ TransportError::Http { status, .. },
+                        )) if status == StatusCode::UNAUTHORIZED && reporter.is_some() => {
+                            match crate::client::handle_unauthorized(
+                                unauthorized_transport,
+                                &mut request_auth_recovery,
+                                &session_telemetry,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    auth_recovery = request_auth_recovery;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    if let Some(reporter) = reporter.as_ref() {
+                                        reporter.report_terminal_unauthorized().await;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            return Err(
+                                report_realtime_admission_error(reporter.as_ref(), err).await
+                            );
+                        }
+                    }
+                }
+            };
 
         let writer = connection.writer();
         let events = connection.events();
@@ -339,6 +558,16 @@ impl RealtimeConversationManager {
             session_kind,
             event_parser,
         });
+        let lease_cancellation_task = lease_cancellation_token.clone().map(|cancellation_token| {
+            let manager = self.clone();
+            let realtime_active = Arc::clone(&realtime_active);
+            tokio::spawn(async move {
+                cancellation_token.cancelled().await;
+                manager
+                    .finish_if_active_from_lease_cancellation(&realtime_active)
+                    .await;
+            })
+        });
 
         let mut guard = self.state.lock().await;
         *guard = Some(ConversationState {
@@ -349,12 +578,16 @@ impl RealtimeConversationManager {
             handoff,
             input_task: task,
             fanout_task: None,
+            lease_cancellation_task,
             realtime_active: Arc::clone(&realtime_active),
+            _lease_reporter: lease_reporter,
+            _lease_guard: lease_guard,
         });
         Ok(RealtimeStartOutput {
             realtime_active,
             events_rx,
             sdp,
+            lease_cancellation_token,
         })
     }
 
@@ -379,16 +612,26 @@ impl RealtimeConversationManager {
         }
     }
 
-    pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) {
-        let state = {
-            let mut guard = self.state.lock().await;
-            match guard.as_ref() {
-                Some(state) if Arc::ptr_eq(&state.realtime_active, realtime_active) => guard.take(),
-                _ => None,
-            }
-        };
+    async fn take_active_state(
+        &self,
+        realtime_active: &Arc<AtomicBool>,
+    ) -> Option<ConversationState> {
+        let mut guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(state) if Arc::ptr_eq(&state.realtime_active, realtime_active) => guard.take(),
+            _ => None,
+        }
+    }
 
-        if let Some(state) = state {
+    pub(crate) async fn finish_if_active(&self, realtime_active: &Arc<AtomicBool>) {
+        if let Some(state) = self.take_active_state(realtime_active).await {
+            stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await;
+        }
+    }
+
+    async fn finish_if_active_from_lease_cancellation(&self, realtime_active: &Arc<AtomicBool>) {
+        if let Some(mut state) = self.take_active_state(realtime_active).await {
+            state.lease_cancellation_task = None;
             stop_conversation_state(state, RealtimeFanoutTaskStop::Detach).await;
         }
     }
@@ -538,6 +781,10 @@ async fn stop_conversation_state(
     fanout_task_stop: RealtimeFanoutTaskStop,
 ) {
     state.realtime_active.store(false, Ordering::Relaxed);
+    if let Some(lease_cancellation_task) = state.lease_cancellation_task.take() {
+        lease_cancellation_task.abort();
+        let _ = lease_cancellation_task.await;
+    }
     state.input_task.abort();
     let _ = state.input_task.await;
 
@@ -591,6 +838,7 @@ struct PreparedRealtimeConversationStart {
     api_provider: ApiProvider,
     extra_headers: Option<HeaderMap>,
     requested_session_id: Option<String>,
+    session_id_is_implicit: bool,
     version: RealtimeWsVersion,
     session_config: RealtimeSessionConfig,
     transport: ConversationStartTransport,
@@ -601,11 +849,11 @@ async fn prepare_realtime_start(
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
     let provider = sess.provider().await;
-    let auth = sess.current_auth().await;
     let config = sess.get_config().await;
     let transport = params
         .transport
         .unwrap_or(ConversationStartTransport::Websocket);
+    let session_id_is_implicit = params.session_id.is_none();
     let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
     if let Some(realtime_ws_base_url) = &config.experimental_realtime_ws_base_url {
         api_provider.base_url = realtime_ws_base_url.clone();
@@ -620,22 +868,23 @@ async fn prepare_realtime_start(
     )
     .await?;
     let requested_session_id = session_config.session_id.clone();
-    let extra_headers = match transport {
-        ConversationStartTransport::Websocket => {
-            let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
-            realtime_request_headers(
-                requested_session_id.as_deref(),
-                Some(realtime_api_key.as_str()),
-            )?
-        }
-        ConversationStartTransport::Webrtc { .. } => {
-            realtime_request_headers(requested_session_id.as_deref(), /*api_key*/ None)?
-        }
+    let realtime_api_key = if matches!(transport, ConversationStartTransport::Websocket)
+        && !sess.services.model_client.pooled_runtime_authority_active()
+    {
+        // Non-pooled direct websocket sessions still rely on the configured API
+        // key. Pooled runtime sessions inject admitted auth in start_inner().
+        let auth = sess.current_auth().await;
+        Some(realtime_api_key(auth.as_ref(), &provider)?)
+    } else {
+        None
     };
+    let extra_headers =
+        realtime_request_headers(requested_session_id.as_deref(), realtime_api_key.as_deref())?;
     Ok(PreparedRealtimeConversationStart {
         api_provider,
         extra_headers,
         requested_session_id,
+        session_id_is_implicit,
         version,
         session_config,
         transport,
@@ -760,6 +1009,7 @@ async fn handle_start_inner(
         api_provider,
         extra_headers,
         requested_session_id,
+        session_id_is_implicit,
         version,
         session_config,
         transport,
@@ -772,8 +1022,11 @@ async fn handle_start_inner(
     let start = RealtimeStart {
         api_provider,
         extra_headers,
+        session_id_is_implicit,
         session_config,
         model_client: sess.services.model_client.clone(),
+        session_telemetry: sess.services.session_telemetry.clone(),
+        cancellation_token: CancellationToken::new(),
         sdp,
     };
     let start_output = sess.conversation.start(start).await?;
@@ -783,7 +1036,11 @@ async fn handle_start_inner(
     sess.send_event_raw(Event {
         id: sub_id.to_string(),
         msg: EventMsg::RealtimeConversationStarted(RealtimeConversationStartedEvent {
-            session_id: requested_session_id,
+            session_id: if session_id_is_implicit {
+                Some(sess.services.model_client.remote_session_id().to_string())
+            } else {
+                requested_session_id
+            },
             version,
         }),
     })
@@ -793,6 +1050,7 @@ async fn handle_start_inner(
         realtime_active,
         events_rx,
         sdp,
+        lease_cancellation_token,
     } = start_output;
     if let Some(sdp) = sdp {
         sess.send_event_raw(Event {
@@ -811,7 +1069,22 @@ async fn handle_start_inner(
             msg,
         };
         let mut end = RealtimeConversationEnd::TransportClosed;
-        while let Ok(event) = events_rx.recv().await {
+        let mut ended_by_lease_cancellation = false;
+        loop {
+            let event = if let Some(cancellation_token) = lease_cancellation_token.as_ref() {
+                tokio::select! {
+                    () = cancellation_token.cancelled() => {
+                        ended_by_lease_cancellation = true;
+                        break;
+                    }
+                    event = events_rx.recv() => event,
+                }
+            } else {
+                events_rx.recv().await
+            };
+            let Ok(event) = event else {
+                break;
+            };
             if !fanout_realtime_active.load(Ordering::Relaxed) {
                 break;
             }
@@ -851,7 +1124,7 @@ async fn handle_start_inner(
                 )))
                 .await;
         }
-        if fanout_realtime_active.swap(false, Ordering::Relaxed) {
+        let should_emit_closed = if fanout_realtime_active.swap(false, Ordering::Relaxed) {
             match end {
                 RealtimeConversationEnd::TransportClosed => {
                     info!("realtime conversation transport closed");
@@ -862,6 +1135,11 @@ async fn handle_start_inner(
                 .conversation
                 .finish_if_active(&fanout_realtime_active)
                 .await;
+            true
+        } else {
+            ended_by_lease_cancellation
+        };
+        if should_emit_closed {
             send_realtime_conversation_closed(&sess_clone, sub_id, end).await;
         }
     });

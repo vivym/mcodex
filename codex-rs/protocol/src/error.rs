@@ -84,6 +84,8 @@ pub enum CodexErr {
     ThreadNotFound(ThreadId),
     #[error("agent thread limit reached (max {max_threads})")]
     AgentLimitReached { max_threads: usize },
+    #[error("No eligible pooled account is available for this turn.")]
+    NoEligiblePooledAccount,
     #[error("session configured event was not the first event in the stream")]
     SessionConfiguredNotFirstEvent,
     /// Returned by run_command_stream when the spawned child process timed out (10s).
@@ -183,6 +185,7 @@ impl CodexErr {
             | CodexErr::ContextWindowExceeded
             | CodexErr::ThreadNotFound(_)
             | CodexErr::AgentLimitReached { .. }
+            | CodexErr::NoEligiblePooledAccount
             | CodexErr::Spawn
             | CodexErr::SessionConfiguredNotFirstEvent
             | CodexErr::UsageLimitReached(_)

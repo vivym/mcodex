@@ -44,6 +44,7 @@ enum Step {
     Auth(AuthModeWidget),
     PooledOnlyNotice(PooledAccessNoticeWidget),
     PooledPausedNotice(PooledAccessNoticeWidget),
+    PooledDefaultSelectionNotice(PooledAccessNoticeWidget),
     TrustDirectory(TrustDirectoryWidget),
 }
 
@@ -109,9 +110,10 @@ impl OnboardingScreen {
         let forced_login_method = config.forced_login_method;
         let auth_widget = if show_login_screen
             || matches!(
-                startup_prompt_decision,
+                &startup_prompt_decision,
                 StartupPromptDecision::PooledOnlyNotice
                     | StartupPromptDecision::PooledAccessPausedNotice
+                    | StartupPromptDecision::PooledDefaultSelectionNotice(_)
             ) {
             app_server_request_handle.map(|app_server_request_handle| {
                 let highlighted_mode = match forced_login_method {
@@ -140,11 +142,12 @@ impl OnboardingScreen {
             config.animations,
         )));
         if matches!(
-            startup_prompt_decision,
+            &startup_prompt_decision,
             StartupPromptDecision::PooledOnlyNotice
                 | StartupPromptDecision::PooledAccessPausedNotice
+                | StartupPromptDecision::PooledDefaultSelectionNotice(_)
         ) {
-            match startup_prompt_decision {
+            match &startup_prompt_decision {
                 StartupPromptDecision::PooledOnlyNotice => {
                     steps.push(Step::PooledOnlyNotice(
                         PooledAccessNoticeWidget::pooled_only(config.animations),
@@ -155,14 +158,25 @@ impl OnboardingScreen {
                         PooledAccessNoticeWidget::pooled_paused(config.animations),
                     ));
                 }
+                StartupPromptDecision::PooledDefaultSelectionNotice(data) => {
+                    steps.push(Step::PooledDefaultSelectionNotice(
+                        PooledAccessNoticeWidget::default_pool_required_with_issue(
+                            data.candidate_pool_ids.clone(),
+                            data.issue_kind,
+                            data.issue_source,
+                            config.animations,
+                        ),
+                    ));
+                }
                 StartupPromptDecision::NeedsLogin | StartupPromptDecision::NoPrompt => {}
             }
         }
         let pending_auth_step = if show_login_screen
             && matches!(
-                startup_prompt_decision,
+                &startup_prompt_decision,
                 StartupPromptDecision::PooledOnlyNotice
                     | StartupPromptDecision::PooledAccessPausedNotice
+                    | StartupPromptDecision::PooledDefaultSelectionNotice(_)
             ) {
             auth_widget
         } else if show_login_screen {
@@ -243,6 +257,7 @@ impl OnboardingScreen {
             Step::Welcome(_)
             | Step::PooledOnlyNotice(_)
             | Step::PooledPausedNotice(_)
+            | Step::PooledDefaultSelectionNotice(_)
             | Step::TrustDirectory(_) => false,
         })
     }
@@ -296,6 +311,7 @@ impl OnboardingScreen {
             Step::Welcome(_)
             | Step::PooledOnlyNotice(_)
             | Step::PooledPausedNotice(_)
+            | Step::PooledDefaultSelectionNotice(_)
             | Step::TrustDirectory(_) => None,
         })
     }
@@ -311,7 +327,9 @@ impl OnboardingScreen {
             .rposition(|step| {
                 matches!(
                     step,
-                    Step::PooledOnlyNotice(_) | Step::PooledPausedNotice(_)
+                    Step::PooledOnlyNotice(_)
+                        | Step::PooledPausedNotice(_)
+                        | Step::PooledDefaultSelectionNotice(_)
                 )
             })
             .map_or(self.steps.len(), |index| index + 1);
@@ -322,7 +340,9 @@ impl OnboardingScreen {
         self.steps.retain(|step| {
             !matches!(
                 step,
-                Step::PooledOnlyNotice(_) | Step::PooledPausedNotice(_)
+                Step::PooledOnlyNotice(_)
+                    | Step::PooledPausedNotice(_)
+                    | Step::PooledDefaultSelectionNotice(_)
             )
         });
     }
@@ -334,7 +354,9 @@ impl OnboardingScreen {
 
     fn active_startup_notice_mut(&mut self) -> Option<&mut PooledAccessNoticeWidget> {
         self.steps.iter_mut().find_map(|step| match step {
-            Step::PooledOnlyNotice(widget) | Step::PooledPausedNotice(widget) => Some(widget),
+            Step::PooledOnlyNotice(widget)
+            | Step::PooledPausedNotice(widget)
+            | Step::PooledDefaultSelectionNotice(widget) => Some(widget),
             Step::Welcome(_) | Step::Auth(_) | Step::TrustDirectory(_) => None,
         })
     }
@@ -343,7 +365,9 @@ impl OnboardingScreen {
         let Some(index) = self.steps.iter().position(|step| {
             matches!(
                 step,
-                Step::PooledOnlyNotice(_) | Step::PooledPausedNotice(_)
+                Step::PooledOnlyNotice(_)
+                    | Step::PooledPausedNotice(_)
+                    | Step::PooledDefaultSelectionNotice(_)
             )
         }) else {
             return;
@@ -471,7 +495,9 @@ impl WidgetRef for &OnboardingScreen {
             match step {
                 Step::Welcome(widget) => widget.set_animations_suppressed(suppress_animations),
                 Step::Auth(widget) => widget.set_animations_suppressed(suppress_animations),
-                Step::PooledOnlyNotice(_) | Step::PooledPausedNotice(_) => {}
+                Step::PooledOnlyNotice(_)
+                | Step::PooledPausedNotice(_)
+                | Step::PooledDefaultSelectionNotice(_) => {}
                 Step::TrustDirectory(_) => {}
             }
         }
@@ -545,9 +571,9 @@ impl KeyboardHandler for Step {
         match self {
             Step::Welcome(widget) => widget.handle_key_event(key_event),
             Step::Auth(widget) => widget.handle_key_event(key_event),
-            Step::PooledOnlyNotice(widget) | Step::PooledPausedNotice(widget) => {
-                widget.handle_key_event(key_event)
-            }
+            Step::PooledOnlyNotice(widget)
+            | Step::PooledPausedNotice(widget)
+            | Step::PooledDefaultSelectionNotice(widget) => widget.handle_key_event(key_event),
             Step::TrustDirectory(widget) => widget.handle_key_event(key_event),
         }
     }
@@ -556,7 +582,9 @@ impl KeyboardHandler for Step {
         match self {
             Step::Welcome(_) => {}
             Step::Auth(widget) => widget.handle_paste(pasted),
-            Step::PooledOnlyNotice(_) | Step::PooledPausedNotice(_) => {}
+            Step::PooledOnlyNotice(_)
+            | Step::PooledPausedNotice(_)
+            | Step::PooledDefaultSelectionNotice(_) => {}
             Step::TrustDirectory(widget) => widget.handle_paste(pasted),
         }
     }
@@ -567,7 +595,9 @@ impl StepStateProvider for Step {
         match self {
             Step::Welcome(w) => w.get_step_state(),
             Step::Auth(w) => w.get_step_state(),
-            Step::PooledOnlyNotice(w) | Step::PooledPausedNotice(w) => {
+            Step::PooledOnlyNotice(w)
+            | Step::PooledPausedNotice(w)
+            | Step::PooledDefaultSelectionNotice(w) => {
                 if w.outcome().is_some() {
                     StepState::Complete
                 } else {
@@ -588,7 +618,9 @@ impl WidgetRef for Step {
             Step::Auth(widget) => {
                 widget.render_ref(area, buf);
             }
-            Step::PooledOnlyNotice(widget) | Step::PooledPausedNotice(widget) => {
+            Step::PooledOnlyNotice(widget)
+            | Step::PooledPausedNotice(widget)
+            | Step::PooledDefaultSelectionNotice(widget) => {
                 widget.render_ref(area, buf);
             }
             Step::TrustDirectory(widget) => {
@@ -764,6 +796,9 @@ mod tests {
     use crate::onboarding::auth::SignInState;
     use crate::onboarding::pooled_access_notice::PooledAccessNoticeWidget;
     use crate::onboarding::welcome::WelcomeWidget;
+    use crate::startup_access::StartupNoticeData;
+    use crate::startup_access::StartupNoticeIssueKind;
+    use crate::startup_access::StartupNoticeIssueSource;
     use crate::startup_access::StartupPromptDecision;
     use crate::test_backend::VT100Backend;
     use crate::tui::FrameRequester;
@@ -793,6 +828,7 @@ mod tests {
                 Step::Auth(_) => "auth",
                 Step::PooledOnlyNotice(_) => "pooled-only",
                 Step::PooledPausedNotice(_) => "pooled-paused",
+                Step::PooledDefaultSelectionNotice(_) => "pooled-default",
                 Step::TrustDirectory(_) => "trust",
             })
             .collect()
@@ -818,6 +854,7 @@ mod tests {
                 Step::Welcome(_)
                 | Step::PooledOnlyNotice(_)
                 | Step::PooledPausedNotice(_)
+                | Step::PooledDefaultSelectionNotice(_)
                 | Step::TrustDirectory(_) => None,
             })
             .expect("auth step")
@@ -887,6 +924,46 @@ mod tests {
         handle_startup_notice_outcome(&mut screen, None, &mut reload_config).await?;
 
         assert_eq!(step_names(&screen), vec!["welcome", "trust"]);
+        assert!(!reload_config);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_default_notice_enter_reveals_auth() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = build_config(&temp_dir).await?;
+        let app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let request_frame = FrameRequester::test_dummy();
+        let args = OnboardingScreenArgs {
+            show_trust_screen: false,
+            show_login_screen: false,
+            startup_prompt_decision: StartupPromptDecision::PooledDefaultSelectionNotice(
+                StartupNoticeData {
+                    issue_kind: StartupNoticeIssueKind::MultiplePoolsRequireDefault,
+                    issue_source: StartupNoticeIssueSource::None,
+                    candidate_pool_ids: vec!["team-main".to_string(), "team-other".to_string()],
+                },
+            ),
+            login_status: LoginStatus::NotAuthenticated,
+            app_server_request_handle: Some(app_server.request_handle()),
+            config,
+        };
+
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        assert_eq!(step_names(&screen), vec!["welcome", "pooled-default"]);
+
+        screen.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        let mut reload_config = false;
+        handle_startup_notice_outcome(&mut screen, None, &mut reload_config).await?;
+
+        assert_eq!(
+            step_names(&screen),
+            vec!["welcome", "pooled-default", "auth"]
+        );
         assert!(!reload_config);
 
         Ok(())

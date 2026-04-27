@@ -23,12 +23,9 @@ impl ToolHandler for Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: CloseAgentArgs = parse_arguments(&arguments)?;
-        let agent_id = resolve_agent_target(&session, &turn, &args.target).await?;
-        let receiver_agent = session
-            .services
-            .agent_control
-            .get_agent_metadata(agent_id)
-            .unwrap_or_default();
+        let receiver = resolve_agent_target_with_metadata(&session, &turn, &args.target).await?;
+        let agent_id = receiver.thread_id;
+        let receiver_agent = receiver.metadata;
         if receiver_agent
             .agent_path
             .as_ref()

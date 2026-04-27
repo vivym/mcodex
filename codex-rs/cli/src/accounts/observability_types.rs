@@ -25,6 +25,7 @@ pub(crate) struct PoolAccountView {
     pub account_id: String,
     pub backend_account_ref: Option<String>,
     pub account_kind: String,
+    pub selection_family: String,
     pub enabled: bool,
     pub health_state: Option<String>,
     pub operational_state: Option<String>,
@@ -33,6 +34,7 @@ pub(crate) struct PoolAccountView {
     pub status_message: Option<String>,
     pub current_lease: Option<PoolLeaseView>,
     pub quota: Option<PoolQuotaView>,
+    pub quotas: Vec<PoolQuotaFamilyView>,
     pub selection: Option<PoolSelectionView>,
     pub updated_at: Option<String>,
 }
@@ -52,6 +54,24 @@ pub(crate) struct PoolQuotaView {
     pub remaining_percent: Option<f64>,
     pub resets_at: Option<String>,
     pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PoolQuotaFamilyView {
+    pub limit_id: String,
+    pub primary: PoolQuotaWindowView,
+    pub secondary: PoolQuotaWindowView,
+    pub exhausted_windows: String,
+    pub predicted_blocked_until: Option<String>,
+    pub next_probe_after: Option<String>,
+    pub next_probe_after_is_future: bool,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PoolQuotaWindowView {
+    pub used_percent: Option<f64>,
+    pub resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +121,11 @@ pub(crate) struct EventView {
     pub details: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatusPoolObservabilityView {
     pub pool_id: String,
     pub summary: Option<PoolSummaryView>,
+    pub accounts: Option<Vec<PoolAccountView>>,
     pub diagnostics: Option<DiagnosticsView>,
     pub warning: Option<String>,
 }
@@ -113,11 +134,19 @@ impl StatusPoolObservabilityView {
     pub(crate) fn from_results(
         pool_id: String,
         summary: anyhow::Result<PoolSummaryView>,
+        accounts: anyhow::Result<Vec<PoolAccountView>>,
         diagnostics: anyhow::Result<DiagnosticsView>,
     ) -> Self {
         let mut warnings = Vec::new();
         let summary = match summary {
             Ok(summary) => Some(summary),
+            Err(err) => {
+                warnings.push(err.to_string());
+                None
+            }
+        };
+        let accounts = match accounts {
+            Ok(accounts) => Some(accounts),
             Err(err) => {
                 warnings.push(err.to_string());
                 None
@@ -134,6 +163,7 @@ impl StatusPoolObservabilityView {
         Self {
             pool_id,
             summary,
+            accounts,
             diagnostics,
             warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         }
@@ -151,6 +181,7 @@ mod tests {
         let view = StatusPoolObservabilityView::from_results(
             "team-main".to_string(),
             Err(anyhow::anyhow!("summary unavailable")),
+            Ok(Vec::new()),
             Ok(sample_diagnostics()),
         );
 
@@ -159,6 +190,7 @@ mod tests {
             StatusPoolObservabilityView {
                 pool_id: "team-main".to_string(),
                 summary: None,
+                accounts: Some(Vec::new()),
                 diagnostics: Some(sample_diagnostics()),
                 warning: Some("summary unavailable".to_string()),
             }
@@ -170,6 +202,7 @@ mod tests {
         let view = StatusPoolObservabilityView::from_results(
             "team-main".to_string(),
             Err(anyhow::anyhow!("summary unavailable")),
+            Ok(Vec::new()),
             Err(anyhow::anyhow!("diagnostics unavailable")),
         );
 
@@ -178,6 +211,7 @@ mod tests {
             StatusPoolObservabilityView {
                 pool_id: "team-main".to_string(),
                 summary: None,
+                accounts: Some(Vec::new()),
                 diagnostics: None,
                 warning: Some("summary unavailable; diagnostics unavailable".to_string()),
             }

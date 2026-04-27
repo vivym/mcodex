@@ -37,6 +37,12 @@ use wiremock::matchers::path_regex;
 
 use crate::test_codex::ApplyPatchModelOutput;
 
+const WEBSOCKET_TEST_DELAY_MS: &str = "__codex_test_delay_ms";
+
+pub fn ws_test_delay(duration: Duration) -> Value {
+    serde_json::json!({ WEBSOCKET_TEST_DELAY_MS: duration.as_millis() as u64 })
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseMock {
     requests: Arc<Mutex<Vec<ResponsesRequest>>>,
@@ -1387,6 +1393,12 @@ pub async fn start_websocket_server_with_headers(
                         .find_map(|event| event.get("delta").and_then(Value::as_str)),
                 );
                 for event in &request_events {
+                    if let Some(delay_ms) =
+                        event.get(WEBSOCKET_TEST_DELAY_MS).and_then(Value::as_u64)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
                     let Ok(payload) = serde_json::to_string(event) else {
                         continue;
                     };
@@ -1399,8 +1411,24 @@ pub async fn start_websocket_server_with_headers(
             if close_after_requests {
                 let _ = ws_stream.close(None).await;
             } else {
-                let _ = shutdown_rx.await;
-                return;
+                loop {
+                    let next_message = tokio::select! {
+                        _ = &mut shutdown_rx => return,
+                        next_message = ws_stream.next() => next_message,
+                    };
+                    match next_message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_)))
+                        | Some(Ok(Message::Text(_)))
+                        | Some(Ok(Message::Binary(_)))
+                        | Some(Ok(Message::Frame(_))) => {}
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    }
+                }
             }
 
             if connections.lock().unwrap().is_empty() {

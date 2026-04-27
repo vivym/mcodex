@@ -16,7 +16,9 @@ use codex_state::AccountHealthState;
 use codex_state::AccountPoolAccountsListQuery;
 use codex_state::AccountPoolEventRecord;
 use codex_state::AccountPoolEventsListQuery;
+use codex_state::AccountQuotaStateRecord;
 use codex_state::AccountRegistryEntryUpdate;
+use codex_state::QuotaExhaustedWindows;
 use codex_state::StateRuntime;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
@@ -78,6 +80,7 @@ async fn local_observability_reader_passthroughs_runtime_reads() {
         backend
             .list_accounts(AccountPoolAccountsListRequest {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: None,
@@ -89,6 +92,7 @@ async fn local_observability_reader_passthroughs_runtime_reads() {
         runtime
             .list_account_pool_accounts(AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: None,
@@ -182,6 +186,7 @@ async fn local_observability_reader_forwards_account_and_event_filters() {
         backend
             .list_accounts(AccountPoolAccountsListRequest {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec![AccountOperationalState::Available]),
@@ -193,6 +198,7 @@ async fn local_observability_reader_forwards_account_and_event_filters() {
         runtime
             .list_account_pool_accounts(AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: Some(vec!["available".to_string()]),
@@ -239,6 +245,7 @@ async fn local_observability_reader_keeps_nulls_for_unknown_state() {
         backend
             .list_accounts(AccountPoolAccountsListRequest {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: None,
@@ -250,6 +257,7 @@ async fn local_observability_reader_keeps_nulls_for_unknown_state() {
         runtime
             .list_account_pool_accounts(AccountPoolAccountsListQuery {
                 pool_id: "team-main".to_string(),
+                account_id: None,
                 cursor: None,
                 limit: Some(10),
                 states: None,
@@ -260,6 +268,86 @@ async fn local_observability_reader_keeps_nulls_for_unknown_state() {
     );
 
     assert_eq!(observed, expected);
+}
+
+#[tokio::test]
+async fn local_observability_reader_preserves_quota_families_and_compat_projection() {
+    let runtime = test_runtime().await;
+    seed_account(&runtime, "acct-1", "team-main", 0, true, true).await;
+    expect_ok(
+        runtime
+            .upsert_account_quota_state(test_quota_state("acct-1", "codex", 82.0, 120))
+            .await,
+    );
+    expect_ok(
+        runtime
+            .upsert_account_quota_state(test_quota_state("acct-1", "chatgpt", 72.0, 180))
+            .await,
+    );
+
+    let backend = LocalAccountPoolBackend::new(runtime.clone(), Duration::seconds(300));
+    let observed = expect_ok(
+        backend
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await,
+    );
+    let expected = expect_ok(
+        runtime
+            .list_account_pool_accounts(AccountPoolAccountsListQuery {
+                pool_id: "team-main".to_string(),
+                account_id: None,
+                cursor: None,
+                limit: Some(10),
+                states: None,
+                account_kinds: None,
+            })
+            .await
+            .and_then(AccountPoolAccountsPage::try_from),
+    );
+
+    assert_eq!(observed, expected);
+    assert_eq!(observed.data[0].quotas.len(), 2);
+    assert_eq!(observed.data[0].quotas[0].limit_id, "chatgpt");
+    assert_eq!(observed.data[0].quotas[1].limit_id, "codex");
+    assert_eq!(
+        observed.data[0]
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.remaining_percent),
+        Some(18.0)
+    );
+}
+
+#[tokio::test]
+async fn local_observability_reader_forwards_account_id_point_lookup() {
+    let runtime = test_runtime().await;
+    seed_account(&runtime, "acct-1", "team-main", 0, true, true).await;
+    seed_account(&runtime, "acct-2", "team-main", 1, true, true).await;
+
+    let backend = LocalAccountPoolBackend::new(runtime, Duration::seconds(300));
+    let observed = expect_ok(
+        backend
+            .list_accounts(AccountPoolAccountsListRequest {
+                pool_id: "team-main".to_string(),
+                account_id: Some("acct-2".to_string()),
+                cursor: Some("not-a-cursor".to_string()),
+                limit: Some(1),
+                states: None,
+                account_kinds: None,
+            })
+            .await,
+    );
+
+    assert_eq!(observed.next_cursor, None);
+    assert_eq!(observed.data.len(), 1);
+    assert_eq!(observed.data[0].account_id, "acct-2");
 }
 
 async fn test_runtime() -> Arc<StateRuntime> {
@@ -330,6 +418,28 @@ fn test_event(
         reason_code: None,
         message: format!("{event_type} event"),
         details_json: None,
+    }
+}
+
+fn test_quota_state(
+    account_id: &str,
+    limit_id: &str,
+    used_percent: f64,
+    resets_at: i64,
+) -> AccountQuotaStateRecord {
+    AccountQuotaStateRecord {
+        account_id: account_id.to_string(),
+        limit_id: limit_id.to_string(),
+        primary_used_percent: Some(used_percent),
+        primary_resets_at: Some(timestamp(resets_at)),
+        secondary_used_percent: Some(10.0),
+        secondary_resets_at: Some(timestamp(resets_at + 60)),
+        observed_at: timestamp(60),
+        exhausted_windows: QuotaExhaustedWindows::Primary,
+        predicted_blocked_until: Some(timestamp(resets_at)),
+        next_probe_after: Some(timestamp(resets_at - 30)),
+        probe_backoff_level: 1,
+        last_probe_result: None,
     }
 }
 

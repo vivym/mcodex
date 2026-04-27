@@ -20,6 +20,12 @@ This phase is safe to develop in parallel with `docs/superpowers/specs/2026-04-1
 
 Do not modify the existing untracked runtime lease plan file unless the user explicitly asks.
 
+Post-merge note, 2026-04-25: runtime lease authority is now merged into `main`.
+The coordination bullets above describe this Phase 1 plan's original execution
+boundary. Current app-server/remote follow-up work should use
+`docs/superpowers/plans/2026-04-19-single-pool-startup-fallback-phase-2-app-server-remote-integration.md`
+as the active baseline.
+
 ## File Structure
 
 - Modify: `codex-rs/state/src/model/account_pool.rs`
@@ -69,7 +75,7 @@ Do not modify the existing untracked runtime lease plan file unless the user exp
 - Read: `docs/superpowers/specs/2026-04-19-single-pool-startup-fallback-and-default-pool-selection-design.md`
 - Read: `docs/superpowers/specs/2026-04-18-runtime-lease-authority-for-subagents-design.md`
 
-- [ ] **Step 1: Confirm branch and unrelated files**
+- [x] **Step 1: Confirm branch and unrelated files**
 
 Run:
 
@@ -80,7 +86,7 @@ git branch --show-current
 
 Expected: current branch is the intended feature branch. Unrelated files, especially `docs/superpowers/plans/2026-04-19-runtime-lease-authority-for-subagents-implementation.md`, are not staged.
 
-- [ ] **Step 2: Locate current startup and CLI seams**
+- [x] **Step 2: Locate current startup and CLI seams**
 
 Run:
 
@@ -101,7 +107,7 @@ Expected: current implementation still has `EffectivePoolResolutionSource::{Over
 - Modify: `codex-rs/state/src/runtime/account_pool.rs`
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 
-- [ ] **Step 1: Write failing model/resolution tests**
+- [x] **Step 1: Write failing model/resolution tests**
 
 Add tests near the existing account-pool runtime tests:
 
@@ -167,7 +173,7 @@ async fn startup_status_requires_default_when_multiple_pools_are_visible() {
 }
 ```
 
-- [ ] **Step 2: Run focused state tests and verify failure**
+- [x] **Step 2: Run focused state tests and verify failure**
 
 Run:
 
@@ -178,7 +184,7 @@ cargo test -p codex-state startup_status_uses_single_visible_pool_when_no_defaul
 
 Expected: FAIL to compile because the new model fields and enum variants do not exist.
 
-- [ ] **Step 3: Add the new model fields and enums**
+- [x] **Step 3: Add the new model fields and enums**
 
 In `codex-rs/state/src/model/account_pool.rs`, extend the model:
 
@@ -251,7 +257,7 @@ Also re-export all newly added public model types from:
 Cross-crate consumers such as `codex-account-pool`, `codex-cli`, and Phase 2
 app-server code must not need to reach into the private `model` module.
 
-- [ ] **Step 4: Update all current status constructors**
+- [x] **Step 4: Update all current status constructors**
 
 Run:
 
@@ -268,7 +274,7 @@ startup_resolution_issue: None,
 candidate_pools: Vec::new(),
 ```
 
-- [ ] **Step 5: Re-run model tests**
+- [x] **Step 5: Re-run model tests**
 
 Run:
 
@@ -287,11 +293,12 @@ Expected: tests compile; new behavior still fails until resolver logic lands.
 - Modify: `codex-rs/account-pool/src/startup_status.rs`
 - Modify: `codex-rs/account-pool/src/backend.rs`
 - Modify: `codex-rs/account-pool/src/manager.rs`
+- Modify: `codex-rs/cli/src/accounts/registration.rs`
 - Test: `codex-rs/state/src/runtime/account_pool.rs`
 - Test: `codex-rs/account-pool/src/startup_resolution.rs`
 - Test: `codex-rs/account-pool/src/startup_status.rs`
 
-- [ ] **Step 1: Add failing resolver tests for invalid explicit defaults and suppression overlay**
+- [x] **Step 1: Add failing resolver tests for invalid explicit defaults and suppression overlay**
 
 Add tests:
 
@@ -374,7 +381,7 @@ async fn invalid_override_reports_override_issue_not_config_issue() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify failure**
+- [x] **Step 2: Run tests and verify failure**
 
 Run:
 
@@ -385,7 +392,7 @@ cargo test -p codex-state invalid_config_default_does_not_fall_back_to_single_vi
 
 Expected: FAIL because current resolver treats missing defaults as normal effective pool ids, synthetic suppression, or config-default failures.
 
-- [ ] **Step 3: Add backend-neutral resolver input types**
+- [x] **Step 3: Add backend-neutral resolver input types**
 
 Create `codex-rs/account-pool/src/startup_resolution.rs` and define resolver-facing shapes:
 
@@ -432,7 +439,7 @@ The resolver must own default precedence, single-pool fallback, explicit-source
 validation, suppression overlay, issue generation, and candidate-pool ordering.
 It must not query SQLite directly.
 
-- [ ] **Step 4: Add local inventory and facts providers**
+- [x] **Step 4: Add local inventory and facts providers**
 
 In `StateRuntime`, add local helpers that return the backend-neutral inventory
 and facts. The local inventory returns distinct pool ids from
@@ -445,7 +452,7 @@ Required behavior:
 - ignore config-only `accounts.pools` entries
 - include pools even when all accounts are disabled/unhealthy
 
-- [ ] **Step 5: Refactor preview to evaluate account eligibility independent of suppression**
+- [x] **Step 5: Refactor preview to evaluate account eligibility independent of suppression**
 
 Keep the account-level selection logic that produces:
 
@@ -461,7 +468,7 @@ Keep the account-level selection logic that produces:
 
 Do not produce `AccountStartupEligibility::Suppressed` from the new resolver path. Preserve the enum variant only for old conversion call sites until Phase 2 cleans projections.
 
-- [ ] **Step 6: Implement precedence and availability**
+- [x] **Step 6: Implement precedence and availability**
 
 Implement this order:
 
@@ -479,20 +486,30 @@ Explicit-source validation must produce the right issue kind:
 
 An invalid higher-priority source must not fall back to a lower-priority single visible pool.
 
-- [ ] **Step 7: Update `read_shared_startup_status` pooled applicability and override mapping**
+- [x] **Step 7: Update `read_shared_startup_status` pooled applicability and override mapping**
 
 In `codex-rs/account-pool/src/startup_status.rs`, pass both
 `configured_default_pool_id` and `explicit_override_pool_id` into the shared
 resolver instead of flattening them with `.or(...)`.
 
-Derive `pooled_applicable` from availability:
+Keep `pooled_applicable` conservative for the legacy pooled-mode gate:
 
 ```rust
-pooled_applicable: !matches!(
-    startup.startup_availability,
-    AccountStartupAvailability::Unavailable
-),
+pooled_applicable: startup.preview.effective_pool_id.is_some(),
 ```
+
+Implementation note: a review pass found that deriving this from
+`startup_availability != Unavailable` would make multi-pool/default-blocker states
+look pooled-applicable to existing core and app-server gates. New CLI/TUI
+surfaces should use `startup_availability` directly; the legacy boolean remains
+true only when an effective pool exists.
+
+Review follow-up: registration is a mutation path, so it must not require a
+configured or persisted default pool to already be visible in registered
+membership. `accounts add chatgpt` resolves its write target as explicit
+override, configured default, persisted default, then resolved startup pool.
+Only an explicit override with no existing durable default is persisted as the
+first durable default; single-visible fallback remains read-only.
 
 When `explicit_override_pool_id` is present:
 
@@ -501,7 +518,7 @@ When `explicit_override_pool_id` is present:
 - map invalid override to `OverridePoolUnavailable`
 - leave config-default issue kinds only for invalid config defaults
 
-- [ ] **Step 8: Update `AccountPoolManager::resolve_pool_id`**
+- [x] **Step 8: Update `AccountPoolManager::resolve_pool_id`**
 
 Replace direct `read_startup_selection().default_pool_id` fallback with shared startup status:
 
@@ -518,7 +535,7 @@ status
 
 Keep this small. The runtime-lease plan may later move this into `RuntimeLeaseAuthority`; this change makes current code consume Phase 1 semantics until then.
 
-- [ ] **Step 9: Run focused tests**
+- [x] **Step 9: Run focused tests**
 
 Run:
 
@@ -530,7 +547,7 @@ cargo test -p codex-account-pool startup_status -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add codex-rs/state/src/model/account_pool.rs codex-rs/state/src/model/mod.rs codex-rs/state/src/lib.rs codex-rs/state/src/runtime/account_pool.rs codex-rs/account-pool/src/backend.rs codex-rs/account-pool/src/startup_resolution.rs codex-rs/account-pool/src/startup_status.rs codex-rs/account-pool/src/manager.rs
@@ -544,7 +561,7 @@ git commit -m "feat(accounts): resolve single visible startup pool"
 - Modify: `codex-rs/account-pool/src/lib.rs`
 - Test: `codex-rs/account-pool/src/startup_default.rs`
 
-- [ ] **Step 1: Write failing helper tests**
+- [x] **Step 1: Write failing helper tests**
 
 Create unit tests for the mutation matrix:
 
@@ -583,7 +600,7 @@ async fn set_default_clears_preferred_when_state_backed_source_is_active() {
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -594,7 +611,7 @@ cargo test -p codex-account-pool startup_default -- --nocapture
 
 Expected: FAIL because `startup_default` does not exist.
 
-- [ ] **Step 3: Implement helper types**
+- [x] **Step 3: Implement helper types**
 
 Add:
 
@@ -619,7 +636,7 @@ pub struct LocalDefaultPoolMutationOutcome {
 
 Use self-documenting constructors if the final API would otherwise require unclear booleans at call sites.
 
-- [ ] **Step 4: Implement `set_local_default_pool`**
+- [x] **Step 4: Implement `set_local_default_pool`**
 
 Required rules:
 
@@ -631,7 +648,7 @@ Required rules:
 - same-pool set with no preferred reset is no-op
 - same-pool set with preferred reset is state-changing
 
-- [ ] **Step 5: Implement `clear_local_default_pool`**
+- [x] **Step 5: Implement `clear_local_default_pool`**
 
 Required rules:
 
@@ -640,7 +657,7 @@ Required rules:
 - clear `preferred_account_id` only when a persisted default existed and no configured default exists
 - clearing absent persisted default succeeds as no-op
 
-- [ ] **Step 6: Run helper tests**
+- [x] **Step 6: Run helper tests**
 
 Run:
 
@@ -651,7 +668,7 @@ cargo test -p codex-account-pool startup_default -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/account-pool/src/startup_default.rs codex-rs/account-pool/src/lib.rs
@@ -665,7 +682,7 @@ git commit -m "feat(accounts): add default pool mutation helper"
 - Add: `codex-rs/cli/src/accounts/default_pool.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Write failing parse and behavior tests**
+- [x] **Step 1: Write failing parse and behavior tests**
 
 Add tests:
 
@@ -715,7 +732,7 @@ async fn accounts_pool_default_set_persists_local_default_without_resuming() -> 
 }
 ```
 
-- [ ] **Step 2: Run focused CLI tests and verify failure**
+- [x] **Step 2: Run focused CLI tests and verify failure**
 
 Run:
 
@@ -726,7 +743,7 @@ cargo test -p codex-cli --test accounts accounts_pool_default -- --nocapture
 
 Expected: FAIL because the subcommand does not exist.
 
-- [ ] **Step 3: Add clap command shape**
+- [x] **Step 3: Add clap command shape**
 
 In `PoolSubcommand`:
 
@@ -756,7 +773,7 @@ pub struct PoolDefaultSetCommand {
 }
 ```
 
-- [ ] **Step 4: Implement CLI presentation module**
+- [x] **Step 4: Implement CLI presentation module**
 
 Create `default_pool.rs` with functions:
 
@@ -783,11 +800,11 @@ Rules:
 - print resume guidance if `suppressed` remains true
 - no JSON output in this phase
 
-- [ ] **Step 5: Dispatch from `run_accounts_impl`**
+- [x] **Step 5: Dispatch from `run_accounts_impl`**
 
 Add a `PoolSubcommand::Default` match arm in the existing runtime-initialized branch.
 
-- [ ] **Step 6: Run CLI tests**
+- [x] **Step 6: Run CLI tests**
 
 Run:
 
@@ -798,7 +815,7 @@ cargo test -p codex-cli --test accounts accounts_pool_default -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/mod.rs codex-rs/cli/src/accounts/default_pool.rs codex-rs/cli/tests/accounts.rs
@@ -812,7 +829,7 @@ git commit -m "feat(cli): add default pool commands"
 - Modify: `codex-rs/cli/tests/accounts.rs`
 - Test support: existing helpers in `accounts.rs`
 
-- [ ] **Step 1: Add failing import target-order tests**
+- [x] **Step 1: Add failing import target-order tests**
 
 Add tests for:
 
@@ -838,7 +855,7 @@ async fn import_legacy_without_pool_requires_pool_when_multiple_visible_pools_ha
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -849,7 +866,7 @@ cargo test -p codex-cli --test accounts import_legacy_without_pool -- --nocaptur
 
 Expected: FAIL because current code still uses legacy/default behavior.
 
-- [ ] **Step 3: Implement target order**
+- [x] **Step 3: Implement target order**
 
 In `registration.rs`, make plain `import-legacy` target resolution:
 
@@ -863,11 +880,11 @@ In `registration.rs`, make plain `import-legacy` target resolution:
 
 Keep explicit `--pool` and `--account-pool` behavior unchanged except for clearer diagnostics.
 
-- [ ] **Step 4: Preserve bootstrap persistence rule**
+- [x] **Step 4: Preserve bootstrap persistence rule**
 
 Only persist `default_pool_id` automatically when pre-command visible inventory was empty and no configured/persisted default existed.
 
-- [ ] **Step 5: Run import tests**
+- [x] **Step 5: Run import tests**
 
 Run:
 
@@ -878,7 +895,7 @@ cargo test -p codex-cli --test accounts import_legacy -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/registration.rs codex-rs/cli/tests/accounts.rs
@@ -892,7 +909,7 @@ git commit -m "fix(cli): resolve legacy import pool target explicitly"
 - Modify: `codex-rs/cli/src/accounts/output.rs`
 - Modify: `codex-rs/cli/tests/accounts.rs`
 
-- [ ] **Step 1: Add failing status JSON tests**
+- [x] **Step 1: Add failing status JSON tests**
 
 Add test:
 
@@ -915,7 +932,7 @@ async fn accounts_status_json_includes_startup_object_for_single_pool_fallback()
 }
 ```
 
-- [ ] **Step 2: Run and verify failure**
+- [x] **Step 2: Run and verify failure**
 
 Run:
 
@@ -926,7 +943,7 @@ cargo test -p codex-cli --test accounts accounts_status_json_includes_startup_ob
 
 Expected: FAIL because the `startup` object is absent.
 
-- [ ] **Step 3: Add wire conversion helpers**
+- [x] **Step 3: Add wire conversion helpers**
 
 In `output.rs`, add private helpers for:
 
@@ -937,7 +954,7 @@ In `output.rs`, add private helpers for:
 
 Keep existing top-level fields unchanged.
 
-- [ ] **Step 4: Add text diagnostics**
+- [x] **Step 4: Add text diagnostics**
 
 Text output should explicitly show:
 
@@ -947,7 +964,7 @@ Text output should explicitly show:
 - suppressed with resolved pool
 - no eligible account
 
-- [ ] **Step 5: Run CLI status tests**
+- [x] **Step 5: Run CLI status tests**
 
 Run:
 
@@ -959,7 +976,7 @@ cargo test -p codex-cli --test accounts_observability
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add codex-rs/cli/src/accounts/diagnostics.rs codex-rs/cli/src/accounts/output.rs codex-rs/cli/tests/accounts.rs codex-rs/cli/tests/accounts_observability.rs
@@ -974,7 +991,7 @@ git commit -m "feat(cli): explain startup pool resolution"
 - Modify: `codex-rs/tui/src/onboarding/onboarding_screen.rs`
 - Update snapshots: `codex-rs/tui/src/onboarding/snapshots/*.snap`
 
-- [ ] **Step 1: Add failing startup decision tests**
+- [x] **Step 1: Add failing startup decision tests**
 
 In `startup_access.rs` tests:
 
@@ -1003,7 +1020,7 @@ fn startup_decision_uses_pool_default_notice_for_multi_pool_blocker() {
 }
 ```
 
-- [ ] **Step 2: Add failing widget snapshot test**
+- [x] **Step 2: Add failing widget snapshot test**
 
 In `pooled_access_notice.rs` tests:
 
@@ -1018,7 +1035,7 @@ fn pooled_default_selection_notice_renders_snapshot() {
 }
 ```
 
-- [ ] **Step 3: Run TUI tests and verify failure**
+- [x] **Step 3: Run TUI tests and verify failure**
 
 Run:
 
@@ -1029,7 +1046,7 @@ cargo test -p codex-tui startup_decision_uses_pool_default_notice_for_multi_pool
 
 Expected: FAIL because the new probe/notice does not exist.
 
-- [ ] **Step 4: Implement new probe and decision**
+- [x] **Step 4: Implement new probe and decision**
 
 Add:
 
@@ -1054,7 +1071,7 @@ For local probing, use `startup_availability`:
 
 Do not let the notice-hidden preference suppress blocker notices.
 
-- [ ] **Step 5: Implement notice kind**
+- [x] **Step 5: Implement notice kind**
 
 Add `PooledAccessNoticeKind::DefaultPoolRequired` with:
 
@@ -1069,13 +1086,13 @@ Add `PooledAccessNoticeKind::DefaultPoolRequired` with:
 
 Keep this read-only; do not implement a picker.
 
-- [ ] **Step 6: Update onboarding routing**
+- [x] **Step 6: Update onboarding routing**
 
 Route `StartupPromptDecision::PooledDefaultSelectionNotice(data)` through the
 existing onboarding screen and pass `candidate_pool_ids` plus issue source into
 the widget. Ensure the login handoff path remains available.
 
-- [ ] **Step 7: Generate and review snapshots**
+- [x] **Step 7: Generate and review snapshots**
 
 Run:
 
@@ -1091,7 +1108,7 @@ Review the new `.snap.new` file, then accept only if correct:
 cargo insta accept -p codex-tui
 ```
 
-- [ ] **Step 8: Run TUI package tests**
+- [x] **Step 8: Run TUI package tests**
 
 Run:
 
@@ -1102,7 +1119,7 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add codex-rs/tui/src/startup_access.rs codex-rs/tui/src/onboarding/pooled_access_notice.rs codex-rs/tui/src/onboarding/onboarding_screen.rs codex-rs/tui/src/onboarding/snapshots
@@ -1114,7 +1131,7 @@ git commit -m "feat(tui): show default pool selection notice"
 **Files:**
 - All files touched in this plan.
 
-- [ ] **Step 1: Run scoped tests**
+- [x] **Step 1: Run scoped tests**
 
 Run:
 
@@ -1129,7 +1146,7 @@ cargo test -p codex-tui
 
 Expected: PASS.
 
-- [ ] **Step 2: Format and fix**
+- [x] **Step 2: Format and fix**
 
 Run:
 
@@ -1144,7 +1161,7 @@ just fix -p codex-tui
 
 Expected: PASS. Do not rerun tests after `fmt`/`fix` unless a command changed behavior manually.
 
-- [ ] **Step 3: Manual local smoke**
+- [x] **Step 3: Manual local smoke**
 
 Use a temp home with one registered pool and no defaults:
 
@@ -1160,7 +1177,7 @@ Expected:
 - `default set` persists `persistedDefaultPoolId`
 - no ChatGPT login prompt path is selected for local single-pool startup
 
-- [ ] **Step 4: Final commit if needed**
+- [x] **Step 4: Final commit if needed**
 
 ```bash
 git status --short

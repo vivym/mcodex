@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use codex_login::AuthProvider;
 use codex_login::CodexAuth;
 use codex_login::auth::LeaseScopedAuthSession;
@@ -236,7 +237,8 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
-        inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
+        runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
         environment: Option<Arc<Environment>>,
         analytics_events_client: Option<AnalyticsEventsClient>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -245,6 +247,7 @@ impl Session {
             session_configuration.collaboration_mode.model(),
             session_configuration.provider
         );
+        let session_source_for_runtime_host = session_source.clone();
         let forked_from_id = initial_history.forked_from_id();
 
         let (conversation_id, rollout_params) = match &initial_history {
@@ -627,10 +630,59 @@ impl Session {
 
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let account_pool_holder_instance_id = format!("codex-core-runtime:{}", Uuid::now_v7());
+        let runtime_lease_host = if runtime_lease_host.is_some()
+            || matches!(session_source_for_runtime_host, SessionSource::SubAgent(_))
+        {
+            runtime_lease_host
+        } else {
+            SessionServices::build_root_runtime_lease_host(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                &account_pool_holder_instance_id,
+            )
+            .await?
+        };
+        let inherited_pooled_runtime_host = matches!(
+            (&session_source_for_runtime_host, runtime_lease_host.as_ref()),
+            (
+                SessionSource::SubAgent(_),
+                Some(host)
+            ) if host.mode() == crate::runtime_lease::RuntimeLeaseHostMode::Pooled
+        );
+        let pooled_runtime_host_active = runtime_lease_host
+            .as_ref()
+            .is_some_and(crate::runtime_lease::RuntimeLeaseHost::is_pooled);
+        let pooled_root_needs_authority = pooled_runtime_host_active
+            && !inherited_pooled_runtime_host
+            && runtime_lease_host
+                .as_ref()
+                .is_some_and(|host| host.pooled_authority().is_none());
+        debug_assert!(
+            !(inherited_pooled_runtime_host && compat_inherited_lease_auth_session.is_some()),
+            "inherited pooled runtime host must not be combined with static inherited lease auth"
+        );
+        if inherited_pooled_runtime_host && let Some(host) = runtime_lease_host.as_ref() {
+            host.ensure_child_startup_ready().map_err(|err| {
+                CodexErr::Fatal(format!(
+                    "inherited pooled runtime host is not usable for child session: {err:#}"
+                ))
+            })?;
+        }
         let lease_auth = Arc::new(crate::lease_auth::SessionLeaseAuth::default());
-        lease_auth.replace_current(inherited_lease_auth_session.clone());
+        lease_auth.replace_current(compat_inherited_lease_auth_session.clone());
         let lease_auth_provider = Arc::new(lease_auth.provider(Arc::clone(&auth_manager)));
-        let account_pool_manager = if inherited_lease_auth_session.is_some() {
+        let authority_owned_runtime_lease = if pooled_root_needs_authority {
+            SessionServices::build_root_runtime_lease_authority(
+                state_db_ctx.clone(),
+                config.accounts.clone(),
+                config.codex_home.clone().to_path_buf(),
+                account_pool_holder_instance_id.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
+        let account_pool_manager = if pooled_runtime_host_active {
             None
         } else {
             SessionServices::build_account_pool_manager(
@@ -693,11 +745,22 @@ impl Session {
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
             account_pool_manager,
+            runtime_lease_host: runtime_lease_host.clone(),
             lease_auth: Arc::clone(&lease_auth),
             thread_store: LocalThreadStore::new(RolloutConfig::from_view(config.as_ref())),
-            model_client: ModelClient::new(
+            model_client: ModelClient::new_with_runtime_lease(
                 Some(Arc::clone(&auth_manager)),
                 Some(lease_auth),
+                runtime_lease_host,
+                Some(Arc::new(tokio::sync::Mutex::new(
+                    crate::runtime_lease::SessionLeaseView::new(),
+                ))),
+                conversation_id.to_string(),
+                Arc::new(crate::runtime_lease::CollaborationTreeBindingHandle::new(
+                    crate::runtime_lease::CollaborationTreeId::root_for_session(
+                        &conversation_id.to_string(),
+                    ),
+                )),
                 conversation_id,
                 installation_id,
                 session_configuration.provider.clone(),
@@ -872,8 +935,27 @@ impl Session {
                 ));
             }
         }
-        sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+        if let Some(runtime_lease_host) = sess.services.runtime_lease_host.as_ref()
+            && runtime_lease_host.is_pooled()
+            && runtime_lease_host.pooled_authority().is_none()
+            && let Some(runtime_lease_authority) = authority_owned_runtime_lease.as_ref()
+        {
+            runtime_lease_host
+                .install_authority(runtime_lease_authority.clone())
+                .with_context(|| {
+                    format!(
+                        "failed to publish runtime lease authority for session {}",
+                        sess.conversation_id
+                    )
+                })?;
+        }
+        sess.services
+            .attach_runtime_lease_session(&sess.conversation_id.to_string())
             .await;
+        if !sess.services.pooled_runtime_active() {
+            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+                .await;
+        }
         let session_start_source = match &initial_history {
             InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -909,5 +991,10 @@ impl Session {
     pub(crate) async fn current_auth(&self) -> Option<CodexAuth> {
         let auth_bridge = self.auth_bridge();
         auth_bridge.auth().await
+    }
+
+    pub(crate) async fn session_source(&self) -> SessionSource {
+        let state = self.state.lock().await;
+        state.session_configuration.session_source.clone()
     }
 }

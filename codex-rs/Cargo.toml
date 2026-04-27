@@ -27,6 +27,7 @@ members = [
     "config",
     "shell-command",
     "shell-escalation",
+    "smoke-fixtures",
     "skills",
     "core",
     "core-plugins",
@@ -172,6 +173,7 @@ codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
 codex-skills = { path = "skills" }
+codex-smoke-fixtures = { path = "smoke-fixtures" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 codex-terminal-detection = { path = "terminal-detection" }
