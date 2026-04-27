@@ -55,6 +55,26 @@ smoke-mcodex-cli *args:
     sh "{{ justfile_directory() }}/scripts/smoke/mcodex-cli.sh" "$@"
 
 [no-cd]
+smoke-mcodex-runtime-gate *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-runtime-gate.sh" "$@"
+
+[no-cd]
+smoke-mcodex-quota-gate *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-quota-gate.sh" "$@"
+
+[no-cd]
+smoke-mcodex-gate *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-gate.sh" "$@"
+
+[no-cd]
+smoke-mcodex-runtime *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-runtime-gate.sh" "$@"
+
+[no-cd]
+smoke-mcodex-quota *args:
+    sh "{{ justfile_directory() }}/scripts/smoke/mcodex-quota-gate.sh" "$@"
+
+[no-cd]
 smoke-mcodex-all *args:
     sh "{{ justfile_directory() }}/scripts/smoke/mcodex-local.sh" "$@"
     sh "{{ justfile_directory() }}/scripts/smoke/mcodex-cli.sh" "$@"
