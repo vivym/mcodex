@@ -2,7 +2,6 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 RUNNER="$SCRIPT_DIR/run-named-cargo-tests.sh"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mcodex-runner-test.XXXXXX")
 
@@ -125,6 +124,24 @@ case "$mode" in
       exit 2
     fi
     ;;
+  timeout-child)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      (
+        trap 'exit 0' INT TERM HUP
+        while :; do
+          sleep 1
+        done
+      ) &
+      child_pid=$!
+      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
+      wait "$child_pid"
+    else
+      echo "unexpected timeout-child invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   *)
     echo "unknown fake cargo mode: $mode" >&2
     exit 2
@@ -133,6 +150,33 @@ esac
 EOF
   chmod +x "$fake_dir/cargo"
   printf '%s\n' "$fake_dir"
+}
+
+write_no_perl_path() {
+  fake_dir=$1
+  no_perl_dir="$TMP_DIR/no-perl-bin"
+  mkdir -p "$no_perl_dir"
+  for tool in dirname grep sed tr wc; do
+    ln -s "$(command -v "$tool")" "$no_perl_dir/$tool"
+  done
+  ln -s "$fake_dir/cargo" "$no_perl_dir/cargo"
+  printf '%s\n' "$no_perl_dir"
+}
+
+assert_process_exits() {
+  pid=$1
+  name=$2
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  echo "expected $name process $pid to be cleaned up" >&2
+  exit 1
 }
 
 descriptor="$TMP_DIR/tests.txt"
@@ -144,6 +188,7 @@ duplicate_bin=$(write_fake_cargo duplicate)
 skipped_bin=$(write_fake_cargo skipped)
 ignored_bin=$(write_fake_cargo ignored)
 no_proof_bin=$(write_fake_cargo no-proof)
+timeout_child_bin=$(write_fake_cargo timeout-child)
 
 assert_passes ok env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$TMP_DIR/ok-cargo-args.log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
 if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
@@ -173,6 +218,47 @@ cat >"$ignored_lines_descriptor" <<EOF
 runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor
 EOF
 assert_passes ignored_lines env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$ignored_lines_descriptor"
+
+comment_only_descriptor="$TMP_DIR/comment-only.txt"
+{
+  printf '   \n'
+  printf '  # indented comment\n'
+} >"$comment_only_descriptor"
+assert_fails comment_only env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$comment_only_descriptor"
+if ! grep -Fq "descriptor contains no runnable tests" "$TMP_DIR/comment_only.err"; then
+  echo "expected comment-only descriptor to report no runnable tests" >&2
+  cat "$TMP_DIR/comment_only.err" >&2
+  exit 1
+fi
+
+no_perl_bin=$(write_no_perl_path "$ok_bin")
+no_perl_log="$TMP_DIR/no-perl-cargo-args.log"
+assert_fails no_perl env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$no_perl_log" PATH="$no_perl_bin" /bin/sh "$RUNNER" "$descriptor"
+if [ -s "$no_perl_log" ]; then
+  echo "expected missing perl to fail before cargo invocation" >&2
+  cat "$no_perl_log" >&2
+  exit 1
+fi
+if ! grep -Fq "perl is required to enforce per-test smoke timeouts" "$TMP_DIR/no_perl.err"; then
+  echo "expected missing perl message" >&2
+  cat "$TMP_DIR/no_perl.err" >&2
+  exit 1
+fi
+
+timeout_descriptor="$TMP_DIR/timeout-child.txt"
+timeout_child_pid_file="$TMP_DIR/timeout-child.pid"
+write_descriptor_line "$timeout_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|1|fake descriptor"
+assert_fails timeout_child env FAKE_CARGO_MODE=timeout-child FAKE_CARGO_CHILD_PID="$timeout_child_pid_file" PATH="$timeout_child_bin:$PATH" sh "$RUNNER" "$timeout_descriptor"
+if [ ! -s "$timeout_child_pid_file" ]; then
+  echo "expected timeout child pid file" >&2
+  exit 1
+fi
+assert_process_exits "$(sed -n '1p' "$timeout_child_pid_file")" timeout-child
+if ! grep -Fq "timed out after 1s" "$TMP_DIR/timeout_child.err"; then
+  echo "expected timeout message" >&2
+  cat "$TMP_DIR/timeout_child.err" >&2
+  exit 1
+fi
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"

@@ -23,7 +23,71 @@ if [ -n "${CODEX_SANDBOX_NETWORK_DISABLED:-}" ]; then
   exit 1
 fi
 
+if ! command -v perl >/dev/null 2>&1; then
+  echo "perl is required to enforce per-test smoke timeouts" >&2
+  exit 2
+fi
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mcodex-smoke.XXXXXX")
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+run_with_timeout() {
+  timeout_secs=$1
+  shift
+  perl -e '
+use strict;
+use warnings;
+
+my $timeout_secs = shift @ARGV;
+my $pid = fork();
+die "fork failed: $!\n" if !defined $pid;
+
+if ($pid == 0) {
+    setpgrp(0, 0) or die "setpgrp failed: $!\n";
+    exec @ARGV or die "exec failed: $!\n";
+}
+
+my $status;
+my $timed_out = 0;
+eval {
+    local $SIG{ALRM} = sub { die "__codex_smoke_timeout__\n"; };
+    alarm $timeout_secs;
+    my $waited = waitpid($pid, 0);
+    die "waitpid failed: $!\n" if $waited < 0;
+    $status = $?;
+    alarm 0;
+};
+
+if ($@) {
+    die $@ if $@ ne "__codex_smoke_timeout__\n";
+    $timed_out = 1;
+}
+
+if ($timed_out) {
+    print STDERR "timed out after ${timeout_secs}s; terminating process group $pid\n";
+    kill "TERM", -$pid;
+    select undef, undef, undef, 0.5;
+    kill "KILL", -$pid;
+    waitpid($pid, 0);
+    print STDERR "timed out after ${timeout_secs}s; killed process group $pid\n";
+    exit 124;
+}
+
+if ($status & 127) {
+    exit 128 + ($status & 127);
+}
+exit($status >> 8);
+' "$timeout_secs" "$@"
+}
+
 line_number=0
+tests_seen=0
 targets_seen=""
 while IFS= read -r line || [ -n "$line" ]; do
   line_number=$((line_number + 1))
@@ -92,6 +156,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     exit 2
   fi
 
+  tests_seen=$((tests_seen + 1))
+
   target_key="$package|$target_kind|$target_name"
   case "
 $targets_seen
@@ -111,25 +177,20 @@ $target_key"
       ;;
   esac
 
-  tmp_list=$(mktemp "${TMPDIR:-/tmp}/mcodex-smoke-list.XXXXXX")
-  tmp_run=$(mktemp "${TMPDIR:-/tmp}/mcodex-smoke-run.XXXXXX")
-  cleanup_current() {
-    rm -f "$tmp_list" "$tmp_run"
-  }
+  tmp_list="$TMP_DIR/list.$line_number"
+  tmp_run="$TMP_DIR/run.$line_number"
 
   echo "listing gate=$gate package=$package target=$target_kind $target_name test=$exact_path"
   if [ "$target_kind" = "--lib" ]; then
     cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
       echo "failed to list named regression: $exact_path" >&2
       cat "$tmp_list" >&2
-      cleanup_current
       exit 1
     }
   else
     cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --list >"$tmp_list" 2>&1 || {
       echo "failed to list named regression: $exact_path" >&2
       cat "$tmp_list" >&2
-      cleanup_current
       exit 1
     }
   fi
@@ -138,28 +199,20 @@ $target_key"
   if [ "$match_count" -ne 1 ]; then
     echo "named regression not found exactly once: $exact_path (matches=$match_count)" >&2
     cat "$tmp_list" >&2
-    cleanup_current
     exit 1
   fi
 
   echo "running gate=$gate package=$package target=$target_kind $target_name timeout=${timeout_secs}s test=$exact_path notes=$notes"
   start_epoch=$(date +%s)
-  if ! command -v perl >/dev/null 2>&1; then
-    echo "perl is required to enforce per-test smoke timeouts" >&2
-    cleanup_current
-    exit 2
-  fi
 
   if [ "$target_kind" = "--lib" ]; then
-    perl -e 'alarm shift; exec @ARGV' "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
+    run_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
       cat "$tmp_run" >&2
-      cleanup_current
       exit 1
     }
   else
-    perl -e 'alarm shift; exec @ARGV' "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
+    run_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" "$exact_path" -- --exact --nocapture >"$tmp_run" 2>&1 || {
       cat "$tmp_run" >&2
-      cleanup_current
       exit 1
     }
   fi
@@ -168,26 +221,27 @@ $target_key"
   if grep -Fq "$SKIP_SENTINEL" "$tmp_run"; then
     echo "critical regression skipped because network is disabled: $exact_path" >&2
     cat "$tmp_run" >&2
-    cleanup_current
     exit 1
   fi
   if grep -Fq "test $exact_path ... ignored" "$tmp_run"; then
     echo "critical regression ignored: $exact_path" >&2
     cat "$tmp_run" >&2
-    cleanup_current
     exit 1
   fi
   proof_count=$(grep -Fxc "test $exact_path ... ok" "$tmp_run" || true)
   if [ "$proof_count" -ne 1 ]; then
     echo "critical regression did not prove exact execution once: $exact_path (proof=$proof_count)" >&2
     cat "$tmp_run" >&2
-    cleanup_current
     exit 1
   fi
 
   cat "$tmp_run"
   echo "passed gate=$gate package=$package target=$target_kind $target_name elapsed=${elapsed}s test=$exact_path"
-  cleanup_current
 done <"$DESCRIPTOR_FILE"
+
+if [ "$tests_seen" -eq 0 ]; then
+  echo "descriptor contains no runnable tests: $DESCRIPTOR_FILE" >&2
+  exit 2
+fi
 
 echo "run-named-cargo-tests: pass descriptor=$DESCRIPTOR_FILE"
