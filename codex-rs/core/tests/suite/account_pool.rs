@@ -682,6 +682,52 @@ async fn account_lease_snapshot_clears_pending_non_replayable_turn_reason_after_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_turns_remain_on_same_account_without_quota_pressure() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_with_primary_usage_percent("resp-1", 12.0),
+            sse_with_primary_usage_percent("resp-2", 13.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(0);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "normal sticky turn 1").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "normal sticky turn 2").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected one request per normal turn");
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID]);
+
+    let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+    let events = list_account_pool_events(&test).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != selected_event_type),
+        "normal turns without quota pressure should not emit automatic switch events: {events:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
