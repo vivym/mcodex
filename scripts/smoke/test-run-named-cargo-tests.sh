@@ -73,7 +73,7 @@ case "$mode" in
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
       printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
     else
       echo "unexpected ok invocation: $args" >&2
       exit 2
@@ -164,6 +164,43 @@ case "$mode" in
       printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
     else
       echo "unexpected duplicate-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  eleven-passed)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    else
+      echo "unexpected eleven-passed invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  duplicate-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    else
+      echo "unexpected duplicate-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  suffixed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out extra\n'
+    else
+      echo "unexpected suffixed-summary invocation: $args" >&2
       exit 2
     fi
     ;;
@@ -377,6 +414,9 @@ no_proof_bin=$(write_fake_cargo no-proof)
 prefixed_proof_bin=$(write_fake_cargo prefixed-proof)
 suffixed_proof_bin=$(write_fake_cargo suffixed-proof)
 duplicate_proof_bin=$(write_fake_cargo duplicate-proof)
+eleven_passed_bin=$(write_fake_cargo eleven-passed)
+duplicate_summary_bin=$(write_fake_cargo duplicate-summary)
+suffixed_summary_bin=$(write_fake_cargo suffixed-summary)
 timeout_child_bin=$(write_fake_cargo timeout-child)
 interrupt_child_bin=$(write_fake_cargo interrupt-child)
 interrupt_warm_child_bin=$(write_fake_cargo interrupt-warm-child)
@@ -391,6 +431,9 @@ fi
 assert_fails prefixed_proof env FAKE_CARGO_MODE=prefixed-proof PATH="$prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails suffixed_proof env FAKE_CARGO_MODE=suffixed-proof PATH="$suffixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate_proof env FAKE_CARGO_MODE=duplicate-proof PATH="$duplicate_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails eleven_passed env FAKE_CARGO_MODE=eleven-passed PATH="$eleven_passed_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails duplicate_summary env FAKE_CARGO_MODE=duplicate-summary PATH="$duplicate_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails suffixed_summary env FAKE_CARGO_MODE=suffixed-summary PATH="$suffixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 if ! grep -Fq "proofs=0" "$TMP_DIR/prefixed_proof.err"; then
   echo "expected prefixed proof failure to report proofs=0" >&2
   cat "$TMP_DIR/prefixed_proof.err" >&2
