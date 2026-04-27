@@ -336,8 +336,9 @@ $target_key"
     cat "$tmp_run" >&2
     exit 1
   fi
-  if ! grep -Fq "test $exact_path ... ok" "$tmp_run"; then
-    echo "critical regression did not prove exact execution: $exact_path" >&2
+  proof_count=$(grep -Fxc "test $exact_path ... ok" "$tmp_run" || true)
+  if [ "$proof_count" -ne 1 ]; then
+    echo "critical regression did not prove exact execution exactly once: $exact_path (proofs=$proof_count)" >&2
     cat "$tmp_run" >&2
     exit 1
   fi

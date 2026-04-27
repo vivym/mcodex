@@ -92,6 +92,18 @@ case "$mode" in
       exit 2
     fi
     ;;
+  suffixed-proof)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok extra\n' "$exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    else
+      echo "unexpected suffixed-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   missing)
     if printf '%s' "$args" | grep -Fq " --list"; then
       true
@@ -139,6 +151,19 @@ case "$mode" in
       printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
     else
       echo "unexpected no-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  duplicate-proof)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    else
+      echo "unexpected duplicate-proof invocation: $args" >&2
       exit 2
     fi
     ;;
@@ -350,6 +375,8 @@ skipped_bin=$(write_fake_cargo skipped)
 ignored_bin=$(write_fake_cargo ignored)
 no_proof_bin=$(write_fake_cargo no-proof)
 prefixed_proof_bin=$(write_fake_cargo prefixed-proof)
+suffixed_proof_bin=$(write_fake_cargo suffixed-proof)
+duplicate_proof_bin=$(write_fake_cargo duplicate-proof)
 timeout_child_bin=$(write_fake_cargo timeout-child)
 interrupt_child_bin=$(write_fake_cargo interrupt-child)
 interrupt_warm_child_bin=$(write_fake_cargo interrupt-warm-child)
@@ -361,7 +388,24 @@ if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
   cat "$TMP_DIR/ok-cargo-args.log" >&2
   exit 1
 fi
-assert_passes prefixed_proof env FAKE_CARGO_MODE=prefixed-proof PATH="$prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails prefixed_proof env FAKE_CARGO_MODE=prefixed-proof PATH="$prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails suffixed_proof env FAKE_CARGO_MODE=suffixed-proof PATH="$suffixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails duplicate_proof env FAKE_CARGO_MODE=duplicate-proof PATH="$duplicate_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+if ! grep -Fq "proofs=0" "$TMP_DIR/prefixed_proof.err"; then
+  echo "expected prefixed proof failure to report proofs=0" >&2
+  cat "$TMP_DIR/prefixed_proof.err" >&2
+  exit 1
+fi
+if ! grep -Fq "proofs=0" "$TMP_DIR/suffixed_proof.err"; then
+  echo "expected suffixed proof failure to report proofs=0" >&2
+  cat "$TMP_DIR/suffixed_proof.err" >&2
+  exit 1
+fi
+if ! grep -Fq "proofs=2" "$TMP_DIR/duplicate_proof.err"; then
+  echo "expected duplicate proof failure to report proofs=2" >&2
+  cat "$TMP_DIR/duplicate_proof.err" >&2
+  exit 1
+fi
 
 empty_test_target_descriptor="$TMP_DIR/empty-test-target.txt"
 empty_test_target_log="$TMP_DIR/empty-test-target-cargo-args.log"
@@ -403,11 +447,11 @@ write_descriptor_line "$empty_notes_descriptor" "runtime|codex-core|--test|all|s
 assert_passes empty_notes env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_notes_descriptor"
 
 ignored_lines_descriptor="$TMP_DIR/ignored-lines.txt"
-cat >"$ignored_lines_descriptor" <<EOF
-   
-  # indented comment
-runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor
-EOF
+{
+  printf '%s\n' '   '
+  printf '%s\n' '  # indented comment'
+  printf '%s\n' 'runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor'
+} >"$ignored_lines_descriptor"
 assert_passes ignored_lines env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$ignored_lines_descriptor"
 
 comment_only_descriptor="$TMP_DIR/comment-only.txt"
