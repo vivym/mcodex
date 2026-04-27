@@ -27,27 +27,30 @@ line_number=0
 targets_seen=""
 while IFS= read -r line || [ -n "$line" ]; do
   line_number=$((line_number + 1))
-  case "$line" in
+  stripped_line=$(printf '%s\n' "$line" | sed 's/^[[:space:]]*//')
+  case "$stripped_line" in
     ""|\#*) continue ;;
   esac
 
-  old_ifs=$IFS
-  IFS='|'
-  set -- $line
-  IFS=$old_ifs
-
-  if [ "$#" -ne 7 ]; then
+  pipe_count=$(printf '%s\n' "$line" | tr -cd '|' | wc -c | tr -d '[:space:]')
+  if [ "$pipe_count" -ne 6 ]; then
     echo "invalid descriptor at $DESCRIPTOR_FILE:$line_number: expected 7 fields" >&2
     exit 2
   fi
 
-  gate=$1
-  package=$2
-  target_kind=$3
-  target_name=$4
-  exact_path=$5
-  timeout_secs=$6
-  notes=$7
+  rest=$line
+  gate=${rest%%|*}
+  rest=${rest#*|}
+  package=${rest%%|*}
+  rest=${rest#*|}
+  target_kind=${rest%%|*}
+  rest=${rest#*|}
+  target_name=${rest%%|*}
+  rest=${rest#*|}
+  exact_path=${rest%%|*}
+  rest=${rest#*|}
+  timeout_secs=${rest%%|*}
+  notes=${rest#*|}
 
   case "$gate" in
     runtime|quota) ;;
@@ -57,16 +60,20 @@ while IFS= read -r line || [ -n "$line" ]; do
       ;;
   esac
 
-  case "$target_kind:$target_name" in
-    --test:-)
-      echo "invalid target '$target_kind|$target_name' at $DESCRIPTOR_FILE:$line_number: --test requires a target name" >&2
-      exit 2
+  case "$target_kind" in
+    --test)
+      case "$target_name" in
+        ""|-)
+          echo "invalid target '$target_kind|$target_name' at $DESCRIPTOR_FILE:$line_number: --test requires a target name" >&2
+          exit 2
+          ;;
+      esac
       ;;
-    --test:*) ;;
-    --lib:-) ;;
-    --lib:*)
-      echo "invalid target '$target_kind|$target_name' at $DESCRIPTOR_FILE:$line_number: --lib target name must be '-'" >&2
-      exit 2
+    --lib)
+      if [ "$target_name" != "-" ]; then
+        echo "invalid target '$target_kind|$target_name' at $DESCRIPTOR_FILE:$line_number: --lib target name must be '-'" >&2
+        exit 2
+      fi
       ;;
     *)
       echo "invalid target '$target_kind|$target_name' at $DESCRIPTOR_FILE:$line_number" >&2

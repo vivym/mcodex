@@ -41,6 +41,12 @@ runtime|codex-core|--test|all|$exact|30|fake descriptor
 EOF
 }
 
+write_descriptor_line() {
+  file=$1
+  line=$2
+  printf '%s\n' "$line" >"$file"
+}
+
 write_fake_cargo() {
   mode=$1
   fake_dir="$TMP_DIR/$mode-bin"
@@ -145,6 +151,29 @@ if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
   cat "$TMP_DIR/ok-cargo-args.log" >&2
   exit 1
 fi
+
+empty_test_target_descriptor="$TMP_DIR/empty-test-target.txt"
+empty_test_target_log="$TMP_DIR/empty-test-target-cargo-args.log"
+write_descriptor_line "$empty_test_target_descriptor" "runtime|codex-core|--test||suite::account_pool::exact_test|30|fake descriptor"
+assert_fails empty_test_target env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$empty_test_target_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_test_target_descriptor"
+if [ -s "$empty_test_target_log" ]; then
+  echo "expected invalid empty --test target to fail before cargo invocation" >&2
+  cat "$empty_test_target_log" >&2
+  exit 1
+fi
+
+empty_notes_descriptor="$TMP_DIR/empty-notes.txt"
+write_descriptor_line "$empty_notes_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|"
+assert_passes empty_notes env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$empty_notes_descriptor"
+
+ignored_lines_descriptor="$TMP_DIR/ignored-lines.txt"
+cat >"$ignored_lines_descriptor" <<EOF
+   
+  # indented comment
+runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor
+EOF
+assert_passes ignored_lines env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$ignored_lines_descriptor"
+
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails skipped env FAKE_CARGO_MODE=skipped PATH="$skipped_bin:$PATH" sh "$RUNNER" "$descriptor"
