@@ -337,15 +337,17 @@ $target_key"
     cat "$tmp_run" >&2
     exit 1
   fi
-  proof_count=$(grep -Fxc "test $exact_path ... ok" "$tmp_run" || true)
-  if [ "$proof_count" -ne 1 ]; then
-    echo "critical regression did not prove exact execution exactly once: $exact_path (proofs=$proof_count)" >&2
+  proof_candidate_count=$(grep -Fc "test $exact_path ... ok" "$tmp_run" || true)
+  valid_proof_count=$(grep -Fxc "test $exact_path ... ok" "$tmp_run" || true)
+  if [ "$proof_candidate_count" -ne 1 ] || [ "$valid_proof_count" -ne 1 ]; then
+    echo "critical regression did not prove exact execution exactly once: $exact_path (proof_candidates=$proof_candidate_count valid_proofs=$valid_proof_count)" >&2
     cat "$tmp_run" >&2
     exit 1
   fi
-  summary_count=$(grep -Ec "$ONE_PASS_SUMMARY_PATTERN" "$tmp_run" || true)
-  if [ "$summary_count" -ne 1 ]; then
-    echo "critical regression did not report exactly one passing test: $exact_path" >&2
+  summary_candidate_count=$(grep -Fc "test result:" "$tmp_run" || true)
+  valid_summary_count=$(grep -Ec "$ONE_PASS_SUMMARY_PATTERN" "$tmp_run" || true)
+  if [ "$summary_candidate_count" -ne 1 ] || [ "$valid_summary_count" -ne 1 ]; then
+    echo "critical regression did not report exactly one valid passing summary: $exact_path (summary_candidates=$summary_candidate_count valid_summaries=$valid_summary_count)" >&2
     cat "$tmp_run" >&2
     exit 1
   fi

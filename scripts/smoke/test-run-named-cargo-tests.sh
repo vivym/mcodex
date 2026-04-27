@@ -134,6 +134,15 @@ case "$mode" in
       exit 2
     fi
     ;;
+  list-fails)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf 'fake cargo list failure\n' >&2
+      exit 101
+    else
+      echo "list-fails mode should fail during list, not run" >&2
+      exit 2
+    fi
+    ;;
   skipped)
     if printf '%s' "$args" | grep -Fq " --list"; then
       printf '%s: test\n' "$requested_exact"
@@ -181,6 +190,32 @@ case "$mode" in
       exit 2
     fi
     ;;
+  extra-prefixed-proof)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'hello test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected extra-prefixed-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  extra-suffixed-proof)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test %s ... ok extra\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected extra-suffixed-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   eleven-passed)
     if printf '%s' "$args" | grep -Fq " --list"; then
       printf '%s: test\n' "$requested_exact"
@@ -203,6 +238,32 @@ case "$mode" in
       printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected duplicate-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  extra-prefixed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+      printf 'hello test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected extra-prefixed-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  extra-suffixed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s extra\n'
+    else
+      echo "unexpected extra-suffixed-summary invocation: $args" >&2
       exit 2
     fi
     ;;
@@ -482,14 +543,19 @@ write_descriptor "$descriptor"
 ok_bin=$(write_fake_cargo ok)
 missing_bin=$(write_fake_cargo missing)
 duplicate_bin=$(write_fake_cargo duplicate)
+list_fails_bin=$(write_fake_cargo list-fails)
 skipped_bin=$(write_fake_cargo skipped)
 ignored_bin=$(write_fake_cargo ignored)
 no_proof_bin=$(write_fake_cargo no-proof)
 prefixed_proof_bin=$(write_fake_cargo prefixed-proof)
 suffixed_proof_bin=$(write_fake_cargo suffixed-proof)
 duplicate_proof_bin=$(write_fake_cargo duplicate-proof)
+extra_prefixed_proof_bin=$(write_fake_cargo extra-prefixed-proof)
+extra_suffixed_proof_bin=$(write_fake_cargo extra-suffixed-proof)
 eleven_passed_bin=$(write_fake_cargo eleven-passed)
 duplicate_summary_bin=$(write_fake_cargo duplicate-summary)
+extra_prefixed_summary_bin=$(write_fake_cargo extra-prefixed-summary)
+extra_suffixed_summary_bin=$(write_fake_cargo extra-suffixed-summary)
 missing_finished_summary_bin=$(write_fake_cargo missing-finished-summary)
 suffixed_summary_bin=$(write_fake_cargo suffixed-summary)
 prefixed_summary_bin=$(write_fake_cargo prefixed-summary)
@@ -553,27 +619,51 @@ fi
 assert_fails prefixed_proof env FAKE_CARGO_MODE=prefixed-proof PATH="$prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails suffixed_proof env FAKE_CARGO_MODE=suffixed-proof PATH="$suffixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate_proof env FAKE_CARGO_MODE=duplicate-proof PATH="$duplicate_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails extra_prefixed_proof env FAKE_CARGO_MODE=extra-prefixed-proof PATH="$extra_prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails extra_suffixed_proof env FAKE_CARGO_MODE=extra-suffixed-proof PATH="$extra_suffixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails eleven_passed env FAKE_CARGO_MODE=eleven-passed PATH="$eleven_passed_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate_summary env FAKE_CARGO_MODE=duplicate-summary PATH="$duplicate_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails extra_prefixed_summary env FAKE_CARGO_MODE=extra-prefixed-summary PATH="$extra_prefixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails extra_suffixed_summary env FAKE_CARGO_MODE=extra-suffixed-summary PATH="$extra_suffixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails missing_finished_summary env FAKE_CARGO_MODE=missing-finished-summary PATH="$missing_finished_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails suffixed_summary env FAKE_CARGO_MODE=suffixed-summary PATH="$suffixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails prefixed_summary env FAKE_CARGO_MODE=prefixed-summary PATH="$prefixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails nonzero_failed_summary env FAKE_CARGO_MODE=nonzero-failed-summary PATH="$nonzero_failed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails nonzero_ignored_summary env FAKE_CARGO_MODE=nonzero-ignored-summary PATH="$nonzero_ignored_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails run_fails env FAKE_CARGO_MODE=run-fails PATH="$run_fails_bin:$PATH" sh "$RUNNER" "$descriptor"
-if ! grep -Fq "proofs=0" "$TMP_DIR/prefixed_proof.err"; then
-  echo "expected prefixed proof failure to report proofs=0" >&2
+if ! grep -Fq "proof_candidates=1 valid_proofs=0" "$TMP_DIR/prefixed_proof.err"; then
+  echo "expected prefixed proof failure to report proof_candidates=1 valid_proofs=0" >&2
   cat "$TMP_DIR/prefixed_proof.err" >&2
   exit 1
 fi
-if ! grep -Fq "proofs=0" "$TMP_DIR/suffixed_proof.err"; then
-  echo "expected suffixed proof failure to report proofs=0" >&2
+if ! grep -Fq "proof_candidates=1 valid_proofs=0" "$TMP_DIR/suffixed_proof.err"; then
+  echo "expected suffixed proof failure to report proof_candidates=1 valid_proofs=0" >&2
   cat "$TMP_DIR/suffixed_proof.err" >&2
   exit 1
 fi
-if ! grep -Fq "proofs=2" "$TMP_DIR/duplicate_proof.err"; then
-  echo "expected duplicate proof failure to report proofs=2" >&2
+if ! grep -Fq "proof_candidates=2 valid_proofs=2" "$TMP_DIR/duplicate_proof.err"; then
+  echo "expected duplicate proof failure to report proof_candidates=2 valid_proofs=2" >&2
   cat "$TMP_DIR/duplicate_proof.err" >&2
+  exit 1
+fi
+if ! grep -Fq "proof_candidates=2 valid_proofs=1" "$TMP_DIR/extra_prefixed_proof.err"; then
+  echo "expected extra prefixed proof failure to report proof_candidates=2 valid_proofs=1" >&2
+  cat "$TMP_DIR/extra_prefixed_proof.err" >&2
+  exit 1
+fi
+if ! grep -Fq "proof_candidates=2 valid_proofs=1" "$TMP_DIR/extra_suffixed_proof.err"; then
+  echo "expected extra suffixed proof failure to report proof_candidates=2 valid_proofs=1" >&2
+  cat "$TMP_DIR/extra_suffixed_proof.err" >&2
+  exit 1
+fi
+if ! grep -Fq "summary_candidates=2 valid_summaries=1" "$TMP_DIR/extra_prefixed_summary.err"; then
+  echo "expected extra prefixed summary failure to report summary_candidates=2 valid_summaries=1" >&2
+  cat "$TMP_DIR/extra_prefixed_summary.err" >&2
+  exit 1
+fi
+if ! grep -Fq "summary_candidates=2 valid_summaries=1" "$TMP_DIR/extra_suffixed_summary.err"; then
+  echo "expected extra suffixed summary failure to report summary_candidates=2 valid_summaries=1" >&2
+  cat "$TMP_DIR/extra_suffixed_summary.err" >&2
   exit 1
 fi
 
@@ -782,6 +872,12 @@ assert_interrupt_cleans_child list-interrupt interrupt-list-child "$interrupt_li
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails list_fails env FAKE_CARGO_MODE=list-fails PATH="$list_fails_bin:$PATH" sh "$RUNNER" "$descriptor"
+if ! grep -Fq "failed to list named regression: suite::account_pool::exact_test" "$TMP_DIR/list_fails.err"; then
+  echo "expected list failure to report failed list operation" >&2
+  cat "$TMP_DIR/list_fails.err" >&2
+  exit 1
+fi
 assert_fails skipped env FAKE_CARGO_MODE=skipped PATH="$skipped_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails ignored env FAKE_CARGO_MODE=ignored PATH="$ignored_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails no_proof env FAKE_CARGO_MODE=no-proof PATH="$no_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
