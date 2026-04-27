@@ -313,19 +313,59 @@ fi
 
 interrupt_descriptor="$TMP_DIR/interrupt-child.txt"
 interrupt_child_pid_file="$TMP_DIR/interrupt-child.pid"
-interrupt_watchdog_pid_file="$TMP_DIR/interrupt-watchdog.pid"
+interrupt_runner_pid_file="$TMP_DIR/interrupt-runner.pid"
+interrupt_status_file="$TMP_DIR/interrupt-runner.status"
 write_descriptor_line "$interrupt_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
 env FAKE_CARGO_MODE=interrupt-child \
   FAKE_CARGO_CHILD_PID="$interrupt_child_pid_file" \
-  FAKE_CARGO_WATCHDOG_PID="$interrupt_watchdog_pid_file" \
+  FAKE_CARGO_WATCHDOG_PID="$TMP_DIR/interrupt-watchdog.pid" \
   PATH="$interrupt_child_bin:$PATH" \
-  sh "$RUNNER" "$interrupt_descriptor" >"$TMP_DIR/interrupt_child.out" 2>"$TMP_DIR/interrupt_child.err" &
-interrupt_runner_pid=$!
+  perl -e '
+use strict;
+use warnings;
+
+$SIG{INT} = "DEFAULT";
+my ($runner_pid_file, $status_file, $runner, $descriptor) = @ARGV;
+my $pid = fork();
+die "fork failed: $!\n" if !defined $pid;
+
+if ($pid == 0) {
+    $SIG{INT} = "DEFAULT";
+    exec "sh", $runner, $descriptor or die "exec failed: $!\n";
+}
+
+open my $pid_fh, ">", $runner_pid_file or die "open runner pid file failed: $!\n";
+print {$pid_fh} "$pid\n";
+close $pid_fh or die "close runner pid file failed: $!\n";
+
+waitpid($pid, 0);
+my $exit_status = ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+open my $status_fh, ">", $status_file or die "open status file failed: $!\n";
+print {$status_fh} "$exit_status\n";
+close $status_fh or die "close status file failed: $!\n";
+' "$interrupt_runner_pid_file" "$interrupt_status_file" "$RUNNER" "$interrupt_descriptor" >"$TMP_DIR/interrupt_child.out" 2>"$TMP_DIR/interrupt_child.err" &
+interrupt_helper_pid=$!
+wait_for_file "$interrupt_runner_pid_file" interrupt-runner-pid
 wait_for_file "$interrupt_child_pid_file" interrupt-child-pid
-wait_for_file "$interrupt_watchdog_pid_file" interrupt-watchdog-pid
-kill -TERM "$(sed -n '1p' "$interrupt_watchdog_pid_file")"
-if wait "$interrupt_runner_pid"; then
-  echo "expected interrupted runner to fail" >&2
+interrupt_start_epoch=$(date +%s)
+kill -INT "$(sed -n '1p' "$interrupt_runner_pid_file")"
+if ! wait "$interrupt_helper_pid"; then
+  echo "interrupt helper failed" >&2
+  cat "$TMP_DIR/interrupt_child.out" >&2
+  cat "$TMP_DIR/interrupt_child.err" >&2
+  exit 1
+fi
+wait_for_file "$interrupt_status_file" interrupt-status
+interrupt_status=$(sed -n '1p' "$interrupt_status_file")
+interrupt_elapsed=$(( $(date +%s) - interrupt_start_epoch ))
+if [ "$interrupt_status" -ne 130 ]; then
+  echo "expected interrupted runner to exit 130, got $interrupt_status" >&2
+  cat "$TMP_DIR/interrupt_child.out" >&2
+  cat "$TMP_DIR/interrupt_child.err" >&2
+  exit 1
+fi
+if [ "$interrupt_elapsed" -ge 10 ]; then
+  echo "expected interrupted runner to exit promptly, took ${interrupt_elapsed}s" >&2
   cat "$TMP_DIR/interrupt_child.out" >&2
   cat "$TMP_DIR/interrupt_child.err" >&2
   exit 1

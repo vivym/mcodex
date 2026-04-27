@@ -29,24 +29,55 @@ if ! command -v perl >/dev/null 2>&1; then
 fi
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mcodex-smoke.XXXXXX")
+ACTIVE_TIMEOUT_PID=
 
 cleanup() {
   rm -rf "$TMP_DIR"
 }
+
+handle_signal() {
+  status=$1
+  trap '' INT TERM HUP QUIT
+  if [ -n "${ACTIVE_TIMEOUT_PID:-}" ]; then
+    kill -TERM "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    ACTIVE_TIMEOUT_PID=
+  fi
+  cleanup
+  exit "$status"
+}
+
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
+trap 'handle_signal 131' QUIT
 
 run_with_timeout() {
   timeout_secs=$1
   shift
+  timeout_status_file="$TMP_DIR/timeout.$$.status"
+  rm -f "$timeout_status_file"
   perl -e '
 use strict;
 use warnings;
 
+my $status_file = shift @ARGV;
 my $timeout_secs = shift @ARGV;
+
+sub finish {
+    my ($exit_status) = @_;
+    open my $fh, ">", $status_file or die "open status file failed: $!\n";
+    print {$fh} "$exit_status\n";
+    close $fh or die "close status file failed: $!\n";
+    exit $exit_status;
+}
+
 my $pid = fork();
-die "fork failed: $!\n" if !defined $pid;
+if (!defined $pid) {
+    print STDERR "fork failed: $!\n";
+    finish(255);
+}
 
 if ($pid == 0) {
     setpgrp(0, 0) or die "setpgrp failed: $!\n";
@@ -62,7 +93,7 @@ sub terminate_child_group {
     kill "KILL", -$pid;
     kill "KILL", $pid;
     waitpid($pid, 0);
-    exit $exit_status;
+    finish($exit_status);
 }
 
 my %signal_status = (
@@ -90,7 +121,10 @@ eval {
 };
 
 if ($@) {
-    die $@ if $@ ne "__codex_smoke_timeout__\n";
+    if ($@ ne "__codex_smoke_timeout__\n") {
+        print STDERR $@;
+        finish(255);
+    }
     $timed_out = 1;
 }
 
@@ -103,14 +137,25 @@ if ($timed_out) {
     kill "KILL", $pid;
     waitpid($pid, 0);
     print STDERR "timed out after ${timeout_secs}s; killed process group $pid\n";
-    exit 124;
+    finish(124);
 }
 
 if ($status & 127) {
-    exit 128 + ($status & 127);
+    finish(128 + ($status & 127));
 }
-exit($status >> 8);
-' "$timeout_secs" "$@"
+finish($status >> 8);
+' "$timeout_status_file" "$timeout_secs" "$@" &
+  ACTIVE_TIMEOUT_PID=$!
+  while [ ! -f "$timeout_status_file" ]; do
+    sleep 1
+  done
+  status=$(sed -n '1p' "$timeout_status_file")
+  rm -f "$timeout_status_file"
+  set +e
+  wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
+  set -e
+  ACTIVE_TIMEOUT_PID=
+  return "$status"
 }
 
 line_number=0
