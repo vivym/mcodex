@@ -1,6 +1,6 @@
 # Mcodex P0 Smoke Runbook
 
-This runbook covers the P0 manual smoke rows from the mcodex smoke-test matrix.
+This runbook covers the P0 smoke rows from the mcodex smoke-test matrix.
 P0-A rows are runnable with an isolated home and a known binary. P0-B rows
 require the future `codex-smoke-fixtures` helper or an equivalent documented
 manual fixture setup before they count as executable.
@@ -479,32 +479,130 @@ expected to include `product`, `installMethod`, `currentVersion`,
 
 ## Automated P0 Subset
 
-Run:
+| Command | Status | Coverage |
+| --- | --- | --- |
+| `just smoke-mcodex-local` | Automated | binary identity, home isolation, default-pool startup rows |
+| `just smoke-mcodex-cli` | Automated | account status, pool show, diagnostics, events |
+| `just smoke-mcodex-all` | Automated, compatibility aggregate | local + CLI only |
+| `just smoke-mcodex-runtime-gate` | Automated, network-enabled shell/CI required | sticky account, lease-scoped auth, subagent lease inheritance, cross-runtime lease exclusivity, shutdown release |
+| `just smoke-mcodex-quota-gate` | Automated, network-enabled shell/CI required | soft quota rotation, hard usage-limit failover, damping, fail-closed no eligible account |
+| `just smoke-mcodex-gate` | Automated merge gate | local + CLI + runtime + quota |
+
+Compatibility notes:
+
+- `just smoke-mcodex-runtime` is a compatibility alias for
+  `just smoke-mcodex-runtime-gate`.
+- `just smoke-mcodex-quota` is a compatibility alias for
+  `just smoke-mcodex-quota-gate`.
+- `just smoke-mcodex-app-server` remains deferred until
+  `smoke-mcodex-app-server-gate` lands.
+- `just smoke-mcodex-all` remains the local+CLI compatibility aggregate. It is
+  not silently broadened to include runtime/quota gates.
+
+Runtime, quota, and aggregate gate commands must run from a network-enabled
+local shell or CI. Check the shell before running them:
 
 ```bash
-MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-local
-MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-cli
-MCODEX_BIN="$PWD/codex-rs/target/debug/mcodex" just smoke-mcodex-all
+test -z "${CODEX_SANDBOX_NETWORK_DISABLED:-}"
 ```
 
-These commands cover the automated local and CLI subset only. Manual TUI,
-installer-wrapper, app-server, runtime, quota, subagent, and remote rows remain
-separate until their harnesses are added.
+Expected exit code: `0`.
 
-## Future Smoke Phases
+If the variable is set, the expected failure text is:
 
-- `just smoke-mcodex-app-server`: M-15 and M-16 app-server startup snapshot,
-  default mutation, and notification rows.
-- `just smoke-mcodex-runtime`: M-18, M-20, and related runtime lease authority
-  rows for pooled turns and busy-account selection.
-- `just smoke-mcodex-quota`: M-21 and M-22 exhausted, near-exhausted, damping,
-  and reprobe/backoff rows.
-- `just smoke-mcodex-installer`: M-04 and M-23 installer-wrapper identity,
-  PATH, and exit-code forwarding rows.
-- Fake remote backend contract smoke: M-24 remote-shaped inventory, startup
-  snapshot, pause/drain/quota facts, and explicit remote-only fact absence.
-- Minimal headless TUI startup smoke: M-05, M-07, M-09, M-13, and M-14 startup
-  surfaces once the TUI harness can capture stable screens.
+```text
+<runtime|quota> gate cannot run with CODEX_SANDBOX_NETWORK_DISABLED set; rerun outside the Codex sandbox or in network-enabled CI
+```
+
+Optional local proxy and artifact overrides:
+
+```bash
+export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"
+export LK_CUSTOM_WEBRTC="${LK_CUSTOM_WEBRTC:-/Users/viv/.cache/mcodex-webrtc/mac-arm64-release}"
+```
+
+Smoke scripts inherit these variables from the caller and do not set them.
+
+## Runtime/Quota Gate Cost Capture
+
+Before a cold run, capture free disk and existing target size:
+
+```bash
+df -h .
+du -sh codex-rs/target 2>/dev/null || true
+```
+
+Warn if free disk is below 20 GB before a cold `codex-core --test all` run.
+Exact filters reduce test execution, not compile graph size, and
+`codex-core --test all` may compile large dependencies such as `v8`.
+
+Record cold and warm timings for:
+
+```bash
+time cargo test --manifest-path codex-rs/Cargo.toml -p codex-core --test all --no-run
+time cargo test --manifest-path codex-rs/Cargo.toml -p codex-core --lib --no-run
+time cargo test --manifest-path codex-rs/Cargo.toml -p codex-app-server --test all --no-run
+time cargo test --manifest-path codex-rs/Cargo.toml -p codex-tui --lib --no-run
+time just smoke-mcodex-runtime-gate
+time just smoke-mcodex-quota-gate
+time just smoke-mcodex-gate
+```
+
+After the cold runtime/quota gate, record the target size:
+
+```bash
+du -sh codex-rs/target 2>/dev/null || true
+```
+
+## Deferred Gate Rows
+
+`just smoke-mcodex-app-server-gate`, `just smoke-mcodex-tui-gate`,
+installer-wrapper smoke, and remote contract smoke are not part of this slice.
+
+`just smoke-mcodex-app-server-gate` future tests:
+
+- `suite::v2::account_lease::account_lease_read_includes_startup_snapshot_for_single_pool_fallback`
+- `suite::v2::account_lease::account_lease_read_preserves_candidate_pools_for_multi_pool_blocker`
+- `suite::v2::account_lease::account_lease_read_reports_live_active_lease_fields_after_turn_start`
+- `suite::v2::account_lease::account_lease_read_and_update_report_live_proactive_switch_suppression_fields`
+- `suite::v2::account_lease::account_lease_updated_emits_on_resume`
+- `suite::v2::account_lease::account_lease_updated_emits_when_automatic_switch_changes_live_snapshot`
+- `suite::v2::account_lease::account_pool_default_set_reuses_cli_mutation_matrix`
+- `suite::v2::account_lease::account_pool_default_clear_noop_does_not_emit_notification`
+- `suite::v2::account_lease::websocket_account_pool_default_set_and_clear_mutate_startup_intent_without_runtime_admission`
+
+`just smoke-mcodex-tui-gate` future tests:
+
+- `tests::pooled_notice_does_not_show_login_screen_until_requested`
+- `chatwidget::tests::status_command_tests::status_command_renders_pooled_lease_details`
+- `chatwidget::tests::status_command_tests::account_lease_updated_adds_automatic_switch_notice_when_account_changes`
+- `chatwidget::tests::status_command_tests::account_lease_updated_adds_non_replayable_turn_notice`
+- `chatwidget::tests::status_command_tests::account_lease_updated_adds_no_eligible_account_error_notice`
+- `chatwidget::tests::status_command_tests::status_command_renders_damped_account_lease_without_next_eligible_hint`
+- `status::tests::status_snapshot_shows_active_pool_and_next_eligible_time`
+- `status::tests::status_snapshot_shows_auto_switch_and_remote_reset_messages`
+- `status::tests::status_snapshot_shows_damped_account_lease_without_next_eligible_time`
+- `status::tests::status_snapshot_shows_no_available_account_error_state`
+
+### Deferred Remote Contract Smoke
+
+`just smoke-mcodex-remote-contract` is deferred until fake remote backend
+support exists. The future gate must include:
+
+| Row | Expected behavior |
+| --- | --- |
+| remote pool inventory read | Remote source exposes pool inventory without persisting remote-only secrets locally. |
+| remote backend unavailable | Fails closed when no valid active lease exists. |
+| remote pause state | Blocks startup with explicit pause source/provenance. |
+| remote drain state | Prevents new selection while preserving observability facts. |
+| remote quota facts | Reports authoritative remote quota facts with source/provenance. |
+| absent remote-only facts | Represents facts explicitly as absent instead of synthesizing local SQLite facts. |
+| remote lease acquire/release | Preserves the same sticky and fail-closed semantics as local leases. |
+| remote lease expiry/revocation | Invalidates the active lease immediately. |
+| remote lease-auth unavailable | Fails closed without falling back to local shared auth. |
+| mirrored account identities | Uses stable mirrored ids for preferred/excluded accounts, not provider secrets. |
+| secret non-persistence | Does not persist remote secrets or authority facts as local source-of-truth rows. |
+| authority/source provenance | Every remote-derived output distinguishes remote facts from local cached observations. |
 
 ## Manual TUI Rows
 
