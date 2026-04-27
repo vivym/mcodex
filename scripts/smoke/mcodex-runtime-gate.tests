@@ -1,0 +1,10 @@
+# gate|package|target_kind|target_name|exact_test_path|timeout_secs|notes
+runtime|codex-core|--test|all|suite::account_pool::normal_turns_remain_on_same_account_without_quota_pressure|120|sticky account without quota pressure
+runtime|codex-core|--test|all|suite::account_pool::second_runtime_skips_account_leased_by_first_runtime|180|cross-runtime lease exclusivity
+runtime|codex-core|--test|all|suite::account_pool::pooled_request_uses_lease_scoped_auth_session_not_shared_auth_snapshot|120|lease-scoped auth snapshot
+runtime|codex-core|--test|all|suite::account_pool::pooled_request_ignores_shared_external_auth_when_lease_is_active|120|active lease ignores shared external auth
+runtime|codex-core|--test|all|suite::account_pool::lease_rotation_updates_live_snapshot_to_the_new_lease|120|live snapshot follows lease rotation
+runtime|codex-core|--test|all|suite::account_pool::long_running_turn_heartbeat_keeps_lease_exclusive|60|known slow heartbeat exclusivity test
+runtime|codex-core|--test|all|suite::account_pool::shutdown_releases_active_lease_for_next_runtime|120|shutdown releases lease
+runtime|codex-core|--lib|-|codex_delegate::tests::run_codex_thread_interactive_inherits_parent_runtime_lease_host|120|subagent inherits parent runtime lease host
+runtime|codex-core|--lib|-|codex_delegate::tests::run_codex_thread_interactive_drops_inherited_lease_auth_when_runtime_host_exists|120|subagent drops inherited auth when runtime host exists
