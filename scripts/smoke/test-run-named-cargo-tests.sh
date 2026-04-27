@@ -71,6 +71,36 @@ for arg do
   previous_arg=$arg
 done
 printf '%s\n' "$args" >> "${FAKE_CARGO_ARGS_LOG:-/dev/null}"
+run_signal_recording_child() {
+  perl -e '
+use strict;
+use warnings;
+
+my ($pid_file, $signal_log) = @ARGV;
+
+for my $sig (qw(INT TERM HUP QUIT)) {
+    my $name = $sig;
+    $SIG{$name} = sub {
+        open my $fh, ">>", $signal_log or die "open signal log failed: $!\n";
+        print {$fh} "$name\n";
+        close $fh or die "close signal log failed: $!\n";
+        exit 0;
+    };
+}
+
+open my $pid_fh, ">", $pid_file or die "open pid file failed: $!\n";
+print {$pid_fh} "$$\n";
+close $pid_fh or die "close pid file failed: $!\n";
+
+while (1) {
+    sleep 1;
+}
+' "${FAKE_CARGO_CHILD_PID:?}" "${FAKE_CARGO_SIGNAL_LOG:?}" &
+  child_pid=$!
+  watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
+  printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
+  wait "$child_pid"
+}
 case "$mode" in
   interrupt-warm-child|interrupt-list-child) ;;
   *)
@@ -377,17 +407,7 @@ case "$mode" in
     if printf '%s' "$args" | grep -Fq " --list"; then
       printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
-      (
-        trap 'exit 0' INT TERM HUP QUIT
-        while :; do
-          sleep 1
-        done
-      ) &
-      child_pid=$!
-      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
-      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
-      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
-      wait "$child_pid"
+      run_signal_recording_child
     else
       echo "unexpected interrupt-child invocation: $args" >&2
       exit 2
@@ -395,17 +415,7 @@ case "$mode" in
     ;;
   interrupt-warm-child)
     if printf '%s' "$args" | grep -Fq " --no-run"; then
-      (
-        trap 'exit 0' INT TERM HUP QUIT
-        while :; do
-          sleep 1
-        done
-      ) &
-      child_pid=$!
-      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
-      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
-      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
-      wait "$child_pid"
+      run_signal_recording_child
     else
       echo "unexpected interrupt-warm-child invocation: $args" >&2
       exit 2
@@ -415,17 +425,7 @@ case "$mode" in
     if printf '%s' "$args" | grep -Fq " --no-run"; then
       printf 'fake cargo warm build\n'
     elif printf '%s' "$args" | grep -Fq " --list"; then
-      (
-        trap 'exit 0' INT TERM HUP QUIT
-        while :; do
-          sleep 1
-        done
-      ) &
-      child_pid=$!
-      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
-      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
-      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
-      wait "$child_pid"
+      run_signal_recording_child
     else
       echo "unexpected interrupt-list-child invocation: $args" >&2
       exit 2
@@ -492,6 +492,7 @@ assert_interrupt_cleans_child() {
   expected_status=$6
   child_pid_file="$TMP_DIR/$name-child.pid"
   watchdog_pid_file="$TMP_DIR/$name-watchdog.pid"
+  signal_log_file="$TMP_DIR/$name-signal.log"
   runner_pid_file="$TMP_DIR/$name-runner.pid"
   status_file="$TMP_DIR/$name-runner.status"
   out_file="$TMP_DIR/$name.out"
@@ -500,18 +501,23 @@ assert_interrupt_cleans_child() {
   env FAKE_CARGO_MODE="$mode" \
     FAKE_CARGO_CHILD_PID="$child_pid_file" \
     FAKE_CARGO_WATCHDOG_PID="$watchdog_pid_file" \
+    FAKE_CARGO_SIGNAL_LOG="$signal_log_file" \
     PATH="$fake_bin:$PATH" \
     perl -e '
 use strict;
 use warnings;
 
-$SIG{INT} = "DEFAULT";
+for my $sig (qw(INT TERM HUP QUIT)) {
+    $SIG{$sig} = "DEFAULT";
+}
 my ($runner_pid_file, $status_file, $runner, $descriptor) = @ARGV;
 my $pid = fork();
 die "fork failed: $!\n" if !defined $pid;
 
 if ($pid == 0) {
-    $SIG{INT} = "DEFAULT";
+    for my $sig (qw(INT TERM HUP QUIT)) {
+        $SIG{$sig} = "DEFAULT";
+    }
     exec "sh", $runner, $descriptor or die "exec failed: $!\n";
 }
 
@@ -542,6 +548,15 @@ close $status_fh or die "close status file failed: $!\n";
   interrupt_elapsed=$(( $(date +%s) - start_epoch ))
   if [ "$interrupt_status" -ne "$expected_status" ]; then
     echo "expected interrupted $name runner to exit $expected_status, got $interrupt_status" >&2
+    cat "$out_file" >&2
+    cat "$err_file" >&2
+    exit 1
+  fi
+  wait_for_file "$signal_log_file" "$name-signal-log"
+  received_signal=$(sed -n '1p' "$signal_log_file")
+  if [ "$received_signal" != "$signal_name" ]; then
+    echo "expected interrupted $name child to receive $signal_name, got $received_signal" >&2
+    cat "$signal_log_file" >&2
     cat "$out_file" >&2
     cat "$err_file" >&2
     exit 1
@@ -611,6 +626,9 @@ if [ -z "${CHECK_MISSING_RUNNER_CHILD:-}" ]; then
 fi
 
 assert_passes ok env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$TMP_DIR/ok-cargo-args.log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
+if command -v dash >/dev/null 2>&1; then
+  assert_passes dash_runner env FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" dash "$RUNNER" "$descriptor"
+fi
 if [ "$(wc -l <"$TMP_DIR/ok-cargo-args.log" | tr -d '[:space:]')" -ne 3 ]; then
   echo "expected --test all descriptor to invoke cargo three times" >&2
   cat "$TMP_DIR/ok-cargo-args.log" >&2
@@ -888,7 +906,8 @@ interrupt_descriptor="$TMP_DIR/interrupt-child.txt"
 write_descriptor_line "$interrupt_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
 assert_interrupt_cleans_child interrupt interrupt-child "$interrupt_child_bin" "$interrupt_descriptor" INT 130
 assert_interrupt_cleans_child warm-interrupt interrupt-warm-child "$interrupt_warm_child_bin" "$interrupt_descriptor" TERM 143
-assert_interrupt_cleans_child list-interrupt interrupt-list-child "$interrupt_list_child_bin" "$interrupt_descriptor" TERM 143
+assert_interrupt_cleans_child list-interrupt interrupt-list-child "$interrupt_list_child_bin" "$interrupt_descriptor" HUP 129
+assert_interrupt_cleans_child quit-interrupt interrupt-child "$interrupt_child_bin" "$interrupt_descriptor" QUIT 131
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"

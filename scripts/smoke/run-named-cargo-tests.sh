@@ -38,9 +38,10 @@ cleanup() {
 
 handle_signal() {
   status=$1
+  signal_name=$2
   trap '' INT TERM HUP QUIT
   if [ -n "${ACTIVE_TIMEOUT_PID:-}" ]; then
-    kill -TERM "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
+    kill "-$signal_name" "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
     wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null || true
     ACTIVE_TIMEOUT_PID=
   fi
@@ -49,10 +50,10 @@ handle_signal() {
 }
 
 trap cleanup EXIT
-trap 'handle_signal 130' INT
-trap 'handle_signal 143' TERM
-trap 'handle_signal 129' HUP
-trap 'handle_signal 131' QUIT
+trap 'handle_signal 130 INT' INT
+trap 'handle_signal 143 TERM' TERM
+trap 'handle_signal 129 HUP' HUP
+trap 'handle_signal 131 QUIT' QUIT
 
 run_cargo_with_timeout() {
   timeout_secs=$1
@@ -78,7 +79,7 @@ sub finish {
 }
 
 sub terminate_child_group {
-    my ($exit_status) = @_;
+    my ($exit_status, $signal_name) = @_;
     alarm 0;
     if (!defined $pid) {
         finish($exit_status);
@@ -86,8 +87,8 @@ sub terminate_child_group {
     if ($pid == 0) {
         exit $exit_status;
     }
-    kill "TERM", -$pid;
-    kill "TERM", $pid;
+    kill $signal_name, -$pid;
+    kill $signal_name, $pid;
     select undef, undef, undef, 0.5;
     kill "KILL", -$pid;
     kill "KILL", $pid;
@@ -104,7 +105,7 @@ my %signal_status = (
 for my $sig (keys %signal_status) {
     my $name = $sig;
     $SIG{$name} = sub {
-        terminate_child_group($signal_status{$name});
+        terminate_child_group($signal_status{$name}, $name);
     };
 }
 
