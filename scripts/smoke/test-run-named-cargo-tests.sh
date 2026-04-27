@@ -2,7 +2,13 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-RUNNER="$SCRIPT_DIR/run-named-cargo-tests.sh"
+RUNNER=${RUNNER:-"$SCRIPT_DIR/run-named-cargo-tests.sh"}
+
+if [ ! -f "$RUNNER" ]; then
+  echo "runner not found: $RUNNER" >&2
+  exit 2
+fi
+
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mcodex-runner-test.XXXXXX")
 
 cleanup() {
@@ -55,7 +61,15 @@ write_fake_cargo() {
 set -eu
 mode=${FAKE_CARGO_MODE:?}
 args=" $* "
-exact="suite::account_pool::exact_test"
+requested_exact="suite::account_pool::exact_test"
+previous_arg=
+for arg do
+  if [ "$arg" = "--" ]; then
+    requested_exact=$previous_arg
+    break
+  fi
+  previous_arg=$arg
+done
 printf '%s\n' "$args" >> "${FAKE_CARGO_ARGS_LOG:-/dev/null}"
 case "$mode" in
   interrupt-warm-child|interrupt-list-child) ;;
@@ -69,11 +83,11 @@ esac
 case "$mode" in
   ok)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected ok invocation: $args" >&2
       exit 2
@@ -81,12 +95,12 @@ case "$mode" in
     ;;
   prefixed-proof)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
       printf 'hello'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected prefixed-proof invocation: $args" >&2
       exit 2
@@ -94,11 +108,11 @@ case "$mode" in
     ;;
   suffixed-proof)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok extra\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test %s ... ok extra\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected suffixed-proof invocation: $args" >&2
       exit 2
@@ -114,7 +128,7 @@ case "$mode" in
     ;;
   duplicate)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n%s: test\n' "$exact" "$exact"
+      printf '%s: test\n%s: test\n' "$requested_exact" "$requested_exact"
     else
       echo "duplicate mode should fail during list, not run" >&2
       exit 2
@@ -122,11 +136,11 @@ case "$mode" in
     ;;
   skipped)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
       printf 'Skipping test because it cannot execute when network is disabled in a Codex sandbox.\n'
-      printf 'test %s ... ok\n' "$exact"
+      printf 'test %s ... ok\n' "$requested_exact"
     else
       echo "unexpected skipped invocation: $args" >&2
       exit 2
@@ -134,10 +148,10 @@ case "$mode" in
     ;;
   ignored)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ignored\n' "$exact"
+      printf 'test %s ... ignored\n' "$requested_exact"
     else
       echo "unexpected ignored invocation: $args" >&2
       exit 2
@@ -145,10 +159,10 @@ case "$mode" in
     ;;
   no-proof)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected no-proof invocation: $args" >&2
       exit 2
@@ -156,12 +170,12 @@ case "$mode" in
     ;;
   duplicate-proof)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected duplicate-proof invocation: $args" >&2
       exit 2
@@ -169,11 +183,11 @@ case "$mode" in
     ;;
   eleven-passed)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected eleven-passed invocation: $args" >&2
       exit 2
@@ -181,32 +195,92 @@ case "$mode" in
     ;;
   duplicate-summary)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected duplicate-summary invocation: $args" >&2
       exit 2
     fi
     ;;
-  suffixed-summary)
+  missing-finished-summary)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
-      printf 'test %s ... ok\n' "$exact"
-      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out extra\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out\n'
+    else
+      echo "unexpected missing-finished-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  suffixed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s extra\n'
     else
       echo "unexpected suffixed-summary invocation: $args" >&2
       exit 2
     fi
     ;;
+  prefixed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'hello test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected prefixed-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  nonzero-failed-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 1 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected nonzero-failed-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  nonzero-ignored-summary)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected nonzero-ignored-summary invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  run-fails)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... FAILED\n' "$requested_exact"
+      exit 101
+    else
+      echo "unexpected run-fails invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   timeout-child)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       (
         trap 'exit 0' INT TERM HUP
@@ -224,7 +298,7 @@ case "$mode" in
     ;;
   interrupt-child)
     if printf '%s' "$args" | grep -Fq " --list"; then
-      printf '%s: test\n' "$exact"
+      printf '%s: test\n' "$requested_exact"
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       (
         trap 'exit 0' INT TERM HUP QUIT
@@ -416,15 +490,63 @@ suffixed_proof_bin=$(write_fake_cargo suffixed-proof)
 duplicate_proof_bin=$(write_fake_cargo duplicate-proof)
 eleven_passed_bin=$(write_fake_cargo eleven-passed)
 duplicate_summary_bin=$(write_fake_cargo duplicate-summary)
+missing_finished_summary_bin=$(write_fake_cargo missing-finished-summary)
 suffixed_summary_bin=$(write_fake_cargo suffixed-summary)
+prefixed_summary_bin=$(write_fake_cargo prefixed-summary)
+nonzero_failed_summary_bin=$(write_fake_cargo nonzero-failed-summary)
+nonzero_ignored_summary_bin=$(write_fake_cargo nonzero-ignored-summary)
+run_fails_bin=$(write_fake_cargo run-fails)
 timeout_child_bin=$(write_fake_cargo timeout-child)
 interrupt_child_bin=$(write_fake_cargo interrupt-child)
 interrupt_warm_child_bin=$(write_fake_cargo interrupt-warm-child)
 interrupt_list_child_bin=$(write_fake_cargo interrupt-list-child)
 
+assert_fails no_descriptor sh "$RUNNER"
+if ! grep -Fq "usage: sh scripts/smoke/run-named-cargo-tests.sh <descriptor-file>" "$TMP_DIR/no_descriptor.err"; then
+  echo "expected no descriptor usage message" >&2
+  cat "$TMP_DIR/no_descriptor.err" >&2
+  exit 1
+fi
+
+assert_fails missing_descriptor sh "$RUNNER" "$TMP_DIR/missing-descriptor.txt"
+if ! grep -Fq "descriptor file not found" "$TMP_DIR/missing_descriptor.err"; then
+  echo "expected missing descriptor message" >&2
+  cat "$TMP_DIR/missing_descriptor.err" >&2
+  exit 1
+fi
+
+if [ -z "${CHECK_MISSING_RUNNER_CHILD:-}" ]; then
+  assert_fails missing_runner env CHECK_MISSING_RUNNER_CHILD=1 RUNNER="$TMP_DIR/missing-runner.sh" sh "$0"
+  if ! grep -Fq "runner not found" "$TMP_DIR/missing_runner.err"; then
+    echo "expected missing runner message" >&2
+    cat "$TMP_DIR/missing_runner.err" >&2
+    exit 1
+  fi
+fi
+
 assert_passes ok env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$TMP_DIR/ok-cargo-args.log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
+if [ "$(wc -l <"$TMP_DIR/ok-cargo-args.log" | tr -d '[:space:]')" -ne 3 ]; then
+  echo "expected --test all descriptor to invoke cargo three times" >&2
+  cat "$TMP_DIR/ok-cargo-args.log" >&2
+  exit 1
+fi
+if ! grep -Fq -- " -p codex-core --test all --no-run " "$TMP_DIR/ok-cargo-args.log"; then
+  echo "expected --test all warm cargo args" >&2
+  cat "$TMP_DIR/ok-cargo-args.log" >&2
+  exit 1
+fi
+if ! grep -Fq -- " -p codex-core --test all suite::account_pool::exact_test -- --exact --list " "$TMP_DIR/ok-cargo-args.log"; then
+  echo "expected --test all list cargo args" >&2
+  cat "$TMP_DIR/ok-cargo-args.log" >&2
+  exit 1
+fi
 if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
   echo "expected runner to invoke cargo with --exact --nocapture" >&2
+  cat "$TMP_DIR/ok-cargo-args.log" >&2
+  exit 1
+fi
+if ! grep -Fq -- " -p codex-core --test all suite::account_pool::exact_test -- --exact --nocapture " "$TMP_DIR/ok-cargo-args.log"; then
+  echo "expected --test all run cargo args" >&2
   cat "$TMP_DIR/ok-cargo-args.log" >&2
   exit 1
 fi
@@ -433,7 +555,12 @@ assert_fails suffixed_proof env FAKE_CARGO_MODE=suffixed-proof PATH="$suffixed_p
 assert_fails duplicate_proof env FAKE_CARGO_MODE=duplicate-proof PATH="$duplicate_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails eleven_passed env FAKE_CARGO_MODE=eleven-passed PATH="$eleven_passed_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate_summary env FAKE_CARGO_MODE=duplicate-summary PATH="$duplicate_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails missing_finished_summary env FAKE_CARGO_MODE=missing-finished-summary PATH="$missing_finished_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails suffixed_summary env FAKE_CARGO_MODE=suffixed-summary PATH="$suffixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails prefixed_summary env FAKE_CARGO_MODE=prefixed-summary PATH="$prefixed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails nonzero_failed_summary env FAKE_CARGO_MODE=nonzero-failed-summary PATH="$nonzero_failed_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails nonzero_ignored_summary env FAKE_CARGO_MODE=nonzero-ignored-summary PATH="$nonzero_ignored_summary_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails run_fails env FAKE_CARGO_MODE=run-fails PATH="$run_fails_bin:$PATH" sh "$RUNNER" "$descriptor"
 if ! grep -Fq "proofs=0" "$TMP_DIR/prefixed_proof.err"; then
   echo "expected prefixed proof failure to report proofs=0" >&2
   cat "$TMP_DIR/prefixed_proof.err" >&2
@@ -460,6 +587,16 @@ if [ -s "$empty_test_target_log" ]; then
   exit 1
 fi
 
+dash_test_target_descriptor="$TMP_DIR/dash-test-target.txt"
+dash_test_target_log="$TMP_DIR/dash-test-target-cargo-args.log"
+write_descriptor_line "$dash_test_target_descriptor" "runtime|codex-core|--test|-|suite::account_pool::exact_test|30|fake descriptor"
+assert_fails dash_test_target env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$dash_test_target_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$dash_test_target_descriptor"
+if [ -s "$dash_test_target_log" ]; then
+  echo "expected invalid '-' --test target to fail before cargo invocation" >&2
+  cat "$dash_test_target_log" >&2
+  exit 1
+fi
+
 empty_package_descriptor="$TMP_DIR/empty-package.txt"
 empty_package_log="$TMP_DIR/empty-package-cargo-args.log"
 write_descriptor_line "$empty_package_descriptor" "runtime||--test|all|suite::account_pool::exact_test|30|fake descriptor"
@@ -477,6 +614,105 @@ assert_fails empty_exact_path env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$empty
 if [ -s "$empty_exact_path_log" ]; then
   echo "expected invalid empty exact path to fail before cargo invocation" >&2
   cat "$empty_exact_path_log" >&2
+  exit 1
+fi
+
+invalid_pipe_count_descriptor="$TMP_DIR/invalid-pipe-count.txt"
+invalid_pipe_count_log="$TMP_DIR/invalid-pipe-count-cargo-args.log"
+write_descriptor_line "$invalid_pipe_count_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30"
+assert_fails invalid_pipe_count env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$invalid_pipe_count_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$invalid_pipe_count_descriptor"
+if [ -s "$invalid_pipe_count_log" ]; then
+  echo "expected invalid pipe count to fail before cargo invocation" >&2
+  cat "$invalid_pipe_count_log" >&2
+  exit 1
+fi
+
+invalid_gate_descriptor="$TMP_DIR/invalid-gate.txt"
+invalid_gate_log="$TMP_DIR/invalid-gate-cargo-args.log"
+write_descriptor_line "$invalid_gate_descriptor" "wrong|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
+assert_fails invalid_gate env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$invalid_gate_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$invalid_gate_descriptor"
+if [ -s "$invalid_gate_log" ]; then
+  echo "expected invalid gate to fail before cargo invocation" >&2
+  cat "$invalid_gate_log" >&2
+  exit 1
+fi
+
+invalid_target_kind_descriptor="$TMP_DIR/invalid-target-kind.txt"
+invalid_target_kind_log="$TMP_DIR/invalid-target-kind-cargo-args.log"
+write_descriptor_line "$invalid_target_kind_descriptor" "runtime|codex-core|--bin|all|suite::account_pool::exact_test|30|fake descriptor"
+assert_fails invalid_target_kind env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$invalid_target_kind_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$invalid_target_kind_descriptor"
+if [ -s "$invalid_target_kind_log" ]; then
+  echo "expected invalid target_kind to fail before cargo invocation" >&2
+  cat "$invalid_target_kind_log" >&2
+  exit 1
+fi
+
+lib_descriptor="$TMP_DIR/lib-target.txt"
+lib_log="$TMP_DIR/lib-cargo-args.log"
+write_descriptor_line "$lib_descriptor" "runtime|codex-core|--lib|-|suite::account_pool::exact_test|30|fake descriptor"
+assert_passes lib_target env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$lib_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$lib_descriptor"
+if ! grep -Fq -- " -p codex-core --lib --no-run " "$lib_log"; then
+  echo "expected --lib warm cargo args" >&2
+  cat "$lib_log" >&2
+  exit 1
+fi
+if ! grep -Fq -- " -p codex-core --lib suite::account_pool::exact_test -- --exact --list " "$lib_log"; then
+  echo "expected --lib list cargo args" >&2
+  cat "$lib_log" >&2
+  exit 1
+fi
+if ! grep -Fq -- " -p codex-core --lib suite::account_pool::exact_test -- --exact --nocapture " "$lib_log"; then
+  echo "expected --lib run cargo args" >&2
+  cat "$lib_log" >&2
+  exit 1
+fi
+if grep -Fq -- " --lib - " "$lib_log"; then
+  echo "expected --lib cargo args not to include '-' target name" >&2
+  cat "$lib_log" >&2
+  exit 1
+fi
+
+invalid_lib_descriptor="$TMP_DIR/invalid-lib-target.txt"
+invalid_lib_log="$TMP_DIR/invalid-lib-target-cargo-args.log"
+write_descriptor_line "$invalid_lib_descriptor" "runtime|codex-core|--lib|name|suite::account_pool::exact_test|30|fake descriptor"
+assert_fails invalid_lib_target env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$invalid_lib_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$invalid_lib_descriptor"
+if [ -s "$invalid_lib_log" ]; then
+  echo "expected invalid --lib target name to fail before cargo invocation" >&2
+  cat "$invalid_lib_log" >&2
+  exit 1
+fi
+
+zero_timeout_descriptor="$TMP_DIR/zero-timeout.txt"
+zero_timeout_log="$TMP_DIR/zero-timeout-cargo-args.log"
+write_descriptor_line "$zero_timeout_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|0|fake descriptor"
+assert_fails zero_timeout env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$zero_timeout_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$zero_timeout_descriptor"
+if [ -s "$zero_timeout_log" ]; then
+  echo "expected zero timeout to fail before cargo invocation" >&2
+  cat "$zero_timeout_log" >&2
+  exit 1
+fi
+
+non_integer_timeout_descriptor="$TMP_DIR/non-integer-timeout.txt"
+non_integer_timeout_log="$TMP_DIR/non-integer-timeout-cargo-args.log"
+write_descriptor_line "$non_integer_timeout_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|abc|fake descriptor"
+assert_fails non_integer_timeout env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$non_integer_timeout_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$non_integer_timeout_descriptor"
+if [ -s "$non_integer_timeout_log" ]; then
+  echo "expected non-integer timeout to fail before cargo invocation" >&2
+  cat "$non_integer_timeout_log" >&2
+  exit 1
+fi
+
+duplicate_target_descriptor="$TMP_DIR/duplicate-target.txt"
+duplicate_target_log="$TMP_DIR/duplicate-target-cargo-args.log"
+{
+  printf '%s\n' "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
+  printf '%s\n' "runtime|codex-core|--test|all|suite::account_pool::second_exact_test|30|fake descriptor"
+} >"$duplicate_target_descriptor"
+assert_passes duplicate_target env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$duplicate_target_log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$duplicate_target_descriptor"
+warm_count=$(grep -Fc -- " -p codex-core --test all --no-run " "$duplicate_target_log" || true)
+if [ "$warm_count" -ne 1 ]; then
+  echo "expected duplicate package/target descriptors to warm once, got $warm_count" >&2
+  cat "$duplicate_target_log" >&2
   exit 1
 fi
 

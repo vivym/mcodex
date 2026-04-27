@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 MANIFEST_PATH="$REPO_ROOT/codex-rs/Cargo.toml"
 SKIP_SENTINEL="Skipping test because it cannot execute when network is disabled in a Codex sandbox."
-ONE_PASS_SUMMARY_PATTERN='^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out(; finished in [0-9][0-9.]*s)?$'
+ONE_PASS_SUMMARY_PATTERN='^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9][0-9]* filtered out; finished in [0-9][0-9]*(\.[0-9][0-9]*)?s$'
 
 if [ "$#" -ne 1 ]; then
   echo "usage: sh scripts/smoke/run-named-cargo-tests.sh <descriptor-file>" >&2
