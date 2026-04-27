@@ -74,6 +74,19 @@ case "$mode" in
       exit 2
     fi
     ;;
+  prefixed-proof)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'hello'
+      printf 'test %s ... ok\n' "$exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n'
+    else
+      echo "unexpected prefixed-proof invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   missing)
     if printf '%s' "$args" | grep -Fq " --list"; then
       true
@@ -142,6 +155,26 @@ case "$mode" in
       exit 2
     fi
     ;;
+  interrupt-child)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      (
+        trap 'exit 0' INT TERM HUP QUIT
+        while :; do
+          sleep 1
+        done
+      ) &
+      child_pid=$!
+      watchdog_pid=$(ps -o ppid= -p "$$" | sed 's/[[:space:]]//g')
+      printf '%s\n' "$child_pid" > "${FAKE_CARGO_CHILD_PID:?}"
+      printf '%s\n' "$watchdog_pid" > "${FAKE_CARGO_WATCHDOG_PID:?}"
+      wait "$child_pid"
+    else
+      echo "unexpected interrupt-child invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   *)
     echo "unknown fake cargo mode: $mode" >&2
     exit 2
@@ -179,6 +212,21 @@ assert_process_exits() {
   exit 1
 }
 
+wait_for_file() {
+  file=$1
+  name=$2
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    if [ -s "$file" ]; then
+      return
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  echo "expected $name file: $file" >&2
+  exit 1
+}
+
 descriptor="$TMP_DIR/tests.txt"
 write_descriptor "$descriptor"
 
@@ -188,7 +236,9 @@ duplicate_bin=$(write_fake_cargo duplicate)
 skipped_bin=$(write_fake_cargo skipped)
 ignored_bin=$(write_fake_cargo ignored)
 no_proof_bin=$(write_fake_cargo no-proof)
+prefixed_proof_bin=$(write_fake_cargo prefixed-proof)
 timeout_child_bin=$(write_fake_cargo timeout-child)
+interrupt_child_bin=$(write_fake_cargo interrupt-child)
 
 assert_passes ok env FAKE_CARGO_MODE=ok FAKE_CARGO_ARGS_LOG="$TMP_DIR/ok-cargo-args.log" PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
 if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
@@ -196,6 +246,7 @@ if ! grep -Fq -- " --exact --nocapture" "$TMP_DIR/ok-cargo-args.log"; then
   cat "$TMP_DIR/ok-cargo-args.log" >&2
   exit 1
 fi
+assert_passes prefixed_proof env FAKE_CARGO_MODE=prefixed-proof PATH="$prefixed_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 
 empty_test_target_descriptor="$TMP_DIR/empty-test-target.txt"
 empty_test_target_log="$TMP_DIR/empty-test-target-cargo-args.log"
@@ -259,6 +310,27 @@ if ! grep -Fq "timed out after 1s" "$TMP_DIR/timeout_child.err"; then
   cat "$TMP_DIR/timeout_child.err" >&2
   exit 1
 fi
+
+interrupt_descriptor="$TMP_DIR/interrupt-child.txt"
+interrupt_child_pid_file="$TMP_DIR/interrupt-child.pid"
+interrupt_watchdog_pid_file="$TMP_DIR/interrupt-watchdog.pid"
+write_descriptor_line "$interrupt_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|30|fake descriptor"
+env FAKE_CARGO_MODE=interrupt-child \
+  FAKE_CARGO_CHILD_PID="$interrupt_child_pid_file" \
+  FAKE_CARGO_WATCHDOG_PID="$interrupt_watchdog_pid_file" \
+  PATH="$interrupt_child_bin:$PATH" \
+  sh "$RUNNER" "$interrupt_descriptor" >"$TMP_DIR/interrupt_child.out" 2>"$TMP_DIR/interrupt_child.err" &
+interrupt_runner_pid=$!
+wait_for_file "$interrupt_child_pid_file" interrupt-child-pid
+wait_for_file "$interrupt_watchdog_pid_file" interrupt-watchdog-pid
+kill -TERM "$(sed -n '1p' "$interrupt_watchdog_pid_file")"
+if wait "$interrupt_runner_pid"; then
+  echo "expected interrupted runner to fail" >&2
+  cat "$TMP_DIR/interrupt_child.out" >&2
+  cat "$TMP_DIR/interrupt_child.err" >&2
+  exit 1
+fi
+assert_process_exits "$(sed -n '1p' "$interrupt_child_pid_file")" interrupt-child
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"

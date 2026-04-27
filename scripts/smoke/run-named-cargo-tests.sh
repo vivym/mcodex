@@ -53,6 +53,31 @@ if ($pid == 0) {
     exec @ARGV or die "exec failed: $!\n";
 }
 
+sub terminate_child_group {
+    my ($exit_status) = @_;
+    alarm 0;
+    kill "TERM", -$pid;
+    kill "TERM", $pid;
+    select undef, undef, undef, 0.5;
+    kill "KILL", -$pid;
+    kill "KILL", $pid;
+    waitpid($pid, 0);
+    exit $exit_status;
+}
+
+my %signal_status = (
+    HUP  => 129,
+    INT  => 130,
+    QUIT => 131,
+    TERM => 143,
+);
+for my $sig (keys %signal_status) {
+    my $name = $sig;
+    $SIG{$name} = sub {
+        terminate_child_group($signal_status{$name});
+    };
+}
+
 my $status;
 my $timed_out = 0;
 eval {
@@ -72,8 +97,10 @@ if ($@) {
 if ($timed_out) {
     print STDERR "timed out after ${timeout_secs}s; terminating process group $pid\n";
     kill "TERM", -$pid;
+    kill "TERM", $pid;
     select undef, undef, undef, 0.5;
     kill "KILL", -$pid;
+    kill "KILL", $pid;
     waitpid($pid, 0);
     print STDERR "timed out after ${timeout_secs}s; killed process group $pid\n";
     exit 124;
@@ -228,9 +255,13 @@ $target_key"
     cat "$tmp_run" >&2
     exit 1
   fi
-  proof_count=$(grep -Fxc "test $exact_path ... ok" "$tmp_run" || true)
-  if [ "$proof_count" -ne 1 ]; then
-    echo "critical regression did not prove exact execution once: $exact_path (proof=$proof_count)" >&2
+  if ! grep -Fq "test $exact_path ... ok" "$tmp_run"; then
+    echo "critical regression did not prove exact execution: $exact_path" >&2
+    cat "$tmp_run" >&2
+    exit 1
+  fi
+  if ! grep -Fq "1 passed; 0 failed; 0 ignored;" "$tmp_run"; then
+    echo "critical regression did not report exactly one passing test: $exact_path" >&2
     cat "$tmp_run" >&2
     exit 1
   fi
