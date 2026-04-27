@@ -304,9 +304,10 @@ $target_key"
     }
   fi
 
-  match_count=$(grep -Fxc "$exact_path: test" "$tmp_list" || true)
-  if [ "$match_count" -ne 1 ]; then
-    echo "named regression not found exactly once: $exact_path (matches=$match_count)" >&2
+  list_candidate_count=$(grep -Ec ': test$' "$tmp_list" || true)
+  exact_match_count=$(grep -Fxc "$exact_path: test" "$tmp_list" || true)
+  if [ "$list_candidate_count" -ne 1 ] || [ "$exact_match_count" -ne 1 ]; then
+    echo "named regression not found as the only listed test: $exact_path (list_candidates=$list_candidate_count exact_matches=$exact_match_count)" >&2
     cat "$tmp_list" >&2
     exit 1
   fi

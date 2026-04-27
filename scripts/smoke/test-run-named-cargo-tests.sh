@@ -134,6 +134,19 @@ case "$mode" in
       exit 2
     fi
     ;;
+  extra-list-candidate)
+    if printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+      printf 'other::test: test\n'
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected extra-list-candidate invocation: $args" >&2
+      exit 2
+    fi
+    ;;
   list-fails)
     if printf '%s' "$args" | grep -Fq " --list"; then
       printf 'fake cargo list failure\n' >&2
@@ -150,6 +163,7 @@ case "$mode" in
       printf 'running 1 test\n'
       printf 'Skipping test because it cannot execute when network is disabled in a Codex sandbox.\n'
       printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected skipped invocation: $args" >&2
       exit 2
@@ -161,6 +175,8 @@ case "$mode" in
     elif printf '%s' "$args" | grep -Fq " --nocapture"; then
       printf 'running 1 test\n'
       printf 'test %s ... ignored\n' "$requested_exact"
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected ignored invocation: $args" >&2
       exit 2
@@ -475,6 +491,7 @@ assert_interrupt_cleans_child() {
   signal_name=$5
   expected_status=$6
   child_pid_file="$TMP_DIR/$name-child.pid"
+  watchdog_pid_file="$TMP_DIR/$name-watchdog.pid"
   runner_pid_file="$TMP_DIR/$name-runner.pid"
   status_file="$TMP_DIR/$name-runner.status"
   out_file="$TMP_DIR/$name.out"
@@ -482,7 +499,7 @@ assert_interrupt_cleans_child() {
 
   env FAKE_CARGO_MODE="$mode" \
     FAKE_CARGO_CHILD_PID="$child_pid_file" \
-    FAKE_CARGO_WATCHDOG_PID="$TMP_DIR/$name-watchdog.pid" \
+    FAKE_CARGO_WATCHDOG_PID="$watchdog_pid_file" \
     PATH="$fake_bin:$PATH" \
     perl -e '
 use strict;
@@ -511,6 +528,7 @@ close $status_fh or die "close status file failed: $!\n";
   helper_pid=$!
   wait_for_file "$runner_pid_file" "$name-runner-pid"
   wait_for_file "$child_pid_file" "$name-child-pid"
+  wait_for_file "$watchdog_pid_file" "$name-watchdog-pid"
   start_epoch=$(date +%s)
   kill "-$signal_name" "$(sed -n '1p' "$runner_pid_file")"
   if ! wait "$helper_pid"; then
@@ -535,6 +553,7 @@ close $status_fh or die "close status file failed: $!\n";
     exit 1
   fi
   assert_process_exits "$(sed -n '1p' "$child_pid_file")" "$name-child"
+  assert_process_exits "$(sed -n '1p' "$watchdog_pid_file")" "$name-watchdog"
 }
 
 descriptor="$TMP_DIR/tests.txt"
@@ -543,6 +562,7 @@ write_descriptor "$descriptor"
 ok_bin=$(write_fake_cargo ok)
 missing_bin=$(write_fake_cargo missing)
 duplicate_bin=$(write_fake_cargo duplicate)
+extra_list_candidate_bin=$(write_fake_cargo extra-list-candidate)
 list_fails_bin=$(write_fake_cargo list-fails)
 skipped_bin=$(write_fake_cargo skipped)
 ignored_bin=$(write_fake_cargo ignored)
@@ -872,7 +892,13 @@ assert_interrupt_cleans_child list-interrupt interrupt-list-child "$interrupt_li
 
 assert_fails missing env FAKE_CARGO_MODE=missing PATH="$missing_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails duplicate env FAKE_CARGO_MODE=duplicate PATH="$duplicate_bin:$PATH" sh "$RUNNER" "$descriptor"
+assert_fails extra_list_candidate env FAKE_CARGO_MODE=extra-list-candidate PATH="$extra_list_candidate_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails list_fails env FAKE_CARGO_MODE=list-fails PATH="$list_fails_bin:$PATH" sh "$RUNNER" "$descriptor"
+if ! grep -Fq "list_candidates=2 exact_matches=1" "$TMP_DIR/extra_list_candidate.err"; then
+  echo "expected extra list candidate failure to report list_candidates=2 exact_matches=1" >&2
+  cat "$TMP_DIR/extra_list_candidate.err" >&2
+  exit 1
+fi
 if ! grep -Fq "failed to list named regression: suite::account_pool::exact_test" "$TMP_DIR/list_fails.err"; then
   echo "expected list failure to report failed list operation" >&2
   cat "$TMP_DIR/list_fails.err" >&2
@@ -880,6 +906,16 @@ if ! grep -Fq "failed to list named regression: suite::account_pool::exact_test"
 fi
 assert_fails skipped env FAKE_CARGO_MODE=skipped PATH="$skipped_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails ignored env FAKE_CARGO_MODE=ignored PATH="$ignored_bin:$PATH" sh "$RUNNER" "$descriptor"
+if ! grep -Fq "critical regression skipped because network is disabled: suite::account_pool::exact_test" "$TMP_DIR/skipped.err"; then
+  echo "expected skipped test to report network-disabled skip rejection" >&2
+  cat "$TMP_DIR/skipped.err" >&2
+  exit 1
+fi
+if ! grep -Fq "critical regression ignored: suite::account_pool::exact_test" "$TMP_DIR/ignored.err"; then
+  echo "expected ignored test to report ignored rejection" >&2
+  cat "$TMP_DIR/ignored.err" >&2
+  exit 1
+fi
 assert_fails no_proof env FAKE_CARGO_MODE=no-proof PATH="$no_proof_bin:$PATH" sh "$RUNNER" "$descriptor"
 assert_fails sandbox env CODEX_SANDBOX_NETWORK_DISABLED=1 FAKE_CARGO_MODE=ok PATH="$ok_bin:$PATH" sh "$RUNNER" "$descriptor"
 
