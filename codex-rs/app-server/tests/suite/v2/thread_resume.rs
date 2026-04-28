@@ -2726,7 +2726,7 @@ async fn thread_resume_by_path_prefers_latest_turn_context_over_session_configur
         ..
     } = to_response::<ThreadResumeResponse>(resume_resp)?;
     assert_eq!(resumed.id, thread.id);
-    assert_eq!(model, "gpt-5-turn-context-resume");
+    assert_eq!(model, "gpt-5.2-codex-turn-context-resume");
     assert_eq!(model_provider, "source_provider");
     assert_eq!(service_tier, Some(ServiceTier::Fast));
     assert_eq!(approval_policy, AskForApproval::Never);
@@ -3762,7 +3762,10 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
             .any(|text| text.contains("<personality_spec>")),
         "expected a personality update message in developer input, got {developer_texts:?}"
     );
-    let instructions_text = request.instructions_text();
+    let instructions_text = request.body_json()["instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         instructions_text.contains(CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT),
         "expected default base instructions from history, got {instructions_text:?}"
@@ -3862,7 +3865,7 @@ fn assert_source_config_request(request: &responses::ResponsesRequest) {
     assert_eq!(body["service_tier"], json!("flex"));
     assert_eq!(body["reasoning"]["effort"], json!("high"));
 
-    let instructions_text = request.instructions_text();
+    let instructions_text = body["instructions"].as_str().unwrap_or_default();
     assert!(
         instructions_text.contains("source base instructions"),
         "expected source base instructions, got {instructions_text:?}"
@@ -3936,7 +3939,7 @@ fn assert_zero_turn_start_override_request(request: &responses::ResponsesRequest
 
 fn assert_turn_context_override_request(request: &responses::ResponsesRequest) {
     let body = request.body_json();
-    assert_eq!(body["model"], json!("gpt-5-turn-context-resume"));
+    assert_eq!(body["model"], json!("gpt-5.2-codex-turn-context-resume"));
     assert_eq!(body["service_tier"], json!("priority"));
     assert_eq!(body["reasoning"]["effort"], json!("low"));
 
@@ -4079,7 +4082,7 @@ fn rewrite_latest_turn_context_for_resume_override(rollout_path: &Path) -> Resul
 }
 
 fn apply_resume_turn_context_override(turn_context: &mut TurnContextItem) {
-    turn_context.model = "gpt-5-turn-context-resume".to_string();
+    turn_context.model = "gpt-5.2-codex-turn-context-resume".to_string();
     turn_context.cwd = PathBuf::from("/tmp/turn-context-resume");
     turn_context.approval_policy = RolloutAskForApproval::Never;
     turn_context.sandbox_policy = RolloutSandboxPolicy::new_read_only_policy();
@@ -4161,7 +4164,7 @@ fn assert_resume_request_without_source_base_instructions(request: &responses::R
     assert_eq!(body["service_tier"], json!("flex"));
     assert_eq!(body["reasoning"]["effort"], json!("high"));
 
-    let instructions_text = request.instructions_text();
+    let instructions_text = body["instructions"].as_str().unwrap_or_default();
     assert!(
         !instructions_text.contains("source base instructions"),
         "resumed turn should not resurrect removed source base instructions: {instructions_text:?}"

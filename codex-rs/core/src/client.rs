@@ -2556,14 +2556,39 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
-            let stream_result = websocket_connection
+            let stream_result = match websocket_connection
                 .stream_request(ws_request, self.websocket_session.connection_reused())
                 .await
-                .map_err(|err| {
+            {
+                Ok(stream_result) => stream_result,
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    inference_trace_attempt.record_failed(&unauthorized_transport);
+                    pending_retry = match handle_unauthorized(
+                        unauthorized_transport,
+                        &mut request_auth_recovery,
+                        session_telemetry,
+                    )
+                    .await
+                    {
+                        Ok(recovery) => {
+                            auth_recovery = request_auth_recovery;
+                            PendingUnauthorizedRetry::from_recovery(recovery)
+                        }
+                        Err(err) => {
+                            active_request.report_terminal_unauthorized().await;
+                            return Err(err);
+                        }
+                    };
+                    continue;
+                }
+                Err(err) => {
                     let err = map_api_error(err);
                     inference_trace_attempt.record_failed(&err);
-                    err
-                })?;
+                    return Err(err);
+                }
+            };
             let (stream, last_request_rx) = map_response_stream(
                 stream_result,
                 session_telemetry.clone(),

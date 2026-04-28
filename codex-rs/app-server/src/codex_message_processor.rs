@@ -332,6 +332,7 @@ use codex_protocol::dynamic_tools::DynamicToolSpec as CoreDynamicToolSpec;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
@@ -347,6 +348,7 @@ use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RealtimeVoicesList;
+use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
@@ -363,6 +365,7 @@ use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::StateRuntime;
+use codex_state::ThreadConfigBaselineSnapshot;
 use codex_state::ThreadMetadata;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::log_db::LogDbLayer;
@@ -3139,6 +3142,24 @@ impl CodexMessageProcessor {
                         .await;
                     return;
                 }
+                if session_configured.rollout_path.is_some()
+                    && let Err(error) = thread.try_ensure_rollout_materialized().await
+                {
+                    listener_task_context
+                        .outgoing
+                        .send_error(
+                            request_id,
+                            JSONRPCErrorError {
+                                code: INTERNAL_ERROR_CODE,
+                                message: format!(
+                                    "failed to materialize rollout for thread {thread_id}: {error}"
+                                ),
+                                data: None,
+                            },
+                        )
+                        .await;
+                    return;
+                }
                 let config_snapshot = thread
                     .config_snapshot()
                     .instrument(tracing::info_span!(
@@ -3146,6 +3167,16 @@ impl CodexMessageProcessor {
                         otel.name = "app_server.thread_start.config_snapshot",
                     ))
                     .await;
+                let effective_config = thread.effective_config().await;
+                if session_configured.rollout_path.is_some() {
+                    persist_thread_config_baseline_from_snapshot(
+                        thread_id,
+                        &config_snapshot,
+                        effective_config.as_ref(),
+                        ThreadConfigBaselineOverrideFlags::default(),
+                    )
+                    .await;
+                }
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     &config_snapshot,
@@ -4892,7 +4923,7 @@ impl CodexMessageProcessor {
         } = params;
         let include_turns = !exclude_turns;
 
-        let thread_history = if let Some(history) = history {
+        let mut thread_history = if let Some(history) = history {
             let Some(thread_history) = self
                 .resume_thread_from_history(request_id.clone(), history.as_slice())
                 .await
@@ -4911,6 +4942,10 @@ impl CodexMessageProcessor {
         };
 
         let history_cwd = thread_history.session_cwd();
+        let requested_baseline_overrides = ThreadConfigBaselineOverrideFlags {
+            personality_overrides_rollout: personality.is_some(),
+            developer_instructions_overrides_rollout: developer_instructions.is_some(),
+        };
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -4924,13 +4959,19 @@ impl CodexMessageProcessor {
             developer_instructions,
             personality,
         );
-        let persisted_resume_metadata = self
+        let persisted_resume_context = self
             .load_and_apply_persisted_resume_metadata(
                 &thread_history,
                 &mut request_overrides,
                 &mut typesafe_overrides,
             )
             .await;
+        if let Some(baseline) = persisted_resume_context
+            .as_ref()
+            .and_then(|context| context.baseline.as_ref())
+        {
+            apply_developer_instructions_override_to_history(&mut thread_history, baseline);
+        }
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match self
@@ -4948,6 +4989,9 @@ impl CodexMessageProcessor {
 
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
         let response_history = thread_history.clone();
+        let persisted_resume_metadata = persisted_resume_context
+            .as_ref()
+            .and_then(|context| context.metadata.as_ref());
         let pooled_runtime_scope_required =
             match Self::pooled_runtime_scope_required_for_config(&config, &transport).await {
                 Ok(required) => required,
@@ -5007,6 +5051,33 @@ impl CodexMessageProcessor {
                     request_id.connection_id,
                     "thread",
                 );
+                let config_snapshot = codex_thread
+                    .config_snapshot()
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_resume.config_snapshot",
+                        otel.name = "app_server.thread_resume.config_snapshot",
+                    ))
+                    .await;
+                let effective_config = codex_thread.effective_config().await;
+                let persisted_override_flags = persisted_resume_context
+                    .as_ref()
+                    .and_then(|context| context.baseline.as_ref())
+                    .map(|baseline| ThreadConfigBaselineOverrideFlags {
+                        personality_overrides_rollout: baseline
+                            .snapshot
+                            .personality_overrides_rollout,
+                        developer_instructions_overrides_rollout: baseline
+                            .snapshot
+                            .developer_instructions_overrides_rollout,
+                    })
+                    .unwrap_or_default();
+                persist_thread_config_baseline_from_snapshot(
+                    thread_id,
+                    &config_snapshot,
+                    effective_config.as_ref(),
+                    requested_baseline_overrides.or(persisted_override_flags),
+                )
+                .await;
 
                 let mut thread = match self
                     .load_thread_from_resume_source_or_send_internal(
@@ -5014,7 +5085,7 @@ impl CodexMessageProcessor {
                         codex_thread.as_ref(),
                         &response_history,
                         rollout_path.as_path(),
-                        persisted_resume_metadata.as_ref(),
+                        persisted_resume_metadata,
                         include_turns,
                     )
                     .await
@@ -5040,9 +5111,8 @@ impl CodexMessageProcessor {
                     thread_status,
                     /*has_live_in_progress_turn*/ false,
                 );
-                let permission_profile = thread_response_permission_profile(
-                    codex_thread.config_snapshot().await.permission_profile,
-                );
+                let permission_profile =
+                    thread_response_permission_profile(config_snapshot.permission_profile);
 
                 let response = ThreadResumeResponse {
                     thread,
@@ -5108,18 +5178,35 @@ impl CodexMessageProcessor {
         thread_history: &InitialHistory,
         request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: &mut ConfigOverrides,
-    ) -> Option<ThreadMetadata> {
+    ) -> Option<PersistedResumeContext> {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
-        let state_db_ctx = get_state_db(&self.config).await?;
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
+        let persisted_baseline =
+            load_thread_config_baseline_from_resumed_history(&state_db_ctx, resumed_history).await;
         let persisted_metadata = state_db_ctx
             .get_thread(resumed_history.conversation_id)
             .await
             .ok()
-            .flatten()?;
-        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
-        Some(persisted_metadata)
+            .flatten();
+        if let Some(persisted_baseline) = persisted_baseline.as_ref() {
+            merge_persisted_thread_config_baseline(
+                request_overrides,
+                typesafe_overrides,
+                persisted_baseline,
+            );
+        } else if let Some(persisted_metadata) = persisted_metadata.as_ref() {
+            merge_persisted_resume_metadata(
+                request_overrides,
+                typesafe_overrides,
+                persisted_metadata,
+            );
+        }
+        Some(PersistedResumeContext {
+            metadata: persisted_metadata,
+            baseline: persisted_baseline,
+        })
     }
 
     async fn resume_running_thread(
@@ -5445,6 +5532,58 @@ impl CodexMessageProcessor {
         }
     }
 
+    async fn load_and_apply_source_config_baseline_from_history(
+        &self,
+        source_thread_id: Option<ThreadId>,
+        rollout_path: &Path,
+        source_history: &InitialHistory,
+        request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: &mut ConfigOverrides,
+    ) -> Option<LoadedThreadConfigBaseline> {
+        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
+        let mut persisted_baseline = match source_history {
+            InitialHistory::Resumed(resumed_history) => {
+                load_thread_config_baseline_from_resumed_history(&state_db_ctx, resumed_history)
+                    .await
+            }
+            InitialHistory::Forked(items) => {
+                let source_thread_id = source_thread_id?;
+                load_thread_config_baseline_from_rollout_items(
+                    &state_db_ctx,
+                    source_thread_id,
+                    rollout_path,
+                    items.as_slice(),
+                )
+                .await
+            }
+            InitialHistory::New | InitialHistory::Cleared => None,
+        };
+        if persisted_baseline.is_none()
+            && let Some(source_thread_id) = source_thread_id
+        {
+            persisted_baseline = state_db_ctx
+                .get_thread_config_baseline(source_thread_id)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!("failed to load thread config baseline for {source_thread_id}: {err}");
+                    None
+                })
+                .map(|snapshot| LoadedThreadConfigBaseline {
+                    snapshot,
+                    stale_developer_instructions: Vec::new(),
+                    history_has_base_instructions: false,
+                });
+        }
+        if let Some(persisted_baseline) = persisted_baseline.as_ref() {
+            merge_persisted_thread_config_baseline(
+                request_overrides,
+                typesafe_overrides,
+                persisted_baseline,
+            );
+        }
+        persisted_baseline
+    }
+
     async fn thread_fork(
         &self,
         request_id: ConnectionRequestId,
@@ -5520,6 +5659,18 @@ impl CodexMessageProcessor {
             }
         };
 
+        let mut source_history = match RolloutRecorder::get_rollout_history(&rollout_path).await {
+            Ok(history) => history,
+            Err(err) => {
+                self.send_invalid_request_error(
+                    request_id,
+                    format!("failed to load rollout `{}`: {err}", rollout_path.display()),
+                )
+                .await;
+                return;
+            }
+        };
+
         let history_cwd =
             read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
                 .await;
@@ -5541,7 +5692,7 @@ impl CodexMessageProcessor {
                 WindowsSandboxLevel::Disabled => {}
             }
         }
-        let request_overrides = if cli_overrides.is_empty() {
+        let mut request_overrides = if cli_overrides.is_empty() {
             None
         } else {
             Some(cli_overrides)
@@ -5560,6 +5711,18 @@ impl CodexMessageProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
+        let source_config_baseline = self
+            .load_and_apply_source_config_baseline_from_history(
+                source_thread_id,
+                rollout_path.as_path(),
+                &source_history,
+                &mut request_overrides,
+                &mut typesafe_overrides,
+            )
+            .await;
+        if let Some(baseline) = source_config_baseline.as_ref() {
+            apply_developer_instructions_override_to_history(&mut source_history, baseline);
+        }
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
         let config = match self
             .config_manager
@@ -5603,10 +5766,10 @@ impl CodexMessageProcessor {
             ..
         } = match self
             .thread_manager
-            .fork_thread(
+            .fork_thread_with_history(
                 ForkSnapshot::Interrupted,
                 config,
-                rollout_path.clone(),
+                source_history,
                 persist_extended_history,
                 self.request_trace_context(&request_id).await,
             )
@@ -9801,6 +9964,34 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
+struct PersistedResumeContext {
+    metadata: Option<ThreadMetadata>,
+    baseline: Option<LoadedThreadConfigBaseline>,
+}
+
+struct LoadedThreadConfigBaseline {
+    snapshot: ThreadConfigBaselineSnapshot,
+    stale_developer_instructions: Vec<String>,
+    history_has_base_instructions: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ThreadConfigBaselineOverrideFlags {
+    personality_overrides_rollout: bool,
+    developer_instructions_overrides_rollout: bool,
+}
+
+impl ThreadConfigBaselineOverrideFlags {
+    fn or(self, other: Self) -> Self {
+        Self {
+            personality_overrides_rollout: self.personality_overrides_rollout
+                || other.personality_overrides_rollout,
+            developer_instructions_overrides_rollout: self.developer_instructions_overrides_rollout
+                || other.developer_instructions_overrides_rollout,
+        }
+    }
+}
+
 fn merge_persisted_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
@@ -9817,6 +10008,312 @@ fn merge_persisted_resume_metadata(
             "model_reasoning_effort".to_string(),
             serde_json::Value::String(reasoning_effort.to_string()),
         );
+    }
+}
+
+async fn persist_thread_config_baseline_from_snapshot(
+    thread_id: ThreadId,
+    config_snapshot: &ThreadConfigSnapshot,
+    effective_config: &Config,
+    override_flags: ThreadConfigBaselineOverrideFlags,
+) {
+    let Some(state_db_ctx) = open_state_db_for_direct_thread_lookup(effective_config).await else {
+        return;
+    };
+    let snapshot = ThreadConfigBaselineSnapshot {
+        thread_id,
+        model: config_snapshot.model.clone(),
+        model_provider_id: config_snapshot.model_provider_id.clone(),
+        service_tier: config_snapshot.service_tier,
+        approval_policy: config_snapshot.approval_policy,
+        approvals_reviewer: config_snapshot.approvals_reviewer,
+        sandbox_policy: config_snapshot.sandbox_policy.clone(),
+        cwd: config_snapshot.cwd.clone().to_path_buf(),
+        reasoning_effort: config_snapshot.reasoning_effort,
+        personality: effective_config.personality,
+        personality_overrides_rollout: override_flags.personality_overrides_rollout,
+        base_instructions: effective_config.base_instructions.clone(),
+        developer_instructions: effective_config.developer_instructions.clone(),
+        developer_instructions_overrides_rollout: override_flags
+            .developer_instructions_overrides_rollout,
+    };
+    if let Err(err) = state_db_ctx.upsert_thread_config_baseline(&snapshot).await {
+        warn!("failed to persist thread config baseline for {thread_id}: {err}");
+    }
+}
+
+async fn load_thread_config_baseline_from_resumed_history(
+    state_db_ctx: &StateDbHandle,
+    resumed_history: &ResumedHistory,
+) -> Option<LoadedThreadConfigBaseline> {
+    load_thread_config_baseline_from_rollout_items(
+        state_db_ctx,
+        resumed_history.conversation_id,
+        resumed_history.rollout_path.as_path(),
+        resumed_history.history.as_slice(),
+    )
+    .await
+}
+
+async fn load_thread_config_baseline_from_rollout_items(
+    state_db_ctx: &StateDbHandle,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    rollout_items: &[RolloutItem],
+) -> Option<LoadedThreadConfigBaseline> {
+    let existing_baseline = state_db_ctx
+        .get_thread_config_baseline(thread_id)
+        .await
+        .unwrap_or_else(|err| {
+            warn!("failed to load existing thread config baseline for {thread_id}: {err}");
+            None
+        });
+    if let Some(builder) = codex_rollout::builder_from_items(rollout_items, rollout_path)
+        && let Err(err) = state_db_ctx
+            .backfill_thread_config_baseline_from_rollout_items(&builder, rollout_items)
+            .await
+    {
+        warn!(
+            "failed to update thread config baseline from rollout `{}`: {err}",
+            rollout_path.display()
+        );
+    }
+    let snapshot = state_db_ctx
+        .get_thread_config_baseline(thread_id)
+        .await
+        .unwrap_or_else(|err| {
+            warn!("failed to load thread config baseline for {thread_id}: {err}");
+            None
+        })?;
+    let stale_developer_instructions = stale_developer_instruction_candidates(
+        existing_baseline.as_ref(),
+        rollout_items,
+        snapshot.developer_instructions.as_deref(),
+    );
+    let history_has_base_instructions =
+        rollout_items_have_base_instructions(thread_id, rollout_items);
+    Some(LoadedThreadConfigBaseline {
+        snapshot,
+        stale_developer_instructions,
+        history_has_base_instructions,
+    })
+}
+
+fn rollout_items_have_base_instructions(
+    thread_id: ThreadId,
+    rollout_items: &[RolloutItem],
+) -> bool {
+    rollout_items.iter().any(|item| match item {
+        RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => {
+            meta_line.meta.base_instructions.is_some()
+        }
+        RolloutItem::EventMsg(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::SessionMeta(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::Compacted(_) => false,
+    })
+}
+
+fn stale_developer_instruction_candidates(
+    existing_baseline: Option<&ThreadConfigBaselineSnapshot>,
+    rollout_items: &[RolloutItem],
+    effective_developer_instructions: Option<&str>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let effective_developer_instructions = effective_developer_instructions.unwrap_or_default();
+    if let Some(existing_baseline) = existing_baseline {
+        push_stale_developer_instruction_candidate(
+            &mut candidates,
+            existing_baseline.developer_instructions.as_deref(),
+            effective_developer_instructions,
+        );
+    }
+    for item in rollout_items {
+        if let RolloutItem::TurnContext(turn_context) = item {
+            push_stale_developer_instruction_candidate(
+                &mut candidates,
+                turn_context.developer_instructions.as_deref(),
+                effective_developer_instructions,
+            );
+        }
+    }
+    candidates
+}
+
+fn push_stale_developer_instruction_candidate(
+    candidates: &mut Vec<String>,
+    candidate: Option<&str>,
+    effective_developer_instructions: &str,
+) {
+    let Some(candidate) = candidate.filter(|candidate| !candidate.is_empty()) else {
+        return;
+    };
+    if candidate == effective_developer_instructions {
+        return;
+    }
+    if candidates.iter().any(|existing| existing == candidate) {
+        return;
+    }
+    candidates.push(candidate.to_string());
+}
+
+fn apply_developer_instructions_override_to_history(
+    history: &mut InitialHistory,
+    baseline: &LoadedThreadConfigBaseline,
+) {
+    if baseline.stale_developer_instructions.is_empty() {
+        return;
+    }
+    let replacement = baseline
+        .snapshot
+        .developer_instructions
+        .as_deref()
+        .filter(|instructions| !instructions.is_empty());
+    let Some(items) = rollout_items_mut(history) else {
+        return;
+    };
+    rewrite_developer_instruction_sections(
+        items,
+        replacement,
+        baseline.stale_developer_instructions.as_slice(),
+    );
+}
+
+fn rollout_items_mut(history: &mut InitialHistory) -> Option<&mut Vec<RolloutItem>> {
+    match history {
+        InitialHistory::New | InitialHistory::Cleared => None,
+        InitialHistory::Resumed(resumed_history) => Some(&mut resumed_history.history),
+        InitialHistory::Forked(items) => Some(items),
+    }
+}
+
+fn rewrite_developer_instruction_sections(
+    items: &mut Vec<RolloutItem>,
+    replacement: Option<&str>,
+    stale_developer_instructions: &[String],
+) {
+    let mut inserted_replacement = false;
+    items.retain_mut(|item| match item {
+        RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+            if role == "developer" =>
+        {
+            content.retain_mut(|content_item| match content_item {
+                ContentItem::InputText { text }
+                    if stale_developer_instructions
+                        .iter()
+                        .any(|stale| stale == text) =>
+                {
+                    if inserted_replacement {
+                        return false;
+                    }
+                    let Some(replacement) = replacement else {
+                        return false;
+                    };
+                    *text = replacement.to_string();
+                    inserted_replacement = true;
+                    true
+                }
+                ContentItem::InputText { .. }
+                | ContentItem::InputImage { .. }
+                | ContentItem::OutputText { .. } => true,
+            });
+            !content.is_empty()
+        }
+        RolloutItem::EventMsg(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::SessionMeta(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::Compacted(_) => true,
+    });
+}
+
+fn merge_persisted_thread_config_baseline(
+    request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+    typesafe_overrides: &mut ConfigOverrides,
+    persisted_baseline: &LoadedThreadConfigBaseline,
+) {
+    let snapshot = &persisted_baseline.snapshot;
+    if !has_model_resume_override(request_overrides.as_ref(), typesafe_overrides) {
+        typesafe_overrides.model = Some(snapshot.model.clone());
+        typesafe_overrides.model_provider = Some(snapshot.model_provider_id.clone());
+        if let Some(reasoning_effort) = snapshot.reasoning_effort {
+            request_overrides.get_or_insert_with(HashMap::new).insert(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String(reasoning_effort.to_string()),
+            );
+        }
+    }
+
+    if typesafe_overrides.service_tier.is_none()
+        && !has_request_override(request_overrides.as_ref(), "service_tier")
+    {
+        typesafe_overrides.service_tier = Some(snapshot.service_tier);
+    }
+    if typesafe_overrides.cwd.is_none() && !has_request_override(request_overrides.as_ref(), "cwd")
+    {
+        typesafe_overrides.cwd = Some(snapshot.cwd.clone());
+    }
+    if typesafe_overrides.approval_policy.is_none()
+        && !has_request_override(request_overrides.as_ref(), "approval_policy")
+    {
+        typesafe_overrides.approval_policy = Some(snapshot.approval_policy);
+    }
+    if typesafe_overrides.approvals_reviewer.is_none()
+        && !has_request_override(request_overrides.as_ref(), "approvals_reviewer")
+    {
+        typesafe_overrides.approvals_reviewer = Some(snapshot.approvals_reviewer);
+    }
+    if typesafe_overrides.sandbox_mode.is_none()
+        && typesafe_overrides.permission_profile.is_none()
+        && !has_request_override(request_overrides.as_ref(), "sandbox_mode")
+        && !has_request_override(request_overrides.as_ref(), "permission_profile")
+    {
+        typesafe_overrides.sandbox_mode = Some(sandbox_mode_from_policy(&snapshot.sandbox_policy));
+    }
+    if typesafe_overrides.base_instructions.is_none()
+        && !has_request_override(request_overrides.as_ref(), "base_instructions")
+        && !has_request_override(request_overrides.as_ref(), "model_instructions_file")
+        && (snapshot.base_instructions.is_some()
+            || !persisted_baseline.history_has_base_instructions)
+    {
+        typesafe_overrides.base_instructions =
+            Some(snapshot.base_instructions.clone().unwrap_or_default());
+    }
+    if typesafe_overrides.developer_instructions.is_none()
+        && !has_request_override(request_overrides.as_ref(), "developer_instructions")
+    {
+        typesafe_overrides.developer_instructions =
+            Some(snapshot.developer_instructions.clone().unwrap_or_default());
+    }
+    if typesafe_overrides.personality.is_none()
+        && !has_request_override(request_overrides.as_ref(), "personality")
+    {
+        typesafe_overrides.personality = snapshot.personality;
+    }
+}
+
+fn has_request_override(
+    request_overrides: Option<&HashMap<String, serde_json::Value>>,
+    key: &str,
+) -> bool {
+    request_overrides.is_some_and(|overrides| overrides.contains_key(key))
+}
+
+fn sandbox_mode_from_policy(
+    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
+) -> codex_protocol::config_types::SandboxMode {
+    match sandbox_policy {
+        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. } => {
+            codex_protocol::config_types::SandboxMode::ReadOnly
+        }
+        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
+            codex_protocol::config_types::SandboxMode::WorkspaceWrite
+        }
+        codex_protocol::protocol::SandboxPolicy::DangerFullAccess
+        | codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => {
+            codex_protocol::config_types::SandboxMode::DangerFullAccess
+        }
     }
 }
 
@@ -10637,6 +11134,20 @@ async fn forked_from_id_from_rollout(path: &Path) -> Option<String> {
 }
 
 fn merge_mutable_thread_metadata(thread: &mut Thread, persisted_thread: Thread) {
+    if thread.id != persisted_thread.id {
+        let preview = std::mem::take(&mut thread.preview);
+        let forked_from_id = thread.forked_from_id.take();
+        let status = thread.status.clone();
+        let path = thread.path.take();
+        let turns = std::mem::take(&mut thread.turns);
+        *thread = persisted_thread;
+        thread.preview = preview;
+        thread.forked_from_id = forked_from_id;
+        thread.status = status;
+        thread.path = path;
+        thread.turns = turns;
+        return;
+    }
     thread.git_info = persisted_thread.git_info;
 }
 

@@ -244,12 +244,18 @@ fn restore_override_only_fields_from_existing(
     snapshot: &mut ThreadConfigBaselineSnapshot,
     existing: &ThreadConfigBaselineSnapshot,
 ) {
-    snapshot.personality = existing.personality;
-    snapshot.personality_overrides_rollout = existing.personality_overrides_rollout;
+    if existing.personality_overrides_rollout || snapshot.personality.is_none() {
+        snapshot.personality = existing.personality;
+        snapshot.personality_overrides_rollout = existing.personality_overrides_rollout;
+    }
     snapshot.base_instructions = existing.base_instructions.clone();
-    snapshot.developer_instructions = existing.developer_instructions.clone();
-    snapshot.developer_instructions_overrides_rollout =
-        existing.developer_instructions_overrides_rollout;
+    if existing.developer_instructions_overrides_rollout
+        || snapshot.developer_instructions.is_none()
+    {
+        snapshot.developer_instructions = existing.developer_instructions.clone();
+        snapshot.developer_instructions_overrides_rollout =
+            existing.developer_instructions_overrides_rollout;
+    }
 }
 
 impl StateRuntime {
@@ -345,11 +351,27 @@ WHERE thread_id = ?
     sandbox_policy = excluded.sandbox_policy,
     cwd = excluded.cwd,
     reasoning_effort = excluded.reasoning_effort,
-    personality = thread_config_baselines.personality,
-    personality_overrides_rollout = thread_config_baselines.personality_overrides_rollout,
+    personality = CASE
+        WHEN thread_config_baselines.personality_overrides_rollout OR excluded.personality IS NULL
+        THEN thread_config_baselines.personality
+        ELSE excluded.personality
+    END,
+    personality_overrides_rollout = CASE
+        WHEN thread_config_baselines.personality_overrides_rollout OR excluded.personality IS NULL
+        THEN thread_config_baselines.personality_overrides_rollout
+        ELSE excluded.personality_overrides_rollout
+    END,
     base_instructions = thread_config_baselines.base_instructions,
-    developer_instructions = thread_config_baselines.developer_instructions,
-    developer_instructions_overrides_rollout = thread_config_baselines.developer_instructions_overrides_rollout
+    developer_instructions = CASE
+        WHEN thread_config_baselines.developer_instructions_overrides_rollout OR excluded.developer_instructions IS NULL
+        THEN thread_config_baselines.developer_instructions
+        ELSE excluded.developer_instructions
+    END,
+    developer_instructions_overrides_rollout = CASE
+        WHEN thread_config_baselines.developer_instructions_overrides_rollout OR excluded.developer_instructions IS NULL
+        THEN thread_config_baselines.developer_instructions_overrides_rollout
+        ELSE excluded.developer_instructions_overrides_rollout
+    END
                 "#
             }
         };
@@ -524,6 +546,7 @@ mod tests {
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
                 cwd: PathBuf::from("/tmp/session-configured-cwd")
                     .try_into()
                     .expect("session configured cwd is absolute"),
@@ -543,6 +566,7 @@ mod tests {
                 approval_policy: AskForApproval::UnlessTrusted,
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5-turn-context".to_string(),
@@ -658,6 +682,7 @@ mod tests {
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
                 cwd: PathBuf::from("/tmp/session-configured-cwd")
                     .try_into()
                     .expect("session configured cwd is absolute"),
@@ -677,6 +702,7 @@ mod tests {
                 approval_policy: AskForApproval::UnlessTrusted,
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5-turn-context".to_string(),
@@ -767,6 +793,48 @@ mod tests {
         expected.developer_instructions = live_snapshot.developer_instructions;
         expected.developer_instructions_overrides_rollout =
             live_snapshot.developer_instructions_overrides_rollout;
+        assert_eq!(
+            runtime.get_thread_config_baseline(thread_id).await?,
+            Some(expected)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_backfill_uses_rollout_fields_when_live_row_is_not_marked_override()
+    -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string()).await?;
+        let thread_id = ThreadId::from_string("f3d74c43-1fa7-48b8-b1c4-ec903627b94b")?;
+        let metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+        runtime.upsert_thread(&metadata).await?;
+
+        let mut live_snapshot = test_snapshot(thread_id);
+        live_snapshot.model = "live-model".to_string();
+        live_snapshot.personality = Some(Personality::Friendly);
+        live_snapshot.personality_overrides_rollout = false;
+        live_snapshot.base_instructions = Some("live base instructions".to_string());
+        live_snapshot.developer_instructions = Some("live developer instructions".to_string());
+        live_snapshot.developer_instructions_overrides_rollout = false;
+        runtime
+            .upsert_thread_config_baseline(&live_snapshot)
+            .await?;
+
+        let mut historical_snapshot = test_snapshot(thread_id);
+        historical_snapshot.model = "historical-model".to_string();
+        historical_snapshot.personality = Some(Personality::Pragmatic);
+        historical_snapshot.personality_overrides_rollout = false;
+        historical_snapshot.base_instructions = Some("historical base instructions".to_string());
+        historical_snapshot.developer_instructions =
+            Some("historical developer instructions".to_string());
+        historical_snapshot.developer_instructions_overrides_rollout = false;
+
+        runtime
+            .upsert_thread_config_baseline_preserving_override_only_fields(&historical_snapshot)
+            .await?;
+
+        let mut expected = historical_snapshot;
+        expected.base_instructions = live_snapshot.base_instructions;
         assert_eq!(
             runtime.get_thread_config_baseline(thread_id).await?,
             Some(expected)

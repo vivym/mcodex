@@ -21,6 +21,9 @@ const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective so
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
+    if config.personality_enabled && model.model_messages.is_none() {
+        model.model_messages = local_personality_messages_for_slug(&model.slug);
+    }
     if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries
         && supports_reasoning_summaries
     {
@@ -54,7 +57,13 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
 
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
-        model.model_messages = None;
+        if config.personality_enabled {
+            if let Some(model_messages) = &mut model.model_messages {
+                model_messages.instructions_template = None;
+            }
+        } else {
+            model.model_messages = None;
+        }
     } else if !config.personality_enabled {
         model.model_messages = None;
     }

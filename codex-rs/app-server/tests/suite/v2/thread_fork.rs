@@ -1426,7 +1426,7 @@ async fn thread_fork_by_path_prefers_latest_turn_context_over_session_configured
         ..
     } = to_response::<ThreadForkResponse>(fork_resp)?;
     assert_eq!(forked.forked_from_id, Some(source_thread_id));
-    assert_eq!(model, "gpt-5-turn-context-fork");
+    assert_eq!(model, "gpt-5.2-codex-turn-context-fork");
     assert_eq!(model_provider, "source_provider");
     assert_eq!(service_tier, Some(ServiceTier::Fast));
     assert_eq!(
@@ -2285,7 +2285,7 @@ fn assert_zero_turn_start_override_request(request: &responses::ResponsesRequest
 
 fn assert_turn_context_override_request(request: &responses::ResponsesRequest) {
     let body = request.body_json();
-    assert_eq!(body["model"], json!("gpt-5-turn-context-fork"));
+    assert_eq!(body["model"], json!("gpt-5.2-codex-turn-context-fork"));
     assert_eq!(body["service_tier"], json!("priority"));
     assert_eq!(body["reasoning"]["effort"], json!("low"));
 
@@ -2381,7 +2381,7 @@ fn rewrite_latest_turn_context_for_fork_override(rollout_path: &Path) -> Result<
 }
 
 fn apply_fork_turn_context_override(turn_context: &mut TurnContextItem) {
-    turn_context.model = "gpt-5-turn-context-fork".to_string();
+    turn_context.model = "gpt-5.2-codex-turn-context-fork".to_string();
     turn_context.cwd = PathBuf::from("/tmp/turn-context-fork");
     turn_context.approval_policy = RolloutAskForApproval::Never;
     turn_context.sandbox_policy = RolloutSandboxPolicy::new_read_only_policy();

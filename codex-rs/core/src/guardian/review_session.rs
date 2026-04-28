@@ -827,7 +827,9 @@ async fn wait_for_guardian_review(
             _ = async {
                 wait_for_any_cancel(external_cancel, internal_cancel).await;
             } => {
-                let keep_review_session = interrupt_and_drain_turn(&review_session.codex).await.is_ok();
+                let keep_review_session =
+                    !internal_cancel.is_some_and(CancellationToken::is_cancelled)
+                        && interrupt_and_drain_turn(&review_session.codex).await.is_ok();
                 return (GuardianReviewSessionOutcome::Aborted, keep_review_session, false);
             }
             event = review_session.codex.next_event() => {
@@ -863,7 +865,7 @@ async fn wait_for_guardian_review(
                             last_error_message = Some(error.message);
                         }
                         EventMsg::TurnAborted(_) => {
-                            return (GuardianReviewSessionOutcome::Aborted, true, false);
+                            return (GuardianReviewSessionOutcome::Aborted, false, false);
                         }
                         _ => {}
                     },
@@ -898,6 +900,7 @@ pub(crate) fn build_guardian_review_session_config(
             .unwrap_or_else(guardian_policy_prompt),
     );
     guardian_config.developer_instructions = None;
+    guardian_config.personality = None;
     guardian_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
     guardian_config.permissions.sandbox_policy =
         Constrained::allow_only(SandboxPolicy::new_read_only_policy());

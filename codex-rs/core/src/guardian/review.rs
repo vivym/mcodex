@@ -55,6 +55,7 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
     "Do not assume the action is unsafe based on the timeout alone. ",
     "You may retry once, or ask the user for guidance or explicit approval.",
 );
+const GUARDIAN_REVIEW_THREAD_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -581,25 +582,31 @@ pub(crate) fn spawn_approval_request_review(
     cancel_token: CancellationToken,
 ) -> oneshot::Receiver<ReviewDecision> {
     let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = tx.send(ReviewDecision::Denied);
-            return;
-        };
-        let decision = runtime.block_on(review_approval_request_with_cancel(
-            &session,
-            &turn,
-            review_id,
-            request,
-            retry_reason,
-            approval_request_source,
-            cancel_token,
-        ));
-        let _ = tx.send(decision);
-    });
+    if let Err(err) = std::thread::Builder::new()
+        .name("guardian-approval-review".to_string())
+        .stack_size(GUARDIAN_REVIEW_THREAD_STACK_SIZE_BYTES)
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = tx.send(ReviewDecision::Denied);
+                return;
+            };
+            let decision = runtime.block_on(Box::pin(review_approval_request_with_cancel(
+                &session,
+                &turn,
+                review_id,
+                request,
+                retry_reason,
+                approval_request_source,
+                cancel_token,
+            )));
+            let _ = tx.send(decision);
+        })
+    {
+        tracing::warn!("failed to spawn guardian approval review thread: {err}");
+    }
     rx
 }
 
@@ -704,7 +711,7 @@ pub(super) async fn run_guardian_review_session(
                 model: guardian_model,
                 reasoning_effort: guardian_reasoning_effort,
                 reasoning_summary: turn.reasoning_summary,
-                personality: turn.personality,
+                personality: None,
                 external_cancel,
             }),
     )

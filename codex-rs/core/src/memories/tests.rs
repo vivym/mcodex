@@ -1113,8 +1113,28 @@ mod phase2 {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_uses_unique_synthetic_background_tree_per_invocation() {
+    #[test]
+    fn dispatch_uses_unique_synthetic_background_tree_per_invocation() {
+        const PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+        std::thread::Builder::new()
+            .name("memory-phase2-background-tree".to_string())
+            .stack_size(PRODUCTION_TOKIO_WORKER_STACK_SIZE_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build memory phase2 test runtime")
+                    .block_on(Box::pin(
+                        dispatch_uses_unique_synthetic_background_tree_per_invocation_inner(),
+                    ))
+            })
+            .expect("spawn memory phase2 test thread")
+            .join()
+            .expect("memory phase2 test thread should not panic");
+    }
+
+    async fn dispatch_uses_unique_synthetic_background_tree_per_invocation_inner() {
         let first_harness = DispatchHarness::new_with_runtime_lease_authority(
             crate::runtime_lease::RuntimeLeaseAuthority::for_test_accepting("acct-memory-a", 31),
         )

@@ -400,6 +400,20 @@ async fn apply_patch_after_request_permissions(strict_auto_review: bool) -> Resu
             ),
             ev_completed(&format!("{response_prefix}-guardian")),
         ]));
+        sse_sequence.push(sse(vec![
+            ev_response_created(&format!("{response_prefix}-retry-guardian")),
+            ev_assistant_message(
+                "msg-strict-request-permissions-patch-retry-guardian",
+                &serde_json::json!({
+                    "risk_level": "low",
+                    "user_authorization": "high",
+                    "outcome": "allow",
+                    "rationale": "The retry applies the same patch within the strict turn grant.",
+                })
+                .to_string(),
+            ),
+            ev_completed(&format!("{response_prefix}-retry-guardian")),
+        ]));
     }
     sse_sequence.push(sse(vec![
         ev_response_created(&format!("{response_prefix}-3")),

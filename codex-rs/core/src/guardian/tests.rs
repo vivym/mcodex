@@ -31,6 +31,7 @@ use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
@@ -2625,6 +2626,7 @@ async fn guardian_review_session_config_clears_parent_developer_instructions() {
     let mut parent_config = test_config().await;
     parent_config.developer_instructions =
         Some("parent or managed config should not replace guardian policy".to_string());
+    parent_config.personality = Some(Personality::Pragmatic);
 
     let guardian_config = build_guardian_review_session_config_for_test(
         &parent_config,
@@ -2635,6 +2637,7 @@ async fn guardian_review_session_config_clears_parent_developer_instructions() {
     .expect("guardian config");
 
     assert_eq!(guardian_config.developer_instructions, None);
+    assert_eq!(guardian_config.personality, None);
     assert_eq!(
         guardian_config.base_instructions,
         Some(guardian_policy_prompt())

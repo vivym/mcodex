@@ -141,7 +141,13 @@ impl McpProcess {
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        Self::new_with_env(codex_home, env_overrides).await
+        Self::new_with_env_and_args_inner(
+            codex_home,
+            env_overrides,
+            &[],
+            /*mark_product_identity_migration*/ false,
+        )
+        .await
     }
 
     async fn new_with_env_and_args(
@@ -149,9 +155,28 @@ impl McpProcess {
         env_overrides: &[(&str, Option<&str>)],
         args: &[&str],
     ) -> anyhow::Result<Self> {
+        Self::new_with_env_and_args_inner(
+            codex_home,
+            env_overrides,
+            args,
+            /*mark_product_identity_migration*/ true,
+        )
+        .await
+    }
+
+    async fn new_with_env_and_args_inner(
+        codex_home: &Path,
+        env_overrides: &[(&str, Option<&str>)],
+        args: &[&str],
+        mark_product_identity_migration: bool,
+    ) -> anyhow::Result<Self> {
         let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
             .context("should find binary for codex-app-server")?;
         let mut cmd = Command::new(program);
+        if mark_product_identity_migration {
+            crate::mark_product_identity_migration_complete(codex_home)
+                .context("should mark product identity migration complete for app-server tests")?;
+        }
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());

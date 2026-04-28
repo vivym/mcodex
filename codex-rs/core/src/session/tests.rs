@@ -979,6 +979,9 @@ async fn user_shell_commands_do_not_inherit_managed_network_proxy() -> anyhow::R
     let (session, rx) = make_session_with_config_and_rx(move |config| {
         config.permissions.sandbox_policy = codex_config::Constrained::allow_any(sandbox_policy);
         config.permissions.network = Some(network_spec);
+        config.permissions.shell_environment_policy.exclude.push(
+            codex_config::types::EnvironmentVariablePattern::new_case_insensitive("HTTP_PROXY"),
+        );
     })
     .await?;
 

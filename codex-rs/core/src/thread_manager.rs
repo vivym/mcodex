@@ -849,8 +849,30 @@ impl ThreadManager {
     where
         S: Into<ForkSnapshot>,
     {
-        let snapshot = snapshot.into();
         let history = RolloutRecorder::get_rollout_history(&path).await?;
+        self.fork_thread_with_history(
+            snapshot,
+            config,
+            history,
+            persist_extended_history,
+            parent_trace,
+        )
+        .await
+    }
+
+    /// Fork an existing thread from already-loaded rollout history.
+    pub async fn fork_thread_with_history<S>(
+        &self,
+        snapshot: S,
+        config: Config,
+        history: InitialHistory,
+        persist_extended_history: bool,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread>
+    where
+        S: Into<ForkSnapshot>,
+    {
+        let snapshot = snapshot.into();
         let source_thread_id = match &history {
             InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
             InitialHistory::Forked(_) => history.forked_from_id(),

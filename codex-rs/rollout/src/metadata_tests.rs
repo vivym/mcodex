@@ -397,6 +397,7 @@ async fn backfill_sessions_ignores_dynamic_tools_from_mismatched_session_meta() 
     std::fs::create_dir_all(sessions_dir.as_path()).expect("create sessions dir");
     let rollout_path = sessions_dir.join(format!("rollout-2026-01-27T12-34-56-{child_uuid}.jsonl"));
     let dynamic_tools = vec![DynamicToolSpec {
+        namespace: None,
         name: "lookup_ticket".to_string(),
         description: "Fetch a ticket".to_string(),
         input_schema: serde_json::json!({
@@ -659,7 +660,10 @@ async fn backfill_sessions_persists_config_baseline_for_preexisting_thread() {
                 approval_policy: AskForApproval::OnRequest,
                 approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
-                cwd: PathBuf::from("/tmp/session-configured-cwd"),
+                permission_profile: None,
+                cwd: PathBuf::from("/tmp/session-configured-cwd")
+                    .try_into()
+                    .expect("session configured cwd is absolute"),
                 reasoning_effort: Some(ReasoningEffort::High),
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -679,7 +683,9 @@ async fn backfill_sessions_persists_config_baseline_for_preexisting_thread() {
                 approval_policy: AskForApproval::UnlessTrusted,
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5-turn-context".to_string(),
                 service_tier: Some(ServiceTier::Fast),
                 personality: Some(Personality::Pragmatic),
@@ -793,7 +799,10 @@ async fn backfill_sessions_preserves_newer_persisted_override_fields_for_preexis
                 approval_policy: AskForApproval::OnRequest,
                 approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
-                cwd: PathBuf::from("/tmp/session-configured-cwd"),
+                permission_profile: None,
+                cwd: PathBuf::from("/tmp/session-configured-cwd")
+                    .try_into()
+                    .expect("session configured cwd is absolute"),
                 reasoning_effort: Some(ReasoningEffort::High),
                 history_log_id: 0,
                 history_entry_count: 0,
@@ -813,7 +822,9 @@ async fn backfill_sessions_preserves_newer_persisted_override_fields_for_preexis
                 approval_policy: AskForApproval::UnlessTrusted,
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5-turn-context".to_string(),
                 service_tier: Some(ServiceTier::Fast),
                 personality: Some(Personality::Pragmatic),

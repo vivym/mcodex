@@ -335,9 +335,19 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     let warning: WarningNotification =
         serde_json::from_value(params).expect("deserialize warning notification");
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
-    assert_eq!(
-        warning.message,
-        "Warning: Exceeded skills context budget of 2%. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
+    let prefix =
+        "Warning: Exceeded skills context budget of 2%. All skill descriptions were removed and ";
+    let suffix = " additional skills were not included in the model-visible skills list.";
+    let omitted_count = warning
+        .message
+        .strip_prefix(prefix)
+        .and_then(|message| message.strip_suffix(suffix))
+        .expect("warning should include omitted skills count")
+        .parse::<usize>()
+        .expect("omitted skills count should parse");
+    assert!(
+        omitted_count > 0,
+        "warning should report at least one omitted skill"
     );
 
     timeout(

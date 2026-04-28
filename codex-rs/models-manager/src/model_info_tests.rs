@@ -1,5 +1,6 @@
 use super::*;
 use crate::ModelsManagerConfig;
+use codex_protocol::config_types::Personality;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -71,4 +72,65 @@ fn model_context_window_uses_model_value_without_override() {
     let updated = with_config_overrides(model.clone(), &config);
 
     assert_eq!(updated, model);
+}
+
+#[test]
+fn base_instructions_override_keeps_personality_messages_when_enabled() {
+    let model = model_info_from_slug("gpt-5.2-codex");
+    let config = ModelsManagerConfig {
+        base_instructions: Some("override instructions".to_string()),
+        personality_enabled: true,
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(updated.base_instructions, "override instructions");
+    assert_eq!(
+        updated.get_model_instructions(Some(Personality::Friendly)),
+        "override instructions"
+    );
+    assert_eq!(
+        updated
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.get_personality_message(Some(Personality::Friendly))),
+        Some(LOCAL_FRIENDLY_TEMPLATE.to_string())
+    );
+}
+
+#[test]
+fn known_local_personality_slug_restores_messages_when_remote_match_has_none() {
+    let mut model = model_info_from_slug("gpt-5.2");
+    model.slug = "gpt-5.2-codex".to_string();
+    model.model_messages = None;
+    let config = ModelsManagerConfig {
+        personality_enabled: true,
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(
+        updated
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.get_personality_message(Some(Personality::Friendly))),
+        Some(LOCAL_FRIENDLY_TEMPLATE.to_string())
+    );
+}
+
+#[test]
+fn base_instructions_override_drops_personality_messages_when_disabled() {
+    let model = model_info_from_slug("gpt-5.2-codex");
+    let config = ModelsManagerConfig {
+        base_instructions: Some("override instructions".to_string()),
+        personality_enabled: false,
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(updated.base_instructions, "override instructions");
+    assert_eq!(updated.model_messages, None);
 }
