@@ -430,7 +430,7 @@
 
   Recorded on April 18, 2026:
 
-  - `cargo build --release --bin mcodex` passed while reusing local artifacts via `LK_CUSTOM_WEBRTC=/Users/viv/Downloads/mac-arm64-release` and `RUSTY_V8_ARCHIVE=/Users/viv/Downloads/librusty_v8_release_aarch64-apple-darwin.a.gz`
+  - `cargo build --release --bin mcodex` passed while reusing local artifacts via `LK_CUSTOM_WEBRTC=/Users/viv/.cache/mcodex-webrtc/mac-arm64-release` and `RUSTY_V8_ARCHIVE=/Users/viv/Downloads/librusty_v8_release_aarch64-apple-darwin.a.gz`
   - `./target/release/mcodex --version` printed `mcodex 0.0.0`
   - `./target/release/mcodex --help` printed `mcodex CLI` and `mcodex`-named public commands/help text
 
