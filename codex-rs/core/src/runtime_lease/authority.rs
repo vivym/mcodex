@@ -92,6 +92,10 @@ impl Drop for ManagerLeaseHeartbeatGuard {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "runtime-lease heartbeat renews the active lease through the owned manager guard"
+)]
 fn start_manager_heartbeat(
     manager: Arc<Mutex<crate::state::AccountPoolManager>>,
     heartbeat_interval: std::time::Duration,
@@ -234,6 +238,10 @@ impl RuntimeLeaseAuthority {
         self.inner.changed.notify_waiters();
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime-lease reports are applied through the owned manager guard"
+    )]
     pub(crate) async fn report_rate_limits(
         &self,
         snapshot: &LeaseSnapshot,
@@ -262,6 +270,10 @@ impl RuntimeLeaseAuthority {
         Ok(())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime-lease reports are applied through the owned manager guard"
+    )]
     pub(crate) async fn report_usage_limit_reached(
         &self,
         snapshot: &LeaseSnapshot,
@@ -288,6 +300,10 @@ impl RuntimeLeaseAuthority {
         Ok(())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime-lease terminal unauthorized reports are applied through the owned manager guard"
+    )]
     pub(crate) async fn report_terminal_unauthorized(
         &self,
         snapshot: &LeaseSnapshot,
@@ -340,6 +356,10 @@ impl RuntimeLeaseAuthority {
         report_result.map(|_| ())
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime-lease snapshots are produced by the owned manager guard"
+    )]
     pub(crate) async fn runtime_snapshot(&self) -> AccountLeaseRuntimeSnapshot {
         let manager = {
             let state = self.inner.state.lock().await;
@@ -360,6 +380,10 @@ impl RuntimeLeaseAuthority {
         snapshot_seed.snapshot().await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "runtime-lease shutdown releases through the owned manager guard"
+    )]
     pub(crate) async fn release_for_shutdown(&self) -> anyhow::Result<()> {
         let manager = {
             let mut state = self.inner.state.lock().await;

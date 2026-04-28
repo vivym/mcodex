@@ -145,6 +145,10 @@ async fn run_remote_compact_task_inner(
     Ok(())
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "remote compaction reports pooled-account usage through the session-owned manager guard"
+)]
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,

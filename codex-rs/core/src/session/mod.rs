@@ -394,6 +394,10 @@ impl Drop for AccountLeaseHeartbeatGuard {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "account-pool heartbeat renews the active lease through the session-owned manager guard"
+)]
 pub(crate) async fn start_account_pool_lease_heartbeat(
     sess: &Arc<Session>,
     lease_selected_for_turn: bool,
@@ -870,6 +874,10 @@ impl Codex {
         self.session.state_db()
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "account-pool snapshots are produced by the session-owned manager guard"
+    )]
     pub(crate) async fn account_lease_snapshot(&self) -> Option<AccountLeaseRuntimeSnapshot> {
         if let Some(account_pool_manager) = self.session.services.account_pool_manager.as_ref() {
             let snapshot_seed = {
@@ -2918,6 +2926,10 @@ impl Session {
         self.send_token_count_event(turn_context).await;
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "rate-limit snapshots are reported through the session-owned account-pool manager guard"
+    )]
     pub(crate) async fn update_rate_limits(
         &self,
         turn_context: &TurnContext,

@@ -186,6 +186,7 @@ impl AgentControl {
         Ok(spawned_agent.thread_id)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn spawn_agent_from_parent_thread(
         &self,
         parent_thread_id: ThreadId,

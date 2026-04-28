@@ -137,6 +137,10 @@ impl SessionServices {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "local account-pool shutdown releases through the service-owned manager guard"
+    )]
     pub(crate) async fn release_runtime_lease_session_for_shutdown(
         &self,
         session_id: &str,

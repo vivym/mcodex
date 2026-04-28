@@ -76,6 +76,7 @@ const MCP_CALL_DURATION_METRIC: &str = "codex.mcp.call.duration_ms";
 
 /// Handles the specified tool call dispatches the appropriate
 /// `McpToolCallBegin` and `McpToolCallEnd` events to the `Session`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_tool_call(
     sess: Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -278,6 +279,7 @@ pub(crate) struct HandledMcpToolCall {
     pub(crate) tool_input: JsonValue,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_approved_mcp_tool_call(
     sess: &Session,
     turn_context: &TurnContext,

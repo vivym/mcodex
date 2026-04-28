@@ -262,6 +262,7 @@ impl ContextManager {
         self.replace(snapshot[..cut_idx].to_vec());
     }
 
+    #[allow(dead_code)]
     pub(crate) fn strip_pre_turn_context_updates(&mut self) -> bool {
         let snapshot = self.items.clone();
         let user_positions = user_message_positions(&snapshot);

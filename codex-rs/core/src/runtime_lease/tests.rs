@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_invalid_type)]
+
 use super::CollaborationTreeBinding;
 use super::CollaborationTreeBindingHandle;
 use super::CollaborationTreeId;

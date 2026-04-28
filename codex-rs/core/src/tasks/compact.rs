@@ -23,6 +23,10 @@ impl SessionTask for CompactTask {
         "session_task.compact"
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "compact tasks prepare pooled-account leases through the session-owned manager guard"
+    )]
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,

@@ -388,6 +388,10 @@ impl RuntimeLeaseHost {
         .await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "startup rollback must keep host lifecycle state consistent while releasing the authority"
+    )]
     async fn rollback_startup_reservation(&self, reservation_id: &str) -> anyhow::Result<()> {
         if !self.is_pooled() {
             return Ok(());
@@ -437,6 +441,10 @@ impl RuntimeLeaseHost {
         }
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "session detach must keep host lifecycle state consistent while releasing the authority"
+    )]
     pub(crate) async fn detach_session(&self, session_id: &str) -> anyhow::Result<()> {
         if !self.is_pooled() {
             return Ok(());

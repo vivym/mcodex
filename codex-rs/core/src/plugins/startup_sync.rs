@@ -15,6 +15,7 @@ use tracing::warn;
 const STARTUP_REMOTE_PLUGIN_SYNC_MARKER_FILE: &str = ".tmp/app-server-remote-plugin-sync-v1";
 const STARTUP_REMOTE_PLUGIN_SYNC_PREREQUISITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[allow(dead_code)]
 pub(crate) fn start_startup_remote_plugin_sync_once(
     manager: Arc<PluginsManager>,
     codex_home: PathBuf,

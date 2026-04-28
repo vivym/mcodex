@@ -313,6 +313,7 @@ impl AuthProvider for OpenAiFileUploadAuth {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_uploaded_local_argument_value(
     _sess: &Session,
     turn_context: &TurnContext,
