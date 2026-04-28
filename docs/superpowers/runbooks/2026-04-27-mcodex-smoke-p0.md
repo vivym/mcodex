@@ -519,6 +519,8 @@ Optional local proxy and artifact overrides:
 ```bash
 export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"
 export LK_CUSTOM_WEBRTC="${LK_CUSTOM_WEBRTC:-/Users/viv/.cache/mcodex-webrtc/mac-arm64-release}"
+# Set only when Cargo needs a local rusty_v8 archive:
+# export RUSTY_V8_ARCHIVE="/path/to/librusty_v8_release_aarch64-apple-darwin.a.gz"
 ```
 
 Smoke scripts inherit these variables from the caller and do not set them.
