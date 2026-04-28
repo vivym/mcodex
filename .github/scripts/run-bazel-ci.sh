@@ -388,6 +388,7 @@ else
     "${bazel_args[@]}"
     --remote_cache=
     --remote_executor=
+    --experimental_remote_downloader=
   )
   if (( ${#post_config_bazel_args[@]} > 0 )); then
     bazel_run_args+=("${post_config_bazel_args[@]}")

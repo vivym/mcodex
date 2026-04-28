@@ -25,6 +25,5 @@ serde_json = { workspace = true }
 [dev-dependencies]
 base64 = { workspace = true }
 pretty_assertions = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

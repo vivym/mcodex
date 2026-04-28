@@ -247,6 +247,13 @@ impl App {
                 (session, turns, false)
             }
         };
+        if turns.is_empty() {
+            // A successfully materialized zero-turn thread is still not useful for a local replay
+            // channel; attaching it would show an empty transcript and block a later real attach.
+            return Err(color_eyre::eyre::eyre!(
+                "Agent thread {thread_id} is not yet available for replay or live attach."
+            ));
+        }
         let channel = self.ensure_thread_channel(thread_id);
         let mut store = channel.store.lock().await;
         store.set_session(session, turns);

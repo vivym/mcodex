@@ -89,6 +89,7 @@ trust_level = "trusted"
         .arg(&repo_root)
         .arg("seed session for resume")
         .env("CODEX_HOME", codex_home.path())
+        .env("MCODEX_HOME", codex_home.path())
         .env("OPENAI_API_KEY", "dummy")
         .env("CODEX_RS_SSE_FIXTURE", fixture_path)
         .output()
@@ -102,6 +103,10 @@ trust_level = "trusted"
     let mut env = HashMap::new();
     env.insert(
         "CODEX_HOME".to_string(),
+        codex_home.path().display().to_string(),
+    );
+    env.insert(
+        "MCODEX_HOME".to_string(),
         codex_home.path().display().to_string(),
     );
     env.insert("OPENAI_API_KEY".to_string(), "dummy".to_string());

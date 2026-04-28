@@ -1,4 +1,4 @@
-load("//:defs.bzl", "MACOS_WEBRTC_RUSTC_LINK_FLAGS", "codex_rust_crate", "multiplatform_binaries")
+load("//:defs.bzl", "MACOS_WEBRTC_RUSTC_LINK_FLAGS", "PLATFORMS", "codex_rust_crate", "multiplatform_binaries")
 
 codex_rust_crate(
     name = "cli",
@@ -12,4 +12,10 @@ multiplatform_binaries(
 
 multiplatform_binaries(
     name = "mcodex",
+)
+
+filegroup(
+    name = "release_binaries",
+    srcs = [":codex_" + platform for platform in PLATFORMS] + [":mcodex_" + platform for platform in PLATFORMS],
+    tags = ["manual"],
 )

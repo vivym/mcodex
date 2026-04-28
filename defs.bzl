@@ -52,12 +52,6 @@ def multiplatform_binaries(name, platforms = PLATFORMS):
             tags = ["manual"],
         )
 
-    native.filegroup(
-        name = "release_binaries",
-        srcs = [name + "_" + platform for platform in platforms],
-        tags = ["manual"],
-    )
-
 def _workspace_root_test_impl(ctx):
     is_windows = ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo])
     launcher = ctx.actions.declare_file(ctx.label.name + ".bat" if is_windows else ctx.label.name)
