@@ -517,10 +517,10 @@ If the variable is set, the expected failure text is:
 Optional local proxy and artifact overrides:
 
 ```bash
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"
-export LK_CUSTOM_WEBRTC="${LK_CUSTOM_WEBRTC:-/Users/viv/.cache/mcodex-webrtc/mac-arm64-release}"
-# Set only when Cargo needs a local rusty_v8 archive:
-# export RUSTY_V8_ARCHIVE="/path/to/librusty_v8_release_aarch64-apple-darwin.a.gz"
+# Set only the values your local shell needs.
+# export HTTPS_PROXY="http://<proxy-host>:<proxy-port>"
+# export LK_CUSTOM_WEBRTC="/absolute/path/to/webrtc-release"
+# export RUSTY_V8_ARCHIVE="/absolute/path/to/librusty_v8_release_aarch64-apple-darwin.a.gz"
 ```
 
 Smoke scripts inherit these variables from the caller and do not set them.
@@ -637,8 +637,9 @@ For failures, capture a screenshot or terminal transcript and the matching
 
 ## Notes
 
-- This runbook intentionally does not implement the fixture crate or smoke
-  scripts.
+- This runbook documents the automated smoke scripts added in this slice, but
+  does not implement the future fixture crate, app-server/TUI gates, installer
+  wrapper smoke, or remote contract smoke.
 - P0-B fixture commands document the planned canonical helper interface:
   `cargo run --manifest-path codex-rs/Cargo.toml -p codex-smoke-fixtures -- seed`.
 - If current JSON field names differ from the markers above, update the
