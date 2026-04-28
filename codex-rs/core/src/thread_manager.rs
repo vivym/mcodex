@@ -319,7 +319,7 @@ impl ThreadManager {
             auth,
             provider,
             codex_home.clone(),
-            Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+            Arc::new(EnvironmentManager::default_for_tests()),
         );
         manager._test_codex_home_guard = Some(TempCodexHomeGuard { path: codex_home });
         manager
@@ -1064,11 +1064,7 @@ impl ThreadManagerState {
         parent_trace: Option<W3cTraceContext>,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
-        let environment = self
-            .environment_manager
-            .current()
-            .await
-            .map_err(|err| CodexErr::Fatal(format!("failed to create environment: {err}")))?;
+        let environment = self.environment_manager.default_environment();
         let watch_registration = match environment.as_ref() {
             Some(environment) if !environment.is_remote() => {
                 self.skills_watcher
@@ -1094,10 +1090,15 @@ impl ThreadManagerState {
             | SessionSource::Custom(_)
             | SessionSource::Unknown => RuntimeLeaseInheritanceSource::None,
         };
-        let (runtime_lease_host, initial_collaboration_tree_id) = match parent_runtime_thread_id {
-            RuntimeLeaseInheritanceSource::None => (None, None),
-            RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => {
-                let parent_thread = self
+        let (runtime_lease_host, initial_collaboration_tree_id, inherited_rollout_trace) =
+            match parent_runtime_thread_id {
+                RuntimeLeaseInheritanceSource::None => (
+                    None,
+                    None,
+                    codex_rollout_trace::RolloutTraceRecorder::disabled(),
+                ),
+                RuntimeLeaseInheritanceSource::LookupThread(parent_thread_id) => {
+                    let parent_thread = self
                     .threads
                     .read()
                     .await
@@ -1108,27 +1109,30 @@ impl ThreadManagerState {
                             "runtime lease parent thread {parent_thread_id} is not loaded; cannot inherit runtime lease authority"
                         ))
                     })?;
-                (
-                    parent_thread
-                        .codex
-                        .session
-                        .services
-                        .runtime_lease_host
-                        .clone(),
-                    Some(
+                    (
                         parent_thread
                             .codex
                             .session
                             .services
-                            .model_client
-                            .current_collaboration_tree_id(),
-                    ),
-                )
-            }
-            RuntimeLeaseInheritanceSource::Explicit(inheritance) => {
-                (inheritance.host, Some(inheritance.collaboration_tree_id))
-            }
-        };
+                            .runtime_lease_host
+                            .clone(),
+                        Some(
+                            parent_thread
+                                .codex
+                                .session
+                                .services
+                                .model_client
+                                .current_collaboration_tree_id(),
+                        ),
+                        parent_thread.codex.session.services.rollout_trace.clone(),
+                    )
+                }
+                RuntimeLeaseInheritanceSource::Explicit(inheritance) => (
+                    inheritance.host,
+                    Some(inheritance.collaboration_tree_id),
+                    codex_rollout_trace::RolloutTraceRecorder::disabled(),
+                ),
+            };
         let mut runtime_lease_startup_reservation =
             if let Some(host) = runtime_lease_host.as_ref().filter(|host| host.is_pooled()) {
                 Some(
@@ -1165,6 +1169,7 @@ impl ThreadManagerState {
             inherited_exec_policy,
             compat_inherited_lease_auth_session: None,
             runtime_lease_host,
+            inherited_rollout_trace,
             user_shell_override,
             parent_trace,
             analytics_events_client: self.analytics_events_client.clone(),

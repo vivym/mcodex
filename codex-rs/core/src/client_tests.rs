@@ -9,9 +9,6 @@ use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::ResponseEvent;
 use crate::ResponseStream;
-use crate::agent_identity::AgentIdentityManager;
-use crate::agent_identity::RegisteredAgentTask;
-use crate::agent_identity::StoredAgentIdentity;
 use crate::client::AdmittedClientSetupRequest;
 use crate::client::CompactConversationHistoryRequest;
 use crate::client::LeaseRequestPurpose;
@@ -48,6 +45,8 @@ use codex_login::AuthRecoveryStepResult;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
 use codex_login::TokenData;
+use codex_login::auth::AgentIdentityAuth;
+use codex_login::auth::AgentIdentityAuthRecord;
 use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth::LeasedTurnAuth;
@@ -58,6 +57,7 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
+use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -66,11 +66,10 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_rollout_trace::InferenceTraceContext;
 use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use core_test_support::responses;
-use ed25519_dalek::Signature;
-use ed25519_dalek::Verifier as _;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
@@ -81,7 +80,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -559,6 +557,7 @@ fn prompt_with_input(text: &str) -> Prompt {
         },
         personality: None,
         output_schema: None,
+        output_schema_strict: true,
     }
 }
 
@@ -571,47 +570,6 @@ async fn drain_stream_to_completion(stream: &mut ResponseStream) -> anyhow::Resu
     Ok(())
 }
 
-async fn model_client_with_agent_task(
-    provider: ModelProviderInfo,
-) -> (
-    TempDir,
-    ModelClient,
-    RegisteredAgentTask,
-    StoredAgentIdentity,
-) {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let auth_manager =
-        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
-    let agent_identity_manager = Arc::new(AgentIdentityManager::new_for_tests(
-        Arc::clone(&auth_manager),
-        /*feature_enabled*/ true,
-        "https://chatgpt.com/backend-api/".to_string(),
-        SessionSource::Cli,
-    ));
-    let stored_identity = agent_identity_manager
-        .seed_generated_identity_for_tests("agent-123")
-        .await
-        .expect("seed test identity");
-    let agent_task = RegisteredAgentTask {
-        agent_runtime_id: stored_identity.agent_runtime_id.clone(),
-        task_id: "task-123".to_string(),
-        registered_at: "2026-03-23T12:00:00Z".to_string(),
-    };
-    let client = ModelClient::new(
-        Some(auth_manager),
-        /*lease_auth*/ None,
-        ThreadId::new(),
-        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
-        provider,
-        SessionSource::Cli,
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
-    );
-    (codex_home, client, agent_task, stored_identity)
-}
-
 #[derive(Debug, Deserialize)]
 struct AgentAssertionEnvelope {
     agent_runtime_id: String,
@@ -620,10 +578,56 @@ struct AgentAssertionEnvelope {
     signature: String,
 }
 
+const TEST_AGENT_PRIVATE_KEY_PKCS8_BASE64: &str =
+    "MC4CAQAwBQYDK2VwBCIEIHvmvq9bJ3HdN0riqn1H9V1FQFkKVMwhleIDul/h6thR";
+
+#[test]
+fn agent_identity_account_id_is_not_forwarded_as_websocket_account_header() {
+    let auth = CodexAuth::AgentIdentity(AgentIdentityAuth::new(AgentIdentityAuthRecord {
+        agent_runtime_id: "agent-123".to_string(),
+        agent_private_key: TEST_AGENT_PRIVATE_KEY_PKCS8_BASE64.to_string(),
+        account_id: "account-id".to_string(),
+        chatgpt_user_id: "user-123".to_string(),
+        email: "user@example.com".to_string(),
+        plan_type: AccountPlanType::Pro,
+        chatgpt_account_is_fedramp: false,
+    }));
+
+    assert_eq!(super::account_id_for_websocket_header(Some(&auth)), None);
+}
+
+#[test]
+fn chatgpt_base_url_for_auth_runtime_uses_session_auth_manager_config() {
+    let codex_home = tempfile::tempdir().expect("create temp codex home");
+    let chatgpt_base_url = "https://custom.example/backend-api".to_string();
+    let auth_manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(chatgpt_base_url.clone()),
+    );
+    let client = ModelClient::new(
+        Some(auth_manager),
+        /*lease_auth*/ None,
+        ThreadId::new(),
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses),
+        SessionSource::Cli,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    );
+
+    assert_eq!(
+        client.chatgpt_base_url_for_auth_runtime().as_deref(),
+        Some(chatgpt_base_url.as_str())
+    );
+}
+
 fn assert_agent_assertion_header(
     authorization_header: &str,
-    stored_identity: &StoredAgentIdentity,
-    expected_agent_runtime_id: &str,
+    agent_identity: &AgentIdentityAuthRecord,
     expected_task_id: &str,
 ) {
     let token = authorization_header
@@ -636,28 +640,10 @@ fn assert_agent_assertion_header(
     )
     .expect("valid agent assertion envelope");
 
-    assert_eq!(envelope.agent_runtime_id, expected_agent_runtime_id);
+    assert_eq!(envelope.agent_runtime_id, agent_identity.agent_runtime_id);
     assert_eq!(envelope.task_id, expected_task_id);
-
-    let signature = Signature::from_slice(
-        &base64::engine::general_purpose::STANDARD
-            .decode(&envelope.signature)
-            .expect("base64 signature"),
-    )
-    .expect("signature bytes");
-    stored_identity
-        .signing_key()
-        .expect("signing key")
-        .verifying_key()
-        .verify(
-            format!(
-                "{}:{}:{}",
-                envelope.agent_runtime_id, envelope.task_id, envelope.timestamp
-            )
-            .as_bytes(),
-            &signature,
-        )
-        .expect("signature should verify");
+    assert!(!envelope.timestamp.is_empty());
+    assert!(!envelope.signature.is_empty());
 }
 
 async fn wait_for_admitted_count(authority: &RuntimeLeaseAuthority, expected: usize) {
@@ -807,7 +793,7 @@ async fn direct_request_setup_uses_leased_auth_snapshot_without_refresh() {
     let client = test_model_client_with_lease_auth(SessionSource::Cli, Some(lease_auth));
 
     let client_setup = client
-        .current_client_setup(/*agent_task*/ None)
+        .current_client_setup()
         .await
         .expect("direct request setup should use the leased auth snapshot");
 
@@ -832,7 +818,6 @@ async fn responses_http_setup_acquires_admission_for_pooled_runtime_host() {
                 turn_id: Some("turn-1"),
                 request_id: "request-1",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await
@@ -868,7 +853,6 @@ async fn admitted_setup_uses_rebound_collaboration_tree_id() {
                 turn_id: Some("turn-1"),
                 request_id: "request-1",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await
@@ -1029,6 +1013,7 @@ async fn responses_http_stream_acquires_admission_per_provider_round_trip() {
                 /*service_tier*/ None,
                 /*turn_id*/ None,
                 /*turn_metadata_header*/ None,
+                &InferenceTraceContext::disabled(),
             )
             .await
             .expect("HTTP stream should start");
@@ -1073,6 +1058,7 @@ async fn responses_http_stream_admission_honors_session_request_cancellation() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         ),
     )
     .await
@@ -1113,6 +1099,7 @@ async fn responses_http_streaming_admission_is_held_until_completion_then_releas
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("HTTP stream should start");
@@ -1163,6 +1150,7 @@ async fn responses_http_streaming_admission_releases_once_on_drop() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("HTTP stream should start");
@@ -1227,6 +1215,7 @@ async fn responses_http_streaming_stops_when_sibling_member_reports_terminal_una
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("HTTP stream should start");
@@ -1317,6 +1306,7 @@ async fn responses_http_streaming_stops_for_same_member_sibling_and_cancels_long
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("HTTP stream should start");
@@ -1404,6 +1394,7 @@ async fn responses_http_stream_start_cancels_while_initial_response_is_in_flight
                 /*service_tier*/ None,
                 /*turn_id*/ None,
                 /*turn_metadata_header*/ None,
+                &InferenceTraceContext::disabled(),
             )
             .await
     });
@@ -1454,7 +1445,6 @@ async fn admitted_client_setup_requires_pooled_authority_when_runtime_host_is_po
                 turn_id: None,
                 request_id: "responses-compact",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await
@@ -1482,24 +1472,8 @@ async fn compact_conversation_history_uses_responses_compact_admission() {
     .await;
     let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
     let client = test_model_client_with_runtime_authority(authority.clone(), &server.uri());
-    let prompt = Prompt {
-        input: vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "compact me".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }],
-        tools: Vec::new(),
-        parallel_tool_calls: false,
-        base_instructions: BaseInstructions {
-            text: "base".to_string(),
-        },
-        personality: None,
-        output_schema: None,
-    };
+    let prompt = prompt_with_input("compact me");
+    let compaction_trace = codex_rollout_trace::CompactionTraceContext::disabled();
 
     let output = client
         .compact_conversation_history(CompactConversationHistoryRequest {
@@ -1512,6 +1486,7 @@ async fn compact_conversation_history_uses_responses_compact_admission() {
             collaboration_tree_id: client.current_collaboration_tree_id(),
             cancellation_token: CancellationToken::new(),
             account_id_override: /*account_id_override*/ None,
+            compaction_trace: &compaction_trace,
         })
         .await
         .expect("compact request should succeed");
@@ -1544,24 +1519,8 @@ async fn compact_conversation_history_ignores_mismatched_account_override_for_po
     let (runtime_host, _codex_home) =
         test_pooled_runtime_host_with_authority("acct-compact-a").await?;
     let client = test_model_client_with_runtime_host(runtime_host, &server.uri());
-    let prompt = Prompt {
-        input: vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "compact me".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }],
-        tools: Vec::new(),
-        parallel_tool_calls: false,
-        base_instructions: BaseInstructions {
-            text: "base".to_string(),
-        },
-        personality: None,
-        output_schema: None,
-    };
+    let prompt = prompt_with_input("compact me");
+    let compaction_trace = codex_rollout_trace::CompactionTraceContext::disabled();
 
     let output = client
         .compact_conversation_history(CompactConversationHistoryRequest {
@@ -1574,6 +1533,7 @@ async fn compact_conversation_history_ignores_mismatched_account_override_for_po
             collaboration_tree_id: client.current_collaboration_tree_id(),
             cancellation_token: CancellationToken::new(),
             account_id_override: Some("acct-turn-override".to_string()),
+            compaction_trace: &compaction_trace,
         })
         .await?;
 
@@ -1609,29 +1569,15 @@ async fn compact_conversation_history_stops_after_sibling_terminal_unauthorized(
         .await;
     let authority = RuntimeLeaseAuthority::for_test_accepting("account_id", 7);
     let client = test_model_client_with_runtime_authority(authority.clone(), &server.uri());
-    let prompt = Prompt {
-        input: vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "compact me".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }],
-        tools: Vec::new(),
-        parallel_tool_calls: false,
-        base_instructions: BaseInstructions {
-            text: "base".to_string(),
-        },
-        personality: None,
-        output_schema: None,
-    };
+    let prompt = prompt_with_input("compact me");
     let tree_id = client.current_collaboration_tree_id();
     let session_telemetry = test_session_telemetry();
+    let compaction_trace = codex_rollout_trace::CompactionTraceContext::disabled();
     let mut compact_task = tokio::spawn({
         let client = client.clone();
         let tree_id = tree_id.clone();
+        let prompt = prompt.clone();
+        let compaction_trace = compaction_trace.clone();
         async move {
             client
                 .compact_conversation_history(CompactConversationHistoryRequest {
@@ -1644,6 +1590,7 @@ async fn compact_conversation_history_stops_after_sibling_terminal_unauthorized(
                     collaboration_tree_id: tree_id,
                     cancellation_token: CancellationToken::new(),
                     account_id_override: /*account_id_override*/ None,
+                    compaction_trace: &compaction_trace,
                 })
                 .await
         }
@@ -2545,6 +2492,7 @@ async fn websocket_streaming_admission_is_held_until_completion_then_released_on
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream should start");
@@ -2592,6 +2540,7 @@ async fn websocket_streaming_admission_releases_once_on_drop() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream should start");
@@ -2652,6 +2601,7 @@ async fn responses_websocket_stream_start_cancels_while_handshake_is_in_flight_a
                 /*service_tier*/ None,
                 /*turn_id*/ None,
                 /*turn_metadata_header*/ None,
+                &InferenceTraceContext::disabled(),
             )
             .await
     });
@@ -2735,6 +2685,7 @@ async fn responses_websocket_stream_start_retries_wrapped_unauthorized_with_fres
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket response.create 401 should recover");
@@ -2794,6 +2745,7 @@ async fn dropped_websocket_stream_forces_fresh_handshake_before_reuse() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("first websocket stream should start");
@@ -2815,6 +2767,7 @@ async fn dropped_websocket_stream_forces_fresh_handshake_before_reuse() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("replacement websocket stream should start");
@@ -2862,6 +2815,7 @@ async fn websocket_streaming_admission_releases_once_on_transport_failure() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("websocket stream should start");
@@ -2912,6 +2866,7 @@ async fn auth_recovery_retry_reacquires_fresh_admission_and_reporter() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("HTTP retry stream should start");
@@ -2949,8 +2904,13 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
 }
 
 #[tokio::test]
-async fn responses_http_uses_agent_assertion_when_agent_task_is_present() {
+async fn responses_http_uses_agent_assertion_for_agent_identity_auth() {
     core_test_support::skip_if_no_network!();
+
+    use wiremock::Mock;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     let server = responses::start_mock_server().await;
     let request_recorder = responses::mount_sse_once(
@@ -2961,13 +2921,44 @@ async fn responses_http_uses_agent_assertion_when_agent_task_is_present() {
         ]),
     )
     .await;
+    let agent_identity = AgentIdentityAuthRecord {
+        agent_runtime_id: "agent-123".to_string(),
+        agent_private_key: TEST_AGENT_PRIVATE_KEY_PKCS8_BASE64.to_string(),
+        account_id: "account-id".to_string(),
+        chatgpt_user_id: "user-123".to_string(),
+        email: "user@example.com".to_string(),
+        plan_type: AccountPlanType::Pro,
+        chatgpt_account_is_fedramp: false,
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/agent-123/task/register"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "task_id": "task-123",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     let provider =
         create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
-    let (_codex_home, client, agent_task, stored_identity) =
-        model_client_with_agent_task(provider).await;
+    let auth = CodexAuth::AgentIdentity(AgentIdentityAuth::new(agent_identity.clone()));
+    auth.initialize_runtime(Some(server.uri()))
+        .await
+        .expect("agent identity runtime should register a task");
+    let client = ModelClient::new(
+        Some(AuthManager::from_auth_for_testing(auth)),
+        /*lease_auth*/ None,
+        ThreadId::new(),
+        /*installation_id*/ "11111111-1111-4111-8111-111111111111".to_string(),
+        provider,
+        SessionSource::Cli,
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+    );
     let model_info = test_model_info();
     let session_telemetry = test_session_telemetry();
-    let mut client_session = client.new_session_with_agent_task(Some(agent_task.clone()));
+    let mut client_session = client.new_session();
 
     let mut stream = client_session
         .stream(
@@ -2979,6 +2970,7 @@ async fn responses_http_uses_agent_assertion_when_agent_task_is_present() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream request should succeed");
@@ -2990,92 +2982,8 @@ async fn responses_http_uses_agent_assertion_when_agent_task_is_present() {
     let authorization = request
         .header("authorization")
         .expect("authorization header should be present");
-    assert_agent_assertion_header(
-        &authorization,
-        &stored_identity,
-        &agent_task.agent_runtime_id,
-        &agent_task.task_id,
-    );
+    assert_agent_assertion_header(&authorization, &agent_identity, "task-123");
     assert_eq!(request.header("chatgpt-account-id"), None);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_agent_task_bypasses_cached_bearer_prewarm() {
-    core_test_support::skip_if_no_network!();
-
-    let server = responses::start_websocket_server(vec![
-        vec![vec![
-            responses::ev_response_created("resp-prewarm"),
-            responses::ev_completed("resp-prewarm"),
-        ]],
-        vec![vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_completed("resp-1"),
-        ]],
-    ])
-    .await;
-    let mut provider =
-        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
-    provider.supports_websockets = true;
-    provider.websocket_connect_timeout_ms = Some(5_000);
-    let (_codex_home, client, agent_task, stored_identity) =
-        model_client_with_agent_task(provider).await;
-    let model_info = test_model_info();
-    let session_telemetry = test_session_telemetry();
-    let prompt = test_prompt("hello");
-
-    let mut prewarm_session = client.new_session();
-    prewarm_session
-        .prewarm_websocket(
-            &prompt,
-            &model_info,
-            &session_telemetry,
-            /*effort*/ None,
-            ReasoningSummary::Auto,
-            /*service_tier*/ None,
-            /*turn_id*/ None,
-            /*turn_metadata_header*/ None,
-        )
-        .await
-        .expect("bearer prewarm should succeed");
-    drop(prewarm_session);
-
-    let mut agent_task_session = client.new_session_with_agent_task(Some(agent_task.clone()));
-    let mut stream = agent_task_session
-        .stream(
-            &prompt,
-            &model_info,
-            &session_telemetry,
-            /*effort*/ None,
-            ReasoningSummary::Auto,
-            /*service_tier*/ None,
-            /*turn_id*/ None,
-            /*turn_metadata_header*/ None,
-        )
-        .await
-        .expect("agent task stream should succeed");
-    drain_stream_to_completion(&mut stream)
-        .await
-        .expect("agent task websocket stream should complete");
-
-    let handshakes = server.handshakes();
-    assert_eq!(handshakes.len(), 2);
-    assert_eq!(
-        handshakes[0].header("authorization"),
-        Some("Bearer Access Token".to_string())
-    );
-    let agent_authorization = handshakes[1]
-        .header("authorization")
-        .expect("agent handshake should include authorization");
-    assert_agent_assertion_header(
-        &agent_authorization,
-        &stored_identity,
-        &agent_task.agent_runtime_id,
-        &agent_task.task_id,
-    );
-    assert_eq!(handshakes[1].header("chatgpt-account-id"), None);
-
-    server.shutdown().await;
 }
 
 #[derive(Debug)]

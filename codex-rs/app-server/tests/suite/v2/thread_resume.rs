@@ -3909,10 +3909,9 @@ fn strip_rollout_context_for_resume_fallback(rollout_path: &Path) -> Result<()> 
             }
             RolloutItem::TurnContext(_) | RolloutItem::EventMsg(EventMsg::SessionConfigured(_)) => {
             }
-            RolloutItem::SessionState(_)
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_) => rewritten.push(serde_json::to_string(&rollout_line)?),
+            RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+                rewritten.push(serde_json::to_string(&rollout_line)?)
+            }
         }
     }
     std::fs::write(rollout_path, rewritten.join("\n") + "\n")?;

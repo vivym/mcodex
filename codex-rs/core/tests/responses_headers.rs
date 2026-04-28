@@ -133,6 +133,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream failed");
@@ -261,6 +262,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream failed");
@@ -378,6 +380,7 @@ async fn responses_respects_model_info_overrides_from_config() {
             /*service_tier*/ None,
             /*turn_id*/ None,
             /*turn_metadata_header*/ None,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
         )
         .await
         .expect("stream failed");

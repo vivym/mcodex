@@ -457,7 +457,6 @@ impl RealtimeConversationManager {
                                         turn_id: None,
                                         request_id: "realtime-websocket",
                                         cancellation_token: request_cancellation_token.clone(),
-                                        agent_task: None,
                                     },
                                 )
                                 .await?;

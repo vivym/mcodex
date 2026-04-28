@@ -492,9 +492,7 @@ mod phase2 {
                 CodexAuth::from_api_key("dummy"),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             );
             let (mut session, _turn_context) = make_session_and_context().await;
             session.services.state_db = Some(Arc::clone(&state_db));
@@ -532,9 +530,7 @@ mod phase2 {
                 CodexAuth::from_api_key("dummy"),
                 config.model_provider.clone(),
                 config.codex_home.to_path_buf(),
-                std::sync::Arc::new(codex_exec_server::EnvironmentManager::new(
-                    /*exec_server_url*/ None,
-                )),
+                std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
             );
             let (mut session, _turn_context) = make_session_and_context().await;
             let session_id = session.conversation_id.to_string();

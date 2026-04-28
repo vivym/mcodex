@@ -6,6 +6,7 @@ use crate::types::RateLimitStatusPayload;
 use crate::types::TurnAttemptsSiblingTurnsResponse;
 use anyhow::Result;
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_client::with_chatgpt_cloudflare_cookie_store;
 use codex_login::CodexAuth;
 use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -137,7 +138,9 @@ impl Client {
         {
             base_url = format!("{base_url}/backend-api");
         }
-        let http = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
+        let http = build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
+            reqwest::Client::builder(),
+        ))?;
         let path_style = PathStyle::from_base_url(&base_url);
         Ok(Self {
             base_url,
@@ -151,10 +154,16 @@ impl Client {
     }
 
     pub fn from_auth(base_url: impl Into<String>, auth: &CodexAuth) -> Result<Self> {
-        let token = auth.get_token().map_err(anyhow::Error::from)?;
-        let mut client = Self::new(base_url)?
-            .with_user_agent(get_codex_user_agent())
-            .with_bearer_token(token);
+        let mut client = Self::new(base_url)?.with_user_agent(get_codex_user_agent());
+        if let Some(authorization_header_value) = auth
+            .agent_identity_authorization_header()
+            .map_err(anyhow::Error::from)?
+        {
+            client = client.with_authorization_header_value(authorization_header_value);
+        } else {
+            let token = auth.get_token().map_err(anyhow::Error::from)?;
+            client = client.with_bearer_token(token);
+        }
         if let Some(account_id) = auth.get_account_id() {
             client = client.with_chatgpt_account_id(account_id);
         }
@@ -604,6 +613,36 @@ mod tests {
     use codex_backend_openapi_models::models::RateLimitReachedKind;
     use codex_backend_openapi_models::models::RateLimitReachedType as BackendRateLimitReachedType;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn with_bearer_token_sets_bearer_authorization_header() {
+        let client = Client::new("https://example.test")
+            .unwrap()
+            .with_bearer_token("test-token");
+
+        assert_eq!(
+            client
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-token")
+        );
+    }
+
+    #[test]
+    fn with_authorization_header_value_sets_exact_authorization_header() {
+        let client = Client::new("https://example.test")
+            .unwrap()
+            .with_authorization_header_value("AgentAssertion signed-value");
+
+        assert_eq!(
+            client
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("AgentAssertion signed-value")
+        );
+    }
 
     #[test]
     fn map_plan_type_supports_usage_based_business_variants() {

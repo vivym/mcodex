@@ -1,5 +1,6 @@
 use crate::events::AppServerRpcTransport;
-use crate::events::GuardianReviewEventParams;
+use crate::events::GuardianReviewAnalyticsResult;
+use crate::events::GuardianReviewTrackContext;
 use crate::events::TrackEventRequest;
 use crate::events::TrackEventsRequest;
 use crate::events::current_runtime_metadata;
@@ -193,9 +194,13 @@ impl AnalyticsEventsClient {
         ));
     }
 
-    pub fn track_guardian_review(&self, input: GuardianReviewEventParams) {
+    pub fn track_guardian_review(
+        &self,
+        tracking: &GuardianReviewTrackContext,
+        result: GuardianReviewAnalyticsResult,
+    ) {
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianReview(
-            Box::new(input),
+            Box::new(tracking.event_params(result)),
         )));
     }
 
@@ -330,7 +335,7 @@ impl AnalyticsEventsClient {
 
 async fn send_track_events(
     auth_provider: &Arc<dyn AuthProvider>,
-    auth_manager: Option<&Arc<AuthManager>>,
+    _auth_manager: Option<&Arc<AuthManager>>,
     base_url: &str,
     events: Vec<TrackEventRequest>,
 ) {
@@ -357,21 +362,11 @@ async fn send_track_events(
         .header("chatgpt-account-id", &account_id)
         .header("Content-Type", "application/json")
         .json(&payload);
-    if let Some(auth_manager) = auth_manager {
-        let Some(authorization_header_value) = auth_manager
-            .chatgpt_authorization_header_for_auth(&auth)
-            .await
-        else {
-            return;
-        };
-        request = request.header("authorization", authorization_header_value);
-    } else {
-        let access_token = match auth.get_token() {
-            Ok(token) => token,
-            Err(_) => return,
-        };
-        request = request.bearer_auth(&access_token);
-    }
+    let access_token = match auth.get_token() {
+        Ok(token) => token,
+        Err(_) => return,
+    };
+    request = request.bearer_auth(&access_token);
     if auth.is_fedramp_account() {
         request = request.header("X-OpenAI-Fedramp", "true");
     }

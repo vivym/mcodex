@@ -102,8 +102,7 @@ pub fn builder_from_items(
 
     if let Some(session_meta) = items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => Some(meta_line),
-        RolloutItem::SessionState(_)
-        | RolloutItem::ResponseItem(_)
+        RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_) => None,
@@ -119,7 +118,6 @@ fn canonical_session_meta(items: &[RolloutItem], thread_id: ThreadId) -> Option<
     items.iter().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => Some(meta_line),
         RolloutItem::SessionMeta(_)
-        | RolloutItem::SessionState(_)
         | RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
@@ -150,10 +148,8 @@ fn normalize_rollout_items_for_state_db(items: &mut [RolloutItem]) {
                     .try_into()
                     .unwrap_or_else(|_| session_configured.cwd.clone());
             }
-            RolloutItem::SessionState(_)
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_) => {}
+            RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+            }
         }
     }
 }
@@ -189,8 +185,7 @@ async fn load_rollout_extraction_data(
     }
     let memory_mode = items.iter().rev().find_map(|item| match item {
         RolloutItem::SessionMeta(meta_line) => meta_line.meta.memory_mode.clone(),
-        RolloutItem::SessionState(_)
-        | RolloutItem::ResponseItem(_)
+        RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::EventMsg(_) => None,

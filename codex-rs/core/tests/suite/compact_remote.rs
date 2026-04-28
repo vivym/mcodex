@@ -331,6 +331,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
                 text_elements: Vec::new(),
@@ -346,6 +347,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact".into(),
                 text_elements: Vec::new(),
@@ -498,6 +500,7 @@ async fn pooled_manual_remote_compact_uses_leased_account_for_compact_and_follow
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "before manual compact".to_string(),
                 text_elements: Vec::new(),
@@ -513,6 +516,7 @@ async fn pooled_manual_remote_compact_uses_leased_account_for_compact_and_follow
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after manual compact".to_string(),
                 text_elements: Vec::new(),
@@ -577,6 +581,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
                 text_elements: Vec::new(),
@@ -671,6 +676,7 @@ async fn pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_foll
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "BEFORE_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
@@ -687,6 +693,7 @@ async fn pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_foll
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -698,6 +705,7 @@ async fn pooled_pre_turn_remote_compact_uses_leased_account_for_compact_and_foll
         .await?;
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "AFTER_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
@@ -778,6 +786,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
@@ -790,6 +799,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
@@ -906,6 +916,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
@@ -918,6 +929,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
@@ -936,6 +948,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that triggers auto compact".into(),
                 text_elements: Vec::new(),
@@ -1034,6 +1047,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that exceeds token threshold".into(),
                 text_elements: Vec::new(),
@@ -1046,6 +1060,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "turn that triggers auto compact".into(),
                 text_elements: Vec::new(),
@@ -1138,6 +1153,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     baseline_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
@@ -1153,6 +1169,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     baseline_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
@@ -1242,6 +1259,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     override_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: first_user_message.into(),
                 text_elements: Vec::new(),
@@ -1257,6 +1275,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 
     override_codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: second_user_message.into(),
                 text_elements: Vec::new(),
@@ -1326,6 +1345,7 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "manual remote compact".into(),
                 text_elements: Vec::new(),
@@ -1405,6 +1425,7 @@ async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()> {
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "manual remote compact".into(),
                 text_elements: Vec::new(),
@@ -1488,6 +1509,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "needs compaction".into(),
                 text_elements: Vec::new(),
@@ -1630,6 +1652,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "start remote compact flow".into(),
                 text_elements: Vec::new(),
@@ -1646,6 +1669,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact in same session".into(),
                 text_elements: Vec::new(),
@@ -1669,6 +1693,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after resume".into(),
                 text_elements: Vec::new(),
@@ -1764,6 +1789,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "start remote compact flow".into(),
                 text_elements: Vec::new(),
@@ -1779,6 +1805,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after compact in same session".into(),
                 text_elements: Vec::new(),
@@ -1849,6 +1876,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -1861,6 +1889,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -1926,6 +1955,7 @@ async fn remote_request_uses_custom_experimental_realtime_start_instructions() -
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -1985,6 +2015,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -1999,6 +2030,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2072,6 +2104,7 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2087,6 +2120,7 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2168,6 +2202,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "SETUP_USER".to_string(),
                 text_elements: Vec::new(),
@@ -2182,6 +2217,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2271,6 +2307,7 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
     initial
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2299,6 +2336,7 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
     resumed
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2381,6 +2419,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
                     approval_policy: None,
                     approvals_reviewer: None,
                     sandbox_policy: None,
+                    permission_profile: None,
                     windows_sandbox_level: None,
                     model: None,
                     effort: None,
@@ -2393,6 +2432,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
         }
         codex
             .submit(Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text: user.to_string(),
                     text_elements: Vec::new(),
@@ -2478,6 +2518,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "BEFORE_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
@@ -2494,6 +2535,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -2505,6 +2547,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
         .await?;
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "AFTER_SWITCH_USER".to_string(),
                 text_elements: Vec::new(),
@@ -2622,6 +2665,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2634,6 +2678,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2717,6 +2762,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2793,6 +2839,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2877,6 +2924,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),
@@ -2892,6 +2940,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_TWO".to_string(),
                 text_elements: Vec::new(),
@@ -2972,6 +3021,7 @@ async fn snapshot_request_shape_remote_manual_compact_without_previous_user_mess
 
     codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "USER_ONE".to_string(),
                 text_elements: Vec::new(),

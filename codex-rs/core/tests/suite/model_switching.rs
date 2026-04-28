@@ -121,6 +121,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -146,6 +147,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -158,6 +160,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch models".into(),
                 text_elements: Vec::new(),
@@ -218,6 +221,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "hello".into(),
                 text_elements: Vec::new(),
@@ -243,6 +247,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
             effort: None,
@@ -255,6 +260,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch model and personality".into(),
                 text_elements: Vec::new(),
@@ -396,6 +402,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![
                 UserInput::Image {
                     image_url: image_url.clone(),
@@ -422,6 +429,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "second turn".to_string(),
                 text_elements: Vec::new(),
@@ -534,6 +542,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -555,6 +564,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
@@ -670,6 +680,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -691,6 +702,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
                 text_elements: Vec::new(),
@@ -804,6 +816,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
                 text_elements: Vec::new(),
@@ -833,6 +846,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "after rollback".to_string(),
                 text_elements: Vec::new(),
@@ -990,6 +1004,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "use larger model".into(),
                 text_elements: Vec::new(),
@@ -1037,6 +1052,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
             approval_policy: None,
             approvals_reviewer: None,
             sandbox_policy: None,
+            permission_profile: None,
             windows_sandbox_level: None,
             model: Some(smaller_model_slug.to_string()),
             effort: None,
@@ -1049,6 +1065,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     test.codex
         .submit(Op::UserTurn {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "switch to smaller model".into(),
                 text_elements: Vec::new(),

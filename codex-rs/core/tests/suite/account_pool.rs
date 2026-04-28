@@ -1966,6 +1966,7 @@ async fn long_running_turn_heartbeat_keeps_lease_exclusive() -> Result<()> {
     first
         .codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: "long-running turn".to_string(),
                 text_elements: Vec::new(),
@@ -2592,6 +2593,7 @@ async fn submit_turn_and_wait(
 ) -> Result<Option<codex_protocol::protocol::ErrorEvent>> {
     test.codex
         .submit(Op::UserInput {
+            environments: None,
             items: vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),

@@ -735,7 +735,32 @@ fn type_body_brace_span(content: &str) -> Option<(usize, usize)> {
 fn find_top_level_brace_span(input: &str) -> Option<(usize, usize)> {
     let mut state = ScanState::default();
     let mut open_index = None;
-    for (index, ch) in input.char_indices() {
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        let next = chars.peek().map(|(_, ch)| *ch);
+        if state.block_comment {
+            if ch == '*' && next == Some('/') {
+                state.block_comment = false;
+                let _ = chars.next();
+            }
+            continue;
+        }
+        if state.line_comment {
+            if ch == '\n' {
+                state.line_comment = false;
+            }
+            continue;
+        }
+        if !state.in_string() && ch == '/' && next == Some('*') {
+            state.block_comment = true;
+            let _ = chars.next();
+            continue;
+        }
+        if !state.in_string() && ch == '/' && next == Some('/') {
+            state.line_comment = true;
+            let _ = chars.next();
+            continue;
+        }
         if !state.in_string() && ch == '{' && state.depth.is_top_level() {
             open_index = Some(index);
         }
@@ -759,7 +784,32 @@ fn split_top_level_multi(input: &str, delimiters: &[char]) -> Vec<String> {
     let mut state = ScanState::default();
     let mut start = 0usize;
     let mut parts = Vec::new();
-    for (index, ch) in input.char_indices() {
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        let next = chars.peek().map(|(_, ch)| *ch);
+        if state.block_comment {
+            if ch == '*' && next == Some('/') {
+                state.block_comment = false;
+                let _ = chars.next();
+            }
+            continue;
+        }
+        if state.line_comment {
+            if ch == '\n' {
+                state.line_comment = false;
+            }
+            continue;
+        }
+        if !state.in_string() && ch == '/' && next == Some('*') {
+            state.block_comment = true;
+            let _ = chars.next();
+            continue;
+        }
+        if !state.in_string() && ch == '/' && next == Some('/') {
+            state.line_comment = true;
+            let _ = chars.next();
+            continue;
+        }
         if !state.in_string() && state.depth.is_top_level() && delimiters.contains(&ch) {
             let part = input[start..index].trim();
             if !part.is_empty() {
@@ -882,6 +932,8 @@ struct ScanState {
     depth: Depth,
     string_delim: Option<char>,
     escape: bool,
+    block_comment: bool,
+    line_comment: bool,
 }
 
 impl ScanState {
@@ -2089,6 +2141,45 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing v2/ThreadStartParams.ts fixture"))?,
         )?;
         assert_eq!(thread_start_ts.contains("mockExperimentalField"), false);
+        assert_eq!(thread_start_ts.contains("experimentalRawEvents"), false);
+        assert_eq!(thread_start_ts.contains("persistExtendedHistory"), false);
+        let thread_resume_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/ThreadResumeParams.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/ThreadResumeParams.ts fixture"))?,
+        )?;
+        assert_eq!(thread_resume_ts.contains("history?:"), false);
+        assert_eq!(thread_resume_ts.contains("path?:"), false);
+        assert_eq!(thread_resume_ts.contains("persistExtendedHistory"), false);
+        let thread_fork_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/ThreadForkParams.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/ThreadForkParams.ts fixture"))?,
+        )?;
+        assert_eq!(thread_fork_ts.contains("path?:"), false);
+        assert_eq!(thread_fork_ts.contains("persistExtendedHistory"), false);
+        let turn_start_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/TurnStartParams.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/TurnStartParams.ts fixture"))?,
+        )?;
+        assert_eq!(turn_start_ts.contains("collaborationMode"), false);
+        let command_execution_request_approval_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/CommandExecutionRequestApprovalParams.ts"))
+                .or_else(|| fixture_tree.get(Path::new("CommandExecutionRequestApprovalParams.ts")))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing CommandExecutionRequestApprovalParams.ts fixture")
+                })?,
+        )?;
+        assert_eq!(
+            command_execution_request_approval_ts.contains("additionalPermissions"),
+            false
+        );
+        assert_eq!(
+            command_execution_request_approval_ts.contains("availableDecisions"),
+            false
+        );
         assert_eq!(
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodParams.ts")),
             false
@@ -2315,10 +2406,16 @@ mod tests {
 
         let thread_start_ts = v2::ThreadStartParams::export_to_string()?;
         assert_eq!(thread_start_ts.contains("mockExperimentalField"), true);
+        assert_eq!(thread_start_ts.contains("experimentalRawEvents"), true);
+        assert_eq!(thread_start_ts.contains("persistExtendedHistory"), true);
         let command_execution_request_approval_ts =
             v2::CommandExecutionRequestApprovalParams::export_to_string()?;
         assert_eq!(
             command_execution_request_approval_ts.contains("additionalPermissions"),
+            true
+        );
+        assert_eq!(
+            command_execution_request_approval_ts.contains("availableDecisions"),
             true
         );
 
@@ -2695,6 +2792,84 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
     }
 
     #[test]
+    fn experimental_type_fields_ts_filter_handles_inline_comments_with_commas() -> Result<()> {
+        let experimental_field_names = HashSet::from([
+            "additionalPermissions".to_string(),
+            "availableDecisions".to_string(),
+            "experimentalRawEvents".to_string(),
+        ]);
+        let content = r#"export type CommandExecutionRequestApprovalParams = { threadId: string,
+/**
+ * For zsh-exec-bridge subcommand approvals, multiple callbacks can belong to
+ * one parent `itemId`, so `approvalId` is a distinct opaque callback id
+ * used to disambiguate routing.
+ */
+approvalId?: string | null,
+/**
+ * Optional additional permissions requested for this command.
+ */
+additionalPermissions?: AdditionalPermissionProfile | null,
+/**
+ * Ordered list of decisions the client may present for this prompt.
+ */
+availableDecisions?: Array<CommandExecutionApprovalDecision> | null,
+/**
+ * If true, opt into emitting raw Responses API items on the event stream.
+ */
+experimentalRawEvents: boolean,
+stableField: string };
+"#;
+
+        let filtered = filter_experimental_type_fields_ts_contents(
+            content.to_string(),
+            &experimental_field_names,
+        );
+
+        assert_eq!(filtered.contains("additionalPermissions"), false);
+        assert_eq!(filtered.contains("availableDecisions"), false);
+        assert_eq!(filtered.contains("experimentalRawEvents"), false);
+        assert_eq!(filtered.contains("approvalId"), true);
+        assert_eq!(filtered.contains("stableField"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn registered_experimental_fields_include_command_approval_fields() {
+        let fields = experimental_fields();
+        assert!(
+            fields.iter().any(|field| {
+                field.type_name == "CommandExecutionRequestApprovalParams"
+                    && field.field_name == "additionalPermissions"
+            }),
+            "missing additionalPermissions experimental field registration: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|field| {
+                field.type_name == "CommandExecutionRequestApprovalParams"
+                    && field.field_name == "availableDecisions"
+            }),
+            "missing availableDecisions experimental field registration: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn command_approval_ts_filter_removes_registered_experimental_fields() -> Result<()> {
+        let experimental_field_names = experimental_fields()
+            .into_iter()
+            .filter(|field| field.type_name == "CommandExecutionRequestApprovalParams")
+            .map(|field| field.field_name.to_string())
+            .collect::<HashSet<_>>();
+        let filtered = filter_experimental_type_fields_ts_contents(
+            v2::CommandExecutionRequestApprovalParams::export_to_string()?,
+            &experimental_field_names,
+        );
+
+        assert_eq!(filtered.contains("additionalPermissions"), false);
+        assert_eq!(filtered.contains("availableDecisions"), false);
+        Ok(())
+    }
+
+    #[test]
     fn stable_schema_filter_removes_mock_experimental_method() -> Result<()> {
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
@@ -2724,6 +2899,10 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             command_execution_request_approval_json.contains("additionalPermissions"),
             false
         );
+        assert_eq!(
+            command_execution_request_approval_json.contains("availableDecisions"),
+            false
+        );
 
         let client_request_json = fs::read_to_string(output_dir.join("ClientRequest.json"))?;
         assert_eq!(
@@ -2736,6 +2915,7 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
         assert_eq!(bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(bundle_json.contains("additionalPermissions"), false);
+        assert_eq!(bundle_json.contains("availableDecisions"), false);
         assert_eq!(bundle_json.contains("MockExperimentalMethodParams"), false);
         assert_eq!(
             bundle_json.contains("MockExperimentalMethodResponse"),
@@ -2745,6 +2925,7 @@ export type Config = { stableField: Keep, unstableField: string | null } & ({ [k
             fs::read_to_string(output_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
         assert_eq!(flat_v2_bundle_json.contains("mockExperimentalField"), false);
         assert_eq!(flat_v2_bundle_json.contains("additionalPermissions"), false);
+        assert_eq!(flat_v2_bundle_json.contains("availableDecisions"), false);
         assert_eq!(
             flat_v2_bundle_json.contains("MockExperimentalMethodParams"),
             false

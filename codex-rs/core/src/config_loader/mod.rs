@@ -46,7 +46,11 @@ pub use codex_config::ConstrainedWithSource;
 pub use codex_config::FeatureRequirementsToml;
 pub use codex_config::FilesystemConstraints;
 pub use codex_config::FilesystemDenyReadPattern;
+pub use codex_config::HookEventsToml;
+pub use codex_config::HookHandlerConfig;
 pub use codex_config::LoaderOverrides;
+pub use codex_config::ManagedHooksRequirementsToml;
+pub use codex_config::MatcherGroup;
 pub use codex_config::McpServerIdentity;
 pub use codex_config::McpServerRequirement;
 pub use codex_config::NetworkConstraints;
@@ -1133,8 +1137,8 @@ async fn load_project_layers(
 ///
 /// If present, re-interpret `managed_config.toml` as a `requirements.toml`
 /// where each specified field is treated as a constraint. Most fields allow
-/// only the specified value. `approvals_reviewer = "guardian_subagent"` also
-/// allows `user` so people can opt out of the guardian reviewer.
+/// only the specified value. `approvals_reviewer = "auto_review"` also allows
+/// `user` so people can opt out of the auto-reviewer.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 struct LegacyManagedConfigToml {
     approval_policy: Option<AskForApproval>,
@@ -1156,7 +1160,7 @@ impl From<LegacyManagedConfigToml> for ConfigRequirementsToml {
         }
         if let Some(approvals_reviewer) = approvals_reviewer {
             let mut allowed_reviewers = vec![approvals_reviewer];
-            if approvals_reviewer == ApprovalsReviewer::GuardianSubagent {
+            if approvals_reviewer == ApprovalsReviewer::AutoReview {
                 allowed_reviewers.push(ApprovalsReviewer::User);
             }
             config_requirements_toml.allowed_approvals_reviewers = Some(allowed_reviewers);
@@ -1243,7 +1247,7 @@ foo = "xyzzy"
     fn legacy_managed_config_backfill_allows_user_when_guardian_is_required() {
         let legacy = LegacyManagedConfigToml {
             approval_policy: None,
-            approvals_reviewer: Some(ApprovalsReviewer::GuardianSubagent),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
             sandbox_mode: None,
         };
 
@@ -1251,10 +1255,7 @@ foo = "xyzzy"
 
         assert_eq!(
             requirements.allowed_approvals_reviewers,
-            Some(vec![
-                ApprovalsReviewer::GuardianSubagent,
-                ApprovalsReviewer::User
-            ])
+            Some(vec![ApprovalsReviewer::AutoReview, ApprovalsReviewer::User,])
         );
     }
 

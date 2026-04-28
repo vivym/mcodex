@@ -45,6 +45,7 @@ use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_rollout_trace::RolloutTraceRecorder;
 use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::QuotaExhaustedWindows;
@@ -55,6 +56,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+fn test_environment_manager() -> Arc<EnvironmentManager> {
+    Arc::new(EnvironmentManager::default_for_tests())
+}
 
 #[test]
 fn session_view_resets_only_when_account_changes_and_pool_disallows_reuse() {
@@ -2399,7 +2404,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -2414,6 +2419,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2424,7 +2430,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         config,
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2445,6 +2451,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2531,7 +2538,6 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
                 turn_id: None,
                 request_id: "runtime-lease-parent-request",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await?;
@@ -2556,7 +2562,6 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
                 turn_id: None,
                 request_id: "runtime-lease-child-request",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await?;
@@ -2635,7 +2640,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
         config,
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2656,6 +2661,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2711,7 +2717,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -2726,6 +2732,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2736,7 +2743,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -2757,6 +2764,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2817,7 +2825,6 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
                 turn_id: None,
                 request_id: "runtime-lease-child-lifecycle-request",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await?;
@@ -2857,7 +2864,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         config,
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -2874,6 +2881,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         runtime_lease_host: Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
             "runtime-c".to_string(),
         ))),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -2901,7 +2909,6 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
                 turn_id: None,
                 request_id: "runtime-lease-contender-request",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await?;
@@ -2967,7 +2974,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
             /*model_catalog*/ None,
             CollaborationModesConfig::default(),
         )),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::new(SkillsManager::new(
             config_codex_home.clone(),
             /*bundled_skills_enabled*/ true,
@@ -2985,6 +2992,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3014,7 +3022,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
             /*model_catalog*/ None,
             CollaborationModesConfig::default(),
         )),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::new(SkillsManager::new(
             config_codex_home,
             /*bundled_skills_enabled*/ true,
@@ -3032,6 +3040,7 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3079,7 +3088,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -3094,6 +3103,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3111,7 +3121,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -3126,6 +3136,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3182,7 +3193,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         config: config.clone(),
         auth_manager: auth_manager.clone(),
         models_manager: Arc::clone(&models_manager),
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager: Arc::clone(&skills_manager),
         plugins_manager: Arc::clone(&plugins_manager),
         mcp_manager: Arc::clone(&mcp_manager),
@@ -3197,6 +3208,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: None,
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3249,7 +3261,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         config,
         auth_manager,
         models_manager,
-        environment_manager: Arc::new(EnvironmentManager::new(/*exec_server_url*/ None)),
+        environment_manager: test_environment_manager(),
         skills_manager,
         plugins_manager,
         mcp_manager,
@@ -3270,6 +3282,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(root_runtime_lease_host.clone()),
+        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
         user_shell_override: None,
         parent_trace: None,
         analytics_events_client: None,
@@ -3301,7 +3314,6 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
                 turn_id: None,
                 request_id: "runtime-lease-config-only-child-request",
                 cancellation_token: CancellationToken::new(),
-                agent_task: None,
             },
         )
         .await?;

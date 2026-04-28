@@ -1058,6 +1058,7 @@ async fn thread_fork_ephemeral_remains_pathless_and_omits_listing() -> Result<()
             source_kinds: None,
             archived: None,
             cwd: None,
+            use_state_db_only: false,
             search_term: None,
         })
         .await?;
@@ -2353,10 +2354,9 @@ fn strip_rollout_context_for_fork_fallback(rollout_path: &Path) -> Result<()> {
             }
             RolloutItem::TurnContext(_) | RolloutItem::EventMsg(EventMsg::SessionConfigured(_)) => {
             }
-            RolloutItem::SessionState(_)
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_) => rewritten.push(serde_json::to_string(&rollout_line)?),
+            RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+                rewritten.push(serde_json::to_string(&rollout_line)?)
+            }
         }
     }
     std::fs::write(rollout_path, rewritten.join("\n") + "\n")?;
@@ -2370,7 +2370,6 @@ fn strip_source_resolution_metadata_for_fork_path(rollout_path: &Path) -> Result
         let rollout_line: RolloutLine = serde_json::from_str(line)?;
         match rollout_line.item {
             RolloutItem::SessionMeta(_)
-            | RolloutItem::SessionState(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::EventMsg(EventMsg::SessionConfigured(_)) => {}
             RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {

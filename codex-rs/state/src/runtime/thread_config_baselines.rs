@@ -194,10 +194,8 @@ impl ThreadConfigBaselineAccumulator {
                 self.developer_instructions = turn_context.developer_instructions.clone();
                 self.developer_instructions_overrides_rollout = false;
             }
-            RolloutItem::SessionState(_)
-            | RolloutItem::EventMsg(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::Compacted(_) => {}
+            RolloutItem::EventMsg(_) | RolloutItem::ResponseItem(_) | RolloutItem::Compacted(_) => {
+            }
         }
     }
 

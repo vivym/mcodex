@@ -16,8 +16,6 @@ use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tempfile::tempdir;
-use tokio::time::Duration;
-use tokio::time::timeout;
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -187,84 +185,13 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
 }
 
 #[test]
-fn chatgpt_auth_persists_agent_identity_for_workspace() {
-    let codex_home = tempdir().unwrap();
-    write_auth_file(
-        AuthFileParams {
-            openai_api_key: None,
-            chatgpt_plan_type: Some("pro".to_string()),
-            chatgpt_account_id: Some("account-123".to_string()),
-        },
-        codex_home.path(),
-    )
-    .expect("failed to write auth file");
-    let auth = super::load_auth(
-        codex_home.path(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    )
-    .expect("load auth")
-    .expect("auth available");
-    let record = AgentIdentityAuthRecord {
-        workspace_id: "account-123".to_string(),
-        chatgpt_user_id: Some("user-123".to_string()),
-        agent_runtime_id: "agent_123".to_string(),
-        agent_private_key: "pkcs8-base64".to_string(),
-        registered_at: "2026-04-13T12:00:00Z".to_string(),
-        background_task_id: None,
-    };
-
-    auth.set_agent_identity(record.clone())
-        .expect("set agent identity");
-
-    assert_eq!(auth.get_agent_identity("account-123"), Some(record.clone()));
-    assert_eq!(auth.get_agent_identity("other-account"), None);
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-    let persisted = storage
-        .load()
-        .expect("load auth")
-        .expect("auth should exist");
-    assert_eq!(persisted.agent_identity, Some(record));
-
-    assert!(auth.remove_agent_identity().expect("remove agent identity"));
-    assert_eq!(auth.get_agent_identity("account-123"), None);
-}
-
-#[test]
-fn dummy_chatgpt_auth_does_not_create_cwd_auth_json_when_identity_is_set() {
-    let cwd_auth = std::env::current_dir()
-        .expect("current dir")
-        .join("auth.json");
-    let had_auth_json_before_test = cwd_auth.exists();
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let record = AgentIdentityAuthRecord {
-        workspace_id: "account_id".to_string(),
-        chatgpt_user_id: None,
-        agent_runtime_id: "agent_123".to_string(),
-        agent_private_key: "pkcs8-base64".to_string(),
-        registered_at: "2026-04-13T12:00:00Z".to_string(),
-        background_task_id: None,
-    };
-
-    auth.set_agent_identity(record.clone())
-        .expect("set agent identity");
-
-    assert_eq!(auth.get_agent_identity("account_id"), Some(record));
-    if !had_auth_json_before_test {
-        assert!(
-            !cwd_auth.exists(),
-            "dummy ChatGPT auth must not write auth.json in the test process cwd"
-        );
-    }
-}
-
-#[test]
 fn unauthorized_recovery_reports_mode_and_step_names() {
     let dir = tempdir().unwrap();
     let manager = AuthManager::shared(
         dir.path().to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
     );
     let managed = UnauthorizedRecovery {
         manager: Arc::clone(&manager),
@@ -366,6 +293,71 @@ async fn external_bearer_only_auth_manager_uses_cached_provider_token() {
 }
 
 #[tokio::test]
+async fn external_chatgpt_refresh_preserves_agent_identity_record() {
+    let codex_home = tempdir().unwrap();
+    let agent_identity = AgentIdentityAuthRecord {
+        agent_runtime_id: "agent-runtime-id".to_string(),
+        agent_private_key: "agent-private-key".to_string(),
+        account_id: "account-id".to_string(),
+        chatgpt_user_id: "user-12345".to_string(),
+        email: "user@example.com".to_string(),
+        plan_type: AccountPlanType::Pro,
+        chatgpt_account_is_fedramp: false,
+    };
+    let initial_access_token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("pro".to_string()),
+        chatgpt_account_id: Some("account-id".to_string()),
+    })
+    .unwrap();
+    let mut initial_auth =
+        AuthDotJson::from_external_access_token(&initial_access_token, "account-id", Some("pro"))
+            .unwrap();
+    initial_auth.agent_identity = Some(agent_identity.clone());
+    save_auth(
+        codex_home.path(),
+        &initial_auth,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .unwrap();
+
+    let refreshed_access_token = fake_jwt_for_auth_file_params(&AuthFileParams {
+        openai_api_key: None,
+        chatgpt_plan_type: Some("pro".to_string()),
+        chatgpt_account_id: Some("account-id".to_string()),
+    })
+    .unwrap();
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        /*chatgpt_base_url*/ None,
+    );
+    manager.set_external_auth(Arc::new(StaticChatgptExternalAuth {
+        refreshed: ExternalAuthTokens::chatgpt(
+            refreshed_access_token.clone(),
+            "account-id",
+            Some("pro".to_string()),
+        ),
+    }));
+
+    manager.refresh_token_from_authority().await.unwrap();
+
+    let refreshed_auth = manager
+        .auth_cached()
+        .and_then(|auth| auth.get_current_auth_json())
+        .expect("refreshed auth should be cached");
+    assert_eq!(refreshed_auth.agent_identity, Some(agent_identity));
+    assert_eq!(
+        refreshed_auth
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.access_token.as_str()),
+        Some(refreshed_access_token.as_str())
+    );
+}
+
+#[tokio::test]
 async fn external_bearer_only_auth_manager_disables_auto_refresh_when_interval_is_zero() {
     let script = ProviderAuthScript::new(&["provider-token", "next-token"]).unwrap();
     let mut auth_config = script.auth_config();
@@ -427,6 +419,25 @@ struct ProviderAuthScript {
     tempdir: TempDir,
     command: String,
     args: Vec<String>,
+}
+
+struct StaticChatgptExternalAuth {
+    refreshed: ExternalAuthTokens,
+}
+
+#[async_trait::async_trait]
+impl ExternalAuth for StaticChatgptExternalAuth {
+    fn auth_mode(&self) -> AuthMode {
+        AuthMode::ChatgptAuthTokens
+    }
+
+    async fn refresh(
+        &self,
+        context: ExternalAuthRefreshContext,
+    ) -> std::io::Result<ExternalAuthTokens> {
+        assert_eq!(context.previous_account_id.as_deref(), Some("account-id"));
+        Ok(self.refreshed.clone())
+    }
 }
 
 impl ProviderAuthScript {
@@ -549,67 +560,6 @@ exit 1
         }))
         .expect("provider auth config should deserialize")
     }
-}
-
-#[tokio::test]
-async fn auth_manager_notifies_when_auth_state_changes() {
-    let dir = tempdir().unwrap();
-    let manager = AuthManager::shared(
-        dir.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
-        AuthCredentialsStoreMode::File,
-    );
-    let mut auth_state_rx = manager.subscribe_auth_state();
-
-    save_auth(
-        dir.path(),
-        &AuthDotJson {
-            auth_mode: Some(ApiAuthMode::ApiKey),
-            openai_api_key: Some("sk-test-key".to_string()),
-            tokens: None,
-            last_refresh: None,
-            agent_identity: None,
-        },
-        AuthCredentialsStoreMode::File,
-    )
-    .expect("save auth");
-
-    assert!(
-        manager.reload(),
-        "reload should report a changed auth state"
-    );
-    timeout(Duration::from_secs(1), auth_state_rx.changed())
-        .await
-        .expect("auth change notification should arrive")
-        .expect("auth state watch should remain open");
-
-    save_auth(
-        dir.path(),
-        &AuthDotJson {
-            auth_mode: Some(ApiAuthMode::ApiKey),
-            openai_api_key: Some("sk-updated-key".to_string()),
-            tokens: None,
-            last_refresh: None,
-            agent_identity: None,
-        },
-        AuthCredentialsStoreMode::File,
-    )
-    .expect("save updated auth");
-
-    assert!(
-        !manager.reload(),
-        "reload remains mode-stable even when the underlying credentials change"
-    );
-    timeout(Duration::from_secs(1), auth_state_rx.changed())
-        .await
-        .expect("auth reload notification should still arrive")
-        .expect("auth state watch should remain open");
-
-    manager.set_forced_chatgpt_workspace_id(Some("workspace-123".to_string()));
-    timeout(Duration::from_secs(1), auth_state_rx.changed())
-        .await
-        .expect("workspace change notification should arrive")
-        .expect("auth state watch should remain open");
 }
 
 struct AuthFileParams {

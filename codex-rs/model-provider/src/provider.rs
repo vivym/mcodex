@@ -5,10 +5,13 @@ use codex_api::Provider;
 use codex_api::SharedAuthProvider;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 
+use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
+use crate::auth::resolve_provider_auth_with_account_override;
 
 /// Runtime provider abstraction used by model execution.
 ///
@@ -53,11 +56,40 @@ pub fn create_model_provider(
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> SharedModelProvider {
+    if provider_info.is_amazon_bedrock() {
+        let aws = provider_info
+            .aws
+            .clone()
+            .unwrap_or(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            });
+        return Arc::new(AmazonBedrockModelProvider {
+            info: provider_info,
+            aws,
+        });
+    }
+
     let auth_manager = auth_manager_for_provider(auth_manager, &provider_info);
     Arc::new(ConfiguredModelProvider {
         info: provider_info,
         auth_manager,
     })
+}
+
+pub fn resolve_auth(
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+) -> codex_protocol::error::Result<SharedAuthProvider> {
+    resolve_provider_auth(auth, provider)
+}
+
+pub fn resolve_auth_with_account_override(
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+    account_id: String,
+) -> codex_protocol::error::Result<SharedAuthProvider> {
+    resolve_provider_auth_with_account_override(auth, provider, account_id)
 }
 
 /// Runtime model provider backed by configured `ModelProviderInfo`.
@@ -89,6 +121,7 @@ impl ModelProvider for ConfiguredModelProvider {
 mod tests {
     use std::num::NonZeroU64;
 
+    use codex_model_provider_info::ModelProviderAwsAuthInfo;
     use codex_protocol::config_types::ModelProviderAuthInfo;
 
     use super::*;
@@ -122,5 +155,20 @@ mod tests {
             .expect("command auth provider should have an auth manager");
 
         assert!(auth_manager.has_external_auth());
+    }
+
+    #[test]
+    fn create_model_provider_does_not_use_openai_auth_manager_for_amazon_bedrock_provider() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
+                profile: Some("codex-bedrock".to_string()),
+                region: None,
+            })),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "openai-api-key",
+            ))),
+        );
+
+        assert!(provider.auth_manager().is_none());
     }
 }
