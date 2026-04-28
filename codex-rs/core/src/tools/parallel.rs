@@ -123,10 +123,10 @@ impl ToolCallRuntime {
                             .dispatch_tool_call_with_code_mode_result(
                                 session,
                                 turn,
+                                dispatch_cancellation_token,
                                 tracker,
                                 call.clone(),
                                 source,
-                                dispatch_cancellation_token,
                             )
                             .instrument(dispatch_span.clone())
                             .await

@@ -251,6 +251,10 @@ impl ResponsesWebsocketConnection {
 
         let current_span = Span::current();
         tokio::spawn(
+            #[expect(
+                clippy::await_holding_invalid_type,
+                reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
+            )]
             async move {
                 if let Some(model) = server_model
                     && tx_event

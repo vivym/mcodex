@@ -26,7 +26,6 @@ use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -34,8 +33,8 @@ use tracing::warn;
 use crate::config::Config;
 use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::new_guardian_review_id;
-use crate::guardian::review_approval_request_with_cancel;
 use crate::guardian::routes_approval_to_guardian;
+use crate::guardian::spawn_approval_request_review;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_ACCEPT_FOR_SESSION;
 use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
@@ -547,7 +546,7 @@ async fn handle_exec_approval(
     } = event;
     let decision = if routes_approval_to_guardian(parent_ctx) {
         let review_cancel = cancel_token.child_token();
-        let review_rx = spawn_guardian_review(
+        let review_rx = spawn_approval_request_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
             new_guardian_review_id(),
@@ -655,7 +654,7 @@ async fn handle_patch_approval(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let review_rx = spawn_guardian_review(
+        let review_rx = spawn_approval_request_review(
             Arc::clone(parent_session),
             Arc::clone(parent_ctx),
             new_guardian_review_id(),
@@ -776,7 +775,7 @@ async fn maybe_auto_review_mcp_request_user_input(
     )
     .await;
     let review_cancel = cancel_token.child_token();
-    let review_rx = spawn_guardian_review(
+    let review_rx = spawn_approval_request_review(
         Arc::clone(parent_session),
         Arc::clone(parent_ctx),
         new_guardian_review_id(),
@@ -820,36 +819,6 @@ async fn maybe_auto_review_mcp_request_user_input(
     })
 }
 
-fn spawn_guardian_review(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    review_id: String,
-    request: GuardianApprovalRequest,
-    retry_reason: Option<String>,
-    cancel_token: CancellationToken,
-) -> oneshot::Receiver<ReviewDecision> {
-    let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = tx.send(ReviewDecision::Denied);
-            return;
-        };
-        let decision = runtime.block_on(review_approval_request_with_cancel(
-            &session,
-            &turn,
-            review_id,
-            request,
-            retry_reason,
-            cancel_token,
-        ));
-        let _ = tx.send(decision);
-    });
-    rx
-}
-
 async fn handle_request_permissions(
     codex: &Codex,
     parent_session: &Arc<Session>,
@@ -862,7 +831,14 @@ async fn handle_request_permissions(
         reason: event.reason,
         permissions: event.permissions,
     };
-    let response_fut = parent_session.request_permissions(parent_ctx, call_id.clone(), args);
+    let cwd = event.cwd.unwrap_or_else(|| parent_ctx.cwd.clone());
+    let response_fut = parent_session.request_permissions_for_cwd(
+        parent_ctx,
+        call_id.clone(),
+        args,
+        cwd,
+        cancel_token.clone(),
+    );
     let response =
         await_request_permissions_with_cancel(response_fut, parent_session, &call_id, cancel_token)
             .await;

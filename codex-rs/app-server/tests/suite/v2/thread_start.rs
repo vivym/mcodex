@@ -66,7 +66,7 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     // Start a v2 thread with an explicit model override.
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.1".to_string()),
+            model: Some("gpt-5.2".to_string()),
             ..Default::default()
         })
         .await?;
@@ -432,7 +432,7 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
 
     let req_id = mcp
         .send_thread_start_request(ThreadStartParams {
-            model: Some("gpt-5.1".to_string()),
+            model: Some("gpt-5.2".to_string()),
             ephemeral: Some(true),
             ..Default::default()
         })

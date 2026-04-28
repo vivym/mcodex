@@ -642,7 +642,8 @@ mod tests {
             codex_core::config::Config::load_default_with_cli_overrides_for_codex_home(
                 codex_home.path().to_path_buf(),
                 Vec::new(),
-            )?;
+            )
+            .await?;
         config.accounts = Some(codex_config::types::AccountsConfigToml {
             backend: None,
             default_pool: Some("pool-main".to_string()),

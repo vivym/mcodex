@@ -364,7 +364,6 @@ fn remote_startup_notice_issue_source_from_resolution_source(
 mod tests {
     use super::*;
     use crate::legacy_core::config::ConfigBuilder;
-    use crate::legacy_core::config_loader::LoaderOverrides;
     use anyhow::anyhow;
     use codex_app_server_protocol::AccountLeaseReadResponse;
     use codex_app_server_protocol::AccountStartupAvailability as RemoteStartupAvailability;
@@ -374,6 +373,7 @@ mod tests {
     use codex_app_server_protocol::AccountStartupResolutionIssueType as RemoteIssueType;
     use codex_app_server_protocol::AccountStartupSnapshot;
     use codex_app_server_protocol::AuthMode as AppServerAuthMode;
+    use codex_config::LoaderOverrides;
     use codex_config::types::AccountsConfigToml;
     use codex_state::AccountRegistryEntryUpdate;
     use codex_state::AccountStartupSelectionUpdate;

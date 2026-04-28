@@ -346,7 +346,7 @@ async fn unified_exec_emits_exec_command_begin_event() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config.use_experimental_unified_exec_tool = true;
         config
             .features
@@ -405,7 +405,7 @@ async fn unified_exec_resolves_relative_workdir() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config.use_experimental_unified_exec_tool = true;
         config
             .features
@@ -474,7 +474,7 @@ async fn unified_exec_respects_workdir_override() -> Result<()> {
 
     let server = start_mock_server().await;
 
-    let mut builder = test_codex().with_model("gpt-5").with_config(|config| {
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
         config.use_experimental_unified_exec_tool = true;
         config
             .features

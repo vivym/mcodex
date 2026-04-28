@@ -109,10 +109,10 @@ impl ToolHandler for JsReplHandler {
         let ToolInvocation {
             session,
             turn,
+            cancellation_token,
             tracker,
             payload,
             call_id,
-            cancellation_token,
             ..
         } = invocation;
 
@@ -138,9 +138,9 @@ impl ToolHandler for JsReplHandler {
             .execute_with_cancellation(
                 Arc::clone(&session),
                 Arc::clone(&turn),
+                cancellation_token,
                 tracker,
                 args,
-                cancellation_token,
             )
             .await;
         let result = match result {

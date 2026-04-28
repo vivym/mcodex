@@ -209,7 +209,6 @@ impl OnboardingScreen {
                 error: None,
             }))
         }
-        // TODO: add git warning.
         Self {
             request_frame,
             steps,
@@ -950,7 +949,7 @@ mod tests {
             config,
         };
 
-        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args);
+        let mut screen = OnboardingScreen::new_with_frame_requester(request_frame, args).await;
         assert_eq!(step_names(&screen), vec!["welcome", "pooled-default"]);
 
         screen.handle_key_event(crossterm::event::KeyEvent::new(

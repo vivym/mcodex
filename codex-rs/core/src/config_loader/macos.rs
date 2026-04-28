@@ -1,6 +1,7 @@
 use super::ConfigRequirementsToml;
 use super::ConfigRequirementsWithSources;
 use super::RequirementSource;
+use super::merge_requirements_with_remote_sandbox_config;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use codex_product_identity::MCODEX;
@@ -85,6 +86,7 @@ fn load_managed_admin_config() -> io::Result<Option<ManagedAdminConfigLayer>> {
 pub(crate) async fn load_managed_admin_requirements_toml(
     target: &mut ConfigRequirementsWithSources,
     override_base64: Option<&str>,
+    host_name: Option<&str>,
 ) -> io::Result<()> {
     if let Some(encoded) = override_base64 {
         let trimmed = encoded.trim();
@@ -92,9 +94,11 @@ pub(crate) async fn load_managed_admin_requirements_toml(
             return Ok(());
         }
 
-        target.merge_unset_fields(
+        merge_requirements_with_remote_sandbox_config(
+            target,
             managed_preferences_requirements_source(MANAGED_PREFERENCES_APPLICATION_ID),
             parse_managed_requirements_base64(trimmed)?,
+            host_name,
         );
         return Ok(());
     }
@@ -102,9 +106,11 @@ pub(crate) async fn load_managed_admin_requirements_toml(
     match task::spawn_blocking(load_managed_admin_requirements).await {
         Ok(result) => {
             if let Some(requirements) = result? {
-                target.merge_unset_fields(
+                merge_requirements_with_remote_sandbox_config(
+                    target,
                     managed_preferences_requirements_source(requirements.domain),
                     requirements.requirements,
+                    host_name,
                 );
             }
             Ok(())

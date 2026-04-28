@@ -55,8 +55,24 @@ pub struct AnalyticsEventsClient {
 }
 
 impl AnalyticsEventsQueue {
+    pub(crate) fn new(auth_manager: Arc<AuthManager>, base_url: String) -> Self {
+        Self::new_with_auth(
+            Arc::new(SharedAuthProvider::new(auth_manager.clone())),
+            Some(auth_manager),
+            base_url,
+        )
+    }
+
     pub(crate) fn new_with_auth_provider(
         auth_provider: Arc<dyn AuthProvider>,
+        base_url: String,
+    ) -> Self {
+        Self::new_with_auth(auth_provider, /*auth_manager*/ None, base_url)
+    }
+
+    fn new_with_auth(
+        auth_provider: Arc<dyn AuthProvider>,
+        auth_manager: Option<Arc<AuthManager>>,
         base_url: String,
     ) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
@@ -65,7 +81,7 @@ impl AnalyticsEventsQueue {
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
-                send_track_events(&auth_provider, &base_url, events).await;
+                send_track_events(&auth_provider, auth_manager.as_ref(), &base_url, events).await;
             }
         });
         Self {
@@ -122,11 +138,10 @@ impl AnalyticsEventsClient {
         base_url: String,
         analytics_enabled: Option<bool>,
     ) -> Self {
-        Self::new_with_auth_provider(
-            Arc::new(SharedAuthProvider::new(auth_manager)),
-            base_url,
+        Self {
+            queue: AnalyticsEventsQueue::new(auth_manager, base_url),
             analytics_enabled,
-        )
+        }
     }
 
     pub fn new_with_auth_provider(
@@ -315,6 +330,7 @@ impl AnalyticsEventsClient {
 
 async fn send_track_events(
     auth_provider: &Arc<dyn AuthProvider>,
+    auth_manager: Option<&Arc<AuthManager>>,
     base_url: &str,
     events: Vec<TrackEventRequest>,
 ) {
@@ -327,10 +343,6 @@ async fn send_track_events(
     if !auth.is_chatgpt_auth() {
         return;
     }
-    let access_token = match auth.get_token() {
-        Ok(token) => token,
-        Err(_) => return,
-    };
     let Some(account_id) = auth.get_account_id() else {
         return;
     };
@@ -339,15 +351,31 @@ async fn send_track_events(
     let url = format!("{base_url}/codex/analytics-events/events");
     let payload = TrackEventsRequest { events };
 
-    let response = create_client()
+    let mut request = create_client()
         .post(&url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
-        .bearer_auth(&access_token)
         .header("chatgpt-account-id", &account_id)
         .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await;
+        .json(&payload);
+    if let Some(auth_manager) = auth_manager {
+        let Some(authorization_header_value) = auth_manager
+            .chatgpt_authorization_header_for_auth(&auth)
+            .await
+        else {
+            return;
+        };
+        request = request.header("authorization", authorization_header_value);
+    } else {
+        let access_token = match auth.get_token() {
+            Ok(token) => token,
+            Err(_) => return,
+        };
+        request = request.bearer_auth(&access_token);
+    }
+    if auth.is_fedramp_account() {
+        request = request.header("X-OpenAI-Fedramp", "true");
+    }
+    let response = request.send().await;
 
     match response {
         Ok(response) if response.status().is_success() => {}
