@@ -35,6 +35,7 @@ use codex_analytics::InputError;
 use codex_analytics::TurnSteerRequestError;
 use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AccountLeaseResumeResponse;
+use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountPoolAccountsListParams;
 use codex_app_server_protocol::AccountPoolDefaultClearResponse;
@@ -52,7 +53,6 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::AuthMode;
-use codex_app_server_protocol::AuthMode as CoreAuthMode;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::CancelLoginAccountResponse;
 use codex_app_server_protocol::CancelLoginAccountStatus;
@@ -103,6 +103,9 @@ use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceInterface;
 use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
+use codex_app_server_protocol::MarketplaceUpgradeErrorInfo;
+use codex_app_server_protocol::MarketplaceUpgradeParams;
+use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpResourceReadResponse;
 use codex_app_server_protocol::McpServerOauthLoginCompletedNotification;
@@ -232,7 +235,6 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_backend_client::AddCreditsNudgeCreditType as BackendAddCreditsNudgeCreditType;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
-use codex_config::Constrained;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::CodexThread;
 use codex_core::CodexThreadTurnContextOverrides;
@@ -240,6 +242,7 @@ use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::RolloutRecorder;
 use codex_core::SessionMeta;
+use codex_core::StartThreadWithToolsOptions;
 use codex_core::SteerInputError;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::ThreadManager;
@@ -261,27 +264,28 @@ use codex_core::find_thread_name_by_id;
 use codex_core::find_thread_names_by_ids;
 use codex_core::find_thread_path_by_id_str;
 use codex_core::path_utils;
-use codex_core::plugins::MarketplaceAddError;
-use codex_core::plugins::MarketplaceRemoveError;
-use codex_core::plugins::MarketplaceRemoveRequest as CoreMarketplaceRemoveRequest;
-use codex_core::plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
-use codex_core::plugins::add_marketplace as add_marketplace_to_codex_home;
-use codex_core::plugins::remove_marketplace;
 use codex_core::read_head_for_summary;
 use codex_core::read_session_meta_line;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
+use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::loader::load_plugin_apps;
 use codex_core_plugins::loader::load_plugin_mcp_servers;
 use codex_core_plugins::manifest::PluginManifestInterface;
 use codex_core_plugins::marketplace::MarketplaceError;
 use codex_core_plugins::marketplace::MarketplacePluginSource;
+use codex_core_plugins::marketplace_add::MarketplaceAddError;
+use codex_core_plugins::marketplace_add::MarketplaceAddRequest;
+use codex_core_plugins::marketplace_add::add_marketplace as add_marketplace_to_codex_home;
+use codex_core_plugins::marketplace_remove::MarketplaceRemoveError;
+use codex_core_plugins::marketplace_remove::MarketplaceRemoveRequest as CoreMarketplaceRemoveRequest;
+use codex_core_plugins::marketplace_remove::remove_marketplace;
 use codex_core_plugins::remote::RemoteMarketplace;
 use codex_core_plugins::remote::RemotePluginCatalogError;
 use codex_core_plugins::remote::RemotePluginDetail as RemoteCatalogPluginDetail;
@@ -314,7 +318,10 @@ use codex_mcp::discover_supported_scopes;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::read_mcp_resource as read_mcp_resource_without_thread;
 use codex_mcp::resolve_oauth_scopes;
+use codex_model_provider::ProviderAccountError;
+use codex_model_provider::create_model_provider;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -326,7 +333,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
@@ -357,7 +363,6 @@ use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::StateRuntime;
-use codex_state::ThreadConfigBaselineSnapshot;
 use codex_state::ThreadMetadata;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::log_db::LogDbLayer;
@@ -375,7 +380,6 @@ use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams as StoreUpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
-use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Error as IoError;
@@ -434,7 +438,6 @@ struct ThreadListFilters {
 
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-#[cfg(debug_assertions)]
 const LOGIN_ISSUER_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_ISSUER";
 const APP_LIST_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
 const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
@@ -485,29 +488,6 @@ enum ThreadShutdownResult {
     TimedOut,
 }
 
-enum ThreadReadViewError {
-    InvalidRequest(String),
-    Internal(String),
-}
-
-#[derive(Clone, Copy)]
-enum ThreadWatchRemovalNotification {
-    Publish,
-    Suppress,
-}
-
-#[derive(Clone, Copy)]
-enum FailedSetupReaperVisibility {
-    Hidden,
-    VisibleStarted,
-}
-
-#[derive(Clone, Copy)]
-enum FailedSetupArtifactCleanup {
-    Preserve,
-    DeleteCreatedRollout,
-}
-
 enum PooledRuntimeAdmission {
     NotPooled,
     Reserved(PooledRuntimeReservation),
@@ -525,6 +505,11 @@ impl PooledRuntimeAdmission {
             reservation.rollback().await;
         }
     }
+}
+
+enum ThreadReadViewError {
+    InvalidRequest(String),
+    Internal(String),
 }
 
 impl Drop for ActiveLogin {
@@ -546,6 +531,7 @@ pub(crate) struct CodexMessageProcessor {
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    account_lease_notifications: Arc<Mutex<HashMap<ThreadId, AccountLeaseUpdatedNotification>>>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     command_exec_manager: CommandExecManager,
@@ -571,6 +557,7 @@ struct ListenerTaskContext {
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    account_lease_notifications: Arc<Mutex<HashMap<ThreadId, AccountLeaseUpdatedNotification>>>,
     config: Arc<Config>,
     analytics_events_client: AnalyticsEventsClient,
     general_analytics_enabled: bool,
@@ -585,6 +572,7 @@ struct ThreadUnloadContext {
     outgoing: Arc<OutgoingMessageSender>,
     pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pooled_runtime_scope: Arc<PooledRuntimeScope>,
+    account_lease_notifications: Arc<Mutex<HashMap<ThreadId, AccountLeaseUpdatedNotification>>>,
     config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
@@ -736,6 +724,13 @@ fn configured_thread_store(config: &Config) -> Arc<dyn ThreadStore> {
     }
 }
 
+fn environment_selection_error_message(err: CodexErr) -> String {
+    match err {
+        CodexErr::InvalidRequest(message) => message,
+        err => err.to_string(),
+    }
+}
+
 impl CodexMessageProcessor {
     async fn instruction_sources_from_config(config: &Config) -> Vec<AbsolutePathBuf> {
         codex_core::AgentsMdManager::new(config)
@@ -823,6 +818,7 @@ impl CodexMessageProcessor {
             active_login: Arc::new(Mutex::new(None)),
             pending_thread_unloads: Arc::new(Mutex::new(HashSet::new())),
             pooled_runtime_scope: Arc::new(PooledRuntimeScope::default()),
+            account_lease_notifications: Arc::new(Mutex::new(HashMap::new())),
             thread_state_manager: ThreadStateManager::new(),
             thread_watch_manager: ThreadWatchManager::new_with_outgoing(outgoing),
             command_exec_manager: CommandExecManager::default(),
@@ -856,14 +852,12 @@ impl CodexMessageProcessor {
         collaboration_modes_config: CollaborationModesConfig,
     ) -> CollaborationMode {
         if collaboration_mode.settings.developer_instructions.is_none()
-            && let Some(instructions) = self
-                .thread_manager
-                .get_models_manager()
-                .list_collaboration_modes_for_config(collaboration_modes_config)
-                .into_iter()
-                .find(|preset| preset.mode == Some(collaboration_mode.mode))
-                .and_then(|preset| preset.developer_instructions.flatten())
-                .filter(|instructions| !instructions.is_empty())
+            && let Some(instructions) =
+                builtin_collaboration_mode_presets(collaboration_modes_config)
+                    .into_iter()
+                    .find(|preset| preset.mode == Some(collaboration_mode.mode))
+                    .and_then(|preset| preset.developer_instructions.flatten())
+                    .filter(|instructions| !instructions.is_empty())
         {
             collaboration_mode.settings.developer_instructions = Some(instructions);
         }
@@ -936,8 +930,8 @@ impl CodexMessageProcessor {
         request: ClientRequest,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        transport: AppServerTransport,
         request_context: RequestContext,
+        transport: AppServerTransport,
     ) {
         let to_connection_request_id = |request_id| ConnectionRequestId {
             connection_id,
@@ -955,8 +949,8 @@ impl CodexMessageProcessor {
                     params,
                     app_server_client_name.clone(),
                     app_server_client_version.clone(),
-                    transport,
                     request_context,
+                    transport,
                 )
                 .await;
             }
@@ -1056,6 +1050,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::MarketplaceRemove { request_id, params } => {
                 self.marketplace_remove(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::MarketplaceUpgrade { request_id, params } => {
+                self.marketplace_upgrade(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::PluginList { request_id, params } => {
@@ -1192,6 +1190,10 @@ impl CodexMessageProcessor {
             } => {
                 self.logout_v2(to_connection_request_id(request_id)).await;
             }
+            ClientRequest::CancelLoginAccount { request_id, params } => {
+                self.cancel_login_v2(to_connection_request_id(request_id), params)
+                    .await;
+            }
             ClientRequest::AccountLeaseRead {
                 request_id,
                 params: _,
@@ -1231,10 +1233,6 @@ impl CodexMessageProcessor {
                 params: _,
             } => {
                 self.account_pool_default_clear(to_connection_request_id(request_id))
-                    .await;
-            }
-            ClientRequest::CancelLoginAccount { request_id, params } => {
-                self.cancel_login_v2(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::GetAccount { request_id, params } => {
@@ -1826,7 +1824,7 @@ impl CodexMessageProcessor {
 
     async fn validate_account_lease_runtime(
         &self,
-        transport: AppServerTransport,
+        transport: &AppServerTransport,
     ) -> std::result::Result<(), JSONRPCErrorError> {
         Self::pooled_runtime_scope_required_for_config(self.config.as_ref(), transport)
             .await
@@ -1835,7 +1833,7 @@ impl CodexMessageProcessor {
 
     async fn pooled_runtime_scope_required_for_config(
         config: &Config,
-        transport: AppServerTransport,
+        transport: &AppServerTransport,
     ) -> std::result::Result<bool, JSONRPCErrorError> {
         let pooled_runtime_scope_required =
             config.accounts.is_some() || account_lease_api::pooled_mode_is_enabled(config).await?;
@@ -1843,7 +1841,7 @@ impl CodexMessageProcessor {
             return Ok(false);
         }
 
-        if matches!(transport, AppServerTransport::WebSocket { .. }) {
+        if !matches!(transport, AppServerTransport::Stdio) {
             return Err(unsupported_transport_error());
         }
 
@@ -2100,16 +2098,15 @@ impl CodexMessageProcessor {
                         .await
                     {
                         Ok(notification) => notification,
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed to durably suppress pooled account startup selection after logout: {}",
-                                error.message
+                        Err(err) => {
+                            warn!(
+                                "failed to suppress account lease selection after logout: {}",
+                                err.message
                             );
                             None
                         }
                     }
                 };
-
                 self.outgoing
                     .send_response(request_id, LogoutAccountResponse {})
                     .await;
@@ -2218,51 +2215,28 @@ impl CodexMessageProcessor {
 
         self.refresh_token_if_requested(do_refresh).await;
 
-        // Whether auth is required for the active model provider.
-        let requires_openai_auth = self.config.model_provider.requires_openai_auth;
-
-        if !requires_openai_auth {
-            let response = GetAccountResponse {
-                account: None,
-                requires_openai_auth,
-            };
-            self.outgoing.send_response(request_id, response).await;
-            return;
-        }
-
-        let account = match self.auth_manager.auth_cached() {
-            Some(auth) => match auth.auth_mode() {
-                CoreAuthMode::ApiKey => Some(Account::ApiKey {}),
-                CoreAuthMode::Chatgpt
-                | CoreAuthMode::ChatgptAuthTokens
-                | CoreAuthMode::AgentIdentity => {
-                    let email = auth.get_account_email();
-                    let plan_type = auth.account_plan_type();
-
-                    match (email, plan_type) {
-                        (Some(email), Some(plan_type)) => {
-                            Some(Account::Chatgpt { email, plan_type })
-                        }
-                        _ => {
-                            let error = JSONRPCErrorError {
-                                code: INVALID_REQUEST_ERROR_CODE,
-                                message:
-                                    "email and plan type are required for chatgpt authentication"
-                                        .to_string(),
-                                data: None,
-                            };
-                            self.outgoing.send_error(request_id, error).await;
-                            return;
-                        }
-                    }
-                }
-            },
-            None => None,
+        let provider = create_model_provider(
+            self.config.model_provider.clone(),
+            Some(self.auth_manager.clone()),
+        );
+        let account_state = match provider.account_state() {
+            Ok(account_state) => account_state,
+            Err(ProviderAccountError::MissingChatgptAccountDetails) => {
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message: "email and plan type are required for chatgpt authentication"
+                        .to_string(),
+                    data: None,
+                };
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
         };
+        let account = account_state.account.map(Account::from);
 
         let response = GetAccountResponse {
             account,
-            requires_openai_auth,
+            requires_openai_auth: account_state.requires_openai_auth,
         };
         self.outgoing.send_response(request_id, response).await;
     }
@@ -2317,7 +2291,7 @@ impl CodexMessageProcessor {
             });
         };
 
-        if !auth.is_chatgpt_auth() {
+        if !auth.uses_codex_backend() {
             return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: "chatgpt authentication required to notify workspace owner".to_string(),
@@ -2372,7 +2346,7 @@ impl CodexMessageProcessor {
             });
         };
 
-        if !auth.is_chatgpt_auth() {
+        if !auth.uses_codex_backend() {
             return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: "chatgpt authentication required to read rate limits".to_string(),
@@ -2735,24 +2709,8 @@ impl CodexMessageProcessor {
         file_system_sandbox_policy: &mut FileSystemSandboxPolicy,
         configured_file_system_sandbox_policy: &FileSystemSandboxPolicy,
     ) {
-        if file_system_sandbox_policy.glob_scan_max_depth.is_none() {
-            file_system_sandbox_policy.glob_scan_max_depth =
-                configured_file_system_sandbox_policy.glob_scan_max_depth;
-        }
-
-        for deny_entry in configured_file_system_sandbox_policy
-            .entries
-            .iter()
-            .filter(|entry| entry.access == FileSystemAccessMode::None)
-        {
-            if !file_system_sandbox_policy
-                .entries
-                .iter()
-                .any(|entry| entry == deny_entry)
-            {
-                file_system_sandbox_policy.entries.push(deny_entry.clone());
-            }
-        }
+        file_system_sandbox_policy
+            .preserve_deny_read_restrictions_from(configured_file_system_sandbox_policy);
     }
 
     async fn command_exec_write(
@@ -2806,8 +2764,8 @@ impl CodexMessageProcessor {
         params: ThreadStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-        transport: AppServerTransport,
         request_context: RequestContext,
+        transport: AppServerTransport,
     ) {
         let ThreadStartParams {
             model,
@@ -2828,6 +2786,7 @@ impl CodexMessageProcessor {
             personality,
             ephemeral,
             session_start_source,
+            environments,
             persist_extended_history,
         } = params;
         if sandbox.is_some() && permission_profile.is_some() {
@@ -2836,6 +2795,24 @@ impl CodexMessageProcessor {
                 "`permissionProfile` cannot be combined with `sandbox`".to_string(),
             )
             .await;
+            return;
+        }
+        let environments = environments.map(|environments| {
+            environments
+                .into_iter()
+                .map(|environment| TurnEnvironmentSelection {
+                    environment_id: environment.environment_id,
+                    cwd: environment.cwd,
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(environments) = environments.as_ref()
+            && let Err(err) = self
+                .thread_manager
+                .validate_environment_selections(environments)
+        {
+            self.send_invalid_request_error(request_id, environment_selection_error_message(err))
+                .await;
             return;
         }
         let mut typesafe_overrides = self.build_thread_config_overrides(
@@ -2858,6 +2835,7 @@ impl CodexMessageProcessor {
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+            account_lease_notifications: Arc::clone(&self.account_lease_notifications),
             config: Arc::clone(&self.config),
             analytics_events_client: self.analytics_events_client.clone(),
             general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
@@ -2878,11 +2856,12 @@ impl CodexMessageProcessor {
                 typesafe_overrides,
                 dynamic_tools,
                 session_start_source,
+                environments,
                 persist_extended_history,
-                transport,
                 service_name,
                 experimental_raw_events,
                 request_trace,
+                transport,
             )
             .await;
         };
@@ -2953,11 +2932,12 @@ impl CodexMessageProcessor {
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
+        environments: Option<Vec<TurnEnvironmentSelection>>,
         persist_extended_history: bool,
-        transport: AppServerTransport,
         service_name: Option<String>,
         experimental_raw_events: bool,
         request_trace: Option<W3cTraceContext>,
+        transport: AppServerTransport,
     ) {
         let requested_cwd = typesafe_overrides.cwd.clone();
         let mut config = match config_manager
@@ -2984,7 +2964,7 @@ impl CodexMessageProcessor {
             requested_permissions_trust_project(&typesafe_overrides, config.cwd.as_path());
 
         if requested_cwd.is_some()
-            && !config.active_project.is_trusted()
+            && config.active_project.trust_level.is_none()
             && (requested_permissions_trust_project
                 || matches!(
                     config.permissions.sandbox_policy.get(),
@@ -3053,6 +3033,11 @@ impl CodexMessageProcessor {
         }
 
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
+        let environments = environments.unwrap_or_else(|| {
+            listener_task_context
+                .thread_manager
+                .default_environment_selections(&config.cwd)
+        });
         let dynamic_tools = dynamic_tools.unwrap_or_default();
         let core_dynamic_tools = if dynamic_tools.is_empty() {
             Vec::new()
@@ -3082,7 +3067,7 @@ impl CodexMessageProcessor {
         };
         let core_dynamic_tool_count = core_dynamic_tools.len();
         let pooled_runtime_scope_required =
-            match Self::pooled_runtime_scope_required_for_config(&config, transport).await {
+            match Self::pooled_runtime_scope_required_for_config(&config, &transport).await {
                 Ok(required) => required,
                 Err(error) => {
                     listener_task_context
@@ -3111,19 +3096,20 @@ impl CodexMessageProcessor {
 
         match listener_task_context
             .thread_manager
-            .start_thread_with_tools_and_service_name(
+            .start_thread_with_tools_and_service_name(StartThreadWithToolsOptions {
                 config,
-                match session_start_source
+                initial_history: match session_start_source
                     .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
                 {
                     codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
                     codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
                 },
-                core_dynamic_tools,
+                dynamic_tools: core_dynamic_tools,
                 persist_extended_history,
-                service_name,
-                request_trace,
-            )
+                metrics_service_name: service_name,
+                parent_trace: request_trace,
+                environments,
+            })
             .instrument(tracing::info_span!(
                 "app_server.thread_start.create_thread",
                 otel.name = "app_server.thread_start.create_thread",
@@ -3147,29 +3133,6 @@ impl CodexMessageProcessor {
                 )
                 .await
                 {
-                    Self::cleanup_failed_top_level_thread_setup_for_context(
-                        ThreadUnloadContext {
-                            thread_manager: listener_task_context.thread_manager.clone(),
-                            outgoing: listener_task_context.outgoing.clone(),
-                            pending_thread_unloads: listener_task_context
-                                .pending_thread_unloads
-                                .clone(),
-                            pooled_runtime_scope: listener_task_context
-                                .pooled_runtime_scope
-                                .clone(),
-                            config: listener_task_context.config.clone(),
-                            thread_state_manager: listener_task_context
-                                .thread_state_manager
-                                .clone(),
-                            thread_watch_manager: listener_task_context
-                                .thread_watch_manager
-                                .clone(),
-                        },
-                        thread_id,
-                        thread.clone(),
-                        FailedSetupArtifactCleanup::DeleteCreatedRollout,
-                    )
-                    .await;
                     listener_task_context
                         .outgoing
                         .send_error(request_id, error)
@@ -3183,64 +3146,6 @@ impl CodexMessageProcessor {
                         otel.name = "app_server.thread_start.config_snapshot",
                     ))
                     .await;
-                if !config_snapshot.ephemeral && session_configured.rollout_path.is_some() {
-                    if let Err(err) = thread.try_ensure_rollout_materialized().await {
-                        Self::cleanup_failed_top_level_thread_setup_for_context(
-                            ThreadUnloadContext {
-                                thread_manager: listener_task_context.thread_manager.clone(),
-                                outgoing: listener_task_context.outgoing.clone(),
-                                pending_thread_unloads: listener_task_context
-                                    .pending_thread_unloads
-                                    .clone(),
-                                pooled_runtime_scope: listener_task_context
-                                    .pooled_runtime_scope
-                                    .clone(),
-                                config: listener_task_context.config.clone(),
-                                thread_state_manager: listener_task_context
-                                    .thread_state_manager
-                                    .clone(),
-                                thread_watch_manager: listener_task_context
-                                    .thread_watch_manager
-                                    .clone(),
-                            },
-                            thread_id,
-                            thread.clone(),
-                            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-                        )
-                        .await;
-                        listener_task_context
-                            .outgoing
-                            .send_error(
-                                request_id,
-                                JSONRPCErrorError {
-                                    code: INTERNAL_ERROR_CODE,
-                                    message: format!(
-                                        "failed to materialize rollout for thread {thread_id}: {err}"
-                                    ),
-                                    data: None,
-                                },
-                            )
-                            .await;
-                        return;
-                    }
-                    let effective_config = thread.effective_config().await;
-                    let start_config_baseline = thread_config_baseline_snapshot(
-                        thread_id,
-                        &session_configured,
-                        &PersistedThreadConfigBaselineFields {
-                            personality: effective_config.personality,
-                            personality_overrides_rollout: false,
-                            base_instructions: effective_config.base_instructions.clone(),
-                            developer_instructions: effective_config.developer_instructions.clone(),
-                            developer_instructions_overrides_rollout: false,
-                        },
-                    );
-                    Self::persist_thread_config_baseline_snapshot_for_config(
-                        listener_task_context.config.as_ref(),
-                        &start_config_baseline,
-                    )
-                    .await;
-                }
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     &config_snapshot,
@@ -3288,10 +3193,8 @@ impl CodexMessageProcessor {
                     /*has_in_progress_turn*/ false,
                 );
 
-                let permission_profile = thread_response_permission_profile(
-                    &config_snapshot.sandbox_policy,
-                    config_snapshot.permission_profile,
-                );
+                let permission_profile =
+                    thread_response_permission_profile(config_snapshot.permission_profile);
 
                 let response = ThreadStartResponse {
                     thread: thread.clone(),
@@ -3335,6 +3238,18 @@ impl CodexMessageProcessor {
                         "app_server.thread_start.notify_started",
                         otel.name = "app_server.thread_start.notify_started",
                     ))
+                    .await;
+            }
+            Err(CodexErr::InvalidRequest(message)) => {
+                pooled_runtime_admission.rollback().await;
+                let error = JSONRPCErrorError {
+                    code: INVALID_REQUEST_ERROR_CODE,
+                    message,
+                    data: None,
+                };
+                listener_task_context
+                    .outgoing
+                    .send_error(request_id, error)
                     .await;
             }
             Err(err) => {
@@ -3483,10 +3398,7 @@ impl CodexMessageProcessor {
             return;
         };
 
-        if let Err(error) = self.prepare_thread_for_archive(*parent_thread_id).await {
-            self.outgoing.send_error(request_id, error).await;
-            return;
-        }
+        self.prepare_thread_for_archive(*parent_thread_id).await;
         match self
             .thread_store
             .archive_thread(StoreArchiveThreadParams {
@@ -3506,12 +3418,7 @@ impl CodexMessageProcessor {
         }
 
         for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
-            if let Err(err) = self.prepare_thread_for_archive(descendant_thread_id).await {
-                warn!(
-                    "failed to prepare spawned descendant thread {descendant_thread_id} for archive while archiving {thread_id}: {err:?}"
-                );
-                continue;
-            }
+            self.prepare_thread_for_archive(descendant_thread_id).await;
             match self
                 .thread_store
                 .archive_thread(StoreArchiveThreadParams {
@@ -4943,7 +4850,7 @@ impl CodexMessageProcessor {
             return;
         }
 
-        if let Err(error) = self.validate_account_lease_runtime(transport).await {
+        if let Err(error) = self.validate_account_lease_runtime(&transport).await {
             self.outgoing.send_error(request_id, error).await;
             return;
         }
@@ -4958,7 +4865,7 @@ impl CodexMessageProcessor {
         }
 
         if self
-            .resume_running_thread(request_id.clone(), &params, transport)
+            .resume_running_thread(request_id.clone(), &params, &transport)
             .await
         {
             return;
@@ -4980,8 +4887,10 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            exclude_turns,
             persist_extended_history,
         } = params;
+        let include_turns = !exclude_turns;
 
         let thread_history = if let Some(history) = history {
             let Some(thread_history) = self
@@ -5001,6 +4910,7 @@ impl CodexMessageProcessor {
             thread_history
         };
 
+        let history_cwd = thread_history.session_cwd();
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
             model_provider,
@@ -5014,36 +4924,16 @@ impl CodexMessageProcessor {
             developer_instructions,
             personality,
         );
-        let persisted_resume_metadata = self.load_persisted_thread_metadata(&thread_history).await;
-        if let Some(persisted_metadata) = persisted_resume_metadata.as_ref() {
-            merge_persisted_resume_metadata(
+        let persisted_resume_metadata = self
+            .load_and_apply_persisted_resume_metadata(
+                &thread_history,
                 &mut request_overrides,
                 &mut typesafe_overrides,
-                persisted_metadata,
-            );
-        }
-        let persisted_resume_config_baseline = self
-            .load_persisted_thread_config_baseline(&thread_history)
+            )
             .await;
-        let source_config_baseline = source_thread_config_baseline_from_history(
-            &thread_history,
-            persisted_resume_config_baseline.as_ref(),
-            persisted_resume_metadata.as_ref(),
-        );
-        let base_instructions_policy = source_base_instructions_policy(
-            thread_history.get_rollout_items().as_slice(),
-            canonical_thread_id_from_history(&thread_history),
-            persisted_resume_config_baseline.as_ref(),
-        );
-        let history_cwd = source_config_baseline
-            .cwd
-            .clone()
-            .or_else(|| thread_history.session_cwd());
-        let request_overrides_for_baseline = request_overrides.clone();
-        let typesafe_overrides_for_baseline = typesafe_overrides.clone();
 
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let mut config = match self
+        let config = match self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
@@ -5055,36 +4945,11 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        if let Err(message) = apply_source_thread_config_baseline(
-            &mut config,
-            &source_config_baseline,
-            request_overrides_for_baseline.as_ref(),
-            &typesafe_overrides_for_baseline,
-            base_instructions_policy,
-        ) {
-            self.send_internal_error(request_id, message).await;
-            return;
-        }
-        let persisted_resume_config_baseline_fields = persisted_thread_config_baseline_fields(
-            &config,
-            &source_config_baseline,
-            persisted_resume_config_baseline.as_ref(),
-            request_overrides_for_baseline.as_ref(),
-            &typesafe_overrides_for_baseline,
-            base_instructions_policy,
-        );
 
-        let fallback_model_provider = config.model_provider_id.clone();
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
         let response_history = thread_history.clone();
-        let failed_setup_artifact_cleanup = match &response_history {
-            InitialHistory::Resumed(_) => FailedSetupArtifactCleanup::Preserve,
-            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
-                FailedSetupArtifactCleanup::DeleteCreatedRollout
-            }
-        };
         let pooled_runtime_scope_required =
-            match Self::pooled_runtime_scope_required_for_config(&config, transport).await {
+            match Self::pooled_runtime_scope_required_for_config(&config, &transport).await {
                 Ok(required) => required,
                 Err(error) => {
                     self.outgoing.send_error(request_id, error).await;
@@ -5120,19 +4985,8 @@ impl CodexMessageProcessor {
                 ..
             }) => {
                 pooled_runtime_admission.promote(thread_id).await;
-                let persisted_resume_config_baseline = thread_config_baseline_snapshot(
-                    thread_id,
-                    &session_configured,
-                    &persisted_resume_config_baseline_fields,
-                );
                 let SessionConfiguredEvent { rollout_path, .. } = session_configured;
                 let Some(rollout_path) = rollout_path else {
-                    self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
-                        thread_id,
-                        &codex_thread,
-                        failed_setup_artifact_cleanup,
-                    )
-                    .await;
                     self.send_internal_error(
                         request_id,
                         format!("rollout path missing for thread {thread_id}"),
@@ -5140,33 +4994,6 @@ impl CodexMessageProcessor {
                     .await;
                     return;
                 };
-                let mut thread = match self
-                    .load_thread_from_resume_source_or_send_internal(
-                        thread_id,
-                        codex_thread.as_ref(),
-                        &response_history,
-                        rollout_path.as_path(),
-                        fallback_model_provider.as_str(),
-                        persisted_resume_metadata.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(thread) => thread,
-                    Err(message) => {
-                        self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
-                            thread_id,
-                            &codex_thread,
-                            failed_setup_artifact_cleanup,
-                        )
-                        .await;
-                        self.send_internal_error(request_id, message).await;
-                        return;
-                    }
-                };
-
-                self.persist_thread_config_baseline_snapshot(&persisted_resume_config_baseline)
-                    .await;
-
                 // Auto-attach a thread listener when resuming a thread.
                 Self::log_listener_attach_result(
                     self.ensure_conversation_listener(
@@ -5180,6 +5007,24 @@ impl CodexMessageProcessor {
                     request_id.connection_id,
                     "thread",
                 );
+
+                let mut thread = match self
+                    .load_thread_from_resume_source_or_send_internal(
+                        thread_id,
+                        codex_thread.as_ref(),
+                        &response_history,
+                        rollout_path.as_path(),
+                        persisted_resume_metadata.as_ref(),
+                        include_turns,
+                    )
+                    .await
+                {
+                    Ok(thread) => thread,
+                    Err(message) => {
+                        self.send_internal_error(request_id, message).await;
+                        return;
+                    }
+                };
 
                 self.thread_watch_manager
                     .upsert_thread(thread.clone())
@@ -5196,7 +5041,6 @@ impl CodexMessageProcessor {
                     /*has_live_in_progress_turn*/ false,
                 );
                 let permission_profile = thread_response_permission_profile(
-                    &session_configured.sandbox_policy,
                     codex_thread.config_snapshot().await.permission_profile,
                 );
 
@@ -5224,24 +5068,28 @@ impl CodexMessageProcessor {
                 }
 
                 let connection_id = request_id.connection_id;
-                let token_usage_thread = response.thread.clone();
-                let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
-                    &response_history.get_rollout_items(),
-                    &token_usage_thread,
-                );
+                let token_usage_thread = include_turns.then(|| response.thread.clone());
                 self.outgoing.send_response(request_id, response).await;
-                // The client needs restored usage before it starts another turn.
-                // Sending after the response preserves JSON-RPC request ordering while
-                // still filling the status line before the next turn lifecycle begins.
-                send_thread_token_usage_update_to_connection(
-                    &self.outgoing,
-                    connection_id,
-                    thread_id,
-                    &token_usage_thread,
-                    codex_thread.as_ref(),
-                    token_usage_turn_id,
-                )
-                .await;
+                // `excludeTurns` is explicitly the cheap resume path, so avoid
+                // rebuilding history only to attribute a replayed usage update.
+                if let Some(token_usage_thread) = token_usage_thread {
+                    let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
+                        &response_history.get_rollout_items(),
+                        token_usage_thread.turns.as_slice(),
+                    );
+                    // The client needs restored usage before it starts another turn.
+                    // Sending after the response preserves JSON-RPC request ordering while
+                    // still filling the status line before the next turn lifecycle begins.
+                    send_thread_token_usage_update_to_connection(
+                        &self.outgoing,
+                        connection_id,
+                        thread_id,
+                        &token_usage_thread,
+                        codex_thread.as_ref(),
+                        token_usage_turn_id,
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 pooled_runtime_admission.rollback().await;
@@ -5255,85 +5103,30 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn load_persisted_thread_metadata(
+    async fn load_and_apply_persisted_resume_metadata(
         &self,
         thread_history: &InitialHistory,
+        request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
+        typesafe_overrides: &mut ConfigOverrides,
     ) -> Option<ThreadMetadata> {
         let InitialHistory::Resumed(resumed_history) = thread_history else {
             return None;
         };
-        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
-        state_db_ctx
+        let state_db_ctx = get_state_db(&self.config).await?;
+        let persisted_metadata = state_db_ctx
             .get_thread(resumed_history.conversation_id)
             .await
             .ok()
-            .flatten()
-    }
-
-    async fn load_persisted_thread_config_baseline(
-        &self,
-        thread_history: &InitialHistory,
-    ) -> Option<ThreadConfigBaselineSnapshot> {
-        let InitialHistory::Resumed(resumed_history) = thread_history else {
-            return None;
-        };
-        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
-        state_db_ctx
-            .get_thread_config_baseline(resumed_history.conversation_id)
-            .await
-            .ok()
-            .flatten()
-    }
-
-    async fn load_thread_metadata_by_id(
-        &self,
-        thread_id: Option<ThreadId>,
-    ) -> Option<ThreadMetadata> {
-        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
-        let thread_id = thread_id?;
-        state_db_ctx.get_thread(thread_id).await.ok().flatten()
-    }
-
-    async fn load_thread_config_baseline_by_id(
-        &self,
-        thread_id: Option<ThreadId>,
-    ) -> Option<ThreadConfigBaselineSnapshot> {
-        let state_db_ctx = open_state_db_for_direct_thread_lookup(&self.config).await?;
-        let thread_id = thread_id?;
-        state_db_ctx
-            .get_thread_config_baseline(thread_id)
-            .await
-            .ok()
-            .flatten()
-    }
-
-    async fn persist_thread_config_baseline_snapshot(
-        &self,
-        snapshot: &ThreadConfigBaselineSnapshot,
-    ) {
-        Self::persist_thread_config_baseline_snapshot_for_config(&self.config, snapshot).await;
-    }
-
-    async fn persist_thread_config_baseline_snapshot_for_config(
-        config: &Config,
-        snapshot: &ThreadConfigBaselineSnapshot,
-    ) {
-        let Some(state_db_ctx) = open_state_db_for_direct_thread_lookup(config).await else {
-            return;
-        };
-        if let Err(err) = state_db_ctx.upsert_thread_config_baseline(snapshot).await {
-            warn!(
-                "failed to persist thread config baseline for {}: {err}",
-                snapshot.thread_id
-            );
-        }
+            .flatten()?;
+        merge_persisted_resume_metadata(request_overrides, typesafe_overrides, &persisted_metadata);
+        Some(persisted_metadata)
     }
 
     async fn resume_running_thread(
         &self,
         request_id: ConnectionRequestId,
         params: &ThreadResumeParams,
-        transport: AppServerTransport,
+        transport: &AppServerTransport,
     ) -> bool {
         if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
             && let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await
@@ -5498,6 +5291,7 @@ impl CodexMessageProcessor {
                     config_snapshot,
                     instruction_sources,
                     thread_summary,
+                    include_turns: !params.exclude_turns,
                 }),
             );
             if listener_command_tx.send(command).is_err() {
@@ -5601,22 +5395,22 @@ impl CodexMessageProcessor {
         thread: &CodexThread,
         thread_history: &InitialHistory,
         rollout_path: &Path,
-        fallback_provider: &str,
         persisted_resume_metadata: Option<&ThreadMetadata>,
+        include_turns: bool,
     ) -> std::result::Result<Thread, String> {
+        let config_snapshot = thread.config_snapshot().await;
         let thread = match thread_history {
             InitialHistory::Resumed(resumed) => {
                 load_thread_summary_for_rollout(
                     &self.config,
                     resumed.conversation_id,
                     resumed.rollout_path.as_path(),
-                    fallback_provider,
+                    config_snapshot.model_provider_id.as_str(),
                     persisted_resume_metadata,
                 )
                 .await
             }
             InitialHistory::Forked(items) => {
-                let config_snapshot = thread.config_snapshot().await;
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     &config_snapshot,
@@ -5632,13 +5426,15 @@ impl CodexMessageProcessor {
         let mut thread = thread?;
         thread.id = thread_id.to_string();
         thread.path = Some(rollout_path.to_path_buf());
-        let history_items = thread_history.get_rollout_items();
-        populate_thread_turns(
-            &mut thread,
-            ThreadTurnSource::HistoryItems(&history_items),
-            /*active_turn*/ None,
-        )
-        .await?;
+        if include_turns {
+            let history_items = thread_history.get_rollout_items();
+            populate_thread_turns(
+                &mut thread,
+                ThreadTurnSource::HistoryItems(&history_items),
+                /*active_turn*/ None,
+            )
+            .await?;
+        }
         self.attach_thread_name(thread_id, &mut thread).await;
         Ok(thread)
     }
@@ -5670,8 +5466,10 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             ephemeral,
+            exclude_turns,
             persist_extended_history,
         } = params;
+        let include_turns = !exclude_turns;
         if sandbox.is_some() && permission_profile.is_some() {
             self.send_invalid_request_error(
                 request_id,
@@ -5681,7 +5479,7 @@ impl CodexMessageProcessor {
             return;
         }
 
-        let (rollout_path, mut source_thread_id) = if let Some(path) = path {
+        let (rollout_path, source_thread_id) = if let Some(path) = path {
             (path, None)
         } else {
             let existing_thread_id = match ThreadId::from_string(&thread_id) {
@@ -5722,46 +5520,9 @@ impl CodexMessageProcessor {
             }
         };
 
-        let source_rollout =
-            match read_rollout_items_and_thread_id_from_rollout(rollout_path.as_path()).await {
-                Ok(source_rollout) => source_rollout,
-                Err(err) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("failed to load rollout `{}`: {err}", rollout_path.display()),
-                    )
-                    .await;
-                    return;
-                }
-            };
-        let (source_rollout_items, rollout_thread_id) = source_rollout;
-        source_thread_id.get_or_insert(rollout_thread_id);
-        let persisted_source_metadata = self.load_thread_metadata_by_id(source_thread_id).await;
-        let persisted_source_config_baseline = self
-            .load_thread_config_baseline_by_id(source_thread_id)
-            .await;
-        let source_config_baseline = source_thread_config_baseline_from_items(
-            &source_rollout_items,
-            source_thread_id,
-            persisted_source_config_baseline.as_ref(),
-            persisted_source_metadata.as_ref(),
-        );
-        let base_instructions_policy = source_base_instructions_policy(
-            &source_rollout_items,
-            source_thread_id,
-            persisted_source_config_baseline.as_ref(),
-        );
-        let history_cwd = match source_config_baseline.cwd.clone() {
-            Some(cwd) => Some(cwd),
-            None => {
-                read_history_cwd_from_state_db(
-                    &self.config,
-                    source_thread_id,
-                    rollout_path.as_path(),
-                )
-                .await
-            }
-        };
+        let history_cwd =
+            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
+                .await;
 
         // Persist Windows sandbox mode.
         let mut cli_overrides = cli_overrides.unwrap_or_default();
@@ -5799,10 +5560,8 @@ impl CodexMessageProcessor {
             /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
-        let request_overrides_for_baseline = request_overrides.clone();
-        let typesafe_overrides_for_baseline = typesafe_overrides.clone();
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
-        let mut config = match self
+        let config = match self
             .config_manager
             .load_for_cwd(request_overrides, typesafe_overrides, history_cwd)
             .await
@@ -5815,29 +5574,11 @@ impl CodexMessageProcessor {
                 return;
             }
         };
-        if let Err(message) = apply_source_thread_config_baseline(
-            &mut config,
-            &source_config_baseline,
-            request_overrides_for_baseline.as_ref(),
-            &typesafe_overrides_for_baseline,
-            base_instructions_policy,
-        ) {
-            self.send_internal_error(request_id, message).await;
-            return;
-        }
-        let persisted_fork_config_baseline_fields = persisted_thread_config_baseline_fields(
-            &config,
-            &source_config_baseline,
-            persisted_source_config_baseline.as_ref(),
-            request_overrides_for_baseline.as_ref(),
-            &typesafe_overrides_for_baseline,
-            base_instructions_policy,
-        );
 
         let fallback_model_provider = config.model_provider_id.clone();
         let instruction_sources = Self::instruction_sources_from_config(&config).await;
         let pooled_runtime_scope_required =
-            match Self::pooled_runtime_scope_required_for_config(&config, transport).await {
+            match Self::pooled_runtime_scope_required_for_config(&config, &transport).await {
                 Ok(required) => required,
                 Err(error) => {
                     self.outgoing.send_error(request_id, error).await;
@@ -5897,13 +5638,20 @@ impl CodexMessageProcessor {
             }
         };
         pooled_runtime_admission.promote(thread_id).await;
-        let persisted_fork_config_baseline = session_configured.rollout_path.as_ref().map(|_| {
-            thread_config_baseline_snapshot(
+
+        // Auto-attach a conversation listener when forking a thread.
+        Self::log_listener_attach_result(
+            self.ensure_conversation_listener(
                 thread_id,
-                &session_configured,
-                &persisted_fork_config_baseline_fields,
+                request_id.connection_id,
+                /*raw_events_enabled*/ false,
+                ApiVersion::V2,
             )
-        });
+            .await,
+            thread_id,
+            request_id.connection_id,
+            "thread",
+        );
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so they rebuild their visible history from the copied source rollout instead.
@@ -5921,8 +5669,6 @@ impl CodexMessageProcessor {
                     thread
                 }
                 Err(err) => {
-                    self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
-                        .await;
                     self.send_internal_error(
                         request_id,
                         format!(
@@ -5939,7 +5685,21 @@ impl CodexMessageProcessor {
             // forked thread names do not inherit the source thread name
             let mut thread =
                 build_thread_from_snapshot(thread_id, &config_snapshot, /*path*/ None);
-            let history_items = source_rollout_items.clone();
+            let history_items = match read_rollout_items_from_rollout(rollout_path.as_path()).await
+            {
+                Ok(items) => items,
+                Err(err) => {
+                    self.send_internal_error(
+                        request_id,
+                        format!(
+                            "failed to load source rollout `{}` for thread {thread_id}: {err}",
+                            rollout_path.display()
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             thread.preview = preview_from_rollout_items(&history_items);
             thread.forked_from_id = source_thread_id
                 .or_else(|| {
@@ -5949,15 +5709,14 @@ impl CodexMessageProcessor {
                     })
                 })
                 .map(|id| id.to_string());
-            if let Err(message) = populate_thread_turns(
-                &mut thread,
-                ThreadTurnSource::HistoryItems(&history_items),
-                /*active_turn*/ None,
-            )
-            .await
+            if include_turns
+                && let Err(message) = populate_thread_turns(
+                    &mut thread,
+                    ThreadTurnSource::HistoryItems(&history_items),
+                    /*active_turn*/ None,
+                )
+                .await
             {
-                self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
-                    .await;
                 self.send_internal_error(request_id, message).await;
                 return;
             }
@@ -5965,6 +5724,7 @@ impl CodexMessageProcessor {
         };
 
         if let Some(fork_rollout_path) = session_configured.rollout_path.as_ref()
+            && include_turns
             && let Err(message) = populate_thread_turns(
                 &mut thread,
                 ThreadTurnSource::RolloutPath(fork_rollout_path.as_path()),
@@ -5972,30 +5732,9 @@ impl CodexMessageProcessor {
             )
             .await
         {
-            self.cleanup_failed_top_level_thread_setup(thread_id, &forked_thread)
-                .await;
             self.send_internal_error(request_id, message).await;
             return;
         }
-
-        if let Some(persisted_fork_config_baseline) = persisted_fork_config_baseline.as_ref() {
-            self.persist_thread_config_baseline_snapshot(persisted_fork_config_baseline)
-                .await;
-        }
-
-        // Auto-attach a conversation listener when forking a thread.
-        Self::log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                /*raw_events_enabled*/ false,
-                ApiVersion::V2,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
 
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())
@@ -6008,7 +5747,6 @@ impl CodexMessageProcessor {
             /*has_in_progress_turn*/ false,
         );
         let permission_profile = thread_response_permission_profile(
-            &session_configured.sandbox_policy,
             forked_thread.config_snapshot().await.permission_profile,
         );
 
@@ -6036,30 +5774,34 @@ impl CodexMessageProcessor {
         }
 
         let connection_id = request_id.connection_id;
-        let token_usage_thread = response.thread.clone();
-        let token_usage_turn_id = if let Some(turn_id) =
-            latest_token_usage_turn_id_for_thread_path(&token_usage_thread).await
-        {
-            Some(turn_id)
-        } else {
-            latest_token_usage_turn_id_from_rollout_path(
-                rollout_path.as_path(),
-                &token_usage_thread,
-            )
-            .await
-        };
+        let token_usage_thread = include_turns.then(|| response.thread.clone());
         self.outgoing.send_response(request_id, response).await;
-        // Mirror the resume contract for forks: the new thread is usable as soon
-        // as the response arrives, so restored usage must follow immediately.
-        send_thread_token_usage_update_to_connection(
-            &self.outgoing,
-            connection_id,
-            thread_id,
-            &token_usage_thread,
-            forked_thread.as_ref(),
-            token_usage_turn_id,
-        )
-        .await;
+        // `excludeTurns` is the cheap fork path, so skip restored usage replay
+        // instead of rebuilding history only to attribute a historical update.
+        if let Some(token_usage_thread) = token_usage_thread {
+            let token_usage_turn_id = if let Some(turn_id) =
+                latest_token_usage_turn_id_for_thread_path(&token_usage_thread).await
+            {
+                Some(turn_id)
+            } else {
+                latest_token_usage_turn_id_from_rollout_path(
+                    rollout_path.as_path(),
+                    token_usage_thread.turns.as_slice(),
+                )
+                .await
+            };
+            // Mirror the resume contract for forks: the new thread is usable as soon
+            // as the response arrives, so restored usage must follow immediately.
+            send_thread_token_usage_update_to_connection(
+                &self.outgoing,
+                connection_id,
+                thread_id,
+                &token_usage_thread,
+                forked_thread.as_ref(),
+                token_usage_turn_id,
+            )
+            .await;
+        }
 
         let notif = ThreadStartedNotification { thread };
         self.outgoing
@@ -6634,8 +6376,8 @@ impl CodexMessageProcessor {
         let environment_manager = self.thread_manager.environment_manager();
         let runtime_environment = match environment_manager.default_environment() {
             Some(environment) => {
-                // Status listing has no turn cwd. This fallback is used by
-                // stdio MCPs whose config omits `cwd`.
+                // Status listing has no turn cwd. This fallback is used only
+                // by executor-backed stdio MCPs whose config omits `cwd`.
                 McpRuntimeEnvironment::new(environment, config.cwd.to_path_buf())
             }
             None => McpRuntimeEnvironment::new(
@@ -6985,341 +6727,15 @@ impl CodexMessageProcessor {
 
     fn thread_unload_context(&self) -> ThreadUnloadContext {
         ThreadUnloadContext {
-            thread_manager: self.thread_manager.clone(),
-            outgoing: self.outgoing.clone(),
-            pending_thread_unloads: self.pending_thread_unloads.clone(),
-            pooled_runtime_scope: self.pooled_runtime_scope.clone(),
-            config: self.config.clone(),
+            thread_manager: Arc::clone(&self.thread_manager),
+            outgoing: Arc::clone(&self.outgoing),
+            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+            account_lease_notifications: Arc::clone(&self.account_lease_notifications),
+            config: Arc::clone(&self.config),
             thread_state_manager: self.thread_state_manager.clone(),
             thread_watch_manager: self.thread_watch_manager.clone(),
         }
-    }
-
-    async fn cleanup_failed_top_level_thread_setup(
-        &self,
-        thread_id: ThreadId,
-        thread: &Arc<CodexThread>,
-    ) {
-        self.cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
-            thread_id,
-            thread,
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-        )
-        .await;
-    }
-
-    async fn cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
-        &self,
-        thread_id: ThreadId,
-        thread: &Arc<CodexThread>,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        Self::cleanup_failed_top_level_thread_setup_for_context(
-            self.thread_unload_context(),
-            thread_id,
-            thread.clone(),
-            artifact_cleanup,
-        )
-        .await;
-    }
-
-    async fn cleanup_failed_top_level_thread_setup_for_context(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        let shutdown_result = Self::wait_for_thread_shutdown(&thread).await;
-        Self::finalize_failed_top_level_thread_setup(
-            context,
-            thread_id,
-            thread,
-            artifact_cleanup,
-            shutdown_result,
-        )
-        .await;
-    }
-
-    async fn finalize_failed_top_level_thread_setup(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-        shutdown_result: ThreadShutdownResult,
-    ) {
-        match shutdown_result {
-            ThreadShutdownResult::Complete => {
-                Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
-                let _ = context.thread_manager.remove_thread(&thread_id).await;
-                Self::finalize_thread_teardown_for_context_with_watch_notification(
-                    context,
-                    thread_id,
-                    ThreadWatchRemovalNotification::Suppress,
-                )
-                .await;
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                warn!(
-                    "failed to submit Shutdown to top-level thread {thread_id} after setup failure; keeping pooled runtime loaded"
-                );
-                Self::spawn_failed_thread_setup_reaper(
-                    context,
-                    thread_id,
-                    thread,
-                    FailedSetupReaperVisibility::Hidden,
-                    artifact_cleanup,
-                );
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!(
-                    "top-level thread {thread_id} shutdown timed out after setup failure; keeping pooled runtime loaded"
-                );
-                Self::spawn_failed_thread_setup_reaper(
-                    context,
-                    thread_id,
-                    thread,
-                    FailedSetupReaperVisibility::Hidden,
-                    artifact_cleanup,
-                );
-            }
-        }
-    }
-
-    async fn cleanup_failed_setup_artifacts(
-        thread_id: ThreadId,
-        thread: &Arc<CodexThread>,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        let FailedSetupArtifactCleanup::DeleteCreatedRollout = artifact_cleanup else {
-            return;
-        };
-
-        if let Some(rollout_path) = thread.rollout_path() {
-            match tokio::fs::remove_file(&rollout_path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    warn!(
-                        "failed to delete rollout `{}` after failed setup for thread {thread_id}: {err}",
-                        rollout_path.display()
-                    );
-                }
-            }
-        }
-
-        if let Some(state_db) = thread.state_db()
-            && let Err(err) = state_db.delete_thread(thread_id).await
-        {
-            warn!("failed to delete state db row after failed setup for thread {thread_id}: {err}");
-        }
-    }
-
-    async fn track_loaded_thread_from_runtime(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: &Arc<CodexThread>,
-    ) -> Thread {
-        let config_snapshot = thread.config_snapshot().await;
-        let mut api_thread =
-            build_thread_from_snapshot(thread_id, &config_snapshot, thread.rollout_path());
-        context
-            .thread_watch_manager
-            .upsert_thread_silently(api_thread.clone())
-            .await;
-        api_thread.status = resolve_thread_status(
-            context
-                .thread_watch_manager
-                .loaded_status_for_thread(&api_thread.id)
-                .await,
-            /*has_in_progress_turn*/ false,
-        );
-        api_thread
-    }
-
-    async fn emit_thread_started_from_runtime(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: &Arc<CodexThread>,
-    ) {
-        let api_thread =
-            Self::track_loaded_thread_from_runtime(context.clone(), thread_id, thread).await;
-        context
-            .outgoing
-            .send_server_notification(ServerNotification::ThreadStarted(
-                ThreadStartedNotification { thread: api_thread },
-            ))
-            .await;
-    }
-
-    fn spawn_failed_thread_setup_reaper(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        visibility: FailedSetupReaperVisibility,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        tokio::spawn(async move {
-            Self::reap_failed_thread_setup(
-                context,
-                thread_id,
-                thread,
-                visibility,
-                artifact_cleanup,
-            )
-            .await;
-        });
-    }
-
-    async fn reap_failed_thread_setup(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        visibility: FailedSetupReaperVisibility,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        let shutdown_result = Self::wait_for_thread_shutdown(&thread).await;
-        Self::finalize_failed_thread_setup_reap(
-            context,
-            thread_id,
-            thread,
-            visibility,
-            artifact_cleanup,
-            shutdown_result,
-        )
-        .await;
-    }
-
-    async fn finalize_failed_thread_setup_reap(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        visibility: FailedSetupReaperVisibility,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-        shutdown_result: ThreadShutdownResult,
-    ) {
-        match shutdown_result {
-            ThreadShutdownResult::Complete => {
-                Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
-                let removed_thread = context
-                    .thread_manager
-                    .remove_thread(&thread_id)
-                    .await
-                    .is_some();
-                let outgoing = context.outgoing.clone();
-                let watch_notification = match visibility {
-                    FailedSetupReaperVisibility::Hidden => ThreadWatchRemovalNotification::Suppress,
-                    FailedSetupReaperVisibility::VisibleStarted => {
-                        ThreadWatchRemovalNotification::Publish
-                    }
-                };
-                Self::finalize_thread_teardown_for_context_with_watch_notification(
-                    context,
-                    thread_id,
-                    watch_notification,
-                )
-                .await;
-                if removed_thread
-                    && matches!(visibility, FailedSetupReaperVisibility::VisibleStarted)
-                {
-                    outgoing
-                        .send_server_notification(ServerNotification::ThreadClosed(
-                            ThreadClosedNotification {
-                                thread_id: thread_id.to_string(),
-                            },
-                        ))
-                        .await;
-                }
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                warn!(
-                    "failed to submit Shutdown while reaping thread {thread_id} after setup failure; keeping pooled runtime loaded"
-                );
-                Self::handle_failed_setup_reap_incomplete(
-                    context,
-                    thread_id,
-                    thread,
-                    visibility,
-                    artifact_cleanup,
-                )
-                .await;
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!(
-                    "thread {thread_id} shutdown timed out while reaping after setup failure; keeping pooled runtime loaded"
-                );
-                Self::handle_failed_setup_reap_incomplete(
-                    context,
-                    thread_id,
-                    thread,
-                    visibility,
-                    artifact_cleanup,
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn handle_failed_setup_reap_incomplete(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        visibility: FailedSetupReaperVisibility,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        match visibility {
-            FailedSetupReaperVisibility::Hidden => {
-                Self::emit_thread_started_from_runtime(context.clone(), thread_id, &thread).await;
-                Self::spawn_visible_failed_setup_completion_reaper(
-                    context,
-                    thread_id,
-                    thread,
-                    artifact_cleanup,
-                );
-            }
-            FailedSetupReaperVisibility::VisibleStarted => {
-                Self::track_loaded_thread_from_runtime(context.clone(), thread_id, &thread).await;
-                Self::spawn_visible_failed_setup_completion_reaper(
-                    context,
-                    thread_id,
-                    thread,
-                    artifact_cleanup,
-                );
-            }
-        }
-    }
-
-    fn spawn_visible_failed_setup_completion_reaper(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        thread: Arc<CodexThread>,
-        artifact_cleanup: FailedSetupArtifactCleanup,
-    ) {
-        tokio::spawn(async move {
-            if let Err(err) = thread.shutdown_and_wait().await {
-                warn!(
-                    "failed to complete visible failed-setup thread {thread_id} shutdown; keeping pooled runtime loaded: {err}"
-                );
-                return;
-            }
-
-            Self::cleanup_failed_setup_artifacts(thread_id, &thread, artifact_cleanup).await;
-            let removed_thread = context
-                .thread_manager
-                .remove_thread(&thread_id)
-                .await
-                .is_some();
-            let outgoing = context.outgoing.clone();
-            Self::finalize_thread_teardown_for_context(context, thread_id).await;
-            if removed_thread {
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(
-                        ThreadClosedNotification {
-                            thread_id: thread_id.to_string(),
-                        },
-                    ))
-                    .await;
-            }
-        });
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
@@ -7330,32 +6746,32 @@ impl CodexMessageProcessor {
         context: ThreadUnloadContext,
         thread_id: ThreadId,
     ) {
-        Self::finalize_thread_teardown_for_context_with_watch_notification(
-            context,
+        let replacement_thread_id = Self::mark_pooled_runtime_thread_unloaded(
+            &context.thread_manager,
+            &context.pooled_runtime_scope,
             thread_id,
-            ThreadWatchRemovalNotification::Publish,
         )
         .await;
+        Self::finalize_thread_teardown_after_pooled_mark(context, thread_id, replacement_thread_id)
+            .await;
     }
 
-    async fn finalize_thread_teardown_for_context_with_watch_notification(
+    async fn finalize_thread_teardown_after_pooled_mark(
         context: ThreadUnloadContext,
         thread_id: ThreadId,
-        watch_notification: ThreadWatchRemovalNotification,
+        replacement_thread_id: Option<ThreadId>,
     ) {
         context
             .pending_thread_unloads
             .lock()
             .await
             .remove(&thread_id);
-        Self::mark_pooled_runtime_thread_unloaded(
-            &context.thread_manager,
-            &context.pooled_runtime_scope,
+        let account_lease_notification = Self::changed_account_lease_notification_after_teardown(
+            &context,
             thread_id,
+            replacement_thread_id,
         )
         .await;
-        let account_lease_notification =
-            Self::changed_account_lease_notification_after_teardown(&context, thread_id).await;
         context
             .outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
@@ -7364,20 +6780,10 @@ impl CodexMessageProcessor {
             .thread_state_manager
             .remove_thread_state(thread_id)
             .await;
-        match watch_notification {
-            ThreadWatchRemovalNotification::Publish => {
-                context
-                    .thread_watch_manager
-                    .remove_thread(&thread_id.to_string())
-                    .await;
-            }
-            ThreadWatchRemovalNotification::Suppress => {
-                context
-                    .thread_watch_manager
-                    .remove_thread_silently(&thread_id.to_string())
-                    .await;
-            }
-        }
+        context
+            .thread_watch_manager
+            .remove_thread(&thread_id.to_string())
+            .await;
         if let Some(notification) = account_lease_notification {
             context
                 .outgoing
@@ -7389,41 +6795,42 @@ impl CodexMessageProcessor {
     async fn changed_account_lease_notification_after_teardown(
         context: &ThreadUnloadContext,
         thread_id: ThreadId,
-    ) -> Option<codex_app_server_protocol::AccountLeaseUpdatedNotification> {
-        let thread_state = context
-            .thread_state_manager
-            .thread_state_if_exists(thread_id)
-            .await?;
+        replacement_thread_id: Option<ThreadId>,
+    ) -> Option<AccountLeaseUpdatedNotification> {
         let (config, live_snapshot) = Self::loaded_or_process_account_lease_config_for_context(
             &context.thread_manager,
             &context.pooled_runtime_scope,
             &context.config,
         )
         .await;
-        let notification = match account_lease_api::read_account_lease(
-            config.as_ref(),
-            live_snapshot,
-        )
-        .await
-        {
-            Ok(response) => response.into(),
-            Err(err) => {
-                warn!(
-                    "failed to build account lease updated notification after thread teardown: {}",
-                    err.message
-                );
-                return None;
-            }
-        };
-        let mut thread_state = thread_state.lock().await;
-        thread_state.take_changed_account_lease_notification(notification)
+        let notification: AccountLeaseUpdatedNotification =
+            match account_lease_api::read_account_lease(config.as_ref(), live_snapshot).await {
+                Ok(response) => response.into(),
+                Err(err) => {
+                    warn!(
+                        "failed to build account lease updated notification after thread teardown: {}",
+                        err.message
+                    );
+                    return None;
+                }
+            };
+        let mut account_lease_notifications = context.account_lease_notifications.lock().await;
+        let previous_notification = account_lease_notifications.remove(&thread_id);
+        if let Some(replacement_thread_id) = replacement_thread_id {
+            account_lease_notifications.insert(replacement_thread_id, notification.clone());
+        }
+        if previous_notification.as_ref() == Some(&notification) {
+            None
+        } else {
+            Some(notification)
+        }
     }
 
     async fn mark_pooled_runtime_thread_unloaded(
         thread_manager: &Arc<ThreadManager>,
         pooled_runtime_scope: &Arc<PooledRuntimeScope>,
         thread_id: ThreadId,
-    ) {
+    ) -> Option<ThreadId> {
         let replacement_thread_id = Self::pooled_runtime_replacement_thread_for_unload(
             thread_manager,
             pooled_runtime_scope,
@@ -7434,6 +6841,7 @@ impl CodexMessageProcessor {
         pooled_runtime_scope
             .mark_thread_unloaded_or_transfer(thread_id, replacement_thread_id)
             .await;
+        replacement_thread_id
     }
 
     async fn pooled_runtime_replacement_thread_for_unload(
@@ -7499,29 +6907,40 @@ impl CodexMessageProcessor {
             .await;
         context
             .thread_state_manager
-            .clear_thread_listener(thread_id)
+            .remove_thread_state(thread_id)
             .await;
 
         tokio::spawn(async move {
             match Self::wait_for_thread_shutdown(&thread).await {
                 ThreadShutdownResult::Complete => {
-                    Self::mark_pooled_runtime_thread_unloaded(
+                    let replacement_thread_id = Self::mark_pooled_runtime_thread_unloaded(
                         &context.thread_manager,
                         &context.pooled_runtime_scope,
                         thread_id,
                     )
                     .await;
-                    let removed_thread = context
+                    if context
                         .thread_manager
                         .remove_thread(&thread_id)
                         .await
-                        .is_some();
-                    let outgoing = context.outgoing.clone();
-                    Self::finalize_thread_teardown_for_context(context, thread_id).await;
-                    if !removed_thread {
+                        .is_none()
+                    {
                         info!("thread {thread_id} was already removed before teardown finalized");
+                        Self::finalize_thread_teardown_after_pooled_mark(
+                            context,
+                            thread_id,
+                            replacement_thread_id,
+                        )
+                        .await;
                         return;
                     }
+                    let outgoing = context.outgoing.clone();
+                    Self::finalize_thread_teardown_after_pooled_mark(
+                        context,
+                        thread_id,
+                        replacement_thread_id,
+                    )
+                    .await;
                     let notification = ThreadClosedNotification {
                         thread_id: thread_id.to_string(),
                     };
@@ -7594,95 +7013,38 @@ impl CodexMessageProcessor {
             .await;
     }
 
-    async fn prepare_thread_for_archive(
-        &self,
-        thread_id: ThreadId,
-    ) -> Result<(), JSONRPCErrorError> {
+    async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
         // If the thread is active, request shutdown and wait briefly.
-        let pooled_runtime_replacement_thread_id =
-            Self::pooled_runtime_replacement_thread_for_unload(
-                &self.thread_manager,
-                &self.pooled_runtime_scope,
-                thread_id,
-            )
-            .await;
-        let active_conversation = self.thread_manager.get_thread(thread_id).await.ok();
-        if let Some(conversation) = active_conversation {
+        let replacement_thread_id = Self::pooled_runtime_replacement_thread_for_unload(
+            &self.thread_manager,
+            &self.pooled_runtime_scope,
+            thread_id,
+        )
+        .await;
+        let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
+        if let Some(conversation) = removed_conversation {
             info!("thread {thread_id} was active; shutting down");
-            let shutdown_result = Self::wait_for_thread_shutdown(&conversation).await;
-            Self::finalize_active_thread_archive_after_shutdown(
-                self.thread_unload_context(),
-                thread_id,
-                pooled_runtime_replacement_thread_id,
-                shutdown_result,
-            )
-            .await?;
-        } else {
-            Self::finalize_thread_archive_teardown(
-                self.thread_unload_context(),
-                thread_id,
-                pooled_runtime_replacement_thread_id,
-            )
-            .await;
-        }
-        Ok(())
-    }
-
-    async fn finalize_active_thread_archive_after_shutdown(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        replacement_thread_id: Option<ThreadId>,
-        shutdown_result: ThreadShutdownResult,
-    ) -> Result<(), JSONRPCErrorError> {
-        match shutdown_result {
-            ThreadShutdownResult::Complete => {
-                Self::finalize_thread_archive_teardown(context, thread_id, replacement_thread_id)
-                    .await;
-                Ok(())
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                error!(
-                    "failed to submit Shutdown to thread {thread_id}; leaving active thread loaded"
-                );
-                Err(JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!(
-                        "failed to archive thread {thread_id}: unable to submit shutdown to active thread; leaving thread loaded"
-                    ),
-                    data: None,
-                })
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!("thread {thread_id} shutdown timed out; leaving active thread loaded");
-                Err(JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!(
-                        "failed to archive thread {thread_id}: active thread did not shut down before timeout; leaving thread loaded"
-                    ),
-                    data: None,
-                })
+            match Self::wait_for_thread_shutdown(&conversation).await {
+                ThreadShutdownResult::Complete => {}
+                ThreadShutdownResult::SubmitFailed => {
+                    error!(
+                        "failed to submit Shutdown to thread {thread_id}; proceeding with archive"
+                    );
+                }
+                ThreadShutdownResult::TimedOut => {
+                    warn!("thread {thread_id} shutdown timed out; proceeding with archive");
+                }
             }
         }
-    }
-
-    async fn finalize_thread_archive_teardown(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        replacement_thread_id: Option<ThreadId>,
-    ) {
-        context
-            .pooled_runtime_scope
+        self.pooled_runtime_scope
             .mark_thread_unloaded_or_transfer(thread_id, replacement_thread_id)
             .await;
-        if context
-            .thread_manager
-            .remove_thread(&thread_id)
-            .await
-            .is_none()
-        {
-            info!("thread {thread_id} was already removed before archive finalized");
-        }
-        Self::finalize_thread_teardown_for_context(context, thread_id).await;
+        Self::finalize_thread_teardown_after_pooled_mark(
+            self.thread_unload_context(),
+            thread_id,
+            replacement_thread_id,
+        )
+        .await;
     }
 
     async fn apps_list(&self, request_id: ConnectionRequestId, params: AppsListParams) {
@@ -7711,7 +7073,7 @@ impl CodexMessageProcessor {
         let auth = self.auth_manager.auth().await;
         if !config
             .features
-            .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth))
+            .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
         {
             self.outgoing
                 .send_response(
@@ -8080,10 +7442,65 @@ impl CodexMessageProcessor {
             }
         }
     }
+
+    async fn marketplace_upgrade(
+        &self,
+        request_id: ConnectionRequestId,
+        params: MarketplaceUpgradeParams,
+    ) {
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => config,
+            Err(err) => {
+                self.outgoing.send_error(request_id, err).await;
+                return;
+            }
+        };
+        let plugins_manager = self.thread_manager.plugins_manager();
+        let MarketplaceUpgradeParams { marketplace_name } = params;
+
+        let result = tokio::task::spawn_blocking(move || {
+            plugins_manager
+                .upgrade_configured_marketplaces_for_config(&config, marketplace_name.as_deref())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(outcome)) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        MarketplaceUpgradeResponse {
+                            selected_marketplaces: outcome.selected_marketplaces,
+                            upgraded_roots: outcome.upgraded_roots,
+                            errors: outcome
+                                .errors
+                                .into_iter()
+                                .map(|err| MarketplaceUpgradeErrorInfo {
+                                    marketplace_name: err.marketplace_name,
+                                    message: err.message,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await;
+            }
+            Ok(Err(message)) => {
+                self.send_invalid_request_error(request_id, message).await;
+            }
+            Err(err) => {
+                self.send_internal_error(
+                    request_id,
+                    format!("failed to upgrade marketplaces: {err}"),
+                )
+                .await;
+            }
+        }
+    }
+
     async fn marketplace_add(&self, request_id: ConnectionRequestId, params: MarketplaceAddParams) {
         let result = add_marketplace_to_codex_home(
             self.config.codex_home.to_path_buf(),
-            codex_core::plugins::MarketplaceAddRequest {
+            MarketplaceAddRequest {
                 source: params.source,
                 ref_name: params.ref_name,
                 sparse_paths: params.sparse_paths.unwrap_or_default(),
@@ -8213,15 +7630,25 @@ impl CodexMessageProcessor {
         let collaboration_mode = params.collaboration_mode.map(|mode| {
             self.normalize_turn_start_collaboration_mode(mode, collaboration_modes_config)
         });
-        let environments = params.environments.map(|environments| {
-            environments
-                .into_iter()
-                .map(|environment| TurnEnvironmentSelection {
-                    environment_id: environment.environment_id,
-                    cwd: environment.cwd,
-                })
-                .collect()
-        });
+        let environments: Option<Vec<TurnEnvironmentSelection>> =
+            params.environments.map(|environments| {
+                environments
+                    .into_iter()
+                    .map(|environment| TurnEnvironmentSelection {
+                        environment_id: environment.environment_id,
+                        cwd: environment.cwd,
+                    })
+                    .collect()
+            });
+        if let Some(environments) = environments.as_ref()
+            && let Err(err) = self
+                .thread_manager
+                .validate_environment_selections(environments)
+        {
+            self.send_invalid_request_error(request_id, environment_selection_error_message(err))
+                .await;
+            return;
+        }
 
         // Map v2 input items to core input items.
         let mapped_items: Vec<CoreInputItem> = params
@@ -8869,12 +8296,12 @@ impl CodexMessageProcessor {
                 })?
         };
 
-        let mut config = parent_thread.effective_config().await.as_ref().clone();
+        let mut config = self.config.as_ref().clone();
         if let Some(review_model) = &config.review_model {
             config.model = Some(review_model.clone());
         }
         let pooled_runtime_scope_required =
-            Self::pooled_runtime_scope_required_for_config(&config, transport).await?;
+            Self::pooled_runtime_scope_required_for_config(&config, &transport).await?;
         let pooled_runtime_admission = self
             .reserve_top_level_pooled_runtime(pooled_runtime_scope_required)
             .await?;
@@ -8946,12 +8373,6 @@ impl CodexMessageProcessor {
                         session_configured.session_id,
                         err
                     );
-                    Self::emit_thread_started_from_runtime(
-                        self.thread_unload_context(),
-                        thread_id,
-                        &review_thread,
-                    )
-                    .await;
                 }
             }
         } else {
@@ -8959,37 +8380,20 @@ impl CodexMessageProcessor {
                 "review thread {} has no rollout path",
                 session_configured.session_id
             );
-            Self::emit_thread_started_from_runtime(
-                self.thread_unload_context(),
-                thread_id,
-                &review_thread,
-            )
-            .await;
         }
 
-        let turn_id = match self
+        let turn_id = self
             .submit_core_op(
                 request_id,
                 review_thread.as_ref(),
                 Op::Review { review_request },
             )
             .await
-        {
-            Ok(turn_id) => turn_id,
-            Err(err) => {
-                self.cleanup_failed_detached_review_thread_start(
-                    thread_id,
-                    &review_thread,
-                    /*thread_started_emitted*/ true,
-                )
-                .await;
-                return Err(JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to start detached review turn: {err}"),
-                    data: None,
-                });
-            }
-        };
+            .map_err(|err| JSONRPCErrorError {
+                code: INTERNAL_ERROR_CODE,
+                message: format!("failed to start detached review turn: {err}"),
+                data: None,
+            })?;
 
         let turn = Self::build_review_turn(turn_id, display_text);
         let review_thread_id = thread_id.to_string();
@@ -8997,105 +8401,6 @@ impl CodexMessageProcessor {
             .await;
 
         Ok(())
-    }
-
-    async fn cleanup_failed_detached_review_thread_start(
-        &self,
-        thread_id: ThreadId,
-        review_thread: &Arc<CodexThread>,
-        thread_started_emitted: bool,
-    ) {
-        let shutdown_result = Self::wait_for_thread_shutdown(review_thread).await;
-        Self::finalize_failed_detached_review_thread_start(
-            self.thread_unload_context(),
-            thread_id,
-            review_thread.clone(),
-            shutdown_result,
-            thread_started_emitted,
-        )
-        .await;
-    }
-
-    async fn finalize_failed_detached_review_thread_start(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        review_thread: Arc<CodexThread>,
-        shutdown_result: ThreadShutdownResult,
-        thread_started_emitted: bool,
-    ) {
-        match shutdown_result {
-            ThreadShutdownResult::Complete => {
-                Self::cleanup_failed_setup_artifacts(
-                    thread_id,
-                    &review_thread,
-                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
-                )
-                .await;
-                let _ = context.thread_manager.remove_thread(&thread_id).await;
-                let outgoing = context.outgoing.clone();
-                Self::finalize_thread_teardown_for_context(context, thread_id).await;
-                if thread_started_emitted {
-                    outgoing
-                        .send_server_notification(ServerNotification::ThreadClosed(
-                            ThreadClosedNotification {
-                                thread_id: thread_id.to_string(),
-                            },
-                        ))
-                        .await;
-                }
-            }
-            ThreadShutdownResult::SubmitFailed => {
-                warn!(
-                    "failed to shut down detached review thread {thread_id} after submit failure; keeping pooled runtime loaded"
-                );
-                Self::ensure_detached_review_thread_started(
-                    context.clone(),
-                    thread_id,
-                    &review_thread,
-                    thread_started_emitted,
-                )
-                .await;
-                Self::spawn_failed_thread_setup_reaper(
-                    context,
-                    thread_id,
-                    review_thread,
-                    FailedSetupReaperVisibility::VisibleStarted,
-                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
-                );
-            }
-            ThreadShutdownResult::TimedOut => {
-                warn!(
-                    "detached review thread {thread_id} shutdown timed out after submit failure; keeping pooled runtime loaded"
-                );
-                Self::ensure_detached_review_thread_started(
-                    context.clone(),
-                    thread_id,
-                    &review_thread,
-                    thread_started_emitted,
-                )
-                .await;
-                Self::spawn_failed_thread_setup_reaper(
-                    context,
-                    thread_id,
-                    review_thread,
-                    FailedSetupReaperVisibility::VisibleStarted,
-                    FailedSetupArtifactCleanup::DeleteCreatedRollout,
-                );
-            }
-        }
-    }
-
-    async fn ensure_detached_review_thread_started(
-        context: ThreadUnloadContext,
-        thread_id: ThreadId,
-        review_thread: &Arc<CodexThread>,
-        thread_started_emitted: bool,
-    ) {
-        if thread_started_emitted {
-            Self::track_loaded_thread_from_runtime(context, thread_id, review_thread).await;
-        } else {
-            Self::emit_thread_started_from_runtime(context, thread_id, review_thread).await;
-        }
     }
 
     async fn review_start(
@@ -9234,6 +8539,7 @@ impl CodexMessageProcessor {
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
                 pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+                account_lease_notifications: Arc::clone(&self.account_lease_notifications),
                 config: Arc::clone(&self.config),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
@@ -9354,6 +8660,7 @@ impl CodexMessageProcessor {
                 outgoing: Arc::clone(&self.outgoing),
                 pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
                 pooled_runtime_scope: Arc::clone(&self.pooled_runtime_scope),
+                account_lease_notifications: Arc::clone(&self.account_lease_notifications),
                 config: Arc::clone(&self.config),
                 analytics_events_client: self.analytics_events_client.clone(),
                 general_analytics_enabled: self.config.features.enabled(Feature::GeneralAnalytics),
@@ -9405,9 +8712,10 @@ impl CodexMessageProcessor {
             thread_state_manager,
             pending_thread_unloads,
             pooled_runtime_scope,
+            account_lease_notifications,
             config,
-            analytics_events_client: _,
-            general_analytics_enabled: _,
+            analytics_events_client,
+            general_analytics_enabled,
             thread_watch_manager,
             fallback_model_provider,
             codex_home,
@@ -9483,9 +8791,7 @@ impl CodexMessageProcessor {
                             conversation_id,
                             conversation.clone(),
                             thread_manager.clone(),
-                            listener_task_context
-                                .general_analytics_enabled
-                                .then(|| listener_task_context.analytics_events_client.clone()),
+                            general_analytics_enabled.then(|| analytics_events_client.clone()),
                             thread_outgoing.clone(),
                             thread_state.clone(),
                             thread_watch_manager.clone(),
@@ -9497,8 +8803,9 @@ impl CodexMessageProcessor {
 
                         maybe_emit_account_lease_updated_notification(
                             &event.msg,
+                            conversation_id,
                             &conversation,
-                            &thread_state,
+                            &account_lease_notifications,
                             &thread_outgoing,
                         )
                         .await;
@@ -9530,6 +8837,7 @@ impl CodexMessageProcessor {
                                 outgoing: outgoing_for_task.clone(),
                                 pending_thread_unloads: pending_thread_unloads.clone(),
                                 pooled_runtime_scope: pooled_runtime_scope.clone(),
+                                account_lease_notifications: account_lease_notifications.clone(),
                                 config: config.clone(),
                                 thread_state_manager: thread_state_manager.clone(),
                                 thread_watch_manager: thread_watch_manager.clone(),
@@ -9751,10 +9059,39 @@ impl CodexMessageProcessor {
             }
             let state_db_ctx = get_state_db(&self.config).await;
             let feedback_thread_ids = match conversation_id {
-                Some(conversation_id) => {
-                    self.feedback_thread_ids_for_upload(conversation_id, state_db_ctx.as_ref())
-                        .await
-                }
+                Some(conversation_id) => match self
+                    .thread_manager
+                    .list_agent_subtree_thread_ids(conversation_id)
+                    .await
+                {
+                    Ok(thread_ids) => thread_ids,
+                    Err(err) => {
+                        warn!(
+                            "failed to list feedback subtree for thread_id={conversation_id}: {err}"
+                        );
+                        let mut thread_ids = vec![conversation_id];
+                        if let Some(state_db_ctx) = state_db_ctx.as_ref() {
+                            for status in [
+                                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
+                                codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
+                            ] {
+                                match state_db_ctx
+                                    .list_thread_spawn_descendants_with_status(
+                                        conversation_id,
+                                        status,
+                                    )
+                                    .await
+                                {
+                                    Ok(descendant_ids) => thread_ids.extend(descendant_ids),
+                                    Err(err) => warn!(
+                                        "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
+                                    ),
+                                }
+                            }
+                        }
+                        thread_ids
+                    }
+                },
                 None => Vec::new(),
             };
             let sqlite_feedback_logs = if let Some(state_db_ctx) = state_db_ctx.as_ref()
@@ -9945,88 +9282,6 @@ impl CodexMessageProcessor {
                 None
             })
     }
-
-    async fn feedback_thread_ids_for_upload(
-        &self,
-        conversation_id: ThreadId,
-        state_db_ctx: Option<&StateDbHandle>,
-    ) -> Vec<ThreadId> {
-        let complete_result = self
-            .thread_manager
-            .list_agent_subtree_thread_ids(conversation_id)
-            .await;
-        self.feedback_thread_ids_for_upload_with_complete_result(
-            conversation_id,
-            state_db_ctx,
-            complete_result,
-        )
-        .await
-    }
-
-    async fn feedback_thread_ids_for_upload_with_complete_result(
-        &self,
-        conversation_id: ThreadId,
-        state_db_ctx: Option<&StateDbHandle>,
-        complete_result: CodexResult<Vec<ThreadId>>,
-    ) -> Vec<ThreadId> {
-        match complete_result {
-            Ok(thread_ids) => thread_ids,
-            Err(err) => {
-                warn!("failed to list feedback subtree for thread_id={conversation_id}: {err}");
-                self.fallback_feedback_thread_ids_for_upload(conversation_id, state_db_ctx)
-                    .await
-            }
-        }
-    }
-
-    async fn fallback_feedback_thread_ids_for_upload(
-        &self,
-        conversation_id: ThreadId,
-        state_db_ctx: Option<&StateDbHandle>,
-    ) -> Vec<ThreadId> {
-        let mut thread_ids = Vec::new();
-        let mut seen_thread_ids = HashSet::new();
-        let mut push_thread_id = |thread_id| {
-            if seen_thread_ids.insert(thread_id) {
-                thread_ids.push(thread_id);
-            }
-        };
-
-        push_thread_id(conversation_id);
-
-        match self
-            .thread_manager
-            .list_live_agent_subtree_thread_ids(conversation_id)
-            .await
-        {
-            Ok(live_thread_ids) => {
-                for thread_id in live_thread_ids {
-                    push_thread_id(thread_id);
-                }
-            }
-            Err(err) => {
-                warn!("failed to list live feedback subtree for thread_id={conversation_id}: {err}")
-            }
-        }
-
-        if let Some(state_db_ctx) = state_db_ctx {
-            match state_db_ctx
-                .list_thread_spawn_descendants(conversation_id)
-                .await
-            {
-                Ok(descendant_ids) => {
-                    for thread_id in descendant_ids {
-                        push_thread_id(thread_id);
-                    }
-                }
-                Err(err) => warn!(
-                    "failed to list persisted feedback subtree for thread_id={conversation_id}: {err}"
-                ),
-            }
-        }
-
-        thread_ids
-    }
 }
 
 fn normalize_thread_list_cwd_filters(
@@ -10092,54 +9347,6 @@ mod thread_list_cwd_filter_tests {
         );
         Ok(())
     }
-}
-
-async fn maybe_emit_account_lease_updated_notification(
-    event: &EventMsg,
-    conversation: &Arc<CodexThread>,
-    thread_state: &Arc<Mutex<ThreadState>>,
-    outgoing: &ThreadScopedOutgoingMessageSender,
-) {
-    if !event_can_change_account_lease_notification(event) {
-        return;
-    }
-
-    let Some(live_snapshot) = conversation.account_lease_snapshot().await else {
-        return;
-    };
-    let config = conversation.effective_config().await;
-    let notification =
-        match account_lease_api::account_lease_updated_notification_from_runtime_snapshot(
-            config.as_ref(),
-            &live_snapshot,
-        )
-        .await
-        {
-            Ok(notification) => notification,
-            Err(err) => {
-                warn!(
-                    "failed to build account lease updated notification from runtime snapshot: {}",
-                    err.message
-                );
-                return;
-            }
-        };
-    let notification = {
-        let mut thread_state = thread_state.lock().await;
-        thread_state.take_changed_account_lease_notification(notification)
-    };
-    if let Some(notification) = notification {
-        outgoing
-            .send_server_notification(ServerNotification::AccountLeaseUpdated(notification))
-            .await;
-    }
-}
-
-fn event_can_change_account_lease_notification(event: &EventMsg) -> bool {
-    matches!(
-        event,
-        EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_) | EventMsg::Error(_)
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10222,12 +9429,13 @@ async fn handle_pending_thread_resume_request(
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
-    if let Err(message) = populate_thread_turns(
-        &mut thread,
-        ThreadTurnSource::RolloutPath(pending.rollout_path.as_path()),
-        active_turn.as_ref(),
-    )
-    .await
+    if pending.include_turns
+        && let Err(message) = populate_thread_turns(
+            &mut thread,
+            ThreadTurnSource::RolloutPath(pending.rollout_path.as_path()),
+            active_turn.as_ref(),
+        )
+        .await
     {
         outgoing
             .send_error(
@@ -10296,8 +9504,7 @@ async fn handle_pending_thread_resume_request(
         ..
     } = pending.config_snapshot;
     let instruction_sources = pending.instruction_sources;
-    let permission_profile =
-        thread_response_permission_profile(&sandbox_policy, permission_profile);
+    let permission_profile = thread_response_permission_profile(permission_profile);
 
     let response = ThreadResumeResponse {
         thread,
@@ -10312,24 +9519,28 @@ async fn handle_pending_thread_resume_request(
         permission_profile,
         reasoning_effort,
     };
-    let token_usage_thread = response.thread.clone();
-    let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_path(
-        pending.rollout_path.as_path(),
-        &token_usage_thread,
-    )
-    .await;
+    let token_usage_thread = pending.include_turns.then(|| response.thread.clone());
     outgoing.send_response(request_id, response).await;
-    // Rejoining a loaded thread has the same UI contract as a cold resume, but
-    // uses the live conversation state instead of reconstructing a new session.
-    send_thread_token_usage_update_to_connection(
-        outgoing,
-        connection_id,
-        conversation_id,
-        &token_usage_thread,
-        conversation.as_ref(),
-        token_usage_turn_id,
-    )
-    .await;
+    // Match cold resume: metadata-only resume should attach the listener without
+    // paying the cost of turn reconstruction for historical usage replay.
+    if let Some(token_usage_thread) = token_usage_thread {
+        let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_path(
+            pending.rollout_path.as_path(),
+            token_usage_thread.turns.as_slice(),
+        )
+        .await;
+        // Rejoining a loaded thread has the same UI contract as a cold resume, but
+        // uses the live conversation state instead of reconstructing a new session.
+        send_thread_token_usage_update_to_connection(
+            outgoing,
+            connection_id,
+            conversation_id,
+            &token_usage_thread,
+            conversation.as_ref(),
+            token_usage_turn_id,
+        )
+        .await;
+    }
     outgoing
         .replay_requests_to_connection_for_thread(connection_id, conversation_id)
         .await;
@@ -10390,6 +9601,61 @@ async fn resolve_pending_server_request(
             },
         ))
         .await;
+}
+
+async fn maybe_emit_account_lease_updated_notification(
+    event: &EventMsg,
+    conversation_id: ThreadId,
+    conversation: &Arc<CodexThread>,
+    account_lease_notifications: &Arc<Mutex<HashMap<ThreadId, AccountLeaseUpdatedNotification>>>,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    if !event_can_change_account_lease_notification(event) {
+        return;
+    }
+
+    let Some(live_snapshot) = conversation.account_lease_snapshot().await else {
+        return;
+    };
+    let config = conversation.effective_config().await;
+    let notification =
+        match account_lease_api::account_lease_updated_notification_from_runtime_snapshot(
+            config.as_ref(),
+            &live_snapshot,
+        )
+        .await
+        {
+            Ok(notification) => notification,
+            Err(err) => {
+                warn!(
+                    "failed to build account lease updated notification from runtime snapshot: {}",
+                    err.message
+                );
+                return;
+            }
+        };
+
+    let changed_notification = {
+        let mut account_lease_notifications = account_lease_notifications.lock().await;
+        if account_lease_notifications.get(&conversation_id) == Some(&notification) {
+            None
+        } else {
+            account_lease_notifications.insert(conversation_id, notification.clone());
+            Some(notification)
+        }
+    };
+    if let Some(notification) = changed_notification {
+        outgoing
+            .send_server_notification(ServerNotification::AccountLeaseUpdated(notification))
+            .await;
+    }
+}
+
+fn event_can_change_account_lease_notification(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::TurnStarted(_) | EventMsg::TurnComplete(_) | EventMsg::Error(_)
+    )
 }
 
 fn merge_turn_history_with_active_turn(turns: &mut Vec<Turn>, active_turn: Turn) {
@@ -10535,220 +9801,6 @@ fn collect_resume_override_mismatches(
     mismatch_details
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-struct SourceThreadConfigBaseline {
-    model: Option<String>,
-    model_provider_id: Option<String>,
-    service_tier: Option<Option<codex_protocol::config_types::ServiceTier>>,
-    approval_policy: Option<codex_protocol::protocol::AskForApproval>,
-    approvals_reviewer: Option<codex_protocol::config_types::ApprovalsReviewer>,
-    sandbox_policy: Option<codex_protocol::protocol::SandboxPolicy>,
-    cwd: Option<PathBuf>,
-    reasoning_effort: Option<Option<codex_protocol::openai_models::ReasoningEffort>>,
-    personality: Option<Option<Personality>>,
-    base_instructions: Option<String>,
-    base_instructions_known: bool,
-    developer_instructions: Option<Option<String>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-struct PersistedThreadConfigBaselineFields {
-    personality: Option<Personality>,
-    personality_overrides_rollout: bool,
-    base_instructions: Option<String>,
-    developer_instructions: Option<String>,
-    developer_instructions_overrides_rollout: bool,
-}
-
-fn source_thread_config_baseline_from_history(
-    thread_history: &InitialHistory,
-    persisted_config_baseline: Option<&ThreadConfigBaselineSnapshot>,
-    persisted_metadata: Option<&ThreadMetadata>,
-) -> SourceThreadConfigBaseline {
-    let items = match thread_history {
-        InitialHistory::New | InitialHistory::Cleared => {
-            return SourceThreadConfigBaseline::default();
-        }
-        InitialHistory::Resumed(resumed) => resumed.history.as_slice(),
-        InitialHistory::Forked(items) => items.as_slice(),
-    };
-    source_thread_config_baseline_from_items(
-        items,
-        canonical_thread_id_from_history(thread_history),
-        persisted_config_baseline,
-        persisted_metadata,
-    )
-}
-
-fn canonical_thread_id_from_history(thread_history: &InitialHistory) -> Option<ThreadId> {
-    match thread_history {
-        InitialHistory::New | InitialHistory::Cleared => None,
-        InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
-        InitialHistory::Forked(_items) => None,
-    }
-}
-
-fn source_thread_config_baseline_from_items(
-    items: &[RolloutItem],
-    canonical_thread_id: Option<ThreadId>,
-    persisted_config_baseline: Option<&ThreadConfigBaselineSnapshot>,
-    persisted_metadata: Option<&ThreadMetadata>,
-) -> SourceThreadConfigBaseline {
-    let mut baseline = SourceThreadConfigBaseline::default();
-
-    if let Some(meta_line) = canonical_session_meta(items, canonical_thread_id) {
-        baseline.cwd = Some(meta_line.meta.cwd.clone());
-        baseline.model_provider_id = meta_line.meta.model_provider.clone();
-        baseline.base_instructions = meta_line
-            .meta
-            .base_instructions
-            .as_ref()
-            .map(|instructions| instructions.text.clone());
-        baseline.base_instructions_known = true;
-    }
-
-    if let Some(session_configured) = items.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::SessionConfigured(session_configured)) => {
-            Some(session_configured)
-        }
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::Compacted(_)
-        | RolloutItem::TurnContext(_)
-        | RolloutItem::EventMsg(_) => None,
-    }) {
-        baseline.model = Some(session_configured.model.clone());
-        baseline.model_provider_id = Some(session_configured.model_provider_id.clone());
-        baseline.service_tier = Some(session_configured.service_tier);
-        baseline.approval_policy = Some(session_configured.approval_policy);
-        baseline.approvals_reviewer = Some(session_configured.approvals_reviewer);
-        baseline.sandbox_policy = Some(session_configured.sandbox_policy.clone());
-        baseline.cwd = Some(session_configured.cwd.clone().to_path_buf());
-        baseline.reasoning_effort = Some(session_configured.reasoning_effort);
-    }
-
-    if let Some(turn_context) = items.iter().rev().find_map(|item| match item {
-        RolloutItem::TurnContext(turn_context) => Some(turn_context),
-        RolloutItem::SessionMeta(_)
-        | RolloutItem::ResponseItem(_)
-        | RolloutItem::Compacted(_)
-        | RolloutItem::EventMsg(_) => None,
-    }) {
-        baseline.model = Some(turn_context.model.clone());
-        baseline.approval_policy = Some(turn_context.approval_policy);
-        baseline.approvals_reviewer = turn_context.approvals_reviewer;
-        baseline.sandbox_policy = Some(turn_context.sandbox_policy.clone());
-        baseline.service_tier = Some(turn_context.service_tier);
-        baseline.cwd = Some(turn_context.cwd.clone());
-        baseline.reasoning_effort = Some(turn_context.effort);
-        baseline.personality = Some(turn_context.personality);
-        baseline.developer_instructions = Some(turn_context.developer_instructions.clone());
-    }
-
-    if let Some(snapshot) = persisted_config_baseline {
-        apply_thread_config_baseline_snapshot_to_source_config_baseline(&mut baseline, snapshot);
-    }
-
-    if let Some(metadata) = persisted_metadata {
-        apply_thread_metadata_to_source_config_baseline(&mut baseline, metadata);
-    }
-
-    baseline
-}
-
-fn canonical_session_meta(
-    items: &[RolloutItem],
-    canonical_thread_id: Option<ThreadId>,
-) -> Option<&SessionMetaLine> {
-    canonical_thread_id.map_or_else(
-        || {
-            items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line),
-                RolloutItem::ResponseItem(_)
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(_) => None,
-            })
-        },
-        |thread_id| {
-            items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => {
-                    Some(meta_line)
-                }
-                RolloutItem::SessionMeta(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::Compacted(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::EventMsg(_) => None,
-            })
-        },
-    )
-}
-
-fn apply_thread_config_baseline_snapshot_to_source_config_baseline(
-    baseline: &mut SourceThreadConfigBaseline,
-    snapshot: &ThreadConfigBaselineSnapshot,
-) {
-    if baseline.model.is_none() {
-        baseline.model = Some(snapshot.model.clone());
-    }
-    if baseline.model_provider_id.is_none() {
-        baseline.model_provider_id = Some(snapshot.model_provider_id.clone());
-    }
-    if baseline.service_tier.is_none() {
-        baseline.service_tier = Some(snapshot.service_tier);
-    }
-    if baseline.approval_policy.is_none() {
-        baseline.approval_policy = Some(snapshot.approval_policy);
-    }
-    if baseline.approvals_reviewer.is_none() {
-        baseline.approvals_reviewer = Some(snapshot.approvals_reviewer);
-    }
-    if baseline.sandbox_policy.is_none() {
-        baseline.sandbox_policy = Some(snapshot.sandbox_policy.clone());
-    }
-    if baseline.cwd.is_none() {
-        baseline.cwd = Some(snapshot.cwd.clone());
-    }
-    if baseline.reasoning_effort.is_none() {
-        baseline.reasoning_effort = Some(snapshot.reasoning_effort);
-    }
-    if baseline.personality.is_none() || snapshot.personality_overrides_rollout {
-        baseline.personality = Some(snapshot.personality);
-    }
-    baseline.base_instructions = snapshot.base_instructions.clone();
-    baseline.base_instructions_known = true;
-    if baseline.developer_instructions.is_none()
-        || snapshot.developer_instructions_overrides_rollout
-    {
-        baseline.developer_instructions = Some(snapshot.developer_instructions.clone());
-    }
-}
-
-fn apply_thread_metadata_to_source_config_baseline(
-    baseline: &mut SourceThreadConfigBaseline,
-    metadata: &ThreadMetadata,
-) {
-    if baseline.model_provider_id.is_none() {
-        baseline.model_provider_id = Some(metadata.model_provider.clone());
-    }
-    if baseline.model.is_none() {
-        baseline.model = metadata.model.clone();
-    }
-    if baseline.reasoning_effort.is_none() {
-        baseline.reasoning_effort = Some(metadata.reasoning_effort);
-    }
-    if baseline.cwd.is_none() {
-        baseline.cwd = Some(metadata.cwd.clone());
-    }
-    if baseline.approval_policy.is_none() {
-        baseline.approval_policy = parse_stringified_thread_value(metadata.approval_mode.as_str());
-    }
-    if baseline.sandbox_policy.is_none() {
-        baseline.sandbox_policy = parse_stringified_thread_value(metadata.sandbox_policy.as_str());
-    }
-}
-
 fn merge_persisted_resume_metadata(
     request_overrides: &mut Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: &mut ConfigOverrides,
@@ -10777,292 +9829,6 @@ fn has_model_resume_override(
         || request_overrides.is_some_and(|overrides| overrides.contains_key("model"))
         || request_overrides
             .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
-}
-
-fn parse_stringified_thread_value<T>(value: &str) -> Option<T>
-where
-    T: DeserializeOwned,
-{
-    serde_json::from_value(serde_json::Value::String(value.to_string()))
-        .or_else(|_| serde_json::from_str(value))
-        .ok()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceBaseInstructionsPolicy {
-    PreserveHistory,
-    ApplyBaselineFallback,
-}
-
-fn rollout_session_meta_base_instructions(
-    items: &[RolloutItem],
-    canonical_thread_id: Option<ThreadId>,
-) -> Option<Option<String>> {
-    canonical_session_meta(items, canonical_thread_id).map(|meta_line| {
-        meta_line
-            .meta
-            .base_instructions
-            .as_ref()
-            .map(|instructions| instructions.text.clone())
-    })
-}
-
-fn source_base_instructions_policy(
-    items: &[RolloutItem],
-    canonical_thread_id: Option<ThreadId>,
-    persisted_config_baseline: Option<&ThreadConfigBaselineSnapshot>,
-) -> SourceBaseInstructionsPolicy {
-    match rollout_session_meta_base_instructions(items, canonical_thread_id) {
-        Some(rollout_base_instructions) => {
-            if persisted_config_baseline
-                .is_some_and(|snapshot| snapshot.base_instructions != rollout_base_instructions)
-            {
-                SourceBaseInstructionsPolicy::ApplyBaselineFallback
-            } else {
-                SourceBaseInstructionsPolicy::PreserveHistory
-            }
-        }
-        None => SourceBaseInstructionsPolicy::ApplyBaselineFallback,
-    }
-}
-
-fn apply_source_thread_config_baseline(
-    config: &mut Config,
-    baseline: &SourceThreadConfigBaseline,
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-    base_instructions_policy: SourceBaseInstructionsPolicy,
-) -> std::result::Result<(), String> {
-    if !has_model_config_override(request_overrides, typesafe_overrides)
-        && let Some(model) = baseline.model.as_ref()
-    {
-        config.model = Some(model.clone());
-    }
-    if !has_model_provider_config_override(request_overrides, typesafe_overrides)
-        && let Some(model_provider_id) = baseline.model_provider_id.as_ref()
-    {
-        let model_provider = config
-            .model_providers
-            .get(model_provider_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "source thread model provider `{model_provider_id}` is not available in current configuration"
-                )
-            })?;
-        config.model_provider_id = model_provider_id.clone();
-        config.model_provider = model_provider;
-    }
-    if !has_service_tier_config_override(request_overrides, typesafe_overrides)
-        && let Some(service_tier) = baseline.service_tier
-    {
-        config.service_tier = service_tier;
-    }
-    if !has_cwd_config_override(request_overrides, typesafe_overrides)
-        && let Some(cwd) = baseline.cwd.as_ref()
-    {
-        config.cwd = AbsolutePathBuf::try_from(cwd.clone()).map_err(|err| {
-            format!(
-                "source thread cwd `{}` is not absolute: {err}",
-                cwd.display()
-            )
-        })?;
-    }
-    if !has_approval_policy_config_override(request_overrides, typesafe_overrides)
-        && let Some(approval_policy) = baseline.approval_policy
-    {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-    }
-    if !has_approvals_reviewer_config_override(request_overrides, typesafe_overrides)
-        && let Some(approvals_reviewer) = baseline.approvals_reviewer
-    {
-        config.approvals_reviewer = approvals_reviewer;
-    }
-    if !has_sandbox_config_override(request_overrides, typesafe_overrides)
-        && let Some(sandbox_policy) = baseline.sandbox_policy.as_ref()
-    {
-        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy.clone());
-    }
-    if !has_reasoning_effort_config_override(request_overrides)
-        && let Some(reasoning_effort) = baseline.reasoning_effort
-    {
-        config.model_reasoning_effort = reasoning_effort;
-    }
-    if !has_base_instructions_config_override(request_overrides, typesafe_overrides) {
-        match base_instructions_policy {
-            SourceBaseInstructionsPolicy::PreserveHistory => {
-                config.base_instructions = None;
-            }
-            SourceBaseInstructionsPolicy::ApplyBaselineFallback => {
-                if baseline.base_instructions_known {
-                    config.base_instructions = baseline.base_instructions.clone();
-                }
-            }
-        }
-    }
-    if !has_developer_instructions_config_override(request_overrides, typesafe_overrides)
-        && let Some(developer_instructions) = baseline.developer_instructions.as_ref()
-    {
-        config.developer_instructions = developer_instructions.clone();
-    }
-    if !has_personality_config_override(request_overrides, typesafe_overrides)
-        && let Some(personality) = baseline.personality
-    {
-        config.personality = personality;
-    }
-    Ok(())
-}
-
-fn persisted_thread_config_baseline_fields(
-    config: &Config,
-    source_config_baseline: &SourceThreadConfigBaseline,
-    persisted_config_baseline: Option<&ThreadConfigBaselineSnapshot>,
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-    base_instructions_policy: SourceBaseInstructionsPolicy,
-) -> PersistedThreadConfigBaselineFields {
-    let base_instructions =
-        if has_base_instructions_config_override(request_overrides, typesafe_overrides) {
-            config.base_instructions.clone()
-        } else {
-            match base_instructions_policy {
-                SourceBaseInstructionsPolicy::PreserveHistory => {
-                    source_config_baseline.base_instructions.clone()
-                }
-                SourceBaseInstructionsPolicy::ApplyBaselineFallback => {
-                    config.base_instructions.clone()
-                }
-            }
-        };
-    PersistedThreadConfigBaselineFields {
-        personality: config.personality,
-        personality_overrides_rollout: has_personality_config_override(
-            request_overrides,
-            typesafe_overrides,
-        ) || persisted_config_baseline
-            .is_some_and(|snapshot| snapshot.personality_overrides_rollout),
-        base_instructions,
-        developer_instructions: config.developer_instructions.clone(),
-        developer_instructions_overrides_rollout: has_developer_instructions_config_override(
-            request_overrides,
-            typesafe_overrides,
-        ) || persisted_config_baseline
-            .is_some_and(|snapshot| snapshot.developer_instructions_overrides_rollout),
-    }
-}
-
-fn thread_config_baseline_snapshot(
-    thread_id: ThreadId,
-    session_configured: &SessionConfiguredEvent,
-    fields: &PersistedThreadConfigBaselineFields,
-) -> ThreadConfigBaselineSnapshot {
-    ThreadConfigBaselineSnapshot {
-        thread_id,
-        model: session_configured.model.clone(),
-        model_provider_id: session_configured.model_provider_id.clone(),
-        service_tier: session_configured.service_tier,
-        approval_policy: session_configured.approval_policy,
-        approvals_reviewer: session_configured.approvals_reviewer,
-        sandbox_policy: session_configured.sandbox_policy.clone(),
-        cwd: session_configured.cwd.clone().to_path_buf(),
-        reasoning_effort: session_configured.reasoning_effort,
-        personality: fields.personality,
-        personality_overrides_rollout: fields.personality_overrides_rollout,
-        base_instructions: fields.base_instructions.clone(),
-        developer_instructions: fields.developer_instructions.clone(),
-        developer_instructions_overrides_rollout: fields.developer_instructions_overrides_rollout,
-    }
-}
-
-fn has_override_key(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    key: &str,
-) -> bool {
-    request_overrides.is_some_and(|overrides| overrides.contains_key(key))
-}
-
-fn has_model_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.model.is_some() || has_override_key(request_overrides, "model")
-}
-
-fn has_model_provider_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.model_provider.is_some()
-        || has_override_key(request_overrides, "model_provider")
-}
-
-fn has_service_tier_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.service_tier.is_some() || has_override_key(request_overrides, "service_tier")
-}
-
-fn has_cwd_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.cwd.is_some() || has_override_key(request_overrides, "cwd")
-}
-
-fn has_approval_policy_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.approval_policy.is_some()
-        || has_override_key(request_overrides, "approval_policy")
-}
-
-fn has_approvals_reviewer_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.approvals_reviewer.is_some()
-        || has_override_key(request_overrides, "approvals_reviewer")
-}
-
-fn has_sandbox_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.sandbox_mode.is_some()
-        || has_override_key(request_overrides, "sandbox_mode")
-        || has_override_key(request_overrides, "sandbox")
-}
-
-fn has_reasoning_effort_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-) -> bool {
-    has_override_key(request_overrides, "model_reasoning_effort")
-}
-
-fn has_base_instructions_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.base_instructions.is_some()
-        || has_override_key(request_overrides, "instructions")
-        || has_override_key(request_overrides, "base_instructions")
-}
-
-fn has_developer_instructions_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.developer_instructions.is_some()
-        || has_override_key(request_overrides, "developer_instructions")
-}
-
-fn has_personality_config_override(
-    request_overrides: Option<&HashMap<String, serde_json::Value>>,
-    typesafe_overrides: &ConfigOverrides,
-) -> bool {
-    typesafe_overrides.personality.is_some() || has_override_key(request_overrides, "personality")
 }
 
 fn skills_to_info(
@@ -11686,7 +10452,21 @@ pub(crate) async fn read_summary_from_rollout(
     fallback_provider: &str,
 ) -> std::io::Result<ConversationSummary> {
     let head = read_head_for_summary(path).await?;
-    let session_meta_line = canonical_session_meta_line_from_summary_head(path, &head)?;
+
+    let Some(first) = head.first() else {
+        return Err(IoError::other(format!(
+            "rollout at {} is empty",
+            path.display()
+        )));
+    };
+
+    let session_meta_line =
+        serde_json::from_value::<SessionMetaLine>(first.clone()).map_err(|_| {
+            IoError::other(format!(
+                "rollout at {} does not start with session metadata",
+                path.display()
+            ))
+        })?;
     let SessionMetaLine {
         meta: session_meta,
         git,
@@ -11741,28 +10521,16 @@ pub(crate) async fn read_summary_from_rollout(
     })
 }
 
-async fn read_rollout_items_and_thread_id_from_rollout(
-    path: &Path,
-) -> std::io::Result<(Vec<RolloutItem>, ThreadId)> {
-    let initial_history = RolloutRecorder::get_rollout_history(path).await?;
-    match initial_history {
-        InitialHistory::New | InitialHistory::Cleared => {
-            Err(std::io::Error::other("missing rollout history"))
-        }
-        InitialHistory::Forked(_items) => Err(std::io::Error::other(format!(
-            "expected resumed rollout history for `{}`",
-            path.display()
-        ))),
-        InitialHistory::Resumed(resumed) => Ok((resumed.history, resumed.conversation_id)),
-    }
-}
-
 pub(crate) async fn read_rollout_items_from_rollout(
     path: &Path,
 ) -> std::io::Result<Vec<RolloutItem>> {
-    read_rollout_items_and_thread_id_from_rollout(path)
-        .await
-        .map(|(items, _thread_id)| items)
+    let items = match RolloutRecorder::get_rollout_history(path).await? {
+        InitialHistory::New | InitialHistory::Cleared => Vec::new(),
+        InitialHistory::Forked(items) => items,
+        InitialHistory::Resumed(resumed) => resumed.history,
+    };
+
+    Ok(items)
 }
 
 fn extract_conversation_summary(
@@ -11861,49 +10629,11 @@ async fn load_thread_summary_for_rollout(
 }
 
 async fn forked_from_id_from_rollout(path: &Path) -> Option<String> {
-    let head = read_head_for_summary(path).await.ok()?;
-    canonical_session_meta_line_from_summary_head(path, &head)
+    read_session_meta_line(path)
+        .await
         .ok()
         .and_then(|meta_line| meta_line.meta.forked_from_id)
         .map(|thread_id| thread_id.to_string())
-}
-
-fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
-    let file_name = path.file_name()?.to_str()?;
-    let stem = file_name.strip_suffix(".jsonl")?;
-    if stem.len() < 37 {
-        return None;
-    }
-    let uuid_start = stem.len().saturating_sub(36);
-    if !stem[..uuid_start].ends_with('-') {
-        return None;
-    }
-    ThreadId::from_string(&stem[uuid_start..]).ok()
-}
-
-fn canonical_session_meta_line_from_summary_head(
-    path: &Path,
-    head: &[serde_json::Value],
-) -> std::io::Result<SessionMetaLine> {
-    let canonical_thread_id = thread_id_from_rollout_path(path);
-    let session_meta_line = head
-        .iter()
-        .filter_map(|value| serde_json::from_value::<SessionMetaLine>(value.clone()).ok())
-        .find(|meta_line| {
-            canonical_thread_id.is_none_or(|thread_id| meta_line.meta.id == thread_id)
-        });
-
-    match (canonical_thread_id, session_meta_line) {
-        (_, Some(meta_line)) => Ok(meta_line),
-        (Some(thread_id), None) => Err(IoError::other(format!(
-            "rollout at {} is missing canonical session metadata for thread {thread_id}",
-            path.display()
-        ))),
-        (None, None) => Err(IoError::other(format!(
-            "rollout at {} does not contain session metadata",
-            path.display()
-        ))),
-    }
 }
 
 fn merge_mutable_thread_metadata(thread: &mut Thread, persisted_thread: Thread) {
@@ -11959,17 +10689,9 @@ fn with_thread_spawn_agent_metadata(
 }
 
 fn thread_response_permission_profile(
-    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
     permission_profile: codex_protocol::models::PermissionProfile,
 ) -> Option<codex_app_server_protocol::PermissionProfile> {
-    match sandbox_policy {
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess
-        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
-        | codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
-            Some(permission_profile.into())
-        }
-        codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => None,
-    }
+    Some(permission_profile.into())
 }
 
 fn requested_permissions_trust_project(overrides: &ConfigOverrides, cwd: &Path) -> bool {
@@ -12273,54 +10995,35 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
     use anyhow::Result;
-    use app_test_support::create_mock_responses_server_repeating_assistant;
-    use app_test_support::create_mock_responses_server_sequence_unchecked;
-    use app_test_support::write_mock_responses_config_toml;
     use chrono::DateTime;
     use chrono::Utc;
-    use codex_analytics::AnalyticsEventsClient;
     use codex_app_server_protocol::ServerRequestPayload;
     use codex_app_server_protocol::ToolRequestUserInputParams;
-    use codex_arg0::Arg0DispatchPaths;
     use codex_config::SessionThreadConfig;
     use codex_config::StaticThreadConfigLoader;
     use codex_config::ThreadConfigSource;
-    use codex_core::ThreadManager;
-    use codex_core::config::Config;
-    use codex_core::config::ConfigBuilder;
     use codex_core::config_loader::CloudRequirementsLoader;
     use codex_core::config_loader::LoaderOverrides;
-    use codex_exec_server::EnvironmentManager;
-    use codex_features::Feature;
-    use codex_feedback::CodexFeedback;
-    use codex_login::AuthManager;
     use codex_model_provider_info::ModelProviderInfo;
     use codex_model_provider_info::WireApi;
-    use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
     use codex_protocol::ThreadId;
-    use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-    use codex_protocol::config_types::ServiceTier;
-    use codex_protocol::models::BaseInstructions;
     use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
-    use codex_protocol::protocol::TurnContextItem;
     use codex_thread_store::StoredThread;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
-    use core_test_support::responses;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
-    use wiremock::MockServer;
 
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {
@@ -12511,25 +11214,28 @@ mod tests {
     }
 
     #[test]
-    fn thread_response_permission_profile_omits_external_sandbox() {
+    fn thread_response_permission_profile_preserves_enforcement() {
         let cwd = test_path_buf("/tmp").abs();
-        let profile = codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
-            &SandboxPolicy::DangerFullAccess,
-            cwd.as_path(),
-        );
-
-        assert_eq!(
-            thread_response_permission_profile(
+        let full_access_profile =
+            codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
+                &SandboxPolicy::DangerFullAccess,
+                cwd.as_path(),
+            );
+        let external_profile =
+            codex_protocol::models::PermissionProfile::from_legacy_sandbox_policy(
                 &SandboxPolicy::ExternalSandbox {
                     network_access: codex_protocol::protocol::NetworkAccess::Restricted,
                 },
-                profile.clone(),
-            ),
-            None
+                cwd.as_path(),
+            );
+
+        assert_eq!(
+            thread_response_permission_profile(external_profile.clone()),
+            Some(external_profile.into())
         );
         assert_eq!(
-            thread_response_permission_profile(&SandboxPolicy::DangerFullAccess, profile.clone()),
-            Some(profile.into())
+            thread_response_permission_profile(full_access_profile.clone()),
+            Some(full_access_profile.into())
         );
     }
 
@@ -12748,6 +11454,7 @@ mod tests {
             base_instructions: None,
             developer_instructions: None,
             personality: None,
+            exclude_turns: false,
             persist_extended_history: false,
         };
         let config_snapshot = ThreadConfigSnapshot {
@@ -12787,9 +11494,6 @@ mod tests {
             codex_protocol::protocol::SessionSource::default(),
         );
         builder.model_provider = Some("mock_provider".to_string());
-        builder.cwd = PathBuf::from("/tmp/source-thread");
-        builder.approval_mode = codex_protocol::protocol::AskForApproval::Never;
-        builder.sandbox_policy = codex_protocol::protocol::SandboxPolicy::DangerFullAccess;
         let mut metadata = builder.build("mock_provider");
         metadata.model = model.map(ToString::to_string);
         metadata.reasoning_effort = reasoning_effort;
@@ -12817,7 +11521,6 @@ mod tests {
     {
         let mut request_overrides = None;
         let mut typesafe_overrides = ConfigOverrides::default();
-
         let persisted_metadata =
             test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
 
@@ -12842,301 +11545,129 @@ mod tests {
     }
 
     #[test]
-    fn source_thread_config_baseline_uses_persisted_metadata_when_rollout_is_incomplete()
-    -> Result<()> {
+    fn merge_persisted_resume_metadata_preserves_explicit_overrides() -> Result<()> {
+        let mut request_overrides = Some(HashMap::from([(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String("low".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides {
+            model: Some("gpt-5.2-codex".to_string()),
+            ..Default::default()
+        };
         let persisted_metadata =
             test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
 
-        let mut baseline = SourceThreadConfigBaseline::default();
-        apply_thread_metadata_to_source_config_baseline(&mut baseline, &persisted_metadata);
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
 
-        assert_eq!(baseline.model, Some("gpt-5.1-codex-max".to_string()));
+        assert_eq!(typesafe_overrides.model, Some("gpt-5.2-codex".to_string()));
         assert_eq!(
-            baseline.model_provider_id,
-            Some("mock_provider".to_string())
-        );
-        assert_eq!(baseline.reasoning_effort, Some(Some(ReasoningEffort::High)));
-        assert_eq!(baseline.cwd, Some(PathBuf::from("/tmp/source-thread")));
-        assert_eq!(
-            baseline.approval_policy,
-            Some(codex_protocol::protocol::AskForApproval::Never)
-        );
-        assert_eq!(
-            baseline.sandbox_policy,
-            Some(codex_protocol::protocol::SandboxPolicy::DangerFullAccess)
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("low".to_string()),
+            )]))
         );
         Ok(())
     }
 
     #[test]
-    fn source_thread_config_baseline_keeps_rollout_values_over_stale_metadata() -> Result<()> {
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_model_overridden() -> Result<()>
+    {
+        let mut request_overrides = Some(HashMap::from([(
+            "model".to_string(),
+            serde_json::Value::String("gpt-5.2-codex".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides::default();
         let persisted_metadata =
             test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
-        let mut baseline = SourceThreadConfigBaseline {
-            model: Some("rollout-model".to_string()),
-            model_provider_id: Some("rollout_provider".to_string()),
-            reasoning_effort: Some(Some(ReasoningEffort::Low)),
-            cwd: Some(PathBuf::from("/tmp/rollout-thread")),
-            approval_policy: Some(codex_protocol::protocol::AskForApproval::OnFailure),
-            sandbox_policy: Some(codex_protocol::protocol::SandboxPolicy::new_read_only_policy()),
+
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
+
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(
+            request_overrides,
+            Some(HashMap::from([(
+                "model".to_string(),
+                serde_json::Value::String("gpt-5.2-codex".to_string()),
+            )]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_provider_overridden()
+    -> Result<()> {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides {
+            model_provider: Some("oss".to_string()),
             ..Default::default()
         };
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
 
-        apply_thread_metadata_to_source_config_baseline(&mut baseline, &persisted_metadata);
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
+        );
 
-        let expected = SourceThreadConfigBaseline {
-            model: Some("rollout-model".to_string()),
-            model_provider_id: Some("rollout_provider".to_string()),
-            reasoning_effort: Some(Some(ReasoningEffort::Low)),
-            cwd: Some(PathBuf::from("/tmp/rollout-thread")),
-            approval_policy: Some(codex_protocol::protocol::AskForApproval::OnFailure),
-            sandbox_policy: Some(codex_protocol::protocol::SandboxPolicy::new_read_only_policy()),
-            ..Default::default()
-        };
-        assert_eq!(baseline, expected);
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(typesafe_overrides.model_provider, Some("oss".to_string()));
+        assert_eq!(request_overrides, None);
         Ok(())
     }
 
     #[test]
-    fn source_thread_config_baseline_prefers_persisted_override_fields_over_rollout_turn_context()
+    fn merge_persisted_resume_metadata_skips_persisted_values_when_reasoning_effort_overridden()
     -> Result<()> {
-        let thread_id = ThreadId::from_string("4f941c35-29b3-493b-b0a4-e25800d9aec1")?;
-        let rollout_path = PathBuf::from("/tmp/rollout.jsonl");
-        let items = vec![
-            RolloutItem::SessionMeta(SessionMetaLine {
-                meta: SessionMeta {
-                    id: thread_id,
-                    timestamp: "2026-04-23T00:00:00Z".to_string(),
-                    cwd: PathBuf::from("/tmp/source-thread"),
-                    originator: "codex".to_string(),
-                    cli_version: "1.0.0".to_string(),
-                    source: codex_protocol::protocol::SessionSource::Cli,
-                    model_provider: Some("rollout-provider".to_string()),
-                    base_instructions: Some(BaseInstructions {
-                        text: "rollout base instructions".to_string(),
-                    }),
-                    ..Default::default()
-                },
-                git: None,
-            }),
-            RolloutItem::EventMsg(EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id: thread_id,
-                forked_from_id: None,
-                thread_name: None,
-                model: "gpt-5-session-configured".to_string(),
-                model_provider_id: "rollout-provider".to_string(),
-                service_tier: Some(ServiceTier::Flex),
-                approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
-                approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-                sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-                permission_profile: None,
-                cwd: PathBuf::from("/tmp/session-configured")
-                    .try_into()
-                    .expect("session configured cwd is absolute"),
-                reasoning_effort: Some(ReasoningEffort::High),
-                history_log_id: 0,
-                history_entry_count: 0,
-                initial_messages: None,
-                network_proxy: None,
-                rollout_path: Some(rollout_path),
-            })),
-            RolloutItem::TurnContext(TurnContextItem {
-                turn_id: Some("turn-1".to_string()),
-                trace_id: None,
-                cwd: PathBuf::from("/tmp/turn-context"),
-                current_date: None,
-                timezone: None,
-                approval_policy: codex_protocol::protocol::AskForApproval::Never,
-                approvals_reviewer: Some(codex_protocol::config_types::ApprovalsReviewer::User),
-                sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
-                network: None,
-                file_system_sandbox_policy: None,
-                model: "gpt-5-turn-context".to_string(),
-                service_tier: Some(ServiceTier::Fast),
-                personality: Some(Personality::Pragmatic),
-                collaboration_mode: None,
-                realtime_active: Some(false),
-                effort: Some(ReasoningEffort::Low),
-                summary: ReasoningSummaryConfig::Auto,
-                user_instructions: None,
-                developer_instructions: Some("rollout developer instructions".to_string()),
-                final_output_json_schema: None,
-                truncation_policy: None,
-            }),
-        ];
-        let snapshot = ThreadConfigBaselineSnapshot {
-            thread_id,
-            model: "persisted-model".to_string(),
-            model_provider_id: "persisted-provider".to_string(),
-            service_tier: Some(ServiceTier::Flex),
-            approval_policy: codex_protocol::protocol::AskForApproval::OnFailure,
-            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-            cwd: PathBuf::from("/tmp/persisted-thread"),
-            reasoning_effort: Some(ReasoningEffort::High),
-            personality: Some(Personality::Friendly),
-            personality_overrides_rollout: true,
-            base_instructions: Some("persisted base instructions".to_string()),
-            developer_instructions: Some("persisted developer instructions".to_string()),
-            developer_instructions_overrides_rollout: true,
-        };
+        let mut request_overrides = Some(HashMap::from([(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String("low".to_string()),
+        )]));
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata =
+            test_thread_metadata(Some("gpt-5.1-codex-max"), Some(ReasoningEffort::High))?;
 
-        let baseline = source_thread_config_baseline_from_items(
-            &items,
-            Some(thread_id),
-            Some(&snapshot),
-            None,
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
         );
 
-        assert_eq!(baseline.model, Some("gpt-5-turn-context".to_string()));
+        assert_eq!(typesafe_overrides.model, None);
         assert_eq!(
-            baseline.base_instructions,
-            Some("persisted base instructions".to_string())
+            request_overrides,
+            Some(HashMap::from([(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String("low".to_string()),
+            )]))
         );
-        assert_eq!(
-            baseline.developer_instructions,
-            Some(Some("persisted developer instructions".to_string()))
-        );
-        assert_eq!(baseline.personality, Some(Some(Personality::Friendly)));
         Ok(())
     }
 
     #[test]
-    fn source_thread_config_baseline_ignores_mismatched_session_meta_for_canonical_thread()
-    -> Result<()> {
-        let canonical_thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
-        let items = vec![
-            RolloutItem::SessionMeta(SessionMetaLine {
-                meta: SessionMeta {
-                    id: ThreadId::new(),
-                    cwd: PathBuf::from("/tmp/polluted-session-cwd"),
-                    model_provider: Some("current_provider".to_string()),
-                    base_instructions: Some(BaseInstructions {
-                        text: "polluted base instructions".to_string(),
-                    }),
-                    ..SessionMeta::default()
-                },
-                git: None,
-            }),
-            RolloutItem::TurnContext(TurnContextItem {
-                turn_id: Some("turn-1".to_string()),
-                trace_id: None,
-                cwd: PathBuf::from("/tmp/turn-context"),
-                current_date: None,
-                timezone: None,
-                approval_policy: codex_protocol::protocol::AskForApproval::Never,
-                approvals_reviewer: Some(codex_protocol::config_types::ApprovalsReviewer::User),
-                sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
-                network: None,
-                file_system_sandbox_policy: None,
-                model: "gpt-5-turn-context".to_string(),
-                service_tier: Some(ServiceTier::Fast),
-                personality: Some(Personality::Pragmatic),
-                collaboration_mode: None,
-                realtime_active: Some(false),
-                effort: Some(ReasoningEffort::Low),
-                summary: ReasoningSummaryConfig::Auto,
-                user_instructions: None,
-                developer_instructions: Some("rollout developer instructions".to_string()),
-                final_output_json_schema: None,
-                truncation_policy: None,
-            }),
-        ];
-        let snapshot = ThreadConfigBaselineSnapshot {
-            thread_id: canonical_thread_id,
-            model: "persisted-model".to_string(),
-            model_provider_id: "source_provider".to_string(),
-            service_tier: Some(ServiceTier::Flex),
-            approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
-            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-            cwd: PathBuf::from("/tmp/persisted-thread"),
-            reasoning_effort: Some(ReasoningEffort::High),
-            personality: Some(Personality::Friendly),
-            personality_overrides_rollout: false,
-            base_instructions: Some("persisted base instructions".to_string()),
-            developer_instructions: Some("persisted developer instructions".to_string()),
-            developer_instructions_overrides_rollout: false,
-        };
+    fn merge_persisted_resume_metadata_skips_missing_values() -> Result<()> {
+        let mut request_overrides = None;
+        let mut typesafe_overrides = ConfigOverrides::default();
+        let persisted_metadata =
+            test_thread_metadata(/*model*/ None, /*reasoning_effort*/ None)?;
 
-        let baseline = source_thread_config_baseline_from_items(
-            &items,
-            Some(canonical_thread_id),
-            Some(&snapshot),
-            None,
+        merge_persisted_resume_metadata(
+            &mut request_overrides,
+            &mut typesafe_overrides,
+            &persisted_metadata,
         );
 
-        assert_eq!(
-            baseline.model_provider_id,
-            Some("source_provider".to_string())
-        );
-        assert_eq!(
-            baseline.base_instructions,
-            Some("persisted base instructions".to_string())
-        );
-        assert_eq!(baseline.cwd, Some(PathBuf::from("/tmp/turn-context")));
-        Ok(())
-    }
-
-    #[test]
-    fn source_thread_config_baseline_prefers_turn_context_over_persisted_override_only_fields()
-    -> Result<()> {
-        let thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
-        let items = vec![RolloutItem::TurnContext(TurnContextItem {
-            turn_id: Some("turn-1".to_string()),
-            trace_id: None,
-            cwd: PathBuf::from("/tmp/turn-context"),
-            current_date: None,
-            timezone: None,
-            approval_policy: codex_protocol::protocol::AskForApproval::Never,
-            approvals_reviewer: Some(codex_protocol::config_types::ApprovalsReviewer::User),
-            sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
-            permission_profile: None,
-            network: None,
-            file_system_sandbox_policy: None,
-            model: "gpt-5-turn-context".to_string(),
-            service_tier: Some(ServiceTier::Fast),
-            personality: Some(Personality::Pragmatic),
-            collaboration_mode: None,
-            realtime_active: Some(false),
-            effort: Some(ReasoningEffort::Low),
-            summary: ReasoningSummaryConfig::Auto,
-            user_instructions: None,
-            developer_instructions: Some("turn context developer instructions".to_string()),
-            final_output_json_schema: None,
-            truncation_policy: None,
-        })];
-        let snapshot = ThreadConfigBaselineSnapshot {
-            thread_id,
-            model: "persisted-model".to_string(),
-            model_provider_id: "persisted-provider".to_string(),
-            service_tier: Some(ServiceTier::Flex),
-            approval_policy: codex_protocol::protocol::AskForApproval::OnFailure,
-            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
-            sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
-            cwd: PathBuf::from("/tmp/persisted-thread"),
-            reasoning_effort: Some(ReasoningEffort::High),
-            personality: Some(Personality::Friendly),
-            personality_overrides_rollout: false,
-            base_instructions: Some("persisted base instructions".to_string()),
-            developer_instructions: Some("persisted developer instructions".to_string()),
-            developer_instructions_overrides_rollout: false,
-        };
-
-        let baseline = source_thread_config_baseline_from_items(
-            &items,
-            Some(thread_id),
-            Some(&snapshot),
-            None,
-        );
-
-        assert_eq!(
-            baseline.developer_instructions,
-            Some(Some("turn context developer instructions".to_string()))
-        );
-        assert_eq!(baseline.personality, Some(Some(Personality::Pragmatic)));
+        assert_eq!(typesafe_overrides.model, None);
+        assert_eq!(request_overrides, None);
         Ok(())
     }
 
@@ -13199,341 +11730,6 @@ mod tests {
         };
 
         assert_eq!(summary, expected);
-        Ok(())
-    }
-
-    struct TestCodexMessageProcessorHarness {
-        _server: MockServer,
-        _codex_home: TempDir,
-        processor: CodexMessageProcessor,
-        thread_manager: Arc<ThreadManager>,
-        config: Arc<Config>,
-        outgoing_rx: mpsc::Receiver<OutgoingEnvelope>,
-    }
-
-    impl TestCodexMessageProcessorHarness {
-        async fn new() -> Result<Self> {
-            let server = create_mock_responses_server_repeating_assistant("Done").await;
-            Self::with_server(server).await
-        }
-
-        async fn with_server(server: MockServer) -> Result<Self> {
-            Self::with_server_and_features(server, &[]).await
-        }
-
-        async fn with_server_and_features(
-            server: MockServer,
-            enabled_features: &[Feature],
-        ) -> Result<Self> {
-            let codex_home = TempDir::new()?;
-            let mut config = build_test_config(codex_home.path(), &server.uri()).await?;
-            for feature in enabled_features {
-                config
-                    .features
-                    .enable(*feature)
-                    .expect("test feature should be known");
-            }
-            let config = Arc::new(config);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
-            let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
-            let auth_manager = AuthManager::shared_from_config(
-                config.as_ref(),
-                /*enable_codex_api_key_env*/ false,
-            );
-            let analytics_events_client = AnalyticsEventsClient::new(
-                Arc::clone(&auth_manager),
-                config.chatgpt_base_url.trim_end_matches('/').to_string(),
-                config.analytics_enabled,
-            );
-            let thread_manager = Arc::new(ThreadManager::new(
-                config.as_ref(),
-                Arc::clone(&auth_manager),
-                SessionSource::VSCode,
-                CollaborationModesConfig {
-                    default_mode_request_user_input: config
-                        .features
-                        .enabled(Feature::DefaultModeRequestUserInput),
-                },
-                Arc::new(EnvironmentManager::default_for_tests()),
-                Some(analytics_events_client.clone()),
-            ));
-            thread_manager
-                .plugins_manager()
-                .set_analytics_events_client(analytics_events_client.clone());
-            let arg0_paths = Arg0DispatchPaths::default();
-            let config_manager = ConfigManager::new(
-                config.codex_home.to_path_buf(),
-                Vec::new(),
-                LoaderOverrides::default(),
-                CloudRequirementsLoader::default(),
-                arg0_paths.clone(),
-                Arc::new(StaticThreadConfigLoader::new(Vec::new())),
-            );
-
-            let processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
-                auth_manager,
-                thread_manager: Arc::clone(&thread_manager),
-                outgoing,
-                analytics_events_client,
-                arg0_paths,
-                config: Arc::clone(&config),
-                config_manager,
-                feedback: CodexFeedback::new(),
-                log_db: None,
-            });
-
-            Ok(Self {
-                _server: server,
-                _codex_home: codex_home,
-                processor,
-                thread_manager,
-                config,
-                outgoing_rx,
-            })
-        }
-    }
-
-    async fn build_test_config(codex_home: &std::path::Path, server_uri: &str) -> Result<Config> {
-        write_mock_responses_config_toml(
-            codex_home,
-            server_uri,
-            &BTreeMap::new(),
-            /*auto_compact_limit*/ 8_192,
-            Some(false),
-            "mock_provider",
-            "compact",
-        )?;
-
-        Ok(ConfigBuilder::default()
-            .codex_home(codex_home.to_path_buf())
-            .build()
-            .await?)
-    }
-
-    async fn read_thread_closed_notification(
-        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
-    ) -> codex_app_server_protocol::ThreadClosedNotification {
-        loop {
-            let envelope =
-                tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
-                    .await
-                    .expect("timed out waiting for thread/closed notification")
-                    .expect("outgoing channel closed");
-            let message = match envelope {
-                OutgoingEnvelope::ToConnection { message, .. }
-                | OutgoingEnvelope::Broadcast { message } => message,
-            };
-            let OutgoingMessage::AppServerNotification(notification) = message else {
-                continue;
-            };
-            let codex_app_server_protocol::ServerNotification::ThreadClosed(notification) =
-                notification
-            else {
-                continue;
-            };
-            return notification;
-        }
-    }
-
-    async fn read_thread_started_notification(
-        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
-    ) -> codex_app_server_protocol::ThreadStartedNotification {
-        loop {
-            let envelope =
-                tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
-                    .await
-                    .expect("timed out waiting for thread/started notification")
-                    .expect("outgoing channel closed");
-            let message = match envelope {
-                OutgoingEnvelope::ToConnection { message, .. }
-                | OutgoingEnvelope::Broadcast { message } => message,
-            };
-            let OutgoingMessage::AppServerNotification(notification) = message else {
-                continue;
-            };
-            let codex_app_server_protocol::ServerNotification::ThreadStarted(notification) =
-                notification
-            else {
-                continue;
-            };
-            return notification;
-        }
-    }
-
-    async fn read_account_lease_updated_notification(
-        outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>,
-    ) -> codex_app_server_protocol::AccountLeaseUpdatedNotification {
-        loop {
-            let envelope =
-                tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
-                    .await
-                    .expect("timed out waiting for accountLease/updated notification")
-                    .expect("outgoing channel closed");
-            let message = match envelope {
-                OutgoingEnvelope::ToConnection { message, .. }
-                | OutgoingEnvelope::Broadcast { message } => message,
-            };
-            let OutgoingMessage::AppServerNotification(notification) = message else {
-                continue;
-            };
-            let codex_app_server_protocol::ServerNotification::AccountLeaseUpdated(notification) =
-                notification
-            else {
-                continue;
-            };
-            return notification;
-        }
-    }
-
-    fn unavailable_startup_snapshot() -> codex_app_server_protocol::AccountStartupSnapshot {
-        codex_app_server_protocol::AccountStartupSnapshot {
-            effective_pool_id: None,
-            effective_pool_resolution_source: "none".to_string(),
-            configured_default_pool_id: None,
-            persisted_default_pool_id: None,
-            startup_availability:
-                codex_app_server_protocol::AccountStartupAvailability::Unavailable,
-            startup_resolution_issue: None,
-            selection_eligibility: "missingPool".to_string(),
-        }
-    }
-
-    fn assert_no_outgoing_message(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
-        assert!(matches!(
-            outgoing_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-    }
-
-    fn drain_outgoing_messages(outgoing_rx: &mut mpsc::Receiver<OutgoingEnvelope>) {
-        while outgoing_rx.try_recv().is_ok() {}
-    }
-
-    async fn wait_until_thread_removed(thread_manager: &Arc<ThreadManager>, thread_id: ThreadId) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if thread_manager.get_thread(thread_id).await.is_err() {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for failed setup reaper to remove thread");
-    }
-
-    #[tokio::test]
-    async fn feedback_thread_ids_fallback_merges_live_and_persisted_subtrees_after_complete_error()
-    -> Result<()> {
-        const PARENT_PROMPT: &str = "spawn child for feedback";
-        const CHILD_PROMPT: &str = "child should be included in feedback";
-        const SPAWN_CALL_ID: &str = "spawn-feedback-child";
-
-        let spawn_args = serde_json::to_string(&json!({ "message": CHILD_PROMPT }))?;
-        let server = create_mock_responses_server_sequence_unchecked(vec![
-            responses::sse(vec![
-                responses::ev_response_created("resp-feedback-parent-1"),
-                responses::ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
-                responses::ev_completed("resp-feedback-parent-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-feedback-child-1"),
-                responses::ev_assistant_message("msg-feedback-child-1", "child done"),
-                responses::ev_completed("resp-feedback-child-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resp-feedback-parent-2"),
-                responses::ev_assistant_message("msg-feedback-parent-2", "parent done"),
-                responses::ev_completed("resp-feedback-parent-2"),
-            ]),
-        ])
-        .await;
-        let harness =
-            TestCodexMessageProcessorHarness::with_server_and_features(server, &[Feature::Collab])
-                .await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let root_thread_id = started.thread_id;
-
-        started
-            .thread
-            .submit(Op::UserInput {
-                items: vec![CoreInputItem::Text {
-                    text: PARENT_PROMPT.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                environments: None,
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-            })
-            .await?;
-
-        let live_thread_ids = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Ok(thread_ids) = harness
-                    .thread_manager
-                    .list_live_agent_subtree_thread_ids(root_thread_id)
-                    .await
-                    && thread_ids.len() == 2
-                {
-                    return thread_ids;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("timed out waiting for live child agent");
-        let live_child_thread_id = live_thread_ids
-            .iter()
-            .copied()
-            .find(|thread_id| *thread_id != root_thread_id)
-            .expect("live subtree should include child");
-        let state_db_ctx = get_state_db(harness.config.as_ref())
-            .await
-            .expect("state DB should exist after root thread start");
-        let persisted_only_thread_id = ThreadId::new();
-        state_db_ctx
-            .upsert_thread_spawn_edge(
-                root_thread_id,
-                live_child_thread_id,
-                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
-            )
-            .await?;
-        state_db_ctx
-            .upsert_thread_spawn_edge(
-                root_thread_id,
-                persisted_only_thread_id,
-                codex_state::DirectionalThreadSpawnEdgeStatus::Open,
-            )
-            .await?;
-
-        let feedback_thread_ids = harness
-            .processor
-            .feedback_thread_ids_for_upload_with_complete_result(
-                root_thread_id,
-                Some(&state_db_ctx),
-                Err(CodexErr::Fatal(
-                    "forced complete lookup failure".to_string(),
-                )),
-            )
-            .await;
-        assert_eq!(
-            feedback_thread_ids,
-            vec![
-                root_thread_id,
-                live_child_thread_id,
-                persisted_only_thread_id
-            ]
-        );
-
-        for thread_id in [root_thread_id, live_child_thread_id] {
-            if let Ok(thread) = harness.thread_manager.get_thread(thread_id).await {
-                let _ = thread.shutdown_and_wait().await;
-            }
-            let _ = harness.thread_manager.remove_thread(&thread_id).await;
-        }
         Ok(())
     }
 
@@ -13638,812 +11834,6 @@ mod tests {
 
         assert_eq!(thread.agent_nickname, Some("atlas".to_string()));
         assert_eq!(thread.agent_role, Some("explorer".to_string()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cleanup_failed_detached_review_thread_start_removes_thread_and_emits_closed()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .thread_watch_manager
-            .upsert_thread_silently(codex_app_server_protocol::Thread {
-                id: thread_id.to_string(),
-                forked_from_id: None,
-                preview: String::new(),
-                ephemeral: false,
-                model_provider: "mock-provider".to_string(),
-                created_at: 0,
-                updated_at: 0,
-                status: codex_app_server_protocol::ThreadStatus::NotLoaded,
-                path: None,
-                cwd: std::path::PathBuf::from("/tmp")
-                    .try_into()
-                    .expect("thread cwd is absolute"),
-                cli_version: "test".to_string(),
-                agent_nickname: None,
-                agent_role: None,
-                source: codex_app_server_protocol::SessionSource::VsCode,
-                git_info: None,
-                name: None,
-                turns: Vec::new(),
-            })
-            .await;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        started.thread.shutdown_and_wait().await?;
-        harness
-            .processor
-            .cleanup_failed_detached_review_thread_start(
-                thread_id,
-                &started.thread,
-                /*thread_started_emitted*/ true,
-            )
-            .await;
-
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_root_thread_id()
-                .await,
-            None
-        );
-        assert_eq!(
-            harness
-                .processor
-                .thread_watch_manager
-                .loaded_status_for_thread(&thread_id.to_string())
-                .await,
-            codex_app_server_protocol::ThreadStatus::NotLoaded
-        );
-        assert_eq!(
-            read_thread_closed_notification(&mut harness.outgoing_rx)
-                .await
-                .thread_id,
-            thread_id.to_string()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cleanup_failed_top_level_thread_setup_removes_thread_and_clears_pooled_runtime()
-    -> Result<()> {
-        let harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        harness
-            .processor
-            .cleanup_failed_top_level_thread_setup(thread_id, &started.thread)
-            .await;
-
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_root_thread_id()
-                .await,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_thread_archive_incomplete_shutdown_keeps_thread_loaded_and_pooled_runtime()
-    -> Result<()> {
-        for shutdown_result in [
-            ThreadShutdownResult::SubmitFailed,
-            ThreadShutdownResult::TimedOut,
-        ] {
-            let harness = TestCodexMessageProcessorHarness::new().await?;
-            let started = harness
-                .thread_manager
-                .start_thread(harness.config.as_ref().clone())
-                .await?;
-            let thread_id = started.thread_id;
-            harness
-                .processor
-                .pooled_runtime_scope
-                .reserve()
-                .await
-                .expect("reserve pooled runtime")
-                .promote(thread_id)
-                .await;
-
-            let result = CodexMessageProcessor::finalize_active_thread_archive_after_shutdown(
-                harness.processor.thread_unload_context(),
-                thread_id,
-                /*replacement_thread_id*/ None,
-                shutdown_result,
-            )
-            .await;
-
-            assert!(
-                result.is_err(),
-                "incomplete shutdown must fail archive finalization"
-            );
-            assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
-            assert_eq!(
-                harness
-                    .processor
-                    .pooled_runtime_scope
-                    .loaded_thread_id()
-                    .await,
-                Some(thread_id)
-            );
-            started.thread.shutdown_and_wait().await?;
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn finalize_thread_teardown_emits_account_lease_update_when_live_state_clears()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-        let previous_live_notification =
-            codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                account_id: Some("acct-1".to_string()),
-                pool_id: Some("pool-main".to_string()),
-                suppressed: false,
-                lease_acquired_at: Some(1),
-                min_switch_interval_secs: Some(30),
-                proactive_switch_pending: Some(false),
-                proactive_switch_suppressed: Some(false),
-                proactive_switch_allowed_at: None,
-                startup: unavailable_startup_snapshot(),
-            };
-        let thread_state = harness
-            .processor
-            .thread_state_manager
-            .thread_state(thread_id)
-            .await;
-        {
-            let mut thread_state = thread_state.lock().await;
-            assert_eq!(
-                thread_state.take_changed_account_lease_notification(previous_live_notification),
-                Some(codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                    account_id: Some("acct-1".to_string()),
-                    pool_id: Some("pool-main".to_string()),
-                    suppressed: false,
-                    lease_acquired_at: Some(1),
-                    min_switch_interval_secs: Some(30),
-                    proactive_switch_pending: Some(false),
-                    proactive_switch_suppressed: Some(false),
-                    proactive_switch_allowed_at: None,
-                    startup: unavailable_startup_snapshot(),
-                })
-            );
-        }
-
-        CodexMessageProcessor::finalize_thread_teardown_for_context(
-            harness.processor.thread_unload_context(),
-            thread_id,
-        )
-        .await;
-
-        assert_eq!(
-            read_account_lease_updated_notification(&mut harness.outgoing_rx).await,
-            codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                account_id: None,
-                pool_id: None,
-                suppressed: false,
-                lease_acquired_at: None,
-                min_switch_interval_secs: None,
-                proactive_switch_pending: None,
-                proactive_switch_suppressed: None,
-                proactive_switch_allowed_at: None,
-                startup: unavailable_startup_snapshot(),
-            }
-        );
-        started.thread.shutdown_and_wait().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unload_thread_without_subscribers_emits_account_lease_update_when_live_state_clears()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-        let previous_live_notification =
-            codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                account_id: Some("acct-1".to_string()),
-                pool_id: Some("pool-main".to_string()),
-                suppressed: false,
-                lease_acquired_at: Some(1),
-                min_switch_interval_secs: Some(30),
-                proactive_switch_pending: Some(false),
-                proactive_switch_suppressed: Some(false),
-                proactive_switch_allowed_at: None,
-                startup: unavailable_startup_snapshot(),
-            };
-        let thread_state = harness
-            .processor
-            .thread_state_manager
-            .thread_state(thread_id)
-            .await;
-        {
-            let mut thread_state = thread_state.lock().await;
-            assert_eq!(
-                thread_state.take_changed_account_lease_notification(previous_live_notification),
-                Some(codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                    account_id: Some("acct-1".to_string()),
-                    pool_id: Some("pool-main".to_string()),
-                    suppressed: false,
-                    lease_acquired_at: Some(1),
-                    min_switch_interval_secs: Some(30),
-                    proactive_switch_pending: Some(false),
-                    proactive_switch_suppressed: Some(false),
-                    proactive_switch_allowed_at: None,
-                    startup: unavailable_startup_snapshot(),
-                })
-            );
-        }
-
-        CodexMessageProcessor::unload_thread_without_subscribers(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            read_account_lease_updated_notification(&mut harness.outgoing_rx).await,
-            codex_app_server_protocol::AccountLeaseUpdatedNotification {
-                account_id: None,
-                pool_id: None,
-                suppressed: false,
-                lease_acquired_at: None,
-                min_switch_interval_secs: None,
-                proactive_switch_pending: None,
-                proactive_switch_suppressed: None,
-                proactive_switch_allowed_at: None,
-                startup: unavailable_startup_snapshot(),
-            }
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cleanup_failed_top_level_thread_setup_deletes_created_rollout_and_state() -> Result<()>
-    {
-        let harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        started.thread.ensure_rollout_materialized().await;
-        let rollout_path = started
-            .thread
-            .rollout_path()
-            .expect("persistent test thread should have a rollout path");
-        let state_db = started
-            .thread
-            .state_db()
-            .expect("persistent test thread should have state db");
-        assert!(
-            tokio::fs::try_exists(&rollout_path).await?,
-            "rollout should exist before failed setup cleanup"
-        );
-        assert!(
-            state_db.get_thread(thread_id).await?.is_some(),
-            "state row should exist before failed setup cleanup"
-        );
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        harness
-            .processor
-            .cleanup_failed_top_level_thread_setup(thread_id, &started.thread)
-            .await;
-
-        assert!(
-            !tokio::fs::try_exists(&rollout_path).await?,
-            "created rollout should be deleted after failed setup cleanup"
-        );
-        assert_eq!(state_db.get_thread(thread_id).await?, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cleanup_failed_top_level_thread_setup_preserves_existing_rollout_and_state_when_requested()
-    -> Result<()> {
-        let harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        started.thread.ensure_rollout_materialized().await;
-        let rollout_path = started
-            .thread
-            .rollout_path()
-            .expect("persistent test thread should have a rollout path");
-        let state_db = started
-            .thread
-            .state_db()
-            .expect("persistent test thread should have state db");
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        harness
-            .processor
-            .cleanup_failed_top_level_thread_setup_with_artifact_cleanup(
-                thread_id,
-                &started.thread,
-                FailedSetupArtifactCleanup::Preserve,
-            )
-            .await;
-
-        assert!(
-            tokio::fs::try_exists(&rollout_path).await?,
-            "existing rollout should be preserved after failed setup cleanup"
-        );
-        assert!(
-            state_db.get_thread(thread_id).await?.is_some(),
-            "existing state row should be preserved after failed setup cleanup"
-        );
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_top_level_thread_setup_reaps_hidden_thread_silently_after_shutdown_timeout()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        CodexMessageProcessor::finalize_failed_top_level_thread_setup(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-            ThreadShutdownResult::TimedOut,
-        )
-        .await;
-
-        assert_no_outgoing_message(&mut harness.outgoing_rx);
-        wait_until_thread_removed(&harness.thread_manager, thread_id).await;
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_root_thread_id()
-                .await,
-            None
-        );
-        assert_no_outgoing_message(&mut harness.outgoing_rx);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hidden_failed_setup_reaper_reveals_thread_when_shutdown_still_times_out() -> Result<()>
-    {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        CodexMessageProcessor::finalize_failed_thread_setup_reap(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            FailedSetupReaperVisibility::Hidden,
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-            ThreadShutdownResult::TimedOut,
-        )
-        .await;
-
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            Some(thread_id)
-        );
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-        started.thread.shutdown_and_wait().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hidden_failed_setup_reaper_closes_revealed_thread_after_late_shutdown() -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        CodexMessageProcessor::finalize_failed_thread_setup_reap(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            FailedSetupReaperVisibility::Hidden,
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-            ThreadShutdownResult::TimedOut,
-        )
-        .await;
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-
-        started.thread.shutdown_and_wait().await?;
-
-        assert_eq!(
-            read_thread_closed_notification(&mut harness.outgoing_rx)
-                .await
-                .thread_id,
-            thread_id.to_string()
-        );
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_detached_review_thread_start_reveals_thread_after_shutdown_timeout()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-
-        CodexMessageProcessor::finalize_failed_detached_review_thread_start(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            ThreadShutdownResult::TimedOut,
-            /*thread_started_emitted*/ false,
-        )
-        .await;
-
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            Some(thread_id)
-        );
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-        started.thread.shutdown_and_wait().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_detached_review_thread_start_does_not_emit_duplicate_started_after_shutdown_timeout()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-        CodexMessageProcessor::emit_thread_started_from_runtime(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            &started.thread,
-        )
-        .await;
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-
-        CodexMessageProcessor::finalize_failed_detached_review_thread_start(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            ThreadShutdownResult::TimedOut,
-            /*thread_started_emitted*/ true,
-        )
-        .await;
-
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_ok());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            Some(thread_id)
-        );
-        assert_no_outgoing_message(&mut harness.outgoing_rx);
-        started.thread.shutdown_and_wait().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_detached_review_visible_reaper_closes_thread_after_late_shutdown() -> Result<()>
-    {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-        CodexMessageProcessor::emit_thread_started_from_runtime(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            &started.thread,
-        )
-        .await;
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-
-        CodexMessageProcessor::finalize_failed_thread_setup_reap(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            FailedSetupReaperVisibility::VisibleStarted,
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-            ThreadShutdownResult::TimedOut,
-        )
-        .await;
-        assert_no_outgoing_message(&mut harness.outgoing_rx);
-
-        started.thread.shutdown_and_wait().await?;
-
-        assert_eq!(
-            read_thread_closed_notification(&mut harness.outgoing_rx)
-                .await
-                .thread_id,
-            thread_id.to_string()
-        );
-        assert!(harness.thread_manager.get_thread(thread_id).await.is_err());
-        assert_eq!(
-            harness
-                .processor
-                .pooled_runtime_scope
-                .loaded_thread_id()
-                .await,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_detached_review_reaper_does_not_emit_closed_when_thread_already_unloaded()
-    -> Result<()> {
-        let mut harness = TestCodexMessageProcessorHarness::new().await?;
-        let started = harness
-            .thread_manager
-            .start_thread(harness.config.as_ref().clone())
-            .await?;
-        let thread_id = started.thread_id;
-        harness
-            .processor
-            .pooled_runtime_scope
-            .reserve()
-            .await
-            .expect("reserve pooled runtime")
-            .promote(thread_id)
-            .await;
-        CodexMessageProcessor::emit_thread_started_from_runtime(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            &started.thread,
-        )
-        .await;
-        assert_eq!(
-            read_thread_started_notification(&mut harness.outgoing_rx)
-                .await
-                .thread
-                .id,
-            thread_id.to_string()
-        );
-
-        assert!(
-            harness
-                .thread_manager
-                .remove_thread(&thread_id)
-                .await
-                .is_some()
-        );
-        CodexMessageProcessor::finalize_thread_teardown_for_context(
-            harness.processor.thread_unload_context(),
-            thread_id,
-        )
-        .await;
-        drain_outgoing_messages(&mut harness.outgoing_rx);
-
-        CodexMessageProcessor::reap_failed_thread_setup(
-            harness.processor.thread_unload_context(),
-            thread_id,
-            started.thread.clone(),
-            FailedSetupReaperVisibility::VisibleStarted,
-            FailedSetupArtifactCleanup::DeleteCreatedRollout,
-        )
-        .await;
-
-        assert_no_outgoing_message(&mut harness.outgoing_rx);
         Ok(())
     }
 

@@ -357,6 +357,10 @@ client_request_definitions! {
         params: v2::MarketplaceRemoveParams,
         response: v2::MarketplaceRemoveResponse,
     },
+    MarketplaceUpgrade => "marketplace/upgrade" {
+        params: v2::MarketplaceUpgradeParams,
+        response: v2::MarketplaceUpgradeResponse,
+    },
     PluginList => "plugin/list" {
         params: v2::PluginListParams,
         response: v2::PluginListResponse,
@@ -1509,6 +1513,45 @@ mod tests {
     }
 
     #[test]
+    fn serialize_account_pool_default_set() -> Result<()> {
+        let request = ClientRequest::AccountPoolDefaultSet {
+            request_id: RequestId::Integer(9),
+            params: v2::AccountPoolDefaultSetParams {
+                pool_id: "team-main".to_string(),
+            },
+        };
+
+        assert_eq!(
+            json!({
+                "method": "accountPool/default/set",
+                "id": 9,
+                "params": {
+                    "poolId": "team-main"
+                }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_account_pool_default_clear() -> Result<()> {
+        let request = ClientRequest::AccountPoolDefaultClear {
+            request_id: RequestId::Integer(9),
+            params: None,
+        };
+
+        assert_eq!(
+            json!({
+                "method": "accountPool/default/clear",
+                "id": 9
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn serialize_client_response() -> Result<()> {
         let cwd = absolute_path("/tmp");
         let response = ClientResponse::ThreadStart {
@@ -1591,22 +1634,7 @@ mod tests {
                         "type": "dangerFullAccess"
                     },
                     "permissionProfile": {
-                        "network": {
-                            "enabled": true,
-                        },
-                        "fileSystem": {
-                            "entries": [
-                                {
-                                    "path": {
-                                        "type": "special",
-                                        "value": {
-                                            "kind": "root",
-                                        },
-                                    },
-                                    "access": "write",
-                                },
-                            ],
-                        },
+                        "type": "disabled"
                     },
                     "reasoningEffort": null
                 }
@@ -1711,7 +1739,7 @@ mod tests {
     #[test]
     fn serialize_account_login_chatgpt_auth_tokens() -> Result<()> {
         let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(8),
+            request_id: RequestId::Integer(6),
             params: v2::LoginAccountParams::ChatgptAuthTokens {
                 access_token: "access-token".to_string(),
                 chatgpt_account_id: "org-123".to_string(),
@@ -1721,7 +1749,7 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "account/login/start",
-                "id": 8,
+                "id": 6,
                 "params": {
                     "type": "chatgptAuthTokens",
                     "accessToken": "access-token",
@@ -1737,7 +1765,7 @@ mod tests {
     #[test]
     fn serialize_get_account() -> Result<()> {
         let request = ClientRequest::GetAccount {
-            request_id: RequestId::Integer(9),
+            request_id: RequestId::Integer(6),
             params: v2::GetAccountParams {
                 refresh_token: false,
             },
@@ -1745,7 +1773,7 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "account/read",
-                "id": 9,
+                "id": 6,
                 "params": {
                     "refreshToken": false
                 }
@@ -1950,45 +1978,6 @@ mod tests {
                     "transport": null,
                     "voice": "marin"
                 }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serialize_account_pool_default_set() -> Result<()> {
-        let request = ClientRequest::AccountPoolDefaultSet {
-            request_id: RequestId::Integer(9),
-            params: v2::AccountPoolDefaultSetParams {
-                pool_id: "team-main".to_string(),
-            },
-        };
-
-        assert_eq!(
-            json!({
-                "method": "accountPool/default/set",
-                "id": 9,
-                "params": {
-                    "poolId": "team-main"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serialize_account_pool_default_clear() -> Result<()> {
-        let request = ClientRequest::AccountPoolDefaultClear {
-            request_id: RequestId::Integer(9),
-            params: None,
-        };
-
-        assert_eq!(
-            json!({
-                "method": "accountPool/default/clear",
-                "id": 9
             }),
             serde_json::to_value(&request)?,
         );

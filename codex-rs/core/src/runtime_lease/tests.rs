@@ -37,15 +37,15 @@ use codex_login::AuthDotJson;
 use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_login::save_auth;
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::SharedModelsManager;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_rollout_trace::RolloutTraceRecorder;
+use codex_rollout_trace::ThreadTraceContext;
 use codex_state::AccountRegistryEntryUpdate;
 use codex_state::AccountStartupSelectionUpdate;
 use codex_state::QuotaExhaustedWindows;
@@ -59,6 +59,23 @@ use uuid::Uuid;
 
 fn test_environment_manager() -> Arc<EnvironmentManager> {
     Arc::new(EnvironmentManager::default_for_tests())
+}
+
+fn test_models_manager(
+    _config: &Config,
+    auth_manager: Arc<codex_login::AuthManager>,
+) -> SharedModelsManager {
+    Arc::new(StaticModelsManager::new(
+        Some(auth_manager),
+        codex_models_manager::bundled_models_response().expect("bundled models should parse"),
+        Default::default(),
+    ))
+}
+
+fn test_thread_store(config: &Config) -> Arc<dyn codex_thread_store::ThreadStore> {
+    Arc::new(codex_thread_store::LocalThreadStore::new(
+        codex_rollout::RolloutConfig::from_view(config),
+    ))
 }
 
 #[test]
@@ -2384,12 +2401,7 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
     let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.to_path_buf(),
-        auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+    let models_manager = test_models_manager(&config, Arc::clone(&auth_manager));
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -2419,15 +2431,17 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
     let child = Codex::spawn(CodexSpawnArgs {
-        config,
+        config: config.clone(),
         auth_manager,
         models_manager,
         environment_manager: test_environment_manager(),
@@ -2451,10 +2465,12 @@ async fn child_session_with_inherited_runtime_host_skips_session_local_account_p
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -2619,12 +2635,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
     let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.to_path_buf(),
-        auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+    let models_manager = test_models_manager(&config, Arc::clone(&auth_manager));
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -2637,7 +2648,7 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
     ));
 
     let spawn_result = Codex::spawn(CodexSpawnArgs {
-        config,
+        config: config.clone(),
         auth_manager,
         models_manager,
         environment_manager: test_environment_manager(),
@@ -2661,10 +2672,12 @@ async fn codex_spawn_rejects_inherited_pooled_runtime_host_without_published_aut
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await;
     let err = match spawn_result {
@@ -2697,12 +2710,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
     let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.to_path_buf(),
-        auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+    let models_manager = test_models_manager(&config, Arc::clone(&auth_manager));
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -2732,10 +2740,12 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -2764,10 +2774,12 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -2861,7 +2873,7 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
     child.shutdown_and_wait().await?;
 
     let contender = Codex::spawn(CodexSpawnArgs {
-        config,
+        config: config.clone(),
         auth_manager,
         models_manager,
         environment_manager: test_environment_manager(),
@@ -2881,10 +2893,12 @@ async fn pooled_host_child_keeps_authority_owned_lease_until_last_session_shutdo
         runtime_lease_host: Some(RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new(
             "runtime-c".to_string(),
         ))),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -2966,14 +2980,9 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         RuntimeLeaseHost::pooled_for_test(RuntimeLeaseHostId::new("runtime-fail".to_string()));
 
     let spawn_result = Codex::spawn(CodexSpawnArgs {
-        config,
+        config: config.clone(),
         auth_manager: auth_manager.clone(),
-        models_manager: Arc::new(ModelsManager::new(
-            config_codex_home.to_path_buf(),
-            auth_manager.clone(),
-            /*model_catalog*/ None,
-            CollaborationModesConfig::default(),
-        )),
+        models_manager: test_models_manager(&config, Arc::clone(&auth_manager)),
         environment_manager: test_environment_manager(),
         skills_manager: Arc::new(SkillsManager::new(
             config_codex_home.clone(),
@@ -2992,10 +3001,12 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await;
 
@@ -3013,15 +3024,11 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
     );
     assert!(runtime_lease_host.pooled_authority().is_none());
 
+    let recovered_config = build_test_config_with_pool(codex_home.path()).await;
     let recovered = Codex::spawn(CodexSpawnArgs {
-        config: build_test_config_with_pool(codex_home.path()).await,
+        config: recovered_config.clone(),
         auth_manager: auth_manager.clone(),
-        models_manager: Arc::new(ModelsManager::new(
-            config_codex_home.to_path_buf(),
-            auth_manager,
-            /*model_catalog*/ None,
-            CollaborationModesConfig::default(),
-        )),
+        models_manager: test_models_manager(&recovered_config, Arc::clone(&auth_manager)),
         environment_manager: test_environment_manager(),
         skills_manager: Arc::new(SkillsManager::new(
             config_codex_home,
@@ -3040,10 +3047,12 @@ async fn failed_startup_does_not_leak_runtime_host_attachment() -> anyhow::Resul
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&recovered_config),
     })
     .await?
     .codex;
@@ -3067,12 +3076,7 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
     let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
-        config_codex_home.to_path_buf(),
-        auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+    let models_manager = test_models_manager(&config, Arc::clone(&auth_manager));
     let plugins_manager = Arc::new(PluginsManager::new(config_codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -3103,10 +3107,12 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -3136,10 +3142,12 @@ async fn root_startup_reuses_existing_runtime_authority_when_host_is_explicitly_
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -3175,12 +3183,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
     let config_codex_home = config.codex_home.clone();
     let auth_manager =
         codex_login::AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
-    let models_manager = Arc::new(ModelsManager::new(
-        config.codex_home.to_path_buf(),
-        auth_manager.clone(),
-        /*model_catalog*/ None,
-        CollaborationModesConfig::default(),
-    ));
+    let models_manager = test_models_manager(&config, Arc::clone(&auth_manager));
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_manager = Arc::new(SkillsManager::new(
@@ -3208,10 +3211,12 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: None,
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;
@@ -3258,7 +3263,7 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
     )?;
 
     let child = Codex::spawn(CodexSpawnArgs {
-        config,
+        config: config.clone(),
         auth_manager,
         models_manager,
         environment_manager: test_environment_manager(),
@@ -3282,10 +3287,12 @@ async fn root_with_config_only_pool_installs_runtime_host_for_future_threadspawn
         inherited_exec_policy: Some(Arc::new(crate::exec_policy::ExecPolicyManager::default())),
         compat_inherited_lease_auth_session: None,
         runtime_lease_host: Some(root_runtime_lease_host.clone()),
-        inherited_rollout_trace: RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: ThreadTraceContext::disabled(),
         user_shell_override: None,
         parent_trace: None,
+        environments: Vec::new(),
         analytics_events_client: None,
+        thread_store: test_thread_store(&config),
     })
     .await?
     .codex;

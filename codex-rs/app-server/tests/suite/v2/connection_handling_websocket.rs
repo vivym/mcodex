@@ -32,15 +32,15 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
+use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
-use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -56,7 +56,7 @@ pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(super) type WsClient = WebSocketStream<TcpStream>;
 type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::test]
@@ -390,6 +390,7 @@ pub(super) async fn spawn_websocket_server_with_args(
     let mut cmd = Command::new(program);
     mark_product_identity_migration_complete(codex_home)
         .context("should mark product identity migration complete for websocket tests")?;
+    cmd.current_dir(codex_home);
     cmd.arg("--listen")
         .arg(listen_url)
         .args(extra_args)
@@ -398,6 +399,12 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stderr(Stdio::piped())
         .env("MCODEX_HOME", codex_home)
         .env_remove("CODEX_HOME")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            codex_home.join("managed_config.toml"),
+        )
         .env("RUST_LOG", "debug");
     let mut process = cmd
         .kill_on_drop(true)
@@ -465,12 +472,21 @@ pub(super) async fn connect_websocket_with_bearer(
     bind_addr: SocketAddr,
     bearer_token: Option<&str>,
 ) -> Result<WsClient> {
-    let url = format!("ws://{}", connectable_bind_addr(bind_addr));
+    let connect_addr = connectable_bind_addr(bind_addr);
+    let url = format!("ws://{connect_addr}");
     let request = websocket_request(url.as_str(), bearer_token, /*origin*/ None)?;
     let deadline = Instant::now() + DEFAULT_READ_TIMEOUT;
     loop {
-        match connect_async(request.clone()).await {
-            Ok((stream, _response)) => return Ok(stream),
+        match TcpStream::connect(connect_addr).await {
+            Ok(stream) => match client_async(request.clone(), stream).await {
+                Ok((stream, _response)) => return Ok(stream),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        bail!("failed to connect websocket to {url}: {err}");
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            },
             Err(err) => {
                 if Instant::now() >= deadline {
                     bail!("failed to connect websocket to {url}: {err}");
@@ -500,10 +516,14 @@ async fn assert_websocket_connect_rejected_with_headers(
     origin: Option<&str>,
     expected_status: StatusCode,
 ) -> Result<()> {
-    let url = format!("ws://{}", connectable_bind_addr(bind_addr));
+    let connect_addr = connectable_bind_addr(bind_addr);
+    let url = format!("ws://{connect_addr}");
     let request = websocket_request(url.as_str(), bearer_token, origin)?;
+    let stream = TcpStream::connect(connect_addr)
+        .await
+        .with_context(|| format!("failed to connect TCP socket to {connect_addr}"))?;
 
-    match connect_async(request).await {
+    match client_async(request, stream).await {
         Ok((_stream, response)) => {
             bail!(
                 "expected websocket handshake rejection, got {}",
@@ -528,6 +548,7 @@ async fn run_websocket_server_to_completion_with_args(
     let mut cmd = Command::new(program);
     mark_product_identity_migration_complete(codex_home)
         .context("should mark product identity migration complete for websocket tests")?;
+    cmd.current_dir(codex_home);
     cmd.arg("--listen")
         .arg(listen_url)
         .args(extra_args)
@@ -536,6 +557,12 @@ async fn run_websocket_server_to_completion_with_args(
         .stderr(Stdio::piped())
         .env("MCODEX_HOME", codex_home)
         .env_remove("CODEX_HOME")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env(
+            "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+            codex_home.join("managed_config.toml"),
+        )
         .env("RUST_LOG", "debug");
     timeout(DEFAULT_READ_TIMEOUT, cmd.output())
         .await

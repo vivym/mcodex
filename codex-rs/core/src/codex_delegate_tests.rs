@@ -394,6 +394,33 @@ async fn run_codex_thread_one_shot_registers_invocation_collaboration_membership
 }
 
 #[tokio::test]
+async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
+    let (parent_session, parent_ctx, _rx_events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = timeout(
+        Duration::from_secs(/*secs*/ 1),
+        run_codex_thread_interactive(
+            parent_ctx.config.as_ref().clone(),
+            Arc::clone(&parent_session.services.auth_manager),
+            /*compat_inherited_lease_auth_session*/ None,
+            Arc::clone(&parent_session.services.models_manager),
+            parent_session,
+            parent_ctx,
+            cancel_token,
+            SubAgentSource::Review,
+            /*initial_history*/ None,
+        ),
+    )
+    .await
+    .expect("cancelled delegate spawn should not hang");
+
+    assert!(matches!(result, Err(CodexErr::TurnAborted)));
+}
+
+#[tokio::test]
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;

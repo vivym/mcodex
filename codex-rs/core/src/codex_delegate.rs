@@ -48,9 +48,10 @@ use crate::session::SUBMISSION_CHANNEL_CAPACITY;
 use crate::session::emit_subagent_session_started;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
 use codex_login::AuthManager;
 use codex_login::auth::LeaseScopedAuthSession;
-use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InitialHistory;
 
@@ -71,7 +72,7 @@ pub(crate) async fn run_codex_thread_interactive(
     config: Config,
     auth_manager: Arc<AuthManager>,
     compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,
     cancel_token: CancellationToken,
@@ -127,14 +128,21 @@ pub(crate) async fn run_codex_thread_interactive(
         runtime_lease_host,
         user_shell_override: None,
         inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
-        inherited_rollout_trace: codex_rollout_trace::RolloutTraceRecorder::disabled(),
+        parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
+        environments: parent_ctx
+            .environments
+            .iter()
+            .map(TurnEnvironment::selection)
+            .collect(),
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+        thread_store: Arc::clone(&parent_session.services.thread_store),
     }))
+    .or_cancel(&cancel_token)
     .await;
     let CodexSpawnOk { codex, .. } = match spawn_result {
-        Ok(spawned) => spawned,
-        Err(err) => {
+        Ok(Ok(spawned)) => spawned,
+        Ok(Err(err)) => {
             if let Some(reservation) = runtime_lease_startup_reservation.take()
                 && let Err(rollback_err) = reservation.rollback().await
             {
@@ -143,6 +151,16 @@ pub(crate) async fn run_codex_thread_interactive(
                 );
             }
             return Err(err);
+        }
+        Err(_) => {
+            if let Some(reservation) = runtime_lease_startup_reservation.take()
+                && let Err(rollback_err) = reservation.rollback().await
+            {
+                warn!(
+                    "failed to roll back runtime lease startup reservation after delegate spawn cancellation: {rollback_err:#}"
+                );
+            }
+            return Err(CodexErr::TurnAborted);
         }
     };
     let initial_collaboration_tree_id = match &subagent_source {
@@ -233,7 +251,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     config: Config,
     auth_manager: Arc<AuthManager>,
     compat_inherited_lease_auth_session: Option<Arc<dyn LeaseScopedAuthSession>>,
-    models_manager: Arc<ModelsManager>,
+    models_manager: SharedModelsManager,
     input: Vec<UserInput>,
     parent_session: Arc<Session>,
     parent_ctx: Arc<TurnContext>,

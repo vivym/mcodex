@@ -61,6 +61,9 @@ mod account_pool_observability;
 mod account_pool_quota;
 mod agent_jobs;
 mod backfill;
+mod device_key;
+#[cfg(test)]
+mod device_key_tests;
 mod logs;
 mod memories;
 mod remote_control;
@@ -69,6 +72,7 @@ mod test_support;
 mod thread_config_baselines;
 mod threads;
 
+pub use device_key::DeviceKeyBindingRecord;
 pub use remote_control::RemoteControlEnrollmentRecord;
 pub use threads::ThreadFilterOptions;
 

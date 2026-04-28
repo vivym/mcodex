@@ -276,61 +276,132 @@
       ]
     },
     "PermissionProfile": {
-      "properties": {
-        "fileSystem": {
-          "anyOf": [
-            {
+      "oneOf": [
+        {
+          "description": "Codex owns sandbox construction for this profile.",
+          "properties": {
+            "fileSystem": {
               "$ref": "#/definitions/PermissionProfileFileSystemPermissions"
             },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "network": {
-          "anyOf": [
-            {
+            "network": {
               "$ref": "#/definitions/PermissionProfileNetworkPermissions"
             },
-            {
-              "type": "null"
+            "type": {
+              "enum": [
+                "managed"
+              ],
+              "title": "ManagedPermissionProfileType",
+              "type": "string"
             }
-          ]
+          },
+          "required": [
+            "fileSystem",
+            "network",
+            "type"
+          ],
+          "title": "ManagedPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Do not apply an outer sandbox.",
+          "properties": {
+            "type": {
+              "enum": [
+                "disabled"
+              ],
+              "title": "DisabledPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DisabledPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Filesystem isolation is enforced by an external caller.",
+          "properties": {
+            "network": {
+              "$ref": "#/definitions/PermissionProfileNetworkPermissions"
+            },
+            "type": {
+              "enum": [
+                "external"
+              ],
+              "title": "ExternalPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "network",
+            "type"
+          ],
+          "title": "ExternalPermissionProfile",
+          "type": "object"
         }
-      },
-      "type": "object"
+      ]
     },
     "PermissionProfileFileSystemPermissions": {
-      "properties": {
-        "entries": {
-          "items": {
-            "$ref": "#/definitions/FileSystemSandboxEntry"
+      "oneOf": [
+        {
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/definitions/FileSystemSandboxEntry"
+              },
+              "type": "array"
+            },
+            "globScanMaxDepth": {
+              "format": "uint",
+              "minimum": 1.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedPermissionProfileFileSystemPermissionsType",
+              "type": "string"
+            }
           },
-          "type": "array"
+          "required": [
+            "entries",
+            "type"
+          ],
+          "title": "RestrictedPermissionProfileFileSystemPermissions",
+          "type": "object"
         },
-        "globScanMaxDepth": {
-          "format": "uint",
-          "minimum": 1.0,
-          "type": [
-            "integer",
-            "null"
-          ]
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unrestricted"
+              ],
+              "title": "UnrestrictedPermissionProfileFileSystemPermissionsType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "UnrestrictedPermissionProfileFileSystemPermissions",
+          "type": "object"
         }
-      },
-      "required": [
-        "entries"
-      ],
-      "type": "object"
+      ]
     },
     "PermissionProfileNetworkPermissions": {
       "properties": {
         "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         }
       },
+      "required": [
+        "enabled"
+      ],
       "type": "object"
     },
     "SandboxMode": {
@@ -349,7 +420,7 @@
       "type": "string"
     }
   },
-  "description": "There are two ways to fork a thread: 1. By thread_id: load the thread from disk by thread_id and fork it into a new thread. 2. By path: load the thread from disk by path and fork it into a new thread.\n\nIf using path, the thread_id param will be ignored. Path-based fork is experimental and requires the experimental API capability.\n\nPrefer using thread_id whenever possible.",
+  "description": "There are two ways to fork a thread: 1. By thread_id: load the thread from disk by thread_id and fork it into a new thread. 2. By path: load the thread from disk by path and fork it into a new thread.\n\nIf using path, the thread_id param will be ignored.\n\nPrefer using thread_id whenever possible.",
   "properties": {
     "approvalPolicy": {
       "anyOf": [
@@ -398,6 +469,10 @@
       ]
     },
     "ephemeral": {
+      "type": "boolean"
+    },
+    "excludeTurns": {
+      "description": "When true, return only thread metadata and live fork state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after forking.",
       "type": "boolean"
     },
     "model": {

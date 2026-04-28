@@ -345,32 +345,22 @@ async fn send_track_events(
     let Some(auth) = auth_provider.auth().await else {
         return;
     };
-    if !auth.is_chatgpt_auth() {
+    if !auth.uses_codex_backend() {
         return;
     }
-    let Some(account_id) = auth.get_account_id() else {
-        return;
-    };
 
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/codex/analytics-events/events");
     let payload = TrackEventsRequest { events };
 
-    let mut request = create_client()
+    let response = create_client()
         .post(&url)
         .timeout(ANALYTICS_EVENTS_TIMEOUT)
-        .header("chatgpt-account-id", &account_id)
+        .headers(codex_model_provider::auth_provider_from_auth(&auth).to_auth_headers())
         .header("Content-Type", "application/json")
-        .json(&payload);
-    let access_token = match auth.get_token() {
-        Ok(token) => token,
-        Err(_) => return,
-    };
-    request = request.bearer_auth(&access_token);
-    if auth.is_fedramp_account() {
-        request = request.header("X-OpenAI-Fedramp", "true");
-    }
-    let response = request.send().await;
+        .json(&payload)
+        .send()
+        .await;
 
     match response {
         Ok(response) if response.status().is_success() => {}

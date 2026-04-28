@@ -17,7 +17,6 @@ import type { SandboxMode } from "./SandboxMode";
  *
  * The precedence is: history > path > thread_id.
  * If using history or path, the thread_id param will be ignored.
- * History and path resume are experimental and require the experimental API capability.
  *
  * Prefer using thread_id whenever possible.
  */
@@ -32,4 +31,9 @@ approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, /**
  * Full permissions override for the resumed thread. Cannot be combined
  * with `sandbox`.
  */
-permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null};
+permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, /**
+ * When true, return only thread metadata and live-resume state without
+ * populating `thread.turns`. This is useful when the client plans to call
+ * `thread/turns/list` immediately after resuming.
+ */
+excludeTurns?: boolean};

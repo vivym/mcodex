@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "account-pool",
     "aws-auth",
     "analytics",
     "agent-identity",
+    "account-pool",
     "backend-client",
     "ansi-escape",
     "async-utils",
@@ -104,7 +104,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.124.0"
+version = "0.125.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -116,8 +116,8 @@ license = "Apache-2.0"
 # Internal
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
-codex-account-pool = { path = "account-pool" }
 codex-agent-identity = { path = "agent-identity" }
+codex-account-pool = { path = "account-pool" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
 codex-aws-auth = { path = "aws-auth" }

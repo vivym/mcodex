@@ -1175,49 +1175,10 @@ async fn run_sampling_request(
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager
-                        .report_usage_limit_reached(e.rate_limits.as_deref(), e.resets_at)
-                        .await
-                    {
-                        warn!("failed to record account-pool usage-limit event: {report_err:#}");
-                    }
-                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(err) => err,
         };
-
-        let unauthorized_failure = matches!(
-            &err,
-            CodexErr::RefreshTokenFailed(_)
-                | CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
-                    status: http::StatusCode::UNAUTHORIZED,
-                    ..
-                },)
-        );
-        match &err {
-            CodexErr::RefreshTokenFailed(_)
-            | CodexErr::UnexpectedStatus(codex_protocol::error::UnexpectedResponseError {
-                status: http::StatusCode::UNAUTHORIZED,
-                ..
-            }) => {
-                if let Some(account_pool_manager) = sess.services.account_pool_manager.as_ref() {
-                    let mut account_pool_manager = account_pool_manager.lock().await;
-                    if let Err(report_err) = account_pool_manager.report_unauthorized().await {
-                        warn!(
-                            "failed to record account-pool unauthorized event after refresh failure: {report_err:#}"
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        if unauthorized_failure {
-            return Err(err);
-        }
 
         if !err.is_retryable() {
             return Err(err);
@@ -1326,7 +1287,7 @@ pub(crate) async fn built_tools(
     } else {
         None
     };
-    let auth = sess.current_auth().await;
+    let auth = sess.services.auth_manager.auth().await;
     let discoverable_tools = if apps_enabled && turn_context.tools_config.tool_suggest {
         if let Some(accessible_connectors) = accessible_connectors_with_enabled_state.as_ref() {
             match connectors::list_tool_suggest_discoverable_tools_with_auth(
@@ -1998,8 +1959,7 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
-    let inference_trace = sess.services.rollout_trace.inference_trace_context(
-        sess.conversation_id,
+    let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
         turn_context.sub_id.as_str(),
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
@@ -2012,7 +1972,7 @@ async fn try_run_sampling_request(
             turn_context.reasoning_effort,
             turn_context.reasoning_summary,
             turn_context.config.service_tier,
-            Some(&turn_context.sub_id),
+            Some(turn_context.sub_id.as_str()),
             turn_metadata_header,
             &inference_trace,
         )

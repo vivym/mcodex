@@ -2003,6 +2003,9 @@ request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
 
+[features]
+plugins = false
+
 [accounts]
 backend = "local"
 allocation_mode = "exclusive"
@@ -2049,6 +2052,9 @@ wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
+
+[features]
+plugins = false
 
 [accounts]
 backend = "local"
@@ -2120,6 +2126,9 @@ wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
+
+[features]
+plugins = false
 
 [accounts]
 backend = "local"

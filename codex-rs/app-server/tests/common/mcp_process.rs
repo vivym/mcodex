@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
@@ -11,9 +10,10 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
+use tokio::sync::Mutex;
 
-use crate::mark_product_identity_migration_complete;
 use anyhow::Context;
+use codex_app_server_protocol::AccountPoolDefaultSetParams;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::CancelLoginAccountParams;
 use codex_app_server_protocol::ClientInfo;
@@ -52,6 +52,7 @@ use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceRemoveParams;
+use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::McpResourceReadParams;
 use codex_app_server_protocol::McpServerToolCallParams;
 use codex_app_server_protocol::MockExperimentalMethodParams;
@@ -104,8 +105,8 @@ pub struct McpProcess {
     process: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
-    pending_messages: VecDeque<JSONRPCMessage>,
     stderr_lines: Arc<Mutex<Vec<String>>>,
+    pending_messages: VecDeque<JSONRPCMessage>,
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
@@ -113,7 +114,7 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
 
 impl McpProcess {
     pub async fn new(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args_and_marker(codex_home, &[], &[], true).await
+        Self::new_with_env_and_args(codex_home, &[], &[]).await
     }
 
     pub async fn new_without_managed_config(codex_home: &Path) -> anyhow::Result<Self> {
@@ -121,7 +122,7 @@ impl McpProcess {
     }
 
     pub async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args_and_marker(codex_home, &[], args, true).await
+        Self::new_with_env_and_args(codex_home, &[], args).await
     }
 
     /// Creates a new MCP process, allowing tests to override or remove
@@ -133,42 +134,34 @@ impl McpProcess {
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args_and_marker(codex_home, env_overrides, &[], true).await
+        Self::new_with_env_and_args(codex_home, env_overrides, &[]).await
     }
 
     pub async fn new_with_env_without_product_identity_marker(
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
-        Self::new_with_env_and_args_and_marker(codex_home, env_overrides, &[], false).await
+        Self::new_with_env(codex_home, env_overrides).await
     }
 
-    async fn new_with_env_and_args_and_marker(
+    async fn new_with_env_and_args(
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
         args: &[&str],
-        mark_migration_complete: bool,
     ) -> anyhow::Result<Self> {
         let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
             .context("should find binary for codex-app-server")?;
         let mut cmd = Command::new(program);
-        if mark_migration_complete {
-            mark_product_identity_migration_complete(codex_home)
-                .context("should mark product identity migration complete for app-server tests")?;
-        }
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.current_dir(codex_home);
-        // Keep mcodex's canonical home while preserving the legacy CODEX_HOME
-        // baseline that command/exec and related subprocess tests inherit.
         cmd.env("MCODEX_HOME", codex_home);
-        cmd.env("CODEX_HOME", codex_home);
-        // The app-server integration suite spawns many child processes in parallel. Keeping the
-        // default child log level at `warn` avoids stderr backpressure and harness capture
-        // contention that can otherwise starve the JSON-RPC control flow and make tests flaky.
-        cmd.env("RUST_LOG", "warn");
+        cmd.env_remove("CODEX_HOME");
+        cmd.env("NO_PROXY", "127.0.0.1,localhost");
+        cmd.env("no_proxy", "127.0.0.1,localhost");
+        cmd.env("RUST_LOG", "info");
         // Keep integration tests isolated from host managed configuration.
         cmd.env(
             "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
@@ -207,13 +200,10 @@ impl McpProcess {
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = process.stderr.take() {
             let mut stderr_reader = BufReader::new(stderr).lines();
-            let captured_stderr_lines = stderr_lines.clone();
+            let stderr_lines_for_task = Arc::clone(&stderr_lines);
             tokio::spawn(async move {
                 while let Ok(Some(line)) = stderr_reader.next_line().await {
-                    captured_stderr_lines
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(line.clone());
+                    stderr_lines_for_task.lock().await.push(line.clone());
                     eprintln!("[mcp stderr] {line}");
                 }
             });
@@ -223,40 +213,22 @@ impl McpProcess {
             process,
             stdin: Some(stdin),
             stdout,
-            pending_messages: VecDeque::new(),
             stderr_lines,
+            pending_messages: VecDeque::new(),
         })
     }
 
-    pub fn stderr_lines(&self) -> Vec<String> {
-        self.stderr_lines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
     pub async fn stderr_lines_after_quiet_period(&self) -> Vec<String> {
-        let quiet_period = std::time::Duration::from_millis(25);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut stable_intervals = 0;
-        let mut lines = self.stderr_lines();
-
-        loop {
-            tokio::time::sleep(quiet_period).await;
-            let next_lines = self.stderr_lines();
-            if next_lines.len() == lines.len() {
-                stable_intervals += 1;
-                if stable_intervals >= 2 || tokio::time::Instant::now() >= deadline {
-                    return next_lines;
-                }
-            } else {
-                stable_intervals = 0;
-                lines = next_lines;
+        let mut previous_len = self.stderr_lines.lock().await.len();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let lines = self.stderr_lines.lock().await;
+            if lines.len() == previous_len {
+                return lines.clone();
             }
-            if tokio::time::Instant::now() >= deadline {
-                return lines;
-            }
+            previous_len = lines.len();
         }
+        self.stderr_lines.lock().await.clone()
     }
 
     /// Performs the initialization handshake with the MCP server.
@@ -367,50 +339,6 @@ impl McpProcess {
             .await
     }
 
-    /// Send an `accountLease/read` JSON-RPC request.
-    pub async fn send_account_lease_read_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("accountLease/read", /*params*/ None)
-            .await
-    }
-
-    /// Send an `accountLease/resume` JSON-RPC request.
-    pub async fn send_account_lease_resume_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("accountLease/resume", /*params*/ None)
-            .await
-    }
-
-    /// Send an `accountPool/default/set` JSON-RPC request.
-    pub async fn send_account_pool_default_set_request(
-        &mut self,
-        pool_id: &str,
-    ) -> anyhow::Result<i64> {
-        self.send_request(
-            "accountPool/default/set",
-            Some(serde_json::json!({ "poolId": pool_id })),
-        )
-        .await
-    }
-
-    /// Send an `accountPool/default/clear` JSON-RPC request.
-    pub async fn send_account_pool_default_clear_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("accountPool/default/clear", /*params*/ None)
-            .await
-    }
-
-    /// Send `accountLease/read` and wait for the response.
-    pub async fn read_account_lease(&mut self) -> anyhow::Result<JSONRPCResponse> {
-        let request_id = self.send_account_lease_read_request().await?;
-        self.read_stream_until_response_message(RequestId::Integer(request_id))
-            .await
-    }
-
-    /// Send `accountLease/resume` and wait for the response.
-    pub async fn account_lease_resume(&mut self) -> anyhow::Result<JSONRPCResponse> {
-        let request_id = self.send_account_lease_resume_request().await?;
-        self.read_stream_until_response_message(RequestId::Integer(request_id))
-            .await
-    }
-
     /// Send an `account/sendAddCreditsNudgeEmail` JSON-RPC request.
     pub async fn send_add_credits_nudge_email_request(
         &mut self,
@@ -421,7 +349,48 @@ impl McpProcess {
             .await
     }
 
-    /// Send `accountPool/default/set` and wait for the response.
+    /// Send an `account/read` JSON-RPC request.
+    pub async fn send_get_account_request(
+        &mut self,
+        params: GetAccountParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("account/read", params).await
+    }
+
+    pub async fn send_account_lease_read_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountLease/read", /*params*/ None)
+            .await
+    }
+
+    pub async fn read_account_lease(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_lease_read_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    pub async fn send_account_lease_resume_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountLease/resume", /*params*/ None)
+            .await
+    }
+
+    pub async fn account_lease_resume(&mut self) -> anyhow::Result<JSONRPCResponse> {
+        let request_id = self.send_account_lease_resume_request().await?;
+        self.read_stream_until_response_message(RequestId::Integer(request_id))
+            .await
+    }
+
+    pub async fn send_account_pool_default_set_request(
+        &mut self,
+        pool_id: &str,
+    ) -> anyhow::Result<i64> {
+        let params = AccountPoolDefaultSetParams {
+            pool_id: pool_id.to_string(),
+        };
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("accountPool/default/set", params).await
+    }
+
     pub async fn account_pool_default_set(
         &mut self,
         pool_id: &str,
@@ -431,20 +400,15 @@ impl McpProcess {
             .await
     }
 
-    /// Send `accountPool/default/clear` and wait for the response.
+    pub async fn send_account_pool_default_clear_request(&mut self) -> anyhow::Result<i64> {
+        self.send_request("accountPool/default/clear", /*params*/ None)
+            .await
+    }
+
     pub async fn account_pool_default_clear(&mut self) -> anyhow::Result<JSONRPCResponse> {
         let request_id = self.send_account_pool_default_clear_request().await?;
         self.read_stream_until_response_message(RequestId::Integer(request_id))
             .await
-    }
-
-    /// Send an `account/read` JSON-RPC request.
-    pub async fn send_get_account_request(
-        &mut self,
-        params: GetAccountParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("account/read", params).await
     }
 
     /// Send an `account/login/start` JSON-RPC request with ChatGPT auth tokens.
@@ -684,6 +648,15 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("marketplace/remove", params).await
+    }
+
+    /// Send a `marketplace/upgrade` JSON-RPC request.
+    pub async fn send_marketplace_upgrade_request(
+        &mut self,
+        params: MarketplaceUpgradeParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("marketplace/upgrade", params).await
     }
 
     /// Send a `plugin/install` JSON-RPC request.
@@ -1346,15 +1319,6 @@ impl McpProcess {
 
     pub async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.read_stream_until_message(|_| true).await
-    }
-
-    pub async fn next_notification_method(&mut self) -> anyhow::Result<String> {
-        loop {
-            let message = self.read_next_message().await?;
-            if let JSONRPCMessage::Notification(notification) = message {
-                return Ok(notification.method);
-            }
-        }
     }
 
     /// Clears any buffered messages so future reads only consider new stream items.

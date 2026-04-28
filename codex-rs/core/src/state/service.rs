@@ -1,8 +1,8 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use crate::RolloutRecorder;
 use crate::SkillsManager;
 use crate::agent::AgentControl;
 use crate::client::ModelClient;
@@ -24,6 +24,8 @@ use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 use codex_account_pool::AccountKind;
+use codex_account_pool::AccountPoolEventType;
+use codex_account_pool::AccountPoolReasonCode;
 use codex_account_pool::AccountRecord;
 use codex_account_pool::LocalAccountPoolBackend;
 use codex_account_pool::ProactiveSwitchObservation;
@@ -37,8 +39,6 @@ use codex_account_pool::SelectionRequest;
 use codex_account_pool::build_selection_plan;
 use codex_account_pool::read_shared_startup_status;
 use codex_analytics::AnalyticsEventsClient;
-use codex_app_server_protocol::AccountPoolEventType;
-use codex_app_server_protocol::AccountPoolReasonCode;
 use codex_config::types::AccountsConfigToml;
 use codex_exec_server::EnvironmentManager;
 use codex_hooks::Hooks;
@@ -47,11 +47,11 @@ use codex_login::auth::LeaseAuthBinding;
 use codex_login::auth::LeaseScopedAuthSession;
 use codex_login::auth::LocalLeaseScopedAuthSession;
 use codex_mcp::McpConnectionManager;
-use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_rollout::state_db::StateDbHandle;
-use codex_rollout_trace::RolloutTraceRecorder;
+use codex_rollout_trace::ThreadTraceContext;
 use codex_state::AccountHealthEvent;
 use codex_state::AccountHealthState;
 use codex_state::AccountLeaseError;
@@ -65,10 +65,10 @@ use codex_state::AccountStartupEligibility;
 use codex_state::LeaseRenewal;
 use codex_state::QuotaExhaustedWindows;
 use codex_state::QuotaProbeResult;
-use codex_thread_store::LocalThreadStore;
+use codex_thread_store::LiveThread;
+use codex_thread_store::ThreadStore;
 use serde_json::Value;
 use serde_json::json;
-use std::path::PathBuf;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -86,14 +86,13 @@ pub(crate) struct SessionServices {
     pub(crate) main_execve_wrapper_exe: Option<PathBuf>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: Hooks,
-    pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
-    pub(crate) rollout_trace: RolloutTraceRecorder,
+    pub(crate) rollout_thread_trace: ThreadTraceContext,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
     pub(crate) auth_manager: Arc<AuthManager>,
-    pub(crate) models_manager: Arc<ModelsManager>,
+    pub(crate) models_manager: SharedModelsManager,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) tool_approvals: Mutex<ApprovalStore>,
     pub(crate) guardian_rejections: Mutex<HashMap<String, GuardianRejection>>,
@@ -111,7 +110,8 @@ pub(crate) struct SessionServices {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) runtime_lease_host: Option<crate::runtime_lease::RuntimeLeaseHost>,
     pub(crate) lease_auth: Arc<crate::lease_auth::SessionLeaseAuth>,
-    pub(crate) thread_store: LocalThreadStore,
+    pub(crate) live_thread: Option<LiveThread>,
+    pub(crate) thread_store: Arc<dyn ThreadStore>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
     pub(crate) code_mode_service: CodeModeService,
@@ -235,8 +235,6 @@ impl SessionServices {
             None,
         )
         .await?;
-        // Top-level sessions keep one runtime control plane even when pooled
-        // mode can only activate after startup.
         if accounts.is_none() && !shared_status.pooled_applicable {
             return Ok(None);
         }
@@ -283,9 +281,6 @@ impl SessionServices {
             None,
         )
         .await?;
-        // Keep the manager available whenever local account-pool config exists so
-        // state-backed startup selection written before the first turn can still
-        // activate pooled mode after startup.
         if accounts.is_none() && !shared_status.pooled_applicable {
             return Ok(None);
         }
@@ -305,418 +300,6 @@ impl SessionServices {
             codex_home,
             holder_instance_id,
         )))))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_config::types::AccountPoolDefinitionToml;
-    use codex_protocol::protocol::RateLimitWindow;
-    use codex_state::AccountQuotaStateRecord;
-    use codex_state::AccountRegistryEntryUpdate;
-    use codex_state::AccountStartupSelectionUpdate;
-    use codex_state::LegacyAccountImport;
-    use codex_state::QuotaExhaustedWindows;
-    use pretty_assertions::assert_eq;
-    use std::collections::HashMap;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn build_account_pool_manager_uses_state_only_persisted_selection() -> anyhow::Result<()>
-    {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        state_db
-            .import_legacy_default_account(LegacyAccountImport {
-                account_id: "acct-state-only".to_string(),
-            })
-            .await?;
-
-        let manager = SessionServices::build_account_pool_manager(
-            Some(state_db),
-            None,
-            home.path().to_path_buf(),
-            "holder-state-only".to_string(),
-        )
-        .await?;
-
-        assert!(manager.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn build_account_pool_manager_keeps_local_accounts_config_available_without_immediate_pool()
-    -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        let mut pools = HashMap::new();
-        pools.insert(
-            "pool-main".to_string(),
-            AccountPoolDefinitionToml {
-                allow_context_reuse: Some(false),
-                account_kinds: None,
-            },
-        );
-
-        let manager = SessionServices::build_account_pool_manager(
-            Some(state_db),
-            Some(AccountsConfigToml {
-                backend: None,
-                default_pool: None,
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: Some(pools),
-            }),
-            home.path().to_path_buf(),
-            "holder-config-only".to_string(),
-        )
-        .await?;
-
-        assert!(manager.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn build_root_runtime_lease_host_keeps_local_accounts_config_available_without_immediate_pool()
-    -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        let mut pools = HashMap::new();
-        pools.insert(
-            "pool-main".to_string(),
-            AccountPoolDefinitionToml {
-                allow_context_reuse: Some(false),
-                account_kinds: None,
-            },
-        );
-
-        let runtime_lease_host = SessionServices::build_root_runtime_lease_host(
-            Some(state_db),
-            Some(AccountsConfigToml {
-                backend: None,
-                default_pool: None,
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: Some(pools),
-            }),
-            "holder-config-only",
-        )
-        .await?;
-
-        assert!(runtime_lease_host.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn build_root_runtime_lease_host_uses_config_default_pool() -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        let mut pools = HashMap::new();
-        pools.insert(
-            "pool-main".to_string(),
-            AccountPoolDefinitionToml {
-                allow_context_reuse: Some(false),
-                account_kinds: None,
-            },
-        );
-
-        let runtime_lease_host = SessionServices::build_root_runtime_lease_host(
-            Some(state_db),
-            Some(AccountsConfigToml {
-                backend: None,
-                default_pool: Some("pool-main".to_string()),
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: Some(pools),
-            }),
-            "holder-config-default",
-        )
-        .await?;
-
-        assert!(runtime_lease_host.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prepare_turn_reports_unhealthy_startup_preferred_account() -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        state_db
-            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
-                account_id: "acct-preferred".to_string(),
-                pool_id: "pool-main".to_string(),
-                position: 0,
-                account_kind: "chatgpt".to_string(),
-                backend_family: "local".to_string(),
-                workspace_id: Some("workspace-main".to_string()),
-                enabled: true,
-                healthy: true,
-            })
-            .await?;
-        state_db
-            .write_account_startup_selection(AccountStartupSelectionUpdate {
-                default_pool_id: Some("pool-main".to_string()),
-                preferred_account_id: Some("acct-preferred".to_string()),
-                suppressed: false,
-            })
-            .await?;
-        let now = Utc::now();
-        state_db
-            .upsert_account_quota_state(AccountQuotaStateRecord {
-                account_id: "acct-preferred".to_string(),
-                limit_id: "codex".to_string(),
-                primary_used_percent: Some(99.0),
-                primary_resets_at: Some(now + Duration::seconds(60)),
-                secondary_used_percent: None,
-                secondary_resets_at: None,
-                observed_at: now,
-                exhausted_windows: QuotaExhaustedWindows::Primary,
-                predicted_blocked_until: Some(now + Duration::seconds(60)),
-                next_probe_after: Some(now + Duration::seconds(30)),
-                probe_backoff_level: 0,
-                last_probe_result: None,
-            })
-            .await?;
-
-        let mut manager = AccountPoolManager::new(
-            state_db,
-            AccountsConfigToml {
-                backend: None,
-                default_pool: Some("pool-main".to_string()),
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: None,
-            },
-            home.path().to_path_buf(),
-            "holder-startup-preferred".to_string(),
-        );
-
-        let selection = manager.prepare_turn().await?;
-
-        assert!(selection.is_none());
-        assert_eq!(
-            manager.snapshot_seed().await.snapshot().await,
-            AccountLeaseRuntimeSnapshot {
-                active: false,
-                suppressed: false,
-                account_id: None,
-                pool_id: None,
-                lease_id: None,
-                lease_epoch: None,
-                runtime_generation: None,
-                lease_acquired_at: None,
-                health_state: None,
-                switch_reason: None,
-                suppression_reason: Some(AccountLeaseRuntimeReason::PreferredAccountUnhealthy),
-                transport_reset_generation: None,
-                last_remote_context_reset_turn_id: None,
-                min_switch_interval_secs: None,
-                proactive_switch_pending: None,
-                proactive_switch_suppressed: None,
-                proactive_switch_allowed_at: None,
-                next_eligible_at: None,
-            }
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn report_usage_limit_reached_records_exhausted_quota_for_rotation() -> anyhow::Result<()>
-    {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        state_db
-            .import_legacy_default_account(LegacyAccountImport {
-                account_id: "acct-primary".to_string(),
-            })
-            .await?;
-        state_db
-            .import_legacy_default_account(LegacyAccountImport {
-                account_id: "acct-secondary".to_string(),
-            })
-            .await?;
-        let mut manager = AccountPoolManager::new(
-            Arc::clone(&state_db),
-            AccountsConfigToml {
-                backend: None,
-                default_pool: Some("legacy-default".to_string()),
-                proactive_switch_threshold_percent: None,
-                lease_ttl_secs: None,
-                heartbeat_interval_secs: None,
-                min_switch_interval_secs: None,
-                allocation_mode: None,
-                pools: None,
-            },
-            home.path().to_path_buf(),
-            "holder-usage-limit".to_string(),
-        );
-
-        let first_selection = manager
-            .prepare_turn()
-            .await?
-            .expect("first turn should acquire primary account");
-        assert_eq!(first_selection.account_id, "acct-primary");
-
-        let reset_at = DateTime::<Utc>::from_timestamp(1_704_067_242, 0)
-            .expect("fixed reset timestamp should be valid");
-        let snapshot = RateLimitSnapshot {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            primary: Some(RateLimitWindow {
-                used_percent: 100.0,
-                window_minutes: Some(15),
-                resets_at: Some(reset_at.timestamp()),
-            }),
-            secondary: None,
-            credits: None,
-            plan_type: None,
-            rate_limit_reached_type: None,
-        };
-        manager
-            .report_usage_limit_reached(Some(&snapshot), Some(reset_at))
-            .await?;
-
-        let quota = state_db
-            .read_account_quota_state("acct-primary", "codex")
-            .await?
-            .expect("usage-limit should persist exhausted quota state");
-        assert_eq!(
-            quota,
-            AccountQuotaStateRecord {
-                account_id: "acct-primary".to_string(),
-                limit_id: "codex".to_string(),
-                primary_used_percent: Some(100.0),
-                primary_resets_at: Some(reset_at),
-                secondary_used_percent: None,
-                secondary_resets_at: None,
-                observed_at: quota.observed_at,
-                exhausted_windows: QuotaExhaustedWindows::Primary,
-                predicted_blocked_until: Some(reset_at),
-                next_probe_after: Some(reset_at),
-                probe_backoff_level: 0,
-                last_probe_result: None,
-            }
-        );
-
-        let second_selection = manager
-            .prepare_turn()
-            .await?
-            .expect("second turn should rotate to the next eligible account");
-        assert_eq!(second_selection.account_id, "acct-secondary");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_seed_keeps_runtime_generation_bound_to_seed_lease_identity()
-    -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        for (position, account_id) in ["acct-seed-a", "acct-seed-b"].into_iter().enumerate() {
-            state_db
-                .upsert_account_registry_entry(AccountRegistryEntryUpdate {
-                    account_id: account_id.to_string(),
-                    pool_id: "pool-main".to_string(),
-                    position: position as i64,
-                    account_kind: "chatgpt".to_string(),
-                    backend_family: "local".to_string(),
-                    workspace_id: Some("workspace-main".to_string()),
-                    enabled: true,
-                    healthy: true,
-                })
-                .await?;
-        }
-        let lease_a = state_db
-            .acquire_account_lease("pool-main", "holder-seed-snapshot", Duration::seconds(300))
-            .await?;
-        let stale_seed = AccountPoolManagerSnapshotSeed {
-            state_db: Arc::clone(&state_db),
-            active_lease: Some(lease_a.clone()),
-            min_switch_interval_secs: 0,
-            proactive_switch_snapshot: None,
-            switch_reason: None,
-            suppression_reason: None,
-            transport_reset_generation: 0,
-            last_remote_context_reset_turn_id: None,
-            active_lease_generation: 1,
-        };
-
-        state_db
-            .release_account_lease(&lease_a.lease_key(), Utc::now())
-            .await?;
-        let lease_b = state_db
-            .acquire_account_lease_excluding(
-                "pool-main",
-                "holder-seed-snapshot",
-                Duration::seconds(300),
-                std::slice::from_ref(&lease_a.account_id),
-            )
-            .await?;
-        assert_eq!(lease_b.account_id, "acct-seed-b");
-
-        let snapshot = stale_seed.snapshot().await;
-
-        assert_eq!(snapshot.account_id.as_deref(), Some("acct-seed-a"));
-        assert_eq!(snapshot.runtime_generation, Some(1));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_seed_preserves_cached_lease_when_holder_read_fails() -> anyhow::Result<()> {
-        let home = TempDir::new()?;
-        let state_db =
-            codex_state::StateRuntime::init(home.path().to_path_buf(), "mock_provider".to_string())
-                .await?;
-        state_db
-            .upsert_account_registry_entry(AccountRegistryEntryUpdate {
-                account_id: "acct-seed-error".to_string(),
-                pool_id: "pool-main".to_string(),
-                position: 0,
-                account_kind: "chatgpt".to_string(),
-                backend_family: "local".to_string(),
-                workspace_id: Some("workspace-main".to_string()),
-                enabled: true,
-                healthy: true,
-            })
-            .await?;
-        let lease = state_db
-            .acquire_account_lease("pool-main", "holder-seed-error", Duration::seconds(300))
-            .await?;
-
-        assert_eq!(
-            validated_active_snapshot_lease(
-                Some(&lease),
-                Err(anyhow::anyhow!("injected holder read failure"))
-            ),
-            Some(lease)
-        );
-        Ok(())
     }
 }
 
@@ -2156,15 +1739,15 @@ impl AccountPoolManager {
             reason_code: Some(AccountPoolReasonCode::QuotaExhausted),
             message: format!("quota probe still blocked {}", lease.account_id),
             details_json: Some(json!({
-                    "source": "probeRefresh",
-                    "outcome": "stillBlocked",
-                    "limitId": quota_state.limit_id,
-                    "exhaustedWindows": quota_exhausted_windows_wire(
-                        quota_state.exhausted_windows
-                    ),
-                    "predictedBlockedUntil": quota_state.predicted_blocked_until,
-                    "nextProbeAfter": next_probe_after,
-                    "reservedUntil": reservation.reserved_until,
+                "source": "probeRefresh",
+                "outcome": "stillBlocked",
+                "limitId": quota_state.limit_id,
+                "exhaustedWindows": quota_exhausted_windows_wire(
+                    quota_state.exhausted_windows
+                ),
+                "predictedBlockedUntil": quota_state.predicted_blocked_until,
+                "nextProbeAfter": next_probe_after,
+                "reservedUntil": reservation.reserved_until,
             })),
         })
         .await?;
@@ -2367,12 +1950,11 @@ impl AccountPoolManager {
                 account_id: event.account_id.map(ToOwned::to_owned),
                 lease_id: event.lease_id.map(ToOwned::to_owned),
                 holder_instance_id: Some(self.holder_instance_id.clone()),
-                event_type: serialized_protocol_enum_name(&event.event_type)?,
+                event_type: event.event_type.as_str().to_string(),
                 reason_code: event
                     .reason_code
-                    .as_ref()
-                    .map(serialized_protocol_enum_name)
-                    .transpose()?,
+                    .map(account_pool_reason_code_wire)
+                    .map(ToOwned::to_owned),
                 message: event.message,
                 details_json: event.details_json,
             })
@@ -2639,12 +2221,28 @@ fn rate_limit_window_resets_at(
         .and_then(|resets_at| DateTime::<Utc>::from_timestamp(resets_at, 0))
 }
 
-fn serialized_protocol_enum_name<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
-    match serde_json::to_value(value)? {
-        serde_json::Value::String(name) => Ok(name),
-        other => Err(anyhow::anyhow!(
-            "protocol enum serialized to a non-string value: {other:?}"
-        )),
+fn account_pool_reason_code_wire(value: AccountPoolReasonCode) -> &'static str {
+    match value {
+        AccountPoolReasonCode::DurablySuppressed => "durablySuppressed",
+        AccountPoolReasonCode::MissingPool => "missingPool",
+        AccountPoolReasonCode::PreferredAccountSelected => "preferredAccountSelected",
+        AccountPoolReasonCode::AutomaticAccountSelected => "automaticAccountSelected",
+        AccountPoolReasonCode::PreferredAccountMissing => "preferredAccountMissing",
+        AccountPoolReasonCode::PreferredAccountInOtherPool => "preferredAccountInOtherPool",
+        AccountPoolReasonCode::PreferredAccountDisabled => "preferredAccountDisabled",
+        AccountPoolReasonCode::PreferredAccountUnhealthy => "preferredAccountUnhealthy",
+        AccountPoolReasonCode::PreferredAccountBusy => "preferredAccountBusy",
+        AccountPoolReasonCode::ManualPause => "manualPause",
+        AccountPoolReasonCode::ManualDrain => "manualDrain",
+        AccountPoolReasonCode::QuotaNearExhausted => "quotaNearExhausted",
+        AccountPoolReasonCode::QuotaExhausted => "quotaExhausted",
+        AccountPoolReasonCode::AuthFailure => "authFailure",
+        AccountPoolReasonCode::CooldownActive => "cooldownActive",
+        AccountPoolReasonCode::MinimumSwitchInterval => "minimumSwitchInterval",
+        AccountPoolReasonCode::NoEligibleAccount => "noEligibleAccount",
+        AccountPoolReasonCode::LeaseHeldByAnotherInstance => "leaseHeldByAnotherInstance",
+        AccountPoolReasonCode::NonReplayableTurn => "nonReplayableTurn",
+        AccountPoolReasonCode::Unknown => "unknown",
     }
 }
 

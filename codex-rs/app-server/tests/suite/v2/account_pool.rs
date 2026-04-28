@@ -38,6 +38,8 @@ use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -457,6 +459,7 @@ async fn stdio_pooled_mode_blocks_request_config_resume_and_fork_as_second_top_l
             base_instructions: None,
             developer_instructions: None,
             personality: None,
+            exclude_turns: false,
             persist_extended_history: false,
         })
         .await?;
@@ -507,7 +510,7 @@ async fn stdio_pooled_mode_releases_host_when_loaded_thread_archives() -> Result
 }
 
 #[tokio::test]
-async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads() -> Result<()> {
+async fn stdio_pooled_mode_releases_host_when_archiving_spawned_subtree() -> Result<()> {
     const PARENT_PROMPT: &str = "spawn two pooled siblings";
     const CHILD_A_PROMPT: &str = "child A pooled work";
     const CHILD_B_PROMPT: &str = "child B pooled work";
@@ -611,8 +614,6 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     .await?;
     let mut child_thread_ids = child_thread_ids;
     child_thread_ids.sort();
-    let first_owner = child_thread_ids[0].clone();
-    let sibling = child_thread_ids[1].clone();
     let parent_follow_up_request = parent_follow_up.single_request();
     let mut reported_child_thread_ids = vec![
         response_function_call_output_agent_id(&parent_follow_up_request, SPAWN_A_CALL_ID)?,
@@ -622,20 +623,9 @@ async fn stdio_pooled_mode_transfers_loaded_owner_across_sibling_spawned_threads
     assert_eq!(reported_child_thread_ids, child_thread_ids);
 
     archive_thread(&mut mcp, parent.id.as_str()).await?;
-    let blocked_by_live_children = start_thread_error(&mut mcp).await?;
-    assert_eq!(
-        pooled_runtime_error_code(&blocked_by_live_children),
-        Some("pooledRuntimeAlreadyLoaded")
-    );
-    wait_for_child_turns_completed(&mut mcp, &child_thread_ids).await?;
-    archive_thread(&mut mcp, first_owner.as_str()).await?;
-    let still_blocked = start_thread_error(&mut mcp).await?;
-    assert_eq!(
-        pooled_runtime_error_code(&still_blocked),
-        Some("pooledRuntimeAlreadyLoaded")
-    );
+    let loaded_after_archive = loaded_thread_ids(&mut mcp).await?;
+    assert_eq!(loaded_after_archive, Vec::<String>::new());
 
-    archive_thread(&mut mcp, sibling.as_str()).await?;
     let next_top_level = start_thread(&mut mcp).await?;
     assert!(!next_top_level.id.is_empty());
     assert!(
@@ -801,6 +791,7 @@ async fn stdio_pooled_mode_blocks_resume_and_fork_that_would_create_second_top_l
             base_instructions: None,
             developer_instructions: None,
             personality: None,
+            exclude_turns: false,
             persist_extended_history: false,
         })
         .await?;
@@ -1261,6 +1252,24 @@ async fn archive_thread(mcp: &mut McpProcess, thread_id: &str) -> Result<()> {
     .await??;
     let _: ThreadArchiveResponse = to_response(response)?;
     Ok(())
+}
+
+async fn loaded_thread_ids(mcp: &mut McpProcess) -> Result<Vec<String>> {
+    let request_id = mcp
+        .send_thread_loaded_list_request(ThreadLoadedListParams::default())
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadLoadedListResponse {
+        mut data,
+        next_cursor,
+    } = to_response(response)?;
+    assert_eq!(next_cursor, None);
+    data.sort();
+    Ok(data)
 }
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {

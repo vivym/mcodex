@@ -1,6 +1,5 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
-use codex_app_server_protocol::AccountLeaseUpdatedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::Turn;
@@ -32,6 +31,7 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
+    pub(crate) include_turns: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
@@ -66,7 +66,6 @@ pub(crate) struct ThreadState {
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     listener_thread: Option<Weak<CodexThread>>,
-    last_account_lease_notification: Option<AccountLeaseUpdatedNotification>,
 }
 
 impl ThreadState {
@@ -125,18 +124,6 @@ impl ThreadState {
         {
             self.current_turn_history.reset();
         }
-    }
-
-    pub(crate) fn take_changed_account_lease_notification(
-        &mut self,
-        notification: AccountLeaseUpdatedNotification,
-    ) -> Option<AccountLeaseUpdatedNotification> {
-        if self.last_account_lease_notification.as_ref() == Some(&notification) {
-            return None;
-        }
-
-        self.last_account_lease_notification = Some(notification.clone());
-        Some(notification)
     }
 }
 
@@ -237,18 +224,6 @@ impl ThreadStateManager {
         state.threads.entry(thread_id).or_default().state.clone()
     }
 
-    pub(crate) async fn thread_state_if_exists(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<Arc<Mutex<ThreadState>>> {
-        self.state
-            .lock()
-            .await
-            .threads
-            .get(&thread_id)
-            .map(|thread_entry| thread_entry.state.clone())
-    }
-
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
         let thread_state = {
             let mut state = self.state.lock().await;
@@ -271,28 +246,6 @@ impl ThreadStateManager {
                 had_listener = thread_state.cancel_tx.is_some(),
                 had_active_turn = thread_state.active_turn_snapshot().is_some(),
                 "clearing thread listener during thread-state teardown"
-            );
-            thread_state.clear_listener();
-        }
-    }
-
-    pub(crate) async fn clear_thread_listener(&self, thread_id: ThreadId) {
-        let thread_state = {
-            let state = self.state.lock().await;
-            state
-                .threads
-                .get(&thread_id)
-                .map(|thread_entry| thread_entry.state.clone())
-        };
-
-        if let Some(thread_state) = thread_state {
-            let mut thread_state = thread_state.lock().await;
-            tracing::debug!(
-                thread_id = %thread_id,
-                listener_generation = thread_state.listener_generation,
-                had_listener = thread_state.cancel_tx.is_some(),
-                had_active_turn = thread_state.active_turn_snapshot().is_some(),
-                "clearing thread listener"
             );
             thread_state.clear_listener();
         }

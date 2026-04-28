@@ -14,7 +14,6 @@ import type { SandboxMode } from "./SandboxMode";
  * 2. By path: load the thread from disk by path and fork it into a new thread.
  *
  * If using path, the thread_id param will be ignored.
- * Path-based fork is experimental and requires the experimental API capability.
  *
  * Prefer using thread_id whenever possible.
  */
@@ -29,4 +28,9 @@ approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, /**
  * Full permissions override for the forked thread. Cannot be combined
  * with `sandbox`.
  */
-permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean};
+permissionProfile?: PermissionProfile | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean, /**
+ * When true, return only thread metadata and live fork state without
+ * populating `thread.turns`. This is useful when the client plans to call
+ * `thread/turns/list` immediately after forking.
+ */
+excludeTurns?: boolean};

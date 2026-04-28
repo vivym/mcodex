@@ -542,61 +542,132 @@
       ]
     },
     "PermissionProfile": {
-      "properties": {
-        "fileSystem": {
-          "anyOf": [
-            {
+      "oneOf": [
+        {
+          "description": "Codex owns sandbox construction for this profile.",
+          "properties": {
+            "fileSystem": {
               "$ref": "#/definitions/PermissionProfileFileSystemPermissions"
             },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "network": {
-          "anyOf": [
-            {
+            "network": {
               "$ref": "#/definitions/PermissionProfileNetworkPermissions"
             },
-            {
-              "type": "null"
+            "type": {
+              "enum": [
+                "managed"
+              ],
+              "title": "ManagedPermissionProfileType",
+              "type": "string"
             }
-          ]
+          },
+          "required": [
+            "fileSystem",
+            "network",
+            "type"
+          ],
+          "title": "ManagedPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Do not apply an outer sandbox.",
+          "properties": {
+            "type": {
+              "enum": [
+                "disabled"
+              ],
+              "title": "DisabledPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "DisabledPermissionProfile",
+          "type": "object"
+        },
+        {
+          "description": "Filesystem isolation is enforced by an external caller.",
+          "properties": {
+            "network": {
+              "$ref": "#/definitions/PermissionProfileNetworkPermissions"
+            },
+            "type": {
+              "enum": [
+                "external"
+              ],
+              "title": "ExternalPermissionProfileType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "network",
+            "type"
+          ],
+          "title": "ExternalPermissionProfile",
+          "type": "object"
         }
-      },
-      "type": "object"
+      ]
     },
     "PermissionProfileFileSystemPermissions": {
-      "properties": {
-        "entries": {
-          "items": {
-            "$ref": "#/definitions/FileSystemSandboxEntry"
+      "oneOf": [
+        {
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/definitions/FileSystemSandboxEntry"
+              },
+              "type": "array"
+            },
+            "globScanMaxDepth": {
+              "format": "uint",
+              "minimum": 1.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "restricted"
+              ],
+              "title": "RestrictedPermissionProfileFileSystemPermissionsType",
+              "type": "string"
+            }
           },
-          "type": "array"
+          "required": [
+            "entries",
+            "type"
+          ],
+          "title": "RestrictedPermissionProfileFileSystemPermissions",
+          "type": "object"
         },
-        "globScanMaxDepth": {
-          "format": "uint",
-          "minimum": 1.0,
-          "type": [
-            "integer",
-            "null"
-          ]
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "unrestricted"
+              ],
+              "title": "UnrestrictedPermissionProfileFileSystemPermissionsType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "UnrestrictedPermissionProfileFileSystemPermissions",
+          "type": "object"
         }
-      },
-      "required": [
-        "entries"
-      ],
-      "type": "object"
+      ]
     },
     "PermissionProfileNetworkPermissions": {
       "properties": {
         "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         }
       },
+      "required": [
+        "enabled"
+      ],
       "type": "object"
     },
     "Personality": {
@@ -1265,7 +1336,7 @@
       "type": "string"
     }
   },
-  "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nThe precedence is: history > path > thread_id. If using history or path, the thread_id param will be ignored. History and path resume are experimental and require the experimental API capability.\n\nPrefer using thread_id whenever possible.",
+  "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nThe precedence is: history > path > thread_id. If using history or path, the thread_id param will be ignored.\n\nPrefer using thread_id whenever possible.",
   "properties": {
     "approvalPolicy": {
       "anyOf": [
@@ -1312,6 +1383,10 @@
         "string",
         "null"
       ]
+    },
+    "excludeTurns": {
+      "description": "When true, return only thread metadata and live-resume state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after resuming.",
+      "type": "boolean"
     },
     "model": {
       "description": "Configuration overrides for the resumed thread, if any.",
