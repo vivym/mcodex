@@ -681,6 +681,52 @@ async fn account_lease_snapshot_clears_pending_non_replayable_turn_reason_after_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_turns_remain_on_same_account_without_quota_pressure() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_response_sequence(
+        &server,
+        vec![
+            sse_with_primary_usage_percent("resp-1", 12.0),
+            sse_with_primary_usage_percent("resp-2", 13.0),
+        ],
+    )
+    .await;
+
+    let mut builder = pooled_accounts_builder().with_config(|config| {
+        config
+            .accounts
+            .as_mut()
+            .expect("pooled accounts config")
+            .min_switch_interval_secs = Some(0);
+    });
+    let test = builder.build(&server).await?;
+    seed_two_accounts(&test).await?;
+
+    let first_turn_error = submit_turn_and_wait(&test, "normal sticky turn 1").await?;
+    assert!(first_turn_error.is_none());
+
+    let second_turn_error = submit_turn_and_wait(&test, "normal sticky turn 2").await?;
+    assert!(second_turn_error.is_none());
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2, "expected one request per normal turn");
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID]);
+
+    let selected_event_type = event_type_name(AccountPoolEventType::ProactiveSwitchSelected);
+    let events = list_account_pool_events(&test).await?;
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != selected_event_type),
+        "normal turns without quota pressure should not emit automatic switch events: {events:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1660,6 +1706,87 @@ async fn shutdown_releases_active_lease_for_next_runtime() -> Result<()> {
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2, "expected one request per runtime turn");
     assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, PRIMARY_ACCOUNT_ID]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_runtime_skips_account_leased_by_first_runtime() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("m1", "first runtime"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("m2", "second runtime"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let shared_home = Arc::new(TempDir::new()?);
+    let mut first_builder = pooled_accounts_builder().with_home(Arc::clone(&shared_home));
+    let first = first_builder.build(&server).await?;
+    seed_two_accounts(&first).await?;
+
+    let first_turn_error = submit_turn_and_wait(&first, "first runtime turn").await?;
+    assert!(first_turn_error.is_none());
+
+    wait_for_active_pool_lease(&first, PRIMARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
+
+    let mut second_builder = pooled_accounts_builder().with_home(Arc::clone(&shared_home));
+    let second = second_builder.build(&server).await?;
+    let second_turn_error = submit_turn_and_wait(&second, "second runtime turn").await?;
+    assert!(
+        second_turn_error.is_none(),
+        "second runtime should use another eligible account while first lease is live: {second_turn_error:?}"
+    );
+
+    wait_for_active_pool_lease(&second, SECONDARY_ACCOUNT_ID, Duration::from_secs(30)).await?;
+
+    let mut third_builder = pooled_accounts_builder().with_home(shared_home);
+    let third = third_builder.build(&server).await?;
+    let third_turn_error = submit_turn_and_wait(&third, "third runtime turn").await?;
+    let third_turn_error = third_turn_error
+        .expect("third runtime should fail closed while all pooled accounts are leased");
+    assert!(
+        third_turn_error
+            .message
+            .contains("No eligible pooled account"),
+        "unexpected fail-closed error: {}",
+        third_turn_error.message
+    );
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected only the first two runtime turns to reach /responses"
+    );
+    assert_account_ids_in_order(&requests, &[PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+    let all_requests = server.received_requests().await.unwrap_or_default();
+    let response_request_count = all_requests
+        .iter()
+        .filter(|request| {
+            request.method == Method::POST && request.url.path().ends_with("/responses")
+        })
+        .count();
+    assert_eq!(
+        response_request_count, 2,
+        "third runtime should not issue /responses while all pooled accounts are leased"
+    );
+
+    third.codex.shutdown_and_wait().await?;
+    second.codex.shutdown_and_wait().await?;
+    first.codex.shutdown_and_wait().await?;
 
     Ok(())
 }

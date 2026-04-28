@@ -1,0 +1,8 @@
+# gate|package|target_kind|target_name|exact_test_path|timeout_secs|notes
+quota|codex-core|--test|all|suite::account_pool::nearing_limit_snapshot_rotates_the_next_turn_before_exhaustion|120|soft quota rotates future turn
+quota|codex-core|--test|all|suite::account_pool::usage_limit_reached_rotates_only_future_turns_on_responses_transport|120|hard usage limit rotates only future turns
+quota|codex-core|--test|all|suite::account_pool::hard_failover_uses_active_limit_family_through_runtime_authority|120|hard failover uses active limit family
+quota|codex-core|--test|all|suite::account_pool::proactive_rotation_does_not_immediately_switch_back_to_just_replaced_account|120|damping prevents switch churn
+quota|codex-core|--test|all|suite::account_pool::account_lease_snapshot_reports_proactive_switch_suppression_without_rate_limited_health|120|snapshot reports damping without rate-limited health
+quota|codex-core|--test|all|suite::account_pool::exhausted_pool_fails_closed_without_legacy_auth_fallback|120|no eligible account fails closed
+quota|codex-core|--test|all|suite::client_websockets::pooled_fail_closed_turn_without_eligible_lease_does_not_open_startup_websocket|120|fail closed does not open startup websocket
