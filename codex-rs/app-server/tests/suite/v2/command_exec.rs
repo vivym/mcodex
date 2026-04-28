@@ -1052,6 +1052,7 @@ async fn read_command_exec_delta_ws(
     }
 }
 
+#[allow(dead_code)]
 async fn read_command_exec_output_until_contains_ws(
     stream: &mut super::connection_handling_websocket::WsClient,
     process_id: &str,

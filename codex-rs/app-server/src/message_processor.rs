@@ -799,6 +799,7 @@ impl MessageProcessor {
             .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_initialized_client_request(
         self: Arc<Self>,
         connection_request_id: ConnectionRequestId,

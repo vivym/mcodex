@@ -109,6 +109,7 @@ impl ThreadWatchManager {
             .await;
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn remove_thread_silently(&self, thread_id: &str) {
         let thread_id = thread_id.to_string();
         self.mutate_and_publish(move |state| {

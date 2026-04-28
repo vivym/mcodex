@@ -18,6 +18,7 @@ use core_test_support::assert_regex_match;
 use core_test_support::process::process_is_alive;
 use core_test_support::process::wait_for_pid_file;
 use core_test_support::process::wait_for_process_exit;
+#[cfg(target_os = "macos")]
 use core_test_support::resolved_python_executable;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
