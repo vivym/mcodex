@@ -554,6 +554,21 @@ After the cold runtime/quota gate, record the target size:
 du -sh codex-rs/target 2>/dev/null || true
 ```
 
+Observed local run on 2026-04-28 for `fca72140d9` on macOS arm64:
+
+| Command | Timing | Notes |
+| --- | --- | --- |
+| `just smoke-mcodex-runtime-gate` | `real 280.68s` | Cold/stale `codex-core --test all` warm build took `2m 11s`; `codex-core --lib` warm build took `1m 06s`. |
+| `just smoke-mcodex-quota-gate` | `real 34.53s` | Reused warm `codex-core --test all` artifacts. |
+| `just smoke-mcodex-gate` | `real 140.59s` | Re-ran local, CLI, runtime, and quota gates with warm artifacts. |
+
+Observed disk on the same run:
+
+| Checkpoint | Free disk | `codex-rs/target` |
+| --- | --- | --- |
+| Before runtime/quota gate verification | `34Gi` | `28G` |
+| After gate verification and `just fix -p codex-core` | `23Gi` | `41G` |
+
 ## Deferred Gate Rows
 
 `just smoke-mcodex-app-server-gate`, `just smoke-mcodex-tui-gate`,
