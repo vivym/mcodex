@@ -102,7 +102,7 @@ while (1) {
   wait "$child_pid"
 }
 case "$mode" in
-  interrupt-warm-child|interrupt-list-child) ;;
+  interrupt-warm-child|interrupt-list-child|warm-slower-than-test-timeout) ;;
   *)
     if printf '%s' "$args" | grep -Fq " --no-run"; then
       printf 'fake cargo warm build\n'
@@ -120,6 +120,21 @@ case "$mode" in
       printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
     else
       echo "unexpected ok invocation: $args" >&2
+      exit 2
+    fi
+    ;;
+  warm-slower-than-test-timeout)
+    if printf '%s' "$args" | grep -Fq " --no-run"; then
+      sleep 2
+      printf 'fake cargo slow warm build\n'
+    elif printf '%s' "$args" | grep -Fq " --list"; then
+      printf '%s: test\n' "$requested_exact"
+    elif printf '%s' "$args" | grep -Fq " --nocapture"; then
+      printf 'running 1 test\n'
+      printf 'test %s ... ok\n' "$requested_exact"
+      printf 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s\n'
+    else
+      echo "unexpected warm-slower-than-test-timeout invocation: $args" >&2
       exit 2
     fi
     ;;
@@ -601,6 +616,7 @@ timeout_child_bin=$(write_fake_cargo timeout-child)
 interrupt_child_bin=$(write_fake_cargo interrupt-child)
 interrupt_warm_child_bin=$(write_fake_cargo interrupt-warm-child)
 interrupt_list_child_bin=$(write_fake_cargo interrupt-list-child)
+warm_slow_bin=$(write_fake_cargo warm-slower-than-test-timeout)
 
 assert_fails no_descriptor sh "$RUNNER"
 if ! grep -Fq "usage: sh scripts/smoke/run-named-cargo-tests.sh <descriptor-file>" "$TMP_DIR/no_descriptor.err"; then
@@ -844,7 +860,11 @@ if [ "$warm_count" -ne 1 ]; then
   exit 1
 fi
 
-if ! grep -Fq '[ ! -s "$timeout_status_file" ]' "$RUNNER"; then
+warm_slow_descriptor="$TMP_DIR/warm-slower-than-test-timeout.txt"
+write_descriptor_line "$warm_slow_descriptor" "runtime|codex-core|--test|all|suite::account_pool::exact_test|1|fake descriptor"
+assert_passes warm_slow env FAKE_CARGO_MODE=warm-slower-than-test-timeout PATH="$warm_slow_bin:$PATH" sh "$RUNNER" "$warm_slow_descriptor"
+
+if ! grep -Fq '[ ! -s "$runner_timeout_status_file" ]' "$RUNNER"; then
   echo "expected runner to wait for non-empty timeout status file" >&2
   exit 1
 fi

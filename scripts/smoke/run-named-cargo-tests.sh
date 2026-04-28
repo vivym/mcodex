@@ -56,10 +56,10 @@ trap 'handle_signal 129 HUP' HUP
 trap 'handle_signal 131 QUIT' QUIT
 
 run_cargo_with_timeout() {
-  timeout_secs=$1
+  runner_timeout_secs=$1
   shift
-  timeout_status_file="$TMP_DIR/timeout.$$.status"
-  rm -f "$timeout_status_file"
+  runner_timeout_status_file="$TMP_DIR/timeout.$$.status"
+  rm -f "$runner_timeout_status_file"
   perl -e '
 use strict;
 use warnings;
@@ -127,7 +127,7 @@ my $status;
 my $timed_out = 0;
 eval {
     local $SIG{ALRM} = sub { die "__codex_smoke_timeout__\n"; };
-    alarm $timeout_secs;
+    alarm $timeout_secs if $timeout_secs > 0;
     my $waited = waitpid($pid, 0);
     die "waitpid failed: $!\n" if $waited < 0;
     $status = $?;
@@ -158,9 +158,9 @@ if ($status & 127) {
     finish(128 + ($status & 127));
 }
 finish($status >> 8);
-' "$timeout_status_file" "$timeout_secs" "$@" &
+' "$runner_timeout_status_file" "$runner_timeout_secs" "$@" &
   ACTIVE_TIMEOUT_PID=$!
-  while [ ! -s "$timeout_status_file" ]; do
+  while [ ! -s "$runner_timeout_status_file" ]; do
     if ! kill -0 "$ACTIVE_TIMEOUT_PID" 2>/dev/null; then
       set +e
       wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
@@ -171,13 +171,13 @@ finish($status >> 8);
     fi
     sleep 1
   done
-  status=$(sed -n '1p' "$timeout_status_file")
-  rm -f "$timeout_status_file"
+  runner_exit_status=$(sed -n '1p' "$runner_timeout_status_file")
+  rm -f "$runner_timeout_status_file"
   set +e
   wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
   set -e
   ACTIVE_TIMEOUT_PID=
-  return "$status"
+  return "$runner_exit_status"
 }
 
 line_number=0
@@ -270,14 +270,14 @@ $targets_seen
 $target_key
 "*) ;;
     *)
-      echo "warming target package=$package target=$target_kind $target_name timeout=${timeout_secs}s"
+      echo "warming target package=$package target=$target_kind $target_name timeout=none"
       if [ "$target_kind" = "--lib" ]; then
-        run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" --no-run || {
+        run_cargo_with_timeout 0 cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" --no-run || {
           echo "failed to warm target package=$package target=$target_kind $target_name" >&2
           exit 1
         }
       else
-        run_cargo_with_timeout "$timeout_secs" cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" --no-run || {
+        run_cargo_with_timeout 0 cargo test --manifest-path "$MANIFEST_PATH" -p "$package" "$target_kind" "$target_name" --no-run || {
           echo "failed to warm target package=$package target=$target_kind $target_name" >&2
           exit 1
         }
